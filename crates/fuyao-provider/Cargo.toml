@@ -1,0 +1,17 @@
+[package]
+name = "fuyao-provider"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fuyao-api = { path = "../fuyao-api" }
+reqwest = { workspace = true }
+async-stream.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

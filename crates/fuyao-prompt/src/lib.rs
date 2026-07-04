@@ -1,0 +1,25 @@
+//! Prompt 模块
+//!
+//! 系统提示词分层构建。
+//! - `loader`: Agent 定义加载（system.md + frontmatter 解析）
+//! - `registry`: Agent 注册表（扫描目录、列举/查询 Agent）
+//! - `default`: 默认 Agent 定义（system.md 不存在时使用）
+//! - `sections`: 7 层 section 构建
+//! - `builder`: `build_system_prompt()` 组装器
+
+pub mod builder;
+pub mod default;
+pub mod error;
+pub mod loader;
+pub mod master;
+pub mod registry;
+pub mod sections;
+
+pub use builder::{build_system_prompt, build_system_prompt_with_identity};
+pub use error::PromptError;
+pub use loader::{load_agent_definition, load_agent_definition_from_agent_paths};
+pub use master::DEFAULT_MASTER_AGENT;
+pub use registry::{
+    AgentContent, AgentFile, AgentInfo, AgentRegistry, AgentSource, PagedAgents, RegistryError,
+    UpdateContentRequest,
+};

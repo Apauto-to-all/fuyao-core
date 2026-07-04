@@ -1,0 +1,13 @@
+[package]
+name = "fuyao-mcp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+fuyao-api = { path = "../fuyao-api" }
+rmcp = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+regex = { workspace = true }
+http = { workspace = true }

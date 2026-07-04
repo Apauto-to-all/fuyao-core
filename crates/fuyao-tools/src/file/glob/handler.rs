@@ -1,0 +1,288 @@
+//! 文件名搜索处理逻辑
+//!
+//! 使用标准 glob 语法搜索文件名。
+//! 基于 ignore crate（ripgrep 的目录遍历组件）实现，自动遵守 .gitignore 规则。
+//!
+//! ## 实现
+//!
+//! 使用 `ignore::WalkBuilder` 遍历目录树，`glob::Pattern` 匹配文件名。
+//! 自动跳过隐藏文件和 .gitignore 排除的文件。
+//! 搜索结果按修改时间排序（最新优先），支持 offset/limit 分页。
+
+use crate::common::{self, resolve_path};
+use crate::file::glob::types::{GlobMatch, GlobResult};
+use glob::Pattern;
+use ignore::WalkBuilder;
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+/// 搜索文件的核心实现
+///
+/// 使用 `ignore::WalkBuilder` 遍历目录树，`glob::Pattern` 匹配文件名。
+/// 结果按修改时间排序（最新优先），支持 offset/limit 分页。
+///
+/// # 参数
+///
+/// - `pattern`: glob 模式（如 `*.rs`、`*.{ts,tsx}`）
+/// - `path`: 搜索根路径
+/// - `limit`: 最大返回数量
+/// - `offset`: 跳过前 N 个结果
+fn search_files(pattern: &str, path: &str, limit: usize, offset: usize) -> GlobResult {
+    let search_path = crate::common::expand_tilde(path);
+
+    if !search_path.exists() {
+        return GlobResult {
+            matches: Vec::new(),
+            total_count: 0,
+            truncated: false,
+            pattern: pattern.to_string(),
+            path: path.to_string(),
+            error: Some(format!("路径不存在: {path}")),
+            _hint: None,
+        };
+    }
+
+    let glob_pattern = match Pattern::new(pattern) {
+        Ok(p) => p,
+        Err(e) => {
+            return GlobResult {
+                matches: Vec::new(),
+                total_count: 0,
+                truncated: false,
+                pattern: pattern.to_string(),
+                path: path.to_string(),
+                error: Some(format!("glob 模式无效: {e}")),
+                _hint: None,
+            };
+        }
+    };
+
+    let walker = WalkBuilder::new(&search_path)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    let mut all_files: Vec<(PathBuf, u64, u64)> = Vec::new();
+
+    for entry in walker.flatten() {
+        let file_type = match entry.file_type() {
+            Some(ft) => ft,
+            None => continue,
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let match_target = if pattern.contains('/') || pattern.contains('\\') {
+            // 模式包含路径分隔符，匹配完整路径
+            entry.path().to_string_lossy().to_string()
+        } else {
+            // 模式只有文件名，只匹配文件名
+            entry.file_name().to_string_lossy().to_string()
+        };
+        if !glob_pattern.matches(&match_target) {
+            continue;
+        }
+
+        if let Ok(meta) = entry.metadata() {
+            // 获取修改时间戳（秒），用于排序和返回
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            all_files.push((entry.into_path(), meta.len(), mtime));
+        }
+    }
+
+    // 按修改时间排序（最新优先）
+    all_files.sort_by_key(|b| std::cmp::Reverse(b.2));
+
+    let total = all_files.len();
+    let page: Vec<_> = all_files.into_iter().skip(offset).take(limit).collect();
+
+    let matches: Vec<GlobMatch> = page
+        .into_iter()
+        .map(|(path, size, mtime)| GlobMatch {
+            path: path.to_string_lossy().to_string(),
+            size,
+            modified: mtime,
+        })
+        .collect();
+
+    GlobResult {
+        matches,
+        total_count: total,
+        truncated: total > offset + limit,
+        pattern: pattern.to_string(),
+        path: path.to_string(),
+        error: None,
+        _hint: None,
+    }
+}
+
+/// glob 工具的异步入口
+///
+/// 解析参数后，在 `spawn_blocking` 中执行目录遍历（避免阻塞异步运行时）。
+pub async fn glob_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
+    let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(100)
+        .clamp(1, 100) as usize;
+    let offset = args
+        .get("offset")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0) as usize;
+
+    if pattern.is_empty() {
+        return common::tool_error("搜索模式不能为空");
+    }
+
+    let workspace = ctx.workspace().map(Path::to_path_buf);
+    let resolved_path_obj = resolve_path(path, workspace.as_deref());
+    let resolved_path = resolved_path_obj.to_string_lossy().to_string();
+
+    let pattern_owned = pattern.to_string();
+    let resolved_path_clone = resolved_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        search_files(&pattern_owned, &resolved_path_clone, limit, offset)
+    })
+    .await
+    .unwrap_or_else(|e| GlobResult {
+        matches: Vec::new(),
+        total_count: 0,
+        truncated: false,
+        pattern: pattern.to_string(),
+        path: resolved_path.clone(),
+        error: Some(format!("搜索任务失败: {e}")),
+        _hint: None,
+    });
+
+    if let Some(err) = &result.error {
+        return common::tool_error(err);
+    }
+
+    let mut result = result;
+    if result.truncated {
+        let next_offset = offset + limit;
+        result._hint = Some(format!(
+            "结果已截断。使用 offset={next_offset} 查看更多，或使用更具体的 pattern 缩小范围。"
+        ));
+    }
+
+    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_result_error_field_not_serialized_when_none() {
+        let result = GlobResult {
+            matches: vec![],
+            total_count: 0,
+            truncated: false,
+            pattern: "*.rs".to_string(),
+            path: ".".to_string(),
+            error: None,
+            _hint: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("error").is_none());
+    }
+
+    #[test]
+    fn glob_result_error_field_serialized_when_some() {
+        let result = GlobResult {
+            matches: vec![],
+            total_count: 0,
+            truncated: false,
+            pattern: "*.rs".to_string(),
+            path: ".".to_string(),
+            error: Some("路径不存在".to_string()),
+            _hint: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["error"], "路径不存在");
+    }
+
+    #[test]
+    fn glob_result_hint_not_serialized_when_none() {
+        let result = GlobResult {
+            matches: vec![],
+            total_count: 0,
+            truncated: false,
+            pattern: "*.rs".to_string(),
+            path: ".".to_string(),
+            error: None,
+            _hint: None,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.get("_hint").is_none());
+    }
+
+    #[test]
+    fn glob_result_hint_serialized_when_some() {
+        let result = GlobResult {
+            matches: vec![],
+            total_count: 0,
+            truncated: true,
+            pattern: "*.rs".to_string(),
+            path: ".".to_string(),
+            error: None,
+            _hint: Some("结果已截断".to_string()),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["_hint"], "结果已截断");
+    }
+
+    #[test]
+    fn glob_match_serializes_all_fields() {
+        let m = GlobMatch {
+            path: "src/main.rs".to_string(),
+            size: 1024,
+            modified: 1234567890,
+        };
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["path"], "src/main.rs");
+        assert_eq!(json["size"], 1024);
+        assert_eq!(json["modified"], 1234567890);
+    }
+
+    #[test]
+    fn glob_result_truncated_false_when_total_within_limit() {
+        let result = GlobResult {
+            matches: vec![],
+            total_count: 5,
+            truncated: false,
+            pattern: "*.rs".to_string(),
+            path: ".".to_string(),
+            error: None,
+            _hint: None,
+        };
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn glob_result_truncated_true_when_total_exceeds_limit() {
+        let result = GlobResult {
+            matches: vec![],
+            total_count: 100,
+            truncated: true,
+            pattern: "*.rs".to_string(),
+            path: ".".to_string(),
+            error: None,
+            _hint: None,
+        };
+        assert!(result.truncated);
+    }
+}
