@@ -4,8 +4,8 @@
 //! - `model`: 模型配置（Model、ModelCost、ModelLimit、ModelModalities、PriceTier）
 //! - `provider`: 供应商配置（Provider、ProviderOptions）
 
-pub mod provider;
 pub mod model;
+pub mod provider;
 
-pub use provider::{Provider, ProviderOptions};
 pub use model::{Model, ModelCost, ModelLimit, ModelModalities, PriceTier};
+pub use provider::{Provider, ProviderOptions};

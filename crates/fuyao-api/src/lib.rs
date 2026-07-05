@@ -26,9 +26,8 @@ pub use agent::{AgentContext, AgentPaths, SharedAgentCtx, ToolRunnerConfig};
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
-    AssistantData, ChunkData, ErrorData, EventBase, InputEvent, InterruptData, InterruptSource,
-    OutputEvent, PluginData, PluginSource, SystemSource, ToolCallData, ToolResultData, UserData,
-    UserMessageData, UserMessageMode, UserMessageSource,
+    EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginOrigin,
+    PluginSource, QueueUpdateKind, SystemSource, UserMessageMode, UserMessageSource,
 };
 pub use paths::parallel::{
     canonicalize_path, extract_path_from_args, paths_overlap, should_parallelize,

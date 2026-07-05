@@ -4,10 +4,10 @@
 
 use crate::message::EventBase;
 
-/// 轮次开始数据
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TurnStartData {
-    /// 事件基类（时间戳等公共字段）
+/// 轮次开始事件 envelope（无 payload，仅 base）
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TurnStartMessage {
+    /// 事件元信息（id/timestamp）
     pub base: EventBase,
 }
 
@@ -17,18 +17,18 @@ mod tests {
 
     #[test]
     fn turn_start_has_timestamp() {
-        let data = TurnStartData {
+        let msg = TurnStartMessage {
             base: EventBase::default(),
         };
-        assert!(data.base.timestamp > 0.0);
+        assert!(msg.base.timestamp > 0.0);
     }
 
     #[test]
     fn turn_start_clone_works() {
-        let data = TurnStartData {
+        let msg = TurnStartMessage {
             base: EventBase::default(),
         };
-        let cloned = data.clone();
+        let cloned = msg.clone();
         assert!(cloned.base.timestamp > 0.0);
     }
 }

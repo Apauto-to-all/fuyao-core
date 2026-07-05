@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// 嵌入到每个事件数据 struct 中作为 `base` 字段。
 /// 包含唯一 ID 和时间戳，后续可扩展 source、trace_id 等字段。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventBase {
     /// 事件唯一 ID（UUID v4）
     pub id: String,
