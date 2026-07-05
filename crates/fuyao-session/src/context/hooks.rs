@@ -236,13 +236,8 @@ impl SessionHooksState {
         let mut compressed_messages = vec![summary_msg];
         compressed_messages.extend(recent_messages);
 
-        // 生成新系统提示词（压缩重建时保留身份覆盖）
-        let new_system_prompt = match &ctx.identity_override {
-            Some(identity) => {
-                fuyao_prompt::build_system_prompt_with_identity(&agent_paths, identity)
-            }
-            None => fuyao_prompt::build_system_prompt(&agent_paths),
-        };
+        // 生成新系统提示词
+        let new_system_prompt = fuyao_prompt::build_system_prompt(&agent_paths);
 
         // 执行 split_session
         let Some(ref mgr) = ctx.session_manager else {

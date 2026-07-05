@@ -37,24 +37,15 @@ use crate::sections::{
     build_project_context_section, build_skills_section, build_tool_guidance_section,
 };
 use fuyao_api::AgentPaths;
-use fuyao_api::prompt_types::AgentDefinition;
 
 /// 构建所有 section
 ///
 /// 按顺序调用各层构建函数，返回 (中文标题, 内容) 列表。
-///
-/// `identity` 不为 None 时覆盖 Layer 1（Agent 身份），其余 6 层不变。
-pub fn build_all_sections(
-    agent_paths: &AgentPaths,
-    identity: Option<&AgentDefinition>,
-) -> Vec<(String, String)> {
+pub fn build_all_sections(agent_paths: &AgentPaths) -> Vec<(String, String)> {
     let mut sections: Vec<(String, String)> = Vec::new();
 
-    // Layer 1: Agent 身份（identity 覆盖时用 identity，否则从 agent_paths 加载）
-    let content = match identity {
-        Some(def) => def.system_prompt.clone(),
-        None => build_agent_identity_section(agent_paths),
-    };
+    // Layer 1: Agent 身份（从 agent_paths 加载 system.md）
+    let content = build_agent_identity_section(agent_paths);
     if !content.is_empty() {
         sections.push(("Agent 定义".to_string(), content));
     }
@@ -110,18 +101,7 @@ fn sections_to_prompt(sections: Vec<(String, String)>) -> String {
 /// 分层组装各 section，返回完整系统提示词。
 /// Layer 1（Agent 身份）从 agent_paths 加载 system.md。
 pub fn build_system_prompt(agent_paths: &AgentPaths) -> String {
-    sections_to_prompt(build_all_sections(agent_paths, None))
-}
-
-/// 构建系统提示词（带身份覆盖）
-///
-/// 与 build_system_prompt 相同，但 Layer 1 用传入的 identity 替代 agent_paths 加载。
-/// 用于 Master 等特殊角色复用 Layer 2-7（项目上下文/工具指南/环境），仅替换身份层。
-pub fn build_system_prompt_with_identity(
-    agent_paths: &AgentPaths,
-    identity: &AgentDefinition,
-) -> String {
-    sections_to_prompt(build_all_sections(agent_paths, Some(identity)))
+    sections_to_prompt(build_all_sections(agent_paths))
 }
 
 #[cfg(test)]
@@ -131,7 +111,7 @@ mod tests {
     #[test]
     fn build_all_sections_returns_non_empty() {
         let ctx = AgentPaths::default();
-        let sections = build_all_sections(&ctx, None);
+        let sections = build_all_sections(&ctx);
         assert!(!sections.is_empty());
         // 应该包含 Agent 定义和环境
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
@@ -154,25 +134,5 @@ mod tests {
         let ctx = AgentPaths::default();
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("当前时间："));
-    }
-
-    #[test]
-    fn build_system_prompt_with_identity_replaces_layer1() {
-        let ctx = AgentPaths::default();
-        let identity = AgentDefinition::new("master", "设计师", "我是工作流设计师");
-        let prompt = build_system_prompt_with_identity(&ctx, &identity);
-        // Layer 1 应为 identity 的 system_prompt
-        assert!(prompt.contains("我是工作流设计师"));
-        // Layer 2-7 仍然存在（环境层）
-        assert!(prompt.contains("# 环境"));
-        assert!(prompt.contains("当前时间："));
-    }
-
-    #[test]
-    fn build_system_prompt_without_identity_uses_default() {
-        let ctx = AgentPaths::default();
-        let prompt = build_system_prompt(&ctx);
-        // 无 identity_override → 走默认 Agent 身份
-        assert!(prompt.contains("Fuyao"));
     }
 }

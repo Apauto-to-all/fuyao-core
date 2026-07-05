@@ -1,7 +1,6 @@
 //! Agent 运行时类型定义
 
 use crate::agent::AgentPaths;
-use crate::prompt_types::AgentDefinition;
 use crate::provider::ThinkingType;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -39,9 +38,6 @@ pub struct AgentContext {
 
     /// 工具运行器配置
     pub tool_runner_config: ToolRunnerConfig,
-
-    /// 身份覆盖（Master 等特殊角色用），None 时从 agent_paths 加载 system.md
-    pub identity_override: Option<AgentDefinition>,
 }
 
 /// 工具运行器配置
@@ -105,7 +101,6 @@ mod tests {
         assert!(ctx.model_config.model_id.is_none());
         assert!(ctx.session_id.is_none());
         assert!(ctx.agent_paths.agent_id.is_none());
-        assert!(ctx.identity_override.is_none());
     }
 
     #[test]

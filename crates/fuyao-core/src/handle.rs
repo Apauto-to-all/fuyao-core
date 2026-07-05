@@ -82,27 +82,23 @@ impl EngineHandle {
         self.hooks.clone()
     }
 
-    /// 获取模型 ID（从 agent_ctx.model_config 获取）
-    pub fn model_id(&self) -> Option<String> {
-        self.agent_ctx
-            .lock()
-            .ok()
-            .and_then(|ctx| ctx.model_config.model_id.clone())
-    }
-
-    /// 设置模型 ID（更新 agent_ctx.model_config）
-    pub fn set_model_id(&self, model_id: String) {
-        if let Ok(mut ctx) = self.agent_ctx.lock() {
-            ctx.model_config.model_id = Some(model_id);
-        }
-    }
-
-    /// 获取 Agent 上下文
+    /// 获取 Agent 上下文（克隆）
+    ///
+    /// 返回当前 AgentContext 的克隆，调用方可读取任意字段（model_config / agent_paths 等）。
+    /// 若需修改，配合 [`set_agent_ctx`](Self::set_agent_ctx) 整体写回。
     pub fn agent_ctx(&self) -> Option<AgentContext> {
         self.agent_ctx.lock().ok().map(|ctx| ctx.clone())
     }
 
-    /// 设置 Agent 上下文
+    /// 设置 Agent 上下文（整体替换）
+    ///
+    /// 典型用法（读-改-写模式，支持运行时切换模型 / 思考参数等）：
+    /// ```ignore
+    /// let mut ctx = handle.agent_ctx()?;
+    /// ctx.model_config.thinking_type = Some(ThinkingType::Enabled);
+    /// ctx.model_config.reasoning_effort = Some("high".to_string());
+    /// handle.set_agent_ctx(ctx);
+    /// ```
     pub fn set_agent_ctx(&self, ctx: AgentContext) {
         if let Ok(mut c) = self.agent_ctx.lock() {
             *c = ctx;

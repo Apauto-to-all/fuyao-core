@@ -10,8 +10,15 @@
 //!
 //! 典型用法：
 //! ```ignore
+//! use fuyao_api::{AgentContext, ModelConfig, ThinkingType};
+//!
 //! let agent_ctx = AgentContext {
-//!     model_id: Some("deepseek/deepseek-v4-flash".to_string()),
+//!     model_config: ModelConfig {
+//!         model_id: Some("deepseek/deepseek-v4-flash".to_string()),
+//!         thinking_type: Some(ThinkingType::Enabled),      // 可选：开思考
+//!         reasoning_effort: Some("high".to_string()),       // 可选：思考强度
+//!         ..Default::default()
+//!     },
 //!     ..Default::default()
 //! };
 //! let (engine, handle) = fuyao_core::init::init_engine(agent_ctx)?;

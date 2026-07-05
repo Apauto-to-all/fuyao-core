@@ -11,14 +11,12 @@ pub mod builder;
 pub mod default;
 pub mod error;
 pub mod loader;
-pub mod master;
 pub mod registry;
 pub mod sections;
 
-pub use builder::{build_system_prompt, build_system_prompt_with_identity};
+pub use builder::build_system_prompt;
 pub use error::PromptError;
 pub use loader::{load_agent_definition, load_agent_definition_from_agent_paths};
-pub use master::DEFAULT_MASTER_AGENT;
 pub use registry::{
     AgentContent, AgentFile, AgentInfo, AgentRegistry, AgentSource, PagedAgents, RegistryError,
     UpdateContentRequest,

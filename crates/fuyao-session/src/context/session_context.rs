@@ -6,7 +6,7 @@
 use crate::SessionManager;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output;
-use fuyao_api::{AgentDefinition, AgentPaths, Message, Session};
+use fuyao_api::{AgentPaths, Message, Session};
 use std::sync::Arc;
 
 /// 会话上下文（内部状态）
@@ -21,8 +21,6 @@ pub struct SessionContext {
     pub(crate) session_manager: Option<Arc<SessionManager>>,
     /// 模型 ID（用于消息标记）
     model_id: Option<String>,
-    /// 身份覆盖（Master 等特殊角色用），None 时 build 走默认 system.md 加载
-    pub(crate) identity_override: Option<AgentDefinition>,
 }
 
 impl SessionContext {
@@ -34,21 +32,12 @@ impl SessionContext {
             agent_paths,
             session_manager: None,
             model_id: None,
-            identity_override: None,
         }
     }
 
     /// 设置模型 ID
     pub fn set_model_id(&mut self, id: String) {
         self.model_id = Some(id);
-    }
-
-    /// 设置身份覆盖（Master 等特殊角色用）
-    ///
-    /// 在 load_plugins 中从 AgentContext.identity_override 传入。
-    /// build 系统提示词时，有值则用 identity_override 替代 Layer 1 身份。
-    pub fn set_identity_override(&mut self, identity: AgentDefinition) {
-        self.identity_override = Some(identity);
     }
 
     /// 确保 SessionManager 已初始化（不创建 session）
@@ -97,12 +86,7 @@ impl SessionContext {
         }
 
         // 优先级3：创建新 session
-        let system_prompt = match &self.identity_override {
-            Some(identity) => {
-                fuyao_prompt::build_system_prompt_with_identity(&self.agent_paths, identity)
-            }
-            None => fuyao_prompt::build_system_prompt(&self.agent_paths),
-        };
+        let system_prompt = fuyao_prompt::build_system_prompt(&self.agent_paths);
         let session = mgr
             .create(
                 None,
@@ -326,12 +310,7 @@ impl SessionContext {
         }
 
         // 构建系统提示词
-        let system_prompt = match &self.identity_override {
-            Some(identity) => {
-                fuyao_prompt::build_system_prompt_with_identity(&self.agent_paths, identity)
-            }
-            None => fuyao_prompt::build_system_prompt(&self.agent_paths),
-        };
+        let system_prompt = fuyao_prompt::build_system_prompt(&self.agent_paths);
 
         // 创建新 session
         let session = mgr
