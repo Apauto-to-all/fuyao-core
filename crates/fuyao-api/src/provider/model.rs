@@ -86,6 +86,9 @@ pub struct Model {
     /// 限制信息
     pub limit: ModelLimit,
 
+    /// 是否支持思考
+    // pub reasoning: bool,
+
     /// 模态支持
     pub modalities: ModelModalities,
 }
