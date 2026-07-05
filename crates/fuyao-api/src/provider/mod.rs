@@ -7,5 +7,5 @@
 pub mod model;
 pub mod provider;
 
-pub use model::{Model, ModelCost, ModelLimit, ModelModalities, PriceTier};
+pub use model::{Model, ModelCost, ModelLimit, ModelModalities, PriceTier, ThinkingType};
 pub use provider::{Provider, ProviderOptions};

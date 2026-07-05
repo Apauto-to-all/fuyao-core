@@ -171,6 +171,26 @@ impl OpenAIProvider {
             body["tool_choice"] = tool_choice.clone();
         }
 
+        // 思考字段条件注入（门控：模型不支持思考则两个字段一律不发）
+        // 详见 03 文档 5.2 门控矩阵
+        if options.model_reasoning {
+            if let Some(t) = &options.thinking_type {
+                body["thinking"] = serde_json::json!({
+                    "type": serde_json::to_value(t).expect("ThinkingType 序列化不会失败")
+                });
+            }
+            // Disabled 时强制不发 reasoning_effort（思考都关了，强度无意义）
+            let disabled = matches!(
+                options.thinking_type,
+                Some(fuyao_api::ThinkingType::Disabled)
+            );
+            if let Some(e) = &options.reasoning_effort
+                && !disabled
+            {
+                body["reasoning_effort"] = serde_json::Value::String(e.clone());
+            }
+        }
+
         body
     }
 
@@ -719,6 +739,7 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
     use crate::provider::{ChatMessage, ChatRequest, StreamOptions as ProviderStreamOptions};
+    use fuyao_api::ThinkingType;
 
     #[test]
     fn chat_url_appends_path() {
@@ -828,6 +849,99 @@ mod tests {
 
         assert!(body["tools"].is_array());
         assert_eq!(body["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn build_request_body_no_thinking_when_model_not_reasoning() {
+        // 门控：model_reasoning=false 时，即使设了思考参数也一律不发
+        let provider = test_provider();
+        let request = ChatRequest::default();
+        let options = ProviderStreamOptions {
+            thinking_type: Some(ThinkingType::Enabled),
+            reasoning_effort: Some("high".to_string()),
+            model_reasoning: false,
+            ..Default::default()
+        };
+        let body = provider.build_request_body(request, "qwen3.6-plus", &options, false);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn build_request_body_no_thinking_when_both_none() {
+        // 思考模型默认（两参数都 None）：请求体不含思考字段
+        let provider = test_provider();
+        let request = ChatRequest::default();
+        let options = ProviderStreamOptions {
+            model_reasoning: true,
+            ..Default::default()
+        };
+        let body = provider.build_request_body(request, "deepseek-v4-flash", &options, false);
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn build_request_body_thinking_enabled_only() {
+        // 开思考但不设强度：仅发 thinking:enabled
+        let provider = test_provider();
+        let request = ChatRequest::default();
+        let options = ProviderStreamOptions {
+            thinking_type: Some(ThinkingType::Enabled),
+            model_reasoning: true,
+            ..Default::default()
+        };
+        let body = provider.build_request_body(request, "deepseek-v4-flash", &options, false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn build_request_body_thinking_enabled_with_effort() {
+        // 开思考 + 指定强度：两者都发
+        let provider = test_provider();
+        let request = ChatRequest::default();
+        let options = ProviderStreamOptions {
+            thinking_type: Some(ThinkingType::Enabled),
+            reasoning_effort: Some("high".to_string()),
+            model_reasoning: true,
+            ..Default::default()
+        };
+        let body = provider.build_request_body(request, "deepseek-v4-flash", &options, false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn build_request_body_accepts_arbitrary_effort_string() {
+        // 自定义档位名（如 "big" 不在常见枚举内）原样透传，fuyao 不校验
+        let provider = test_provider();
+        let request = ChatRequest::default();
+        let options = ProviderStreamOptions {
+            thinking_type: Some(ThinkingType::Enabled),
+            reasoning_effort: Some("big".to_string()),
+            model_reasoning: true,
+            ..Default::default()
+        };
+        let body = provider.build_request_body(request, "weird-model", &options, false);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["reasoning_effort"], "big");
+    }
+
+    #[test]
+    fn build_request_body_thinking_disabled_omits_effort() {
+        // 关思考：仅发 thinking:disabled，强制不发 reasoning_effort（强度此时无意义）
+        let provider = test_provider();
+        let request = ChatRequest::default();
+        let options = ProviderStreamOptions {
+            thinking_type: Some(ThinkingType::Disabled),
+            reasoning_effort: Some("high".to_string()),
+            model_reasoning: true,
+            ..Default::default()
+        };
+        let body = provider.build_request_body(request, "deepseek-v4-flash", &options, false);
+        assert_eq!(body["thinking"]["type"], "disabled");
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]

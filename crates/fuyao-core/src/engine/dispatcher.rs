@@ -286,7 +286,7 @@ mod tests {
 
     fn test_agent_ctx() -> AgentContext {
         let mut ctx = AgentContext::default();
-        ctx.model_id = Some("test-model".to_string());
+        ctx.model_config.model_id = Some("test-model".to_string());
         ctx
     }
 

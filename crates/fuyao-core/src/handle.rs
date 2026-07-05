@@ -82,18 +82,18 @@ impl EngineHandle {
         self.hooks.clone()
     }
 
-    /// 获取模型 ID（从 agent_ctx 获取）
+    /// 获取模型 ID（从 agent_ctx.model_config 获取）
     pub fn model_id(&self) -> Option<String> {
         self.agent_ctx
             .lock()
             .ok()
-            .and_then(|ctx| ctx.model_id.clone())
+            .and_then(|ctx| ctx.model_config.model_id.clone())
     }
 
-    /// 设置模型 ID（更新 agent_ctx）
+    /// 设置模型 ID（更新 agent_ctx.model_config）
     pub fn set_model_id(&self, model_id: String) {
         if let Ok(mut ctx) = self.agent_ctx.lock() {
-            ctx.model_id = Some(model_id);
+            ctx.model_config.model_id = Some(model_id);
         }
     }
 

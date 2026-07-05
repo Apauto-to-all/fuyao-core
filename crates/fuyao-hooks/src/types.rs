@@ -48,10 +48,8 @@ pub type OutputObserveFn =
 /// LLM 错误处理动作
 #[derive(Debug, Clone)]
 pub enum LlmErrorAction {
-    /// 继续重试当前模型（默认）
+    /// 继续重试（默认）
     Retry,
-    /// 退回到指定模型
-    Fallback(String),
     /// 放弃，终止轮次
     Abort,
 }

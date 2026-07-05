@@ -290,30 +290,6 @@ mod tests {
     }
 
     #[test]
-    fn hook_on_llm_error_fallback_action() {
-        let mut reg = HooksRegistry::new();
-        reg.register_on_llm_error(
-            0,
-            Arc::new(|_error, retry_count| {
-                if retry_count >= 3 {
-                    LlmErrorAction::Fallback("deepseek/deepseek-v4-flash".to_string())
-                } else {
-                    LlmErrorAction::Retry
-                }
-            }),
-        );
-        assert!(matches!(
-            reg.hook_on_llm_error("rate limit", 1),
-            LlmErrorAction::Retry
-        ));
-        let action = reg.hook_on_llm_error("rate limit", 3);
-        assert!(matches!(action, LlmErrorAction::Fallback(_)));
-        if let LlmErrorAction::Fallback(model) = action {
-            assert_eq!(model, "deepseek/deepseek-v4-flash");
-        }
-    }
-
-    #[test]
     fn hook_on_llm_error_abort_action() {
         let mut reg = HooksRegistry::new();
         reg.register_on_llm_error(0, Arc::new(|_, _| LlmErrorAction::Abort));

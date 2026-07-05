@@ -155,10 +155,29 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         })
         .unwrap_or_else(default_modalities_output);
 
+    // reasoning：是否思考模型，缺省 false
+    let reasoning = table
+        .get("reasoning")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // reasoning_efforts：支持的强度档位名（用户自定义字符串数组，原样收集透传）
+    let reasoning_efforts = table
+        .get("reasoning_efforts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(Model {
         name,
         cost,
         limit,
+        reasoning,
+        reasoning_efforts,
         modalities: fuyao_api::ModelModalities { input, output },
     })
 }
@@ -442,5 +461,94 @@ mod tests {
         assert_eq!(toml_number_as_f64(&int_val), Some(42.0));
         assert_eq!(toml_number_as_f64(&float_val), Some(3.14));
         assert_eq!(toml_number_as_f64(&str_val), None);
+    }
+
+    #[test]
+    fn parse_model_defaults_reasoning_false_when_absent() {
+        let toml_str = r#"
+            [providers.aliyun]
+            name = "阿里云百炼"
+            [providers.aliyun.models."qwen3.6-plus"]
+            name = "qwen3.6-plus"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers_table = value.get("providers").unwrap();
+        let providers = load_providers(providers_table);
+
+        let model = &providers["aliyun"].models["qwen3.6-plus"];
+        assert!(!model.reasoning);
+        assert!(model.reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn parse_model_parses_reasoning_and_efforts() {
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            reasoning = true
+            reasoning_efforts = ["low", "medium", "high", "max"]
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers_table = value.get("providers").unwrap();
+        let providers = load_providers(providers_table);
+
+        let model = &providers["deepseek"].models["deepseek-v4-flash"];
+        assert!(model.reasoning);
+        assert_eq!(
+            model.reasoning_efforts,
+            vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "max".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_model_accepts_arbitrary_effort_strings() {
+        // 档位名由用户自定义，任意字符串都接受（如 "big" 不在常见枚举内也能配置）
+        let toml_str = r#"
+            [providers.somevendor]
+            name = "SomeVendor"
+            [providers.somevendor.models.weird-model]
+            name = "weird-model"
+            reasoning = true
+            reasoning_efforts = ["big", "max", "turbo"]
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers_table = value.get("providers").unwrap();
+        let providers = load_providers(providers_table);
+
+        let model = &providers["somevendor"].models["weird-model"];
+        assert!(model.reasoning);
+        assert_eq!(
+            model.reasoning_efforts,
+            vec!["big".to_string(), "max".to_string(), "turbo".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_model_skips_non_string_effort_entries() {
+        // 非字符串项（如误写数字）静默跳过，只保留字符串项
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.test-model]
+            name = "test-model"
+            reasoning = true
+            reasoning_efforts = ["high", 123, "max"]
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers_table = value.get("providers").unwrap();
+        let providers = load_providers(providers_table);
+
+        let model = &providers["deepseek"].models["test-model"];
+        assert_eq!(
+            model.reasoning_efforts,
+            vec!["high".to_string(), "max".to_string()]
+        );
     }
 }

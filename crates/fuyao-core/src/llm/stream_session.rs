@@ -1,7 +1,7 @@
 //! 单次 LLM 流式调用会话
 //!
 //! 封装 Provider 流式调用的完整生命周期：
-//! - 创建 stream → 重试重建（退避/Fallback）
+//! - 创建 stream → 重试重建（退避）
 //! - 解码事件 → 累积 text/reasoning/tool_calls
 //! - 推送流式事件到前端
 //! - 返回完整结果
@@ -35,12 +35,12 @@ pub struct StreamResult {
     pub usage: StreamUsage,
 }
 
-/// 运行一次完整的流式 LLM 调用（含重试/退避/Fallback）
+/// 运行一次完整的流式 LLM 调用（含重试/退避）
 ///
 /// # 参数
 /// - `provider`: LLM Provider 实例
 /// - `request`: 聊天请求（消息列表等）
-/// - `agent_ctx`: Agent 上下文（含 model_id，支持运行时 Fallback 切换）
+/// - `agent_ctx`: Agent 上下文（含 model_id）
 /// - `tools_schema`: 工具 schema 列表
 /// - `emitter`: 统一事件发送器
 /// - `accumulator`: 共享累积器（用于中断时读取部分结果）
@@ -62,23 +62,37 @@ pub async fn run_stream_session(
     let mut accumulated_reasoning = String::new();
 
     'stream: loop {
-        // 每次重建 stream 时读取最新 model_id（支持 Fallback 切换）
-        let current_model_id = agent_ctx
-            .lock()
-            .expect("Agent 上下文锁异常")
-            .model_id
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        // 一次锁取全 model_config + agent_paths（AgentContext 是 Arc<Mutex>，禁止重复加锁）
+        let (current_model_id, agent_paths, thinking_type, reasoning_effort) = {
+            let g = agent_ctx.lock().expect("Agent 上下文锁异常");
+            (
+                g.model_config
+                    .model_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                g.agent_paths.clone(),
+                g.model_config.thinking_type.clone(),
+                g.model_config.reasoning_effort.clone(),
+            )
+        };
         // API 请求使用短名（"aliyun/qwen3.6-plus" → "qwen3.6-plus"）
         let api_model_name = current_model_id
             .split('/')
             .nth(1)
             .unwrap_or(&current_model_id);
 
+        // 查 Model 元信息，取 reasoning 能力做门控（不支持思考则请求体不发思考字段）
+        let model_reasoning = fuyao_provider::get_model(&current_model_id, &agent_paths)
+            .map(|m| m.reasoning)
+            .unwrap_or(false);
+
         let options = StreamOptions {
             temperature: None,
             tools: tools_schema.clone(),
             tool_choice: None,
+            thinking_type,
+            reasoning_effort,
+            model_reasoning,
         };
 
         let stream = provider.stream_chat(request.clone(), api_model_name, options);
@@ -205,11 +219,6 @@ pub async fn run_stream_session(
                                 acc.lock().expect("流式累积器锁异常").phase =
                                     StreamPhase::Streaming;
                             }
-                            continue 'stream;
-                        }
-                        LlmErrorAction::Fallback(fallback_model) => {
-                            agent_ctx.lock().expect("Agent 上下文锁异常").model_id =
-                                Some(fallback_model);
                             continue 'stream;
                         }
                         LlmErrorAction::Abort => {

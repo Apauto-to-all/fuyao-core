@@ -67,6 +67,8 @@ mod tests {
                 name: "qwen3.6-plus".to_string(),
                 cost: ModelCost::default(),
                 limit: ModelLimit::default(),
+                reasoning: false,
+                reasoning_efforts: vec![],
                 modalities: ModelModalities::default(),
             },
         );

@@ -22,7 +22,7 @@ pub mod skill_types;
 pub mod tool;
 
 // 导出常用类型
-pub use agent::{AgentContext, AgentPaths, SharedAgentCtx, ToolRunnerConfig};
+pub use agent::{AgentContext, AgentPaths, ModelConfig, SharedAgentCtx, ToolRunnerConfig};
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
@@ -40,6 +40,7 @@ pub use plugin_types::{InterceptPoint, ObservePoint, PluginManifest};
 pub use prompt_types::AgentDefinition;
 pub use provider::{
     Model, ModelCost, ModelLimit, ModelModalities, PriceTier, Provider, ProviderOptions,
+    ThinkingType,
 };
 pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
 pub use session_types::{Message, Session, TodoItem};

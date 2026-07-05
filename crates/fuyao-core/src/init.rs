@@ -87,20 +87,21 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), In
 
     // 3. 确定 model_id：显式指定 > 配置文件默认 > 第一个已注册模型
     let model_id = agent_ctx
+        .model_config
         .model_id
         .clone()
         .or_else(|| get_default_model_id(&agent_paths))
         .ok_or_else(|| {
             let loaded = list_models(&agent_paths);
             InitError::NoModelWithDetail {
-                model_id: agent_ctx.model_id.clone(),
+                model_id: agent_ctx.model_config.model_id.clone(),
                 available: loaded.keys().cloned().collect(),
             }
         })?;
 
     // 更新 agent_ctx 中的 model_id（确保已设置，供 Engine 内部读取）
     let mut agent_ctx = agent_ctx;
-    agent_ctx.model_id = Some(model_id.clone());
+    agent_ctx.model_config.model_id = Some(model_id.clone());
 
     // 4. 创建 Provider 实例（按 model_id 中 `/` 之前的 provider_id）
     let provider_id = model_id.split('/').next().unwrap_or("");

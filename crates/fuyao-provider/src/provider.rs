@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::Stream;
+use fuyao_api::ThinkingType;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
@@ -65,6 +66,12 @@ pub struct StreamOptions {
     pub temperature: Option<f64>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
+    /// 思考开关（由 ModelConfig 透传，build_request_body 按 model_reasoning 门控注入）
+    pub thinking_type: Option<ThinkingType>,
+    /// 思考强度档位名（用户自定义字符串，透传给服务器）
+    pub reasoning_effort: Option<String>,
+    /// 模型是否支持思考（由 stream_session 从 registry 查 Model 后填充，门控开关）
+    pub model_reasoning: bool,
 }
 
 /// 对话请求

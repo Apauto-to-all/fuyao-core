@@ -74,6 +74,18 @@ impl Default for ModelModalities {
     }
 }
 
+/// 思考模式开关（对应 OpenAI 兼容协议的 thinking.type 字段）
+///
+/// 序列化为 snake_case 字符串："enabled" / "disabled"
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingType {
+    /// 开启思考
+    Enabled,
+    /// 关闭思考
+    Disabled,
+}
+
 /// 模型配置
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Model {
@@ -86,8 +98,16 @@ pub struct Model {
     /// 限制信息
     pub limit: ModelLimit,
 
-    /// 是否支持思考
-    // pub reasoning: bool,
+    /// 是否支持思考（能力声明，配置层静态维护，运行时门控依据）
+    #[serde(default)]
+    pub reasoning: bool,
+
+    /// 支持的思考强度档位列表（用户自定义字符串，透传给服务器；空则只能开关思考）
+    ///
+    /// 档位名由各供应商自定义（如 "high"/"max"/"big"/"turbo"），
+    /// fuyao 不做枚举约束，配置什么就透传什么，服务器自识别。
+    #[serde(default)]
+    pub reasoning_efforts: Vec<String>,
 
     /// 模态支持
     pub modalities: ModelModalities,
@@ -128,8 +148,20 @@ mod tests {
             name: "qwen3.6-plus".to_string(),
             cost: ModelCost::default(),
             limit: ModelLimit::default(),
+            reasoning: false,
+            reasoning_efforts: vec![],
             modalities: ModelModalities::default(),
         };
         assert_eq!(model.name, "qwen3.6-plus");
+        assert!(!model.reasoning);
+        assert!(model.reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn thinking_type_serializes_snake_case() {
+        let json = serde_json::to_string(&ThinkingType::Enabled).unwrap();
+        assert_eq!(json, "\"enabled\"");
+        let json = serde_json::to_string(&ThinkingType::Disabled).unwrap();
+        assert_eq!(json, "\"disabled\"");
     }
 }
