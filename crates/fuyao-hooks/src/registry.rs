@@ -332,9 +332,8 @@ mod tests {
 
     #[tokio::test]
     async fn init_send_inputs_calls_handler_with_sender() {
-        use fuyao_api::message::{
-            EventBase, InputEvent, UserData, UserMessageMode, UserMessageSource,
-        };
+        use fuyao_api::message::input::{UserMessage, UserPayload};
+        use fuyao_api::message::{EventBase, InputEvent, UserMessageMode, UserMessageSource};
         let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(10);
         let mut reg = HooksRegistry::new();
         let called = Arc::new(std::sync::Mutex::new(false));
@@ -346,13 +345,17 @@ mod tests {
                 Box::pin(async move {
                     *called.lock().unwrap() = true;
                     sender
-                        .try_send(InputEvent::User(UserData {
+                        .try_send(InputEvent::User(UserMessage {
                             base: EventBase::default(),
-                            content: "引导消息".to_string(),
-                            mode: UserMessageMode::Guide,
-                            source: UserMessageSource::Plugin(fuyao_api::message::PluginSource {
-                                name: "hook".to_string(),
-                            }),
+                            payload: UserPayload {
+                                content: "引导消息".to_string(),
+                                mode: UserMessageMode::Guide,
+                                source: UserMessageSource::Plugin(
+                                    fuyao_api::message::PluginSource {
+                                        name: "hook".to_string(),
+                                    },
+                                ),
+                            },
                         }))
                         .ok();
                 })
@@ -373,9 +376,8 @@ mod tests {
 
     #[tokio::test]
     async fn init_send_input_panic_protection() {
-        use fuyao_api::message::{
-            EventBase, InputEvent, UserData, UserMessageMode, UserMessageSource,
-        };
+        use fuyao_api::message::input::{UserMessage, UserPayload};
+        use fuyao_api::message::{EventBase, InputEvent, UserMessageMode, UserMessageSource};
         let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(10);
         let mut reg = HooksRegistry::new();
         reg.register_send_input(
@@ -387,13 +389,17 @@ mod tests {
             Arc::new(|sender| {
                 Box::pin(async move {
                     sender
-                        .try_send(InputEvent::User(UserData {
+                        .try_send(InputEvent::User(UserMessage {
                             base: EventBase::default(),
-                            content: "降级消息".to_string(),
-                            mode: UserMessageMode::Guide,
-                            source: UserMessageSource::Plugin(fuyao_api::message::PluginSource {
-                                name: "hook".to_string(),
-                            }),
+                            payload: UserPayload {
+                                content: "降级消息".to_string(),
+                                mode: UserMessageMode::Guide,
+                                source: UserMessageSource::Plugin(
+                                    fuyao_api::message::PluginSource {
+                                        name: "hook".to_string(),
+                                    },
+                                ),
+                            },
                         }))
                         .ok();
                 })

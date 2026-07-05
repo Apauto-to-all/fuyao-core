@@ -8,10 +8,12 @@
 use super::session_context::SessionContext;
 use crate::compressor::tracker::CompressionTracker;
 use crate::compressor::{COMPRESSION_SYSTEM_PROMPT, MAX_RECENT_WINDOW, expand_for_integrity};
-use fuyao_api::message::event_input::{
-    PluginData, PluginSource, UserData, UserMessageMode, UserMessageSource,
+use fuyao_api::message::input::{
+    PluginEventSource, PluginMessage, PluginOrigin, PluginPayload, PluginSource, UserMessage,
+    UserMessageMode, UserMessageSource, UserPayload,
 };
-use fuyao_api::message::{AssistantData, EventBase, InputEvent, OutputEvent};
+use fuyao_api::message::output::AssistantMessage;
+use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{Session, SharedAgentCtx};
 use fuyao_hooks::{BeforeLlmOutput, HooksRegistry};
 use std::sync::Arc;
@@ -97,13 +99,18 @@ impl SessionHooksState {
     /// 发送插件通知事件
     fn emit_plugin(&self, event_type: &str, message: &str) {
         if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::Plugin(PluginData {
+            let _ = tx.try_send(InputEvent::Plugin(PluginMessage {
                 base: EventBase::default(),
-                source: "session_manager".to_string(),
-                event_type: event_type.to_string(),
-                data: None,
-                error: None,
-                message: Some(message.to_string()),
+                payload: PluginPayload {
+                    source: PluginEventSource {
+                        origin: PluginOrigin::Internal,
+                        name: "session_manager".to_string(),
+                    },
+                    event_type: event_type.to_string(),
+                    data: None,
+                    error: None,
+                    message: Some(message.to_string()),
+                },
             }));
         }
     }
@@ -112,22 +119,27 @@ impl SessionHooksState {
     fn emit_cumulative_stats(&self, session: &Session) {
         if let Some(ref tx) = self.tx_send {
             let cost = session.messages.last().map(|m| m.cost).unwrap_or(0.0);
-            let _ = tx.try_send(InputEvent::Plugin(PluginData {
+            let _ = tx.try_send(InputEvent::Plugin(PluginMessage {
                 base: EventBase::default(),
-                source: "session_manager".into(),
-                event_type: "cumulative_stats".into(),
-                data: Some(serde_json::json!({
-                    "message_count": session.message_count,
-                    "tool_call_count": session.tool_call_count,
-                    "total_prompt_tokens": session.total_prompt_tokens,
-                    "total_completion_tokens": session.total_completion_tokens,
-                    "total_reasoning_tokens": session.total_reasoning_tokens,
-                    "total_cached_tokens": session.total_cached_tokens,
-                    "cost": cost,
-                    "total_cost": session.total_cost,
-                })),
-                error: None,
-                message: None,
+                payload: PluginPayload {
+                    source: PluginEventSource {
+                        origin: PluginOrigin::Internal,
+                        name: "session_manager".into(),
+                    },
+                    event_type: "cumulative_stats".into(),
+                    data: Some(serde_json::json!({
+                        "message_count": session.message_count,
+                        "tool_call_count": session.tool_call_count,
+                        "total_prompt_tokens": session.total_prompt_tokens,
+                        "total_completion_tokens": session.total_completion_tokens,
+                        "total_reasoning_tokens": session.total_reasoning_tokens,
+                        "total_cached_tokens": session.total_cached_tokens,
+                        "cost": cost,
+                        "total_cost": session.total_cost,
+                    })),
+                    error: None,
+                    message: None,
+                },
             }));
         }
     }
@@ -145,13 +157,15 @@ impl SessionHooksState {
     /// 注入压缩引导消息到引擎 Guide 队列
     fn inject_compression_guide(&mut self) {
         if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::User(UserData {
+            let _ = tx.try_send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
-                content: COMPRESSION_SYSTEM_PROMPT.to_string(),
-                mode: UserMessageMode::Guide,
-                source: UserMessageSource::Plugin(PluginSource {
-                    name: "compressor".to_string(),
-                }),
+                payload: UserPayload {
+                    content: COMPRESSION_SYSTEM_PROMPT.to_string(),
+                    mode: UserMessageMode::Guide,
+                    source: UserMessageSource::Plugin(PluginSource {
+                        name: "compressor".to_string(),
+                    }),
+                },
             }));
             self.compression_in_progress = true;
         }
@@ -164,10 +178,10 @@ impl SessionHooksState {
     /// 2. 引导消息之前的消息 = 原始对话，计算保留窗口
     /// 3. expand_for_integrity 确保块完整
     /// 4. 新 session = [摘要消息] + [保留窗口消息]
-    async fn handle_compression_complete(&mut self, data: &AssistantData) {
+    async fn handle_compression_complete(&mut self, data: &AssistantMessage) {
         self.compression_in_progress = false;
 
-        let summary_content = match data.content.as_ref() {
+        let summary_content = match data.payload.content.as_ref() {
             Some(content) if !content.is_empty() => content.clone(),
             _ => return,
         };
@@ -186,12 +200,12 @@ impl SessionHooksState {
         // 构造摘要消息
         let mut summary_msg =
             fuyao_api::Message::assistant(Some(format!("[对话摘要]\n{summary_content}")));
-        summary_msg.reasoning = data.reasoning.clone();
-        summary_msg.finish_reason = data.finish_reason.clone();
-        summary_msg.prompt_tokens = data.prompt_tokens;
-        summary_msg.completion_tokens = data.completion_tokens;
-        summary_msg.reasoning_tokens = data.reasoning_tokens;
-        summary_msg.cached_tokens = data.cached_tokens;
+        summary_msg.reasoning = data.payload.reasoning.clone();
+        summary_msg.finish_reason = data.payload.finish_reason.clone();
+        summary_msg.prompt_tokens = data.payload.prompt_tokens;
+        summary_msg.completion_tokens = data.payload.completion_tokens;
+        summary_msg.reasoning_tokens = data.payload.reasoning_tokens;
+        summary_msg.cached_tokens = data.payload.cached_tokens;
 
         // 获取当前消息列表
         let all_messages = ctx.get_messages();
@@ -325,8 +339,11 @@ pub async fn register_session_hooks(
                     let mut guard = s.lock().await;
                     // 正在压缩中 → 检查是否是摘要响应（无工具调用）
                     if guard.compression_in_progress {
-                        let has_tool_calls =
-                            data.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
+                        let has_tool_calls = data
+                            .payload
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|tc| !tc.is_empty());
                         if !has_tool_calls {
                             guard.handle_compression_complete(data).await;
                         }
@@ -334,7 +351,7 @@ pub async fn register_session_hooks(
                     }
 
                     // 非压缩中 → 检测阈值，决定是否触发压缩
-                    let prompt_tokens = data.prompt_tokens as usize;
+                    let prompt_tokens = data.payload.prompt_tokens as usize;
                     if guard.tracker.should_compress(prompt_tokens) {
                         guard.inject_compression_guide();
                     }
@@ -386,14 +403,14 @@ mod tests {
         let event = rx.try_recv().unwrap();
         match event {
             InputEvent::User(data) => {
-                assert_eq!(data.mode, UserMessageMode::Guide);
+                assert_eq!(data.payload.mode, UserMessageMode::Guide);
                 assert_eq!(
-                    data.source,
+                    data.payload.source,
                     UserMessageSource::Plugin(PluginSource {
                         name: "compressor".to_string(),
                     })
                 );
-                assert_eq!(data.content, COMPRESSION_SYSTEM_PROMPT);
+                assert_eq!(data.payload.content, COMPRESSION_SYSTEM_PROMPT);
             }
             _ => panic!("应为 User 事件"),
         }

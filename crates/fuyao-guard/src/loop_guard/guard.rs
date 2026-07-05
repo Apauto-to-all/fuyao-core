@@ -7,13 +7,13 @@
 
 use std::sync::Arc;
 
-use fuyao_api::message::{
-    ChunkData, EventBase, InputEvent, OutputEvent, ToolCallData, ToolResultData,
-    event_input::{
-        InterruptData, InterruptSource, PluginData as InputPluginData, PluginSource, UserData,
-        UserMessageMode, UserMessageSource,
-    },
+use fuyao_api::message::input::{
+    InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource, PluginMessage,
+    PluginOrigin, PluginPayload, PluginSource, UserMessage, UserMessageMode, UserMessageSource,
+    UserPayload,
 };
+use fuyao_api::message::output::{ChunkMessage, ToolCallMessage, ToolResultMessage};
+use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_hooks::InterceptResult;
 use tokio::sync::Mutex;
 
@@ -73,13 +73,18 @@ impl LoopGuardState {
     /// 转发为 OutputEvent::Plugin 通知 UI。
     fn emit_plugin(&self, event_type: &str, message: &str) {
         if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::Plugin(InputPluginData {
+            let _ = tx.try_send(InputEvent::Plugin(PluginMessage {
                 base: EventBase::default(),
-                source: "loop_guard".to_string(),
-                event_type: event_type.to_string(),
-                data: None,
-                error: None,
-                message: Some(message.to_string()),
+                payload: PluginPayload {
+                    source: PluginEventSource {
+                        origin: PluginOrigin::Internal,
+                        name: "loop_guard".to_string(),
+                    },
+                    event_type: event_type.to_string(),
+                    data: None,
+                    error: None,
+                    message: Some(message.to_string()),
+                },
             }));
         }
     }
@@ -89,10 +94,12 @@ impl LoopGuardState {
     /// 通过 tx_send 发送 InputEvent::Interrupt，由引擎主循环统一处理。
     fn send_interrupt(&self, reason: String) {
         if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::Interrupt(InterruptData {
+            let _ = tx.try_send(InputEvent::Interrupt(InterruptMessage {
                 base: EventBase::default(),
-                reason,
-                source: InterruptSource::Hook,
+                payload: InterruptPayload {
+                    reason,
+                    source: InterruptSource::Hook,
+                },
             }));
         }
     }
@@ -103,13 +110,15 @@ impl LoopGuardState {
     /// 引擎收到后注入对话历史，供下次 LLM 调用时 AI 看到引导消息。
     fn send_inject_message(&self, content: String) {
         if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::User(UserData {
+            let _ = tx.try_send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
-                content,
-                mode: UserMessageMode::Guide,
-                source: UserMessageSource::Plugin(PluginSource {
-                    name: "loop_guard".to_string(),
-                }),
+                payload: UserPayload {
+                    content,
+                    mode: UserMessageMode::Guide,
+                    source: UserMessageSource::Plugin(PluginSource {
+                        name: "loop_guard".to_string(),
+                    }),
+                },
             }));
         }
     }
@@ -139,10 +148,10 @@ impl LoopGuardState {
     }
 
     /// 处理流式内容块（文本循环检测）
-    pub fn handle_chunk(&mut self, chunk: &ChunkData) {
+    pub fn handle_chunk(&mut self, chunk: &ChunkMessage) {
         let result = self.text_guard.handle_chunk(
-            chunk.content.as_deref(),
-            chunk.reasoning.as_deref(),
+            chunk.payload.content.as_deref(),
+            chunk.payload.reasoning.as_deref(),
             self.interrupt_count,
         );
 
@@ -170,10 +179,10 @@ impl LoopGuardState {
     }
 
     /// 处理工具调用事件（工具循环检测，优先级高于文本）
-    pub fn handle_tool_call(&mut self, tc: &ToolCallData) {
+    pub fn handle_tool_call(&mut self, tc: &ToolCallMessage) {
         let result = self.tool_guard.handle_tool_call(
-            &tc.tool_name,
-            &tc.tool_args.to_string(),
+            &tc.payload.tool_name,
+            &tc.payload.tool_args.to_string(),
             self.interrupt_count,
         );
 
@@ -206,20 +215,20 @@ impl LoopGuardState {
     }
 
     /// 处理工具结果拦截：注入警告或替换内容
-    pub fn intercept_tool_result(&mut self, result: &mut ToolResultData) {
+    pub fn intercept_tool_result(&mut self, result: &mut ToolResultMessage) {
         if !self.pending_inject.is_empty() {
             let inject = std::mem::take(&mut self.pending_inject);
-            result.content = format!("[循环检测] {inject}");
+            result.payload.content = format!("[循环检测] {inject}");
         } else if !self.pending_warn.is_empty() {
             let warn = std::mem::take(&mut self.pending_warn);
-            result.content = format!("[循环检测警告] {warn}\n\n{}", result.content);
+            result.payload.content = format!("[循环检测警告] {warn}\n\n{}", result.payload.content);
         }
     }
 }
 
 /// 构建输出观察钩子
 ///
-/// 重置时机绑定到 `OutputEvent::UserMessage` 的 deliver（与 session_mgr 观察同步），
+/// 重置时机绑定到 `OutputEvent::User` 的 deliver（与 session_mgr 观察同步），
 /// 按消息来源区分重置范围：
 /// - 用户主动消息（source=User）：完全重置（新对话意图）
 /// - 插件/系统注入（source=Plugin/System）：仅清理 pending 状态，不重置检测器
@@ -232,7 +241,7 @@ pub fn make_output_observe(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::Ou
         Box::pin(async move {
             let mut guard = state.lock().await;
             match &msg {
-                OutputEvent::UserMessage(um) => match &um.source {
+                OutputEvent::User(um) => match &um.payload.source {
                     UserMessageSource::User => guard.reset_turn(),
                     UserMessageSource::Plugin(_) | UserMessageSource::System(_) => {
                         guard.clear_pending();
@@ -278,31 +287,40 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::message::EventBase;
+    use fuyao_api::message::output::{
+        ChunkPayload, ToolCallPayload, ToolResultPayload, UserMessage as OutputUserMessage,
+        UserPayload as OutputUserPayload,
+    };
 
-    fn make_chunk(content: Option<&str>, reasoning: Option<&str>) -> ChunkData {
-        ChunkData {
+    fn make_chunk(content: Option<&str>, reasoning: Option<&str>) -> ChunkMessage {
+        ChunkMessage {
             base: EventBase::default(),
-            content: content.map(|s| s.to_string()),
-            reasoning: reasoning.map(|s| s.to_string()),
+            payload: ChunkPayload {
+                content: content.map(|s| s.to_string()),
+                reasoning: reasoning.map(|s| s.to_string()),
+            },
         }
     }
 
-    fn make_tool_call(name: &str, args: &str) -> ToolCallData {
-        ToolCallData {
+    fn make_tool_call(name: &str, args: &str) -> ToolCallMessage {
+        ToolCallMessage {
             base: EventBase::default(),
-            tool_call_id: "call_1".to_string(),
-            tool_name: name.to_string(),
-            tool_args: serde_json::from_str(args).unwrap_or(serde_json::Value::Null),
+            payload: ToolCallPayload {
+                tool_call_id: "call_1".to_string(),
+                tool_name: name.to_string(),
+                tool_args: serde_json::from_str(args).unwrap_or(serde_json::Value::Null),
+            },
         }
     }
 
-    fn make_tool_result(name: &str, content: &str) -> ToolResultData {
-        ToolResultData {
+    fn make_tool_result(name: &str, content: &str) -> ToolResultMessage {
+        ToolResultMessage {
             base: EventBase::default(),
-            tool_call_id: "call_1".to_string(),
-            tool_name: name.to_string(),
-            content: content.to_string(),
+            payload: ToolResultPayload {
+                tool_call_id: "call_1".to_string(),
+                tool_name: name.to_string(),
+                content: content.to_string(),
+            },
         }
     }
 
@@ -315,9 +333,9 @@ mod tests {
         let event = rx.try_recv().unwrap();
         match event {
             InputEvent::Plugin(data) => {
-                assert_eq!(data.source, "loop_guard");
-                assert_eq!(data.event_type, "loop_warn");
-                assert_eq!(data.message, Some("测试通知".to_string()));
+                assert_eq!(data.payload.source.name, "loop_guard");
+                assert_eq!(data.payload.event_type, "loop_warn");
+                assert_eq!(data.payload.message, Some("测试通知".to_string()));
             }
             _ => panic!("应为 Plugin 事件"),
         }
@@ -391,8 +409,8 @@ mod tests {
         state.pending_warn = "连续 4 次相同操作 bash".to_string();
         let mut tr = make_tool_result("bash", "原始结果");
         state.intercept_tool_result(&mut tr);
-        assert!(tr.content.starts_with("[循环检测警告]"));
-        assert!(tr.content.contains("原始结果"));
+        assert!(tr.payload.content.starts_with("[循环检测警告]"));
+        assert!(tr.payload.content.contains("原始结果"));
     }
 
     #[test]
@@ -401,8 +419,8 @@ mod tests {
         state.pending_inject = "检测到循环序列".to_string();
         let mut tr = make_tool_result("bash", "原始结果");
         state.intercept_tool_result(&mut tr);
-        assert!(tr.content.starts_with("[循环检测]"));
-        assert!(!tr.content.contains("原始结果"));
+        assert!(tr.payload.content.starts_with("[循环检测]"));
+        assert!(!tr.payload.content.contains("原始结果"));
     }
 
     #[test]
@@ -410,7 +428,7 @@ mod tests {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
         let mut tr = make_tool_result("bash", "原始结果");
         state.intercept_tool_result(&mut tr);
-        assert_eq!(tr.content, "原始结果");
+        assert_eq!(tr.payload.content, "原始结果");
     }
 
     #[tokio::test]
@@ -459,7 +477,7 @@ mod tests {
         match result {
             InterceptResult::Pass(event) => {
                 if let OutputEvent::ToolResult(tr) = event {
-                    assert!(tr.content.starts_with("[循环检测警告]"));
+                    assert!(tr.payload.content.starts_with("[循环检测警告]"));
                 } else {
                     panic!("应为 ToolResult");
                 }
@@ -507,8 +525,8 @@ mod tests {
         let event = rx.try_recv().unwrap();
         match event {
             InputEvent::Interrupt(data) => {
-                assert_eq!(data.reason, "循环检测");
-                assert_eq!(data.source, InterruptSource::Hook);
+                assert_eq!(data.payload.reason, "循环检测");
+                assert_eq!(data.payload.source, InterruptSource::Hook);
             }
             _ => panic!("应为 Interrupt 事件"),
         }
@@ -578,8 +596,6 @@ mod tests {
     /// 插件注入消息不应重置 tool_history，确保检测保持"热"状态
     #[tokio::test]
     async fn plugin_message_preserves_tool_history() {
-        use fuyao_api::message::event_output::UserMessageData;
-
         let state = Arc::new(Mutex::new(LoopGuardState::new(LoopGuardConfig {
             tool_repeat_threshold: 3,
             ..Default::default()
@@ -603,13 +619,15 @@ mod tests {
         }
 
         // 模拟插件注入消息（loop_guard 注入引导消息）
-        observe(OutputEvent::UserMessage(UserMessageData {
+        observe(OutputEvent::User(OutputUserMessage {
             base: EventBase::default(),
-            content: "[循环检测] 请调整策略".into(),
-            mode: UserMessageMode::Guide,
-            source: UserMessageSource::Plugin(PluginSource {
-                name: "loop_guard".into(),
-            }),
+            payload: OutputUserPayload {
+                content: "[循环检测] 请调整策略".into(),
+                mode: UserMessageMode::Guide,
+                source: UserMessageSource::Plugin(PluginSource {
+                    name: "loop_guard".into(),
+                }),
+            },
         }))
         .await;
 
@@ -629,8 +647,6 @@ mod tests {
     /// 插件注入后 AI 继续重复工具，应立即被检测到
     #[tokio::test]
     async fn plugin_message_keeps_detection_hot() {
-        use fuyao_api::message::event_output::UserMessageData;
-
         let (tx_send, _rx_send) = tokio::sync::mpsc::channel(16);
         let state = Arc::new(Mutex::new(LoopGuardState::new(LoopGuardConfig {
             tool_repeat_threshold: 3,
@@ -664,13 +680,15 @@ mod tests {
         }
 
         // 模拟插件注入消息
-        observe(OutputEvent::UserMessage(UserMessageData {
+        observe(OutputEvent::User(OutputUserMessage {
             base: EventBase::default(),
-            content: "[循环检测] 请调整策略".into(),
-            mode: UserMessageMode::Guide,
-            source: UserMessageSource::Plugin(PluginSource {
-                name: "loop_guard".into(),
-            }),
+            payload: OutputUserPayload {
+                content: "[循环检测] 请调整策略".into(),
+                mode: UserMessageMode::Guide,
+                source: UserMessageSource::Plugin(PluginSource {
+                    name: "loop_guard".into(),
+                }),
+            },
         }))
         .await;
 
@@ -691,8 +709,6 @@ mod tests {
     /// 用户消息完全重置所有状态
     #[tokio::test]
     async fn user_message_fully_resets_state() {
-        use fuyao_api::message::event_output::UserMessageData;
-
         let state = Arc::new(Mutex::new(LoopGuardState::new(LoopGuardConfig {
             tool_repeat_threshold: 3,
             ..Default::default()
@@ -710,11 +726,13 @@ mod tests {
         }
 
         // 用户主动发消息
-        observe(OutputEvent::UserMessage(UserMessageData {
+        observe(OutputEvent::User(OutputUserMessage {
             base: EventBase::default(),
-            content: "新任务".into(),
-            mode: UserMessageMode::Pending,
-            source: UserMessageSource::User,
+            payload: OutputUserPayload {
+                content: "新任务".into(),
+                mode: UserMessageMode::Pending,
+                source: UserMessageSource::User,
+            },
         }))
         .await;
 

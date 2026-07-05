@@ -4,7 +4,8 @@
 //! 引擎负责构建完整 Message，此模块只做直接存储。
 
 use crate::SessionManager;
-use fuyao_api::message::{AssistantData, OutputEvent, ToolResultData, UserMessageData};
+use fuyao_api::message::OutputEvent;
+use fuyao_api::message::output;
 use fuyao_api::{AgentDefinition, AgentPaths, Message, Session};
 use std::sync::Arc;
 
@@ -160,7 +161,7 @@ impl SessionContext {
     /// 返回 true 表示实际持久化了消息（用于触发统计发射）。
     pub async fn on_output(&mut self, event: OutputEvent) -> bool {
         match event {
-            OutputEvent::UserMessage(data) => self.handle_user_message(&data).await,
+            OutputEvent::User(data) => self.handle_user_message(&data).await,
             OutputEvent::Assistant(data) => {
                 // Assistant 仅在 LLM 调用后产生，before_llm 已确保 session 初始化
                 if self.session_id.is_none() {
@@ -179,11 +180,11 @@ impl SessionContext {
         }
     }
 
-    /// 存储用户消息（通过 OutputEvent::UserMessage 触发）
+    /// 存储用户消息（通过 OutputEvent::User 触发）
     ///
     /// 用户消息是 session 创建的触发点：首次收到用户消息时自动创建 session。
     /// 这确保"发送第一条消息后才创建 session"，避免启动即创建空 session。
-    async fn handle_user_message(&mut self, data: &UserMessageData) -> bool {
+    async fn handle_user_message(&mut self, data: &output::UserMessage) -> bool {
         // 首次用户消息触发 session 懒初始化
         let initial_id = None; // 新建场景无初始 id
         if self.ensure_session(initial_id).await.is_err() {
@@ -191,11 +192,12 @@ impl SessionContext {
         }
 
         // 内存
-        self.messages.push(Message::user(data.content.clone()));
+        self.messages
+            .push(Message::user(data.payload.content.clone()));
 
         // DB 持久化
         if let (Some(session_id), Some(mgr)) = (&self.session_id, &self.session_manager) {
-            let msg = Message::user(data.content.clone());
+            let msg = Message::user(data.payload.content.clone());
             mgr.add_message(session_id, msg, &self.agent_paths)
                 .await
                 .is_ok()
@@ -207,19 +209,19 @@ impl SessionContext {
     /// 存储引擎构建的完整助手消息（cost 由 SessionManager 在存储时自动计算）
     ///
     /// 返回 true 表示持久化成功。
-    async fn handle_assistant_message(&mut self, data: AssistantData) -> bool {
+    async fn handle_assistant_message(&mut self, data: output::AssistantMessage) -> bool {
         // 构建 Message
-        let mut msg = Message::assistant(data.content.clone());
+        let mut msg = Message::assistant(data.payload.content.clone());
         msg.model_id = self.model_id.clone();
-        msg.reasoning = data.reasoning.clone();
-        msg.finish_reason = data.finish_reason.clone();
-        msg.completion_tokens = data.completion_tokens;
-        msg.prompt_tokens = data.prompt_tokens;
-        msg.reasoning_tokens = data.reasoning_tokens;
-        msg.cached_tokens = data.cached_tokens;
+        msg.reasoning = data.payload.reasoning.clone();
+        msg.finish_reason = data.payload.finish_reason.clone();
+        msg.completion_tokens = data.payload.completion_tokens;
+        msg.prompt_tokens = data.payload.prompt_tokens;
+        msg.reasoning_tokens = data.payload.reasoning_tokens;
+        msg.cached_tokens = data.payload.cached_tokens;
 
         // 工具调用
-        if let Some(tool_calls) = data.tool_calls {
+        if let Some(tool_calls) = data.payload.tool_calls {
             msg.tool_calls = Some(
                 serde_json::to_value(
                     tool_calls
@@ -256,9 +258,12 @@ impl SessionContext {
     /// 存储工具结果消息
     ///
     /// 返回 true 表示持久化成功。
-    async fn handle_tool_result(&mut self, data: ToolResultData) -> bool {
+    async fn handle_tool_result(&mut self, data: output::ToolResultMessage) -> bool {
         // 构建 tool Message
-        let msg = Message::tool_result(data.tool_call_id.clone(), data.content.clone());
+        let msg = Message::tool_result(
+            data.payload.tool_call_id.clone(),
+            data.payload.content.clone(),
+        );
 
         // 内存
         self.messages.push(msg.clone());

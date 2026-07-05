@@ -241,8 +241,8 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::message::input;
     use fuyao_api::message::EventBase;
+    use fuyao_api::message::input;
     use fuyao_provider::{
         BoxStream, ChatRequest, ChatResponse, FinishReason, Provider as LlmProvider, StreamError,
         StreamEvent, StreamOptions, StreamUsage,

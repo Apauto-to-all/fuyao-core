@@ -15,6 +15,7 @@ use crate::message::EventBase;
 /// 注：此类型与 `user::PluginSource`（用户消息来源 `UserMessageSource::Plugin` 用）语义不同：
 /// - `PluginEventSource`：插件**事件**的来源（{origin 内外, name}），用于 PluginMessage
 /// - `PluginSource`（user.rs）：插件**注入用户消息**的来源（{name}），用于 UserMessageSource::Plugin
+///
 /// 两者故意区分命名，不合并。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginEventSource {
