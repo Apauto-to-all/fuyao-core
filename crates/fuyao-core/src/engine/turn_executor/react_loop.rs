@@ -8,7 +8,8 @@ use crate::engine::types::TurnCommand;
 use crate::interrupt::{self, StreamAccumulator, StreamPhase};
 use crate::llm::stream_session;
 use crate::tool_runner;
-use fuyao_api::message::{EventBase, OutputEvent, QueueUpdateData, QueueUpdateKind, TurnStartData};
+use fuyao_api::message::output::{QueueUpdateMessage, QueueUpdatePayload, TurnStartMessage};
+use fuyao_api::message::{EventBase, OutputEvent, QueueUpdateKind};
 use std::sync::{Arc, Mutex};
 
 use super::TurnExecutor;
@@ -39,23 +40,22 @@ impl TurnExecutor {
 
             match msg {
                 Some(queued) => {
-                    // 取出时 deliver：发送 UserMessage 到 CLI + 触发插件观察
+                    // 取出时 deliver：发送 User 到 CLI + 触发插件观察
                     let msg_base = queued.message.base.clone();
-                    crate::dispatch::deliver(
-                        &self.emitter,
-                        fuyao_api::message::OutputEvent::UserMessage(queued.message),
-                    )
-                    .await;
+                    crate::dispatch::deliver(&self.emitter, OutputEvent::User(queued.message))
+                        .await;
                     // 通知 UI 队列长度变化（消费事件，复用 base.id 让 UI 知道哪条消息被消费了）
                     let guide_count = self.guide_queue.lock().expect("引导队列锁异常").len();
                     let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
                     let _ = self
                         .emitter
-                        .send(OutputEvent::QueueUpdate(QueueUpdateData {
+                        .send(OutputEvent::QueueUpdate(QueueUpdateMessage {
                             base: msg_base,
-                            guide_count,
-                            pending_count,
-                            kind: QueueUpdateKind::Consumed,
+                            payload: QueueUpdatePayload {
+                                guide_count,
+                                pending_count,
+                                kind: QueueUpdateKind::Consumed,
+                            },
                         }))
                         .await;
                     // 用该消息跑一轮 ReAct 循环
@@ -89,7 +89,7 @@ impl TurnExecutor {
 
         // 发出轮次开始事件，供插件重置轮次级状态
         let _ = self
-            .emit_event(OutputEvent::TurnStart(TurnStartData {
+            .emit_event(OutputEvent::TurnStart(TurnStartMessage {
                 base: EventBase::default(),
             }))
             .await;

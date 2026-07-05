@@ -12,9 +12,8 @@ use crate::engine::types::{
     SharedGuideQueue, SharedHooks, SharedPendingQueue, SharedTools, TurnCommand,
 };
 use crate::handle::{EngineHandle, HandleParams, new_handle};
-use fuyao_api::message::{
-    InputEvent, OutputEvent, QueueUpdateData, QueueUpdateKind, UserMessageMode,
-};
+use fuyao_api::message::output;
+use fuyao_api::message::{InputEvent, OutputEvent, QueueUpdateKind, UserMessageMode};
 use fuyao_api::{AgentContext, SharedAgentCtx, ToolFn};
 use fuyao_provider::Provider as LlmProvider;
 use std::collections::HashMap;
@@ -131,9 +130,16 @@ impl Engine {
 
             match event {
                 InputEvent::User(user_data) => {
-                    // ① 拦截（不 deliver），拿到拦截后的 UserMessageData
+                    // ① 拦截（不 deliver），拿到拦截后的输出 UserMessage
                     let intercepted = crate::dispatch::dispatch_intercept(
-                        OutputEvent::UserMessage(user_data.clone().into()),
+                        OutputEvent::User(output::UserMessage {
+                            base: user_data.base.clone(),
+                            payload: output::UserPayload {
+                                content: user_data.payload.content.clone(),
+                                mode: user_data.payload.mode,
+                                source: user_data.payload.source.clone(),
+                            },
+                        }),
                         None,
                         &self.emitter,
                     )
@@ -141,7 +147,7 @@ impl Engine {
 
                     // 拦截器 Block 时丢弃该消息（不入队）
                     let message = match intercepted {
-                        Some(OutputEvent::UserMessage(m)) => m,
+                        Some(OutputEvent::User(m)) => m,
                         _ => continue,
                     };
 
@@ -149,7 +155,7 @@ impl Engine {
                     // 先记录 base.id，入队后用于 QueueUpdate 事件（UI 配对临时气泡）
                     let msg_base = message.base.clone();
                     let queued = crate::engine::types::QueuedUserMessage { user_data, message };
-                    match queued.user_data.mode {
+                    match queued.user_data.payload.mode {
                         UserMessageMode::Guide => {
                             self.guide_queue
                                 .lock()
@@ -172,11 +178,13 @@ impl Engine {
                     let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
                     let _ = self
                         .emitter
-                        .send(OutputEvent::QueueUpdate(QueueUpdateData {
+                        .send(OutputEvent::QueueUpdate(output::QueueUpdateMessage {
                             base: msg_base,
-                            guide_count,
-                            pending_count,
-                            kind: QueueUpdateKind::Enqueued,
+                            payload: output::QueueUpdatePayload {
+                                guide_count,
+                                pending_count,
+                                kind: QueueUpdateKind::Enqueued,
+                            },
                         }))
                         .await;
                 }
@@ -184,7 +192,13 @@ impl Engine {
                     // 统一管道：转化 → 拦截 → 处理回调 → 发送 → 观察
                     let tx = self.tx_command.clone();
                     crate::dispatch::dispatch(
-                        OutputEvent::Interrupt(data.clone().into()),
+                        OutputEvent::Interrupt(output::InterruptMessage {
+                            base: data.base.clone(),
+                            payload: output::InterruptPayload {
+                                reason: data.payload.reason.clone(),
+                                source: data.payload.source.clone(),
+                            },
+                        }),
                         Some(Box::new(move || {
                             let _ = tx.try_send(TurnCommand::Interrupt(data));
                         })),
@@ -195,13 +209,22 @@ impl Engine {
                 InputEvent::Plugin(data) => {
                     // 统一管道：转化 → 拦截 → 无处理回调 → 发送 → 观察
                     crate::dispatch::dispatch(
-                        OutputEvent::Plugin(data.into()),
+                        OutputEvent::Plugin(output::PluginMessage {
+                            base: data.base,
+                            payload: output::PluginPayload {
+                                source: data.payload.source,
+                                event_type: data.payload.event_type,
+                                data: data.payload.data,
+                                error: data.payload.error,
+                                message: data.payload.message,
+                            },
+                        }),
                         None,
                         &self.emitter,
                     )
                     .await;
                 }
-                InputEvent::Shutdown => {
+                InputEvent::Shutdown(_) => {
                     let _ = self.tx_command.send(TurnCommand::Stop).await;
                     break;
                 }
@@ -218,7 +241,8 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::message::OutputEvent;
+    use fuyao_api::message::input;
+    use fuyao_api::message::EventBase;
     use fuyao_provider::{
         BoxStream, ChatRequest, ChatResponse, FinishReason, Provider as LlmProvider, StreamError,
         StreamEvent, StreamOptions, StreamUsage,
@@ -294,12 +318,10 @@ mod tests {
         assert_eq!(guard.1.len(), 1);
     }
 
-    /// 验证：UserMessage 输出事件复用输入事件的 base.id 与时间戳
+    /// 验证：User 输出事件复用输入事件的 base.id 与时间戳
     /// 确保 UI 气泡与用户输入能一一对应
     #[tokio::test]
     async fn user_message_output_reuses_input_base() {
-        use fuyao_api::message::{EventBase, InputEvent, UserData};
-
         let provider = Box::new(MockProvider);
         let (mut engine, handle) = Engine::new(provider, test_agent_ctx());
 
@@ -310,31 +332,33 @@ mod tests {
         let input_ts = 1234567890.5_f64;
         let _ = handle
             .tx_input
-            .send(InputEvent::User(UserData {
+            .send(InputEvent::User(input::UserMessage {
                 base: EventBase {
                     id: input_id.clone(),
                     timestamp: input_ts,
                 },
-                content: "测试复用".to_string(),
-                mode: fuyao_api::message::UserMessageMode::Guide,
-                source: fuyao_api::message::UserMessageSource::User,
+                payload: input::UserPayload {
+                    content: "测试复用".to_string(),
+                    mode: fuyao_api::message::UserMessageMode::Guide,
+                    source: fuyao_api::message::UserMessageSource::User,
+                },
             }))
             .await;
 
-        // 收集事件直到拿到 UserMessage
+        // 收集事件直到拿到 User
         let user_message = loop {
             match tokio::time::timeout(std::time::Duration::from_secs(2), handle.next_event()).await
             {
-                Ok(Some(OutputEvent::UserMessage(d))) => break d,
+                Ok(Some(OutputEvent::User(d))) => break d,
                 Ok(Some(_)) => continue,
-                _ => panic!("未在超时内收到 UserMessage 事件"),
+                _ => panic!("未在超时内收到 User 事件"),
             }
         };
 
         // 验证：输出事件 base 与输入事件 base 完全一致
         assert_eq!(user_message.base.id, input_id);
         assert_eq!(user_message.base.timestamp, input_ts);
-        assert_eq!(user_message.content, "测试复用");
+        assert_eq!(user_message.payload.content, "测试复用");
 
         handle.shutdown().await;
         let _ = engine_task.await;
@@ -392,8 +416,6 @@ mod tests {
     /// 携带 base.id 与队列长度快照
     #[tokio::test]
     async fn user_message_emits_queue_update_on_enqueue() {
-        use fuyao_api::message::{EventBase, InputEvent, QueueUpdateKind, UserData};
-
         let provider = Box::new(MockProvider);
         let (mut engine, handle) = Engine::new(provider, test_agent_ctx());
 
@@ -402,14 +424,16 @@ mod tests {
         let input_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
         let _ = handle
             .tx_input
-            .send(InputEvent::User(UserData {
+            .send(InputEvent::User(input::UserMessage {
                 base: EventBase {
                     id: input_id.clone(),
                     timestamp: 0.0,
                 },
-                content: "队列事件测试".to_string(),
-                mode: fuyao_api::message::UserMessageMode::Guide,
-                source: fuyao_api::message::UserMessageSource::User,
+                payload: input::UserPayload {
+                    content: "队列事件测试".to_string(),
+                    mode: fuyao_api::message::UserMessageMode::Guide,
+                    source: fuyao_api::message::UserMessageSource::User,
+                },
             }))
             .await;
 
@@ -423,10 +447,10 @@ mod tests {
             }
         };
 
-        assert_eq!(queue_update.kind, QueueUpdateKind::Enqueued);
+        assert_eq!(queue_update.payload.kind, QueueUpdateKind::Enqueued);
         assert_eq!(queue_update.base.id, input_id);
         // 至少有刚入队的那一条
-        assert!(queue_update.guide_count >= 1);
+        assert!(queue_update.payload.guide_count >= 1);
 
         handle.shutdown().await;
         let _ = engine_task.await;

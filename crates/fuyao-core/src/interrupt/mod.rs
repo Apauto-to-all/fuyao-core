@@ -17,8 +17,9 @@ pub(crate) mod llm_toolcall;
 pub(crate) mod retry_backoff;
 pub(crate) mod tool_exec;
 
-use fuyao_api::message::event_input::InterruptSource;
-use fuyao_api::message::{EventBase, ToolResultData};
+use fuyao_api::message::EventBase;
+use fuyao_api::message::input::InterruptSource;
+use fuyao_api::message::output::{ToolResultMessage, ToolResultPayload};
 use fuyao_provider::{StreamUsage, ToolCallData};
 
 /// 流式阶段（用于中断时判断场景）
@@ -72,11 +73,13 @@ pub(crate) fn make_interrupt_tool_result(
     tool_name: String,
     source: InterruptSource,
     reason: String,
-) -> ToolResultData {
-    ToolResultData {
+) -> ToolResultMessage {
+    ToolResultMessage {
         base: EventBase::default(),
-        tool_call_id,
-        tool_name,
-        content: format!("[{:?}][{}]", source, reason),
+        payload: ToolResultPayload {
+            tool_call_id,
+            tool_name,
+            content: format!("[{:?}][{}]", source, reason),
+        },
     }
 }

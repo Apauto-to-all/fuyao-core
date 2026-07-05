@@ -6,7 +6,7 @@
 
 use crate::engine::EventEmitter;
 use crate::interrupt;
-use fuyao_api::message::InterruptData;
+use fuyao_api::message::input::InterruptMessage;
 use fuyao_provider::ToolCallData;
 
 /// 处理工具执行中的中断
@@ -16,11 +16,11 @@ use fuyao_provider::ToolCallData;
 /// 中断输出事件已由 InputDispatcher dispatch 管道发出，此处只负责增量结果。
 pub(crate) async fn handle(
     emitter: &EventEmitter,
-    data: InterruptData,
+    data: InterruptMessage,
     tool_calls: &[ToolCallData],
 ) {
-    let source = data.source.clone();
-    let reason = data.reason.clone();
+    let source = data.payload.source.clone();
+    let reason = data.payload.reason.clone();
     for tc in tool_calls {
         let result = interrupt::make_interrupt_tool_result(
             tc.id.clone(),

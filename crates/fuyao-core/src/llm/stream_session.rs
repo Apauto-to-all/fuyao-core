@@ -10,7 +10,11 @@ use crate::engine::EventEmitter;
 use crate::interrupt::{StreamAccumulator, StreamPhase};
 use futures_util::{StreamExt, pin_mut};
 use fuyao_api::SharedAgentCtx;
-use fuyao_api::message::{EventBase, OutputEvent, ToolCallData};
+use fuyao_api::message::input::{PluginEventSource, PluginOrigin};
+use fuyao_api::message::output::{
+    ErrorMessage, ErrorPayload, PluginMessage, PluginPayload, ToolCallMessage, ToolCallPayload,
+};
+use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::LlmErrorAction;
 use fuyao_provider::retry::{backoff_duration, is_retryable};
 use fuyao_provider::{
@@ -86,11 +90,11 @@ pub async fn run_stream_session(
                     retry_count = 0;
                     let output_events = decoder.process(event);
                     for oe in output_events {
-                        if let OutputEvent::Chunk(data) = &oe {
-                            if let Some(content) = &data.content {
+                        if let OutputEvent::Chunk(msg) = &oe {
+                            if let Some(content) = &msg.payload.content {
                                 accumulated_text.push_str(content);
                             }
-                            if let Some(reasoning) = &data.reasoning {
+                            if let Some(reasoning) = &msg.payload.reasoning {
                                 accumulated_reasoning.push_str(reasoning);
                             }
                         }
@@ -111,13 +115,18 @@ pub async fn run_stream_session(
                 Err(e) if matches!(e, StreamError::ContextOverflow) => {
                     // 上下文溢出：推送插件事件，触发压缩后继续
                     crate::dispatch::dispatch(
-                        OutputEvent::Plugin(fuyao_api::message::PluginData {
-                            base: fuyao_api::message::EventBase::default(),
-                            source: "stream_session".to_string(),
-                            event_type: "context_overflow".to_string(),
-                            data: None,
-                            error: None,
-                            message: Some("上下文溢出，触发压缩...".to_string()),
+                        OutputEvent::Plugin(PluginMessage {
+                            base: EventBase::default(),
+                            payload: PluginPayload {
+                                source: PluginEventSource {
+                                    origin: PluginOrigin::Internal,
+                                    name: "stream_session".to_string(),
+                                },
+                                event_type: "context_overflow".to_string(),
+                                data: None,
+                                error: None,
+                                message: Some("上下文溢出，触发压缩...".to_string()),
+                            },
                         }),
                         None,
                         emitter,
@@ -125,10 +134,12 @@ pub async fn run_stream_session(
                     .await;
 
                     crate::dispatch::dispatch(
-                        OutputEvent::Error(fuyao_api::message::ErrorData {
-                            base: fuyao_api::message::EventBase::default(),
-                            message: e.to_string(),
-                            recoverable: true,
+                        OutputEvent::Error(ErrorMessage {
+                            base: EventBase::default(),
+                            payload: ErrorPayload {
+                                message: e.to_string(),
+                                recoverable: true,
+                            },
                         }),
                         None,
                         emitter,
@@ -148,10 +159,12 @@ pub async fn run_stream_session(
                 }
                 Err(e) if !is_retryable(&e) => {
                     crate::dispatch::dispatch(
-                        OutputEvent::Error(fuyao_api::message::ErrorData {
-                            base: fuyao_api::message::EventBase::default(),
-                            message: e.to_string(),
-                            recoverable: false,
+                        OutputEvent::Error(ErrorMessage {
+                            base: EventBase::default(),
+                            payload: ErrorPayload {
+                                message: e.to_string(),
+                                recoverable: false,
+                            },
                         }),
                         None,
                         emitter,
@@ -163,10 +176,12 @@ pub async fn run_stream_session(
                     retry_count += 1;
 
                     crate::dispatch::dispatch(
-                        OutputEvent::Error(fuyao_api::message::ErrorData {
-                            base: fuyao_api::message::EventBase::default(),
-                            message: format!("LLM 错误 (重试 {}): {}", retry_count, e),
-                            recoverable: true,
+                        OutputEvent::Error(ErrorMessage {
+                            base: EventBase::default(),
+                            payload: ErrorPayload {
+                                message: format!("LLM 错误 (重试 {}): {}", retry_count, e),
+                                recoverable: true,
+                            },
                         }),
                         None,
                         emitter,
@@ -199,10 +214,12 @@ pub async fn run_stream_session(
                         }
                         LlmErrorAction::Abort => {
                             crate::dispatch::dispatch(
-                                OutputEvent::Error(fuyao_api::message::ErrorData {
-                                    base: fuyao_api::message::EventBase::default(),
-                                    message: e.to_string(),
-                                    recoverable: false,
+                                OutputEvent::Error(ErrorMessage {
+                                    base: EventBase::default(),
+                                    payload: ErrorPayload {
+                                        message: e.to_string(),
+                                        recoverable: false,
+                                    },
                                 }),
                                 None,
                                 emitter,
@@ -226,11 +243,13 @@ pub async fn run_stream_session(
     for tc in &tool_calls {
         let args: serde_json::Value =
             serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
-        let event = OutputEvent::ToolCall(ToolCallData {
+        let event = OutputEvent::ToolCall(ToolCallMessage {
             base: EventBase::default(),
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.name.clone(),
-            tool_args: args,
+            payload: ToolCallPayload {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                tool_args: args,
+            },
         });
 
         // 统一事件发送

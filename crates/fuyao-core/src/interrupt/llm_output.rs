@@ -5,6 +5,7 @@
 
 use crate::engine::EventEmitter;
 use crate::llm::event_builder;
+use fuyao_api::message::input::InterruptMessage;
 use fuyao_provider::StreamUsage;
 
 /// 处理 LLM 流式输出中的中断
@@ -13,7 +14,7 @@ use fuyao_provider::StreamUsage;
 /// 中断输出事件已由 InputDispatcher dispatch 管道发出，此处只负责增量结果。
 pub(crate) async fn handle(
     emitter: &EventEmitter,
-    _data: fuyao_api::message::InterruptData,
+    _data: InterruptMessage,
     text: &str,
     reasoning: &str,
     usage: &StreamUsage,

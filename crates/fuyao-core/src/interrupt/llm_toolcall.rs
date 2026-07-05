@@ -6,7 +6,7 @@
 use crate::engine::EventEmitter;
 use crate::interrupt;
 use crate::llm::event_builder;
-use fuyao_api::message::InterruptData;
+use fuyao_api::message::input::InterruptMessage;
 use fuyao_provider::{StreamUsage, ToolCallData};
 
 /// 处理 LLM 工具调用流中的中断
@@ -17,7 +17,7 @@ use fuyao_provider::{StreamUsage, ToolCallData};
 /// 中断输出事件已由 InputDispatcher dispatch 管道发出，此处只负责增量结果。
 pub(crate) async fn handle(
     emitter: &EventEmitter,
-    data: InterruptData,
+    data: InterruptMessage,
     text: &str,
     reasoning: &str,
     tool_calls: &[ToolCallData],
@@ -47,8 +47,8 @@ pub(crate) async fn handle(
     }
 
     // 为每个有效工具调用发出中断专用 ToolResult
-    let source = data.source.clone();
-    let reason = data.reason.clone();
+    let source = data.payload.source.clone();
+    let reason = data.payload.reason.clone();
     for tc in &valid_calls {
         let result = interrupt::make_interrupt_tool_result(
             tc.id.clone(),

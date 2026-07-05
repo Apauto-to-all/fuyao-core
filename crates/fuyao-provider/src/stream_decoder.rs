@@ -4,7 +4,8 @@
 //! 输出 OutputEvent 给 Engine 推送到外部。
 
 use crate::{StreamEvent, StreamUsage};
-use fuyao_api::message::{ChunkData, EventBase, OutputEvent};
+use fuyao_api::message::output::{ChunkMessage, ChunkPayload};
+use fuyao_api::message::{EventBase, OutputEvent};
 
 /// 工具调用增量状态
 #[derive(Debug, Clone)]
@@ -40,18 +41,22 @@ impl StreamDecoder {
     pub fn process(&mut self, event: StreamEvent) -> Vec<OutputEvent> {
         match event {
             StreamEvent::TextDelta { content } => {
-                vec![OutputEvent::Chunk(ChunkData {
+                vec![OutputEvent::Chunk(ChunkMessage {
                     base: EventBase::default(),
-                    content: Some(content),
-                    reasoning: None,
+                    payload: ChunkPayload {
+                        content: Some(content),
+                        reasoning: None,
+                    },
                 })]
             }
 
             StreamEvent::ReasoningDelta { content } => {
-                vec![OutputEvent::Chunk(ChunkData {
+                vec![OutputEvent::Chunk(ChunkMessage {
                     base: EventBase::default(),
-                    content: None,
-                    reasoning: Some(content),
+                    payload: ChunkPayload {
+                        content: None,
+                        reasoning: Some(content),
+                    },
                 })]
             }
 
@@ -172,7 +177,7 @@ mod tests {
         });
         assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0], OutputEvent::Chunk(e) if e.content.as_deref() == Some("Hello"))
+            matches!(&events[0], OutputEvent::Chunk(m) if m.payload.content.as_deref() == Some("Hello"))
         );
     }
 
@@ -184,7 +189,7 @@ mod tests {
         });
         assert_eq!(events.len(), 1);
         assert!(
-            matches!(&events[0], OutputEvent::Chunk(e) if e.reasoning.as_deref() == Some("思考中"))
+            matches!(&events[0], OutputEvent::Chunk(m) if m.payload.reasoning.as_deref() == Some("思考中"))
         );
     }
 

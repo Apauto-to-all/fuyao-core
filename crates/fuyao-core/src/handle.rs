@@ -2,9 +2,10 @@
 
 use crate::engine::types::{SharedGuideQueue, SharedPendingQueue};
 use crate::engine::{SharedHooks, SharedTools};
-use fuyao_api::message::{
-    EventBase, InputEvent, InterruptData, InterruptSource, OutputEvent, UserData, UserMessageSource,
+use fuyao_api::message::input::{
+    InterruptMessage, InterruptPayload, InterruptSource, ShutdownMessage, UserMessage, UserPayload,
 };
+use fuyao_api::message::{EventBase, InputEvent, OutputEvent, UserMessageSource};
 use fuyao_api::{AgentContext, QueueSnapshot, QueueSnapshotItem, SharedAgentCtx, ToolFn};
 use tokio::sync::mpsc;
 
@@ -33,11 +34,13 @@ impl EngineHandle {
     pub async fn send_message(&self, content: String) {
         let _ = self
             .tx_input
-            .send(InputEvent::User(UserData {
+            .send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
-                content,
-                mode: Default::default(),
-                source: UserMessageSource::User,
+                payload: UserPayload {
+                    content,
+                    mode: Default::default(),
+                    source: UserMessageSource::User,
+                },
             }))
             .await;
     }
@@ -47,16 +50,25 @@ impl EngineHandle {
     /// 唯一入口原则：所有中断都走 InputEvent::Interrupt，
     /// InputDispatcher 收到后转发给 TurnExecutor。
     pub fn cancel(&self) {
-        let _ = self.tx_input.try_send(InputEvent::Interrupt(InterruptData {
-            base: EventBase::default(),
-            reason: "用户取消".to_string(),
-            source: InterruptSource::User,
-        }));
+        let _ = self
+            .tx_input
+            .try_send(InputEvent::Interrupt(InterruptMessage {
+                base: EventBase::default(),
+                payload: InterruptPayload {
+                    reason: "用户取消".to_string(),
+                    source: InterruptSource::User,
+                },
+            }));
     }
 
     /// 关闭引擎
     pub async fn shutdown(&self) {
-        let _ = self.tx_input.send(InputEvent::Shutdown).await;
+        let _ = self
+            .tx_input
+            .send(InputEvent::Shutdown(ShutdownMessage {
+                base: EventBase::default(),
+            }))
+            .await;
     }
 
     /// 接收下一个事件
@@ -154,8 +166,8 @@ impl EngineHandle {
             q.iter()
                 .map(|q| QueueSnapshotItem {
                     id: q.message.base.id.clone(),
-                    content_preview: snapshot_content(&q.message.content),
-                    mode: q.user_data.mode,
+                    content_preview: snapshot_content(&q.message.payload.content),
+                    mode: q.user_data.payload.mode,
                 })
                 .collect::<Vec<_>>()
         };
@@ -164,8 +176,8 @@ impl EngineHandle {
             q.iter()
                 .map(|q| QueueSnapshotItem {
                     id: q.message.base.id.clone(),
-                    content_preview: snapshot_content(&q.message.content),
-                    mode: q.user_data.mode,
+                    content_preview: snapshot_content(&q.message.payload.content),
+                    mode: q.user_data.payload.mode,
                 })
                 .collect::<Vec<_>>()
         };

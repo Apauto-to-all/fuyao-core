@@ -10,7 +10,8 @@
 use crate::llm::event_builder;
 use crate::llm::stream_session;
 use fuyao_api::AgentContext;
-use fuyao_api::message::{EventBase, OutputEvent, QueueUpdateData, QueueUpdateKind};
+use fuyao_api::message::output::{QueueUpdateMessage, QueueUpdatePayload};
+use fuyao_api::message::{EventBase, OutputEvent, QueueUpdateKind};
 use fuyao_provider::ChatMessage;
 use fuyao_provider::ChatRequest;
 use std::collections::HashMap;
@@ -93,21 +94,19 @@ impl TurnExecutor {
         let next = self.guide_queue.lock().expect("引导队列锁异常").pop_front();
         if let Some(queued) = next {
             let msg_base = queued.message.base.clone();
-            crate::dispatch::deliver(
-                &self.emitter,
-                fuyao_api::message::OutputEvent::UserMessage(queued.message),
-            )
-            .await;
+            crate::dispatch::deliver(&self.emitter, OutputEvent::User(queued.message)).await;
             // 通知 UI 队列长度变化（消费事件，复用 base.id）
             let guide_count = self.guide_queue.lock().expect("引导队列锁异常").len();
             let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
             let _ = self
                 .emitter
-                .send(OutputEvent::QueueUpdate(QueueUpdateData {
+                .send(OutputEvent::QueueUpdate(QueueUpdateMessage {
                     base: msg_base,
-                    guide_count,
-                    pending_count,
-                    kind: QueueUpdateKind::Consumed,
+                    payload: QueueUpdatePayload {
+                        guide_count,
+                        pending_count,
+                        kind: QueueUpdateKind::Consumed,
+                    },
                 }))
                 .await;
             true
@@ -144,11 +143,13 @@ impl TurnExecutor {
         let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
         let _ = self
             .emitter
-            .send(OutputEvent::QueueUpdate(QueueUpdateData {
+            .send(OutputEvent::QueueUpdate(QueueUpdateMessage {
                 base: EventBase::default(),
-                guide_count,
-                pending_count,
-                kind: QueueUpdateKind::Transferred,
+                payload: QueueUpdatePayload {
+                    guide_count,
+                    pending_count,
+                    kind: QueueUpdateKind::Transferred,
+                },
             }))
             .await;
     }

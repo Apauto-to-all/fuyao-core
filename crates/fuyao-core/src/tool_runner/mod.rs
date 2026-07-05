@@ -9,7 +9,8 @@
 pub(crate) mod executor;
 
 use crate::engine::EventEmitter;
-use fuyao_api::message::{EventBase, OutputEvent, ToolResultData};
+use fuyao_api::message::output::{ToolResultMessage, ToolResultPayload};
+use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_api::{AgentContext, ToolFn};
 use std::collections::HashMap;
 
@@ -35,11 +36,13 @@ pub(crate) async fn orchestrate(
 
     // 推送 ToolResult 事件
     for result in &tool_results {
-        let event = OutputEvent::ToolResult(ToolResultData {
+        let event = OutputEvent::ToolResult(ToolResultMessage {
             base: EventBase::default(),
-            tool_call_id: result.tool_call_id.clone(),
-            tool_name: result.tool_name.clone(),
-            content: result.content.clone(),
+            payload: ToolResultPayload {
+                tool_call_id: result.tool_call_id.clone(),
+                tool_name: result.tool_name.clone(),
+                content: result.content.clone(),
+            },
         });
 
         let _ = crate::dispatch::dispatch(event, None, emitter).await;
