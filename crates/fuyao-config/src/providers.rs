@@ -155,12 +155,6 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         })
         .unwrap_or_else(default_modalities_output);
 
-    // reasoning：是否思考模型，缺省 false
-    let reasoning = table
-        .get("reasoning")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
     // reasoning_efforts：支持的强度档位名（用户自定义字符串数组，原样收集透传）
     let reasoning_efforts = table
         .get("reasoning_efforts")
@@ -176,7 +170,6 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         name,
         cost,
         limit,
-        reasoning,
         reasoning_efforts,
         modalities: fuyao_api::ModelModalities { input, output },
     })
@@ -476,7 +469,6 @@ mod tests {
         let providers = load_providers(providers_table);
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
-        assert!(!model.reasoning);
         assert!(model.reasoning_efforts.is_empty());
     }
 
@@ -487,7 +479,6 @@ mod tests {
             name = "DeepSeek"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
-            reasoning = true
             reasoning_efforts = ["low", "medium", "high", "max"]
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
@@ -495,7 +486,6 @@ mod tests {
         let providers = load_providers(providers_table);
 
         let model = &providers["deepseek"].models["deepseek-v4-flash"];
-        assert!(model.reasoning);
         assert_eq!(
             model.reasoning_efforts,
             vec![
@@ -515,7 +505,6 @@ mod tests {
             name = "SomeVendor"
             [providers.somevendor.models.weird-model]
             name = "weird-model"
-            reasoning = true
             reasoning_efforts = ["big", "max", "turbo"]
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
@@ -523,7 +512,6 @@ mod tests {
         let providers = load_providers(providers_table);
 
         let model = &providers["somevendor"].models["weird-model"];
-        assert!(model.reasoning);
         assert_eq!(
             model.reasoning_efforts,
             vec!["big".to_string(), "max".to_string(), "turbo".to_string()]
@@ -538,7 +526,6 @@ mod tests {
             name = "DeepSeek"
             [providers.deepseek.models.test-model]
             name = "test-model"
-            reasoning = true
             reasoning_efforts = ["high", 123, "max"]
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();

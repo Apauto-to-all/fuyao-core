@@ -98,10 +98,6 @@ pub struct Model {
     /// 限制信息
     pub limit: ModelLimit,
 
-    /// 是否支持思考（能力声明，配置层静态维护，运行时门控依据）
-    #[serde(default)]
-    pub reasoning: bool,
-
     /// 支持的思考强度档位列表（用户自定义字符串，透传给服务器；空则只能开关思考）
     ///
     /// 档位名由各供应商自定义（如 "high"/"max"/"big"/"turbo"），
@@ -148,12 +144,10 @@ mod tests {
             name: "qwen3.6-plus".to_string(),
             cost: ModelCost::default(),
             limit: ModelLimit::default(),
-            reasoning: false,
             reasoning_efforts: vec![],
             modalities: ModelModalities::default(),
         };
         assert_eq!(model.name, "qwen3.6-plus");
-        assert!(!model.reasoning);
         assert!(model.reasoning_efforts.is_empty());
     }
 

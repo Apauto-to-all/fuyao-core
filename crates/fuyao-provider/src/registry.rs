@@ -149,7 +149,6 @@ mod tests {
             name: name.to_string(),
             cost: ModelCost::default(),
             limit: ModelLimit::default(),
-            reasoning: false,
             reasoning_efforts: vec![],
             modalities: ModelModalities::default(),
         }

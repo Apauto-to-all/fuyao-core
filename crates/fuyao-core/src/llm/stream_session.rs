@@ -62,15 +62,14 @@ pub async fn run_stream_session(
     let mut accumulated_reasoning = String::new();
 
     'stream: loop {
-        // 一次锁取全 model_config + agent_paths（AgentContext 是 Arc<Mutex>，禁止重复加锁）
-        let (current_model_id, agent_paths, thinking_type, reasoning_effort) = {
+        // 一次锁取全 model_config（AgentContext 是 Arc<Mutex>，禁止重复加锁）
+        let (current_model_id, thinking_type, reasoning_effort) = {
             let g = agent_ctx.lock().expect("Agent 上下文锁异常");
             (
                 g.model_config
                     .model_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string()),
-                g.agent_paths.clone(),
                 g.model_config.thinking_type.clone(),
                 g.model_config.reasoning_effort.clone(),
             )
@@ -81,18 +80,12 @@ pub async fn run_stream_session(
             .nth(1)
             .unwrap_or(&current_model_id);
 
-        // 查 Model 元信息，取 reasoning 能力做门控（不支持思考则请求体不发思考字段）
-        let model_reasoning = fuyao_provider::get_model(&current_model_id, &agent_paths)
-            .map(|m| m.reasoning)
-            .unwrap_or(false);
-
         let options = StreamOptions {
             temperature: None,
             tools: tools_schema.clone(),
             tool_choice: None,
             thinking_type,
             reasoning_effort,
-            model_reasoning,
         };
 
         let stream = provider.stream_chat(request.clone(), api_model_name, options);
