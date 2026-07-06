@@ -45,10 +45,12 @@ impl Engine {
     /// 创建引擎，返回 (Engine, EngineHandle)
     ///
     /// 内部 spawn TurnExecutor 常驻任务，Engine 自身作为 InputDispatcher。
+    /// 通道容量从全局配置 `get_config().engine` 读取。
     pub fn new(provider: Box<dyn LlmProvider>, agent_ctx: AgentContext) -> (Self, EngineHandle) {
-        let (tx_input, rx_input) = mpsc::channel(64);
-        let (tx_event, rx_event) = mpsc::channel(256);
-        let (tx_command, rx_command) = mpsc::channel(64);
+        let engine_cfg = fuyao_api::get_config().engine.clone();
+        let (tx_input, rx_input) = mpsc::channel(engine_cfg.input_channel_capacity);
+        let (tx_event, rx_event) = mpsc::channel(engine_cfg.output_channel_capacity);
+        let (tx_command, rx_command) = mpsc::channel(engine_cfg.command_channel_capacity);
 
         let shared_agent_ctx: SharedAgentCtx = Arc::new(std::sync::Mutex::new(agent_ctx));
         let shared_tools: SharedTools =

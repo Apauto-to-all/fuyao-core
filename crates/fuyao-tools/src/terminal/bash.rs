@@ -2,7 +2,6 @@
 //!
 //! 提供命令执行的完整功能。
 
-use crate::config::{TERMINAL_DEFAULT_TIMEOUT, TERMINAL_MAX_TIMEOUT};
 use crate::redact::redact_sensitive_text;
 use crate::terminal::execute::{execute_command, format_result};
 use crate::terminal::safety::{check_command_safety, validate_workdir};
@@ -30,12 +29,13 @@ pub(crate) async fn bash_impl(args: Value, ctx: &ToolCallContext) -> String {
         return crate::common::tool_error(&security_result.reason);
     }
 
-    // 3. 提取超时时间
+    // 3. 提取超时时间（默认/上限从全局配置 get_config().tools.limits 读取）
+    let limits = fuyao_api::get_config().tools.limits.clone();
     let timeout_secs = args
         .get("timeout")
         .and_then(|v| v.as_u64())
-        .unwrap_or(TERMINAL_DEFAULT_TIMEOUT)
-        .min(TERMINAL_MAX_TIMEOUT);
+        .unwrap_or(limits.terminal_default_timeout_secs)
+        .min(limits.terminal_max_timeout_secs);
     let timeout = Duration::from_secs(timeout_secs);
 
     // 4. 确定工作目录（优先显式 workdir，否则使用 workspace）

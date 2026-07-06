@@ -336,9 +336,9 @@ async fn wait_and_retry(
     tool_name: &str,
     args: &Value,
 ) -> Option<String> {
-    // 等待 session 恢复
+    // 等待 session 恢复（时长从全局配置 get_config().mcp 读取）
     let deadline = tokio::time::Instant::now()
-        + Duration::from_secs(crate::constants::SESSION_RECOVERY_WAIT_SEC);
+        + Duration::from_secs(fuyao_api::get_config().mcp.session_recovery_wait_secs);
     loop {
         if tokio::time::Instant::now() >= deadline {
             break;

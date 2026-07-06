@@ -23,7 +23,6 @@ use tokio::sync::{Mutex, Notify, watch};
 
 use fuyao_api::MCPServerConfig;
 
-use crate::constants::{MAX_BACKOFF_SECONDS, MAX_INITIAL_CONNECT_RETRIES, MAX_RECONNECT_RETRIES};
 use crate::security::build_safe_env;
 
 /// MCP 连接错误
@@ -119,6 +118,8 @@ impl MCPConnection {
         let error_clone = error_result.clone();
 
         let handle = tokio::spawn(async move {
+            let mcp_cfg = fuyao_api::get_config();
+            let mcp = &mcp_cfg.mcp;
             let mut retries: u32 = 0;
             let mut initial_retries: u32 = 0;
             let mut backoff: u64 = 1;
@@ -141,10 +142,10 @@ impl MCPConnection {
                     Err(e) => {
                         connected.store(false, std::sync::atomic::Ordering::Relaxed);
 
-                        if initial_retries < MAX_INITIAL_CONNECT_RETRIES {
+                        if initial_retries < mcp.max_initial_connect_retries {
                             initial_retries += 1;
                             tokio::time::sleep(Duration::from_secs(backoff)).await;
-                            backoff = (backoff * 2).min(MAX_BACKOFF_SECONDS);
+                            backoff = (backoff * 2).min(mcp.max_backoff_secs);
 
                             if *shutdown_rx.borrow() {
                                 let mut err = error_clone.lock().await;
@@ -159,12 +160,12 @@ impl MCPConnection {
                         }
 
                         retries += 1;
-                        if retries > MAX_RECONNECT_RETRIES {
+                        if retries > mcp.max_reconnect_retries {
                             break;
                         }
 
                         tokio::time::sleep(Duration::from_secs(backoff)).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF_SECONDS);
+                        backoff = (backoff * 2).min(mcp.max_backoff_secs);
                     }
                 }
             }

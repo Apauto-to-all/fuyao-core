@@ -2,8 +2,6 @@
 //!
 //! 提供分页参数验证和内容切片功能。
 
-use crate::config::WEBFETCH_MAX_OUTPUT_CHARS;
-
 /// 分页结果
 pub struct PaginationResult {
     /// 分页后的内容
@@ -17,10 +15,16 @@ pub struct PaginationResult {
 }
 
 /// 验证并规范化分页参数
+///
+/// limit 默认/上限从全局配置 `get_config().tools.limits.webfetch_max_output_chars` 读取。
 pub fn validate_pagination(offset: Option<usize>, limit: Option<usize>) -> (usize, usize) {
+    let max_output = fuyao_api::get_config()
+        .tools
+        .limits
+        .webfetch_max_output_chars;
     let valid_offset = offset.unwrap_or(0);
-    let valid_limit = limit.unwrap_or(WEBFETCH_MAX_OUTPUT_CHARS);
-    let valid_limit = valid_limit.clamp(1, WEBFETCH_MAX_OUTPUT_CHARS);
+    let valid_limit = limit.unwrap_or(max_output);
+    let valid_limit = valid_limit.clamp(1, max_output);
     (valid_offset, valid_limit)
 }
 
@@ -57,18 +61,26 @@ mod tests {
 
     #[test]
     fn validate_pagination_defaults() {
+        let max_output = fuyao_api::get_config()
+            .tools
+            .limits
+            .webfetch_max_output_chars;
         let (offset, limit) = validate_pagination(None, None);
         assert_eq!(offset, 0);
-        assert_eq!(limit, WEBFETCH_MAX_OUTPUT_CHARS);
+        assert_eq!(limit, max_output);
     }
 
     #[test]
     fn validate_pagination_clamps_limit() {
+        let max_output = fuyao_api::get_config()
+            .tools
+            .limits
+            .webfetch_max_output_chars;
         let (_, limit) = validate_pagination(None, Some(0));
         assert_eq!(limit, 1);
 
-        let (_, limit) = validate_pagination(None, Some(WEBFETCH_MAX_OUTPUT_CHARS + 100));
-        assert_eq!(limit, WEBFETCH_MAX_OUTPUT_CHARS);
+        let (_, limit) = validate_pagination(None, Some(max_output + 100));
+        assert_eq!(limit, max_output);
     }
 
     #[test]

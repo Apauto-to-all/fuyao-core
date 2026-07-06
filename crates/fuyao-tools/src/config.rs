@@ -1,6 +1,7 @@
-//! 工具系统配置模块
+//! 工具系统配置常量
 //!
-//! 定义所有工具共享的常量，包括读取限制、搜索配置、脱敏开关等。
+//! 高频可调项（超时/限制类）已迁移至 `fuyao_api::config::ToolsLimitsConfig`，
+//! 通过 `[tools.limits]` 配置段读取。此处仅保留非高频常量（多数用户无需调整）。
 
 /// 最大读取字符数
 pub const MAX_READ_CHARS: usize = 100_000;
@@ -43,30 +44,6 @@ pub const SEARCH_EXCLUDE_DIRS: &[&str] = &[
     ".mypy_cache",
     ".ruff_cache",
 ];
-
-/// 搜索命令超时时间（秒）
-pub const SEARCH_TIMEOUT: u64 = 60;
-
-/// 默认终端超时时间（秒）
-pub const TERMINAL_DEFAULT_TIMEOUT: u64 = 120;
-
-/// 最大终端超时时间（秒）
-pub const TERMINAL_MAX_TIMEOUT: u64 = 6000;
-
-/// 最大终端输出字符数
-pub const TERMINAL_MAX_OUTPUT_CHARS: usize = 50_000;
-
-/// 默认 WebFetch 超时时间（秒）
-pub const WEBFETCH_DEFAULT_TIMEOUT: u64 = 30;
-
-/// 最大 WebFetch 超时时间（秒）
-pub const WEBFETCH_MAX_TIMEOUT: u64 = 180;
-
-/// 最大输出字符数
-pub const WEBFETCH_MAX_OUTPUT_CHARS: usize = 100_000;
-
-/// 最大下载字节数（5MB）
-pub const WEBFETCH_MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 
 /// 模拟浏览器 User-Agent
 pub const WEBFETCH_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \

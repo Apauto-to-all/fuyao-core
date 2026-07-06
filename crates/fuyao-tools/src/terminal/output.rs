@@ -2,7 +2,6 @@
 //!
 //! 多编码解码、ANSI 转义清理、输出截断。
 
-use crate::config::TERMINAL_MAX_OUTPUT_CHARS;
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -66,13 +65,19 @@ pub fn strip_ansi(text: &str) -> String {
 // =========== 输出截断 ===========
 
 /// 截断过长输出，保留头部 40% + 尾部 60%
+///
+/// 截断阈值从全局配置 `get_config().tools.limits.terminal_max_output_chars` 读取。
 pub fn truncate_output(text: &str) -> String {
-    if text.len() <= TERMINAL_MAX_OUTPUT_CHARS {
+    let max_chars = fuyao_api::get_config()
+        .tools
+        .limits
+        .terminal_max_output_chars;
+    if text.len() <= max_chars {
         return text.to_string();
     }
 
-    let head_chars = (TERMINAL_MAX_OUTPUT_CHARS as f64 * 0.4) as usize;
-    let tail_chars = TERMINAL_MAX_OUTPUT_CHARS - head_chars;
+    let head_chars = (max_chars as f64 * 0.4) as usize;
+    let tail_chars = max_chars - head_chars;
     let omitted = text.len() - head_chars - tail_chars;
 
     format!(
@@ -122,7 +127,11 @@ mod tests {
 
     #[test]
     fn truncate_output_long() {
-        let long = "a".repeat(TERMINAL_MAX_OUTPUT_CHARS + 1000);
+        let max_chars = fuyao_api::get_config()
+            .tools
+            .limits
+            .terminal_max_output_chars;
+        let long = "a".repeat(max_chars + 1000);
         let result = truncate_output(&long);
         assert!(result.contains("输出已截断"));
         assert!(result.starts_with('a'));

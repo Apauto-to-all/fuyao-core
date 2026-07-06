@@ -28,7 +28,6 @@ mod safety;
 mod shell;
 mod types;
 
-use crate::config::{TERMINAL_DEFAULT_TIMEOUT, TERMINAL_MAX_TIMEOUT};
 use crate::registry::ToolEntry;
 use bash::bash_impl;
 use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters};
@@ -38,6 +37,11 @@ use std::collections::HashMap;
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
     let handler: ToolFn =
         std::sync::Arc::new(|args, ctx| Box::pin(async move { bash_impl(args, &ctx).await }));
+
+    // 超时默认/上限从全局配置读取，反映到工具参数描述
+    let limits = fuyao_api::get_config().tools.limits.clone();
+    let terminal_default = limits.terminal_default_timeout_secs;
+    let terminal_max = limits.terminal_max_timeout_secs;
 
     let mut properties = HashMap::new();
     properties.insert(
@@ -54,10 +58,8 @@ pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
         "timeout".to_string(),
         ToolParameterProperty {
             kind: "integer".to_string(),
-            description: format!(
-                "超时时间(秒, 默认: {TERMINAL_DEFAULT_TIMEOUT}, 最大: {TERMINAL_MAX_TIMEOUT})"
-            ),
-            default: Some(serde_json::json!(TERMINAL_DEFAULT_TIMEOUT)),
+            description: format!("超时时间(秒, 默认: {terminal_default}, 最大: {terminal_max})"),
+            default: Some(serde_json::json!(terminal_default)),
             enum_values: None,
             items: None,
         },

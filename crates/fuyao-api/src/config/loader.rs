@@ -81,6 +81,12 @@ pub fn load_merged_config(
         return Ok(None);
     }
 
+    // 对 mcp_servers 段做 ${VAR} 环境变量插值（原 fuyao-mcp 的 parse_mcp_servers 职责，
+    // 统一到加载层：所有消费方经 get_config().mcp_servers 拿到的都是已插值结果）
+    if let Some(toml::Value::Table(mcp_table)) = merged_table.get_mut("mcp_servers") {
+        interpolate_env_vars_table(mcp_table);
+    }
+
     // providers 单独走容错解析（serde 不支持 TOML 整数→f64 价格转换）
     let providers = merged_table
         .remove("providers")
@@ -92,6 +98,59 @@ pub fn load_merged_config(
     config.providers = providers;
 
     Ok(Some(config))
+}
+
+/// 递归对 table 内所有 string 值做 ${VAR} 环境变量插值
+fn interpolate_env_vars_table(table: &mut toml::Table) {
+    for (_, value) in table.iter_mut() {
+        interpolate_env_vars_value(value);
+    }
+}
+
+/// 递归对 toml::Value 做 ${VAR} 插值（仅影响 string；table/array 递归深入）
+fn interpolate_env_vars_value(value: &mut toml::Value) {
+    match value {
+        toml::Value::String(s) => *s = interpolate_env_vars_string(s),
+        toml::Value::Table(t) => {
+            for (_, v) in t.iter_mut() {
+                interpolate_env_vars_value(v);
+            }
+        }
+        toml::Value::Array(a) => {
+            for v in a {
+                interpolate_env_vars_value(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 替换字符串中的 ${VAR} 占位符
+///
+/// 未找到的环境变量保留原样（`${VAR}` 字面量）。无闭合 `}` 时剩余部分作为字面量。
+/// 在 ASCII 边界（`${`、`}`）切片，UTF-8 安全。
+fn interpolate_env_vars_string(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find('}') {
+            let var = &after_open[..end];
+            match std::env::var(var) {
+                Ok(val) => result.push_str(&val),
+                // 未找到变量：保留原样 ${VAR}
+                Err(_) => result.push_str(&rest[start..start + 2 + end + 1]),
+            }
+            rest = &after_open[end + 1..];
+        } else {
+            // 无闭合 }，剩余作为字面量
+            result.push_str(&rest[start..]);
+            return result;
+        }
+    }
+    result.push_str(rest);
+    result
 }
 
 /// 从 `AgentPaths` 加载配置
@@ -271,5 +330,52 @@ args = ["server.js"]
         assert_eq!(cfg.mcp_servers["test"].command.as_deref(), Some("node"));
 
         let _ = std::fs::remove_file(&workspace);
+    }
+
+    /// mcp_servers 的 ${VAR} 环境变量插值
+    #[test]
+    fn mcp_servers_env_var_interpolation() {
+        unsafe { std::env::set_var("FUYAO_TEST_MCP_HOST", "example.com") };
+        let workspace = temp_config_path(
+            "mcp_interp",
+            r#"
+[mcp_servers.http]
+url = "https://${FUYAO_TEST_MCP_HOST}/mcp"
+[mcp_servers.stdio]
+command = "node"
+args = ["${FUYAO_TEST_MCP_HOST}/srv.js", "literal"]
+"#,
+        );
+
+        let cfg = load_merged_config(None, None, Some(&workspace))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cfg.mcp_servers["http"].url.as_deref(),
+            Some("https://example.com/mcp")
+        );
+        let args = cfg.mcp_servers["stdio"].args.as_ref().unwrap();
+        assert_eq!(args[0], "example.com/srv.js");
+        assert_eq!(args[1], "literal");
+
+        unsafe { std::env::remove_var("FUYAO_TEST_MCP_HOST") };
+        let _ = std::fs::remove_file(&workspace);
+    }
+
+    #[test]
+    fn interpolate_string_no_placeholder() {
+        assert_eq!(interpolate_env_vars_string("hello"), "hello");
+    }
+
+    #[test]
+    fn interpolate_string_missing_var_keeps_original() {
+        let r = interpolate_env_vars_string("x=${FUYAO_NONEXISTENT_VAR_9999}y");
+        assert_eq!(r, "x=${FUYAO_NONEXISTENT_VAR_9999}y");
+    }
+
+    #[test]
+    fn interpolate_string_unclosed_keeps_literal() {
+        let r = interpolate_env_vars_string("a${UNCLOSED");
+        assert_eq!(r, "a${UNCLOSED");
     }
 }

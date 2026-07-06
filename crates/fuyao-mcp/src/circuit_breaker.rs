@@ -7,8 +7,6 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use crate::constants::{CIRCUIT_BREAKER_COOLDOWN_SEC, CIRCUIT_BREAKER_THRESHOLD};
-
 /// 熔断器全局状态
 struct BreakerState {
     /// 各 server 的连续错误计数
@@ -34,13 +32,14 @@ fn recover_or_lock<T>(state: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 /// 增加错误计数，达到阈值时打开熔断器
 pub fn bump_error(server_name: &str) {
+    let threshold = fuyao_api::get_config().mcp.circuit_breaker_threshold;
     let mut state = recover_or_lock(&BREAKER_STATE);
     let count = state
         .error_counts
         .entry(server_name.to_string())
         .or_insert(0);
     *count += 1;
-    if *count >= CIRCUIT_BREAKER_THRESHOLD {
+    if *count >= threshold {
         state
             .opened_at
             .insert(server_name.to_string(), Instant::now());
@@ -59,17 +58,21 @@ pub fn reset_error(server_name: &str) {
 /// 返回 None 表示放行，返回 Some(msg) 表示熔断器已打开。
 /// 冷却期过后自动放行（half-open）。
 pub fn check_breaker(server_name: &str) -> Option<String> {
+    let cfg = fuyao_api::get_config();
+    let threshold = cfg.mcp.circuit_breaker_threshold;
+    let cooldown = cfg.mcp.circuit_breaker_cooldown_secs;
+
     let state = recover_or_lock(&BREAKER_STATE);
     let count = state.error_counts.get(server_name).copied().unwrap_or(0);
-    if count < CIRCUIT_BREAKER_THRESHOLD {
+    if count < threshold {
         return None;
     }
 
     let opened_at = state.opened_at.get(server_name)?;
     let age = opened_at.elapsed().as_secs();
 
-    if age < CIRCUIT_BREAKER_COOLDOWN_SEC {
-        let remaining = CIRCUIT_BREAKER_COOLDOWN_SEC.saturating_sub(age).max(1);
+    if age < cooldown {
+        let remaining = cooldown.saturating_sub(age).max(1);
         Some(format!(
             "MCP server '{server_name}' is unreachable after {count} consecutive failures. Auto-retry available in ~{remaining}s."
         ))
@@ -96,6 +99,11 @@ mod tests {
     fn setup() {
         reset_all();
     }
+
+    /// 默认阈值（与 McpGlobalConfig::default().circuit_breaker_threshold 一致）
+    const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
+    /// 默认冷却秒（与 McpGlobalConfig::default().circuit_breaker_cooldown_secs 一致）
+    const CIRCUIT_BREAKER_COOLDOWN_SEC: u64 = 60;
 
     #[test]
     fn bump_error_increments_count() {

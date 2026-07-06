@@ -221,7 +221,8 @@ impl SessionHooksState {
                 let original = &all_messages[..guide];
                 // recent_window 从全局配置读取；保留窗口 = min(window, 原始消息数 / window)
                 let recent_window = fuyao_api::get_config().session.compression.recent_window;
-                let recent_window = std::cmp::min(recent_window, original.len() / recent_window.max(1));
+                let recent_window =
+                    std::cmp::min(recent_window, original.len() / recent_window.max(1));
                 if recent_window == 0 {
                     // 消息太少，不保留额外窗口
                     Vec::new()

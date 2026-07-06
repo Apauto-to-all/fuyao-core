@@ -2,9 +2,9 @@
 //!
 //! 检测流式文本内容的自相似度（重复），根据严重程度升级处理。
 
-use fuyao_api::LoopGuardConfig;
 use crate::loop_guard::detectors::detect_text_self_similarity;
 use crate::loop_guard::types::LoopSeverity;
+use fuyao_api::LoopGuardConfig;
 
 /// 文本循环检测结果
 #[derive(Debug)]

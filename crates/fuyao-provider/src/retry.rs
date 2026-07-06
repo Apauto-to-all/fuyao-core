@@ -73,9 +73,7 @@ pub fn backoff_duration(retry: u32, error: &StreamError) -> std::time::Duration 
         ..
     } = error
     {
-        return std::time::Duration::from_millis(
-            (secs * 1000).min(p.max_delay_with_headers_ms),
-        );
+        return std::time::Duration::from_millis((secs * 1000).min(p.max_delay_with_headers_ms));
     }
 
     // 优先级 3 & 4: 指数退避

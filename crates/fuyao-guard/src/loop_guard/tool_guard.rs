@@ -4,9 +4,9 @@
 
 use std::collections::VecDeque;
 
-use fuyao_api::LoopGuardConfig;
 use crate::loop_guard::detectors::{detect_tool_repetition, detect_tool_sequence_pattern};
 use crate::loop_guard::types::{LoopSeverity, ToolCallRecord};
+use fuyao_api::LoopGuardConfig;
 
 /// 工具循环检测结果
 #[derive(Debug)]

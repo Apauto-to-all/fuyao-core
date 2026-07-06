@@ -16,23 +16,26 @@ use super::redirect::{get_redirect_url, is_same_domain_redirect};
 use super::safety::check_url_safety;
 use super::types::{WebFetchRedirect, WebFetchResult};
 use crate::common;
-use crate::config::{
-    WEBFETCH_DEFAULT_TIMEOUT, WEBFETCH_MAX_DOWNLOAD_BYTES, WEBFETCH_MAX_TIMEOUT,
-    WEBFETCH_USER_AGENT,
-};
+use crate::config::WEBFETCH_USER_AGENT;
 use serde_json::Value;
 use std::time::Instant;
 
-/// 验证并规范化超时时间
+/// 验证并规范化超时时间（默认/上限从全局配置 get_config().tools.limits 读取）
 fn validate_timeout(timeout: Option<u64>) -> u64 {
+    let limits = fuyao_api::get_config().tools.limits.clone();
     match timeout {
-        None => WEBFETCH_DEFAULT_TIMEOUT,
-        Some(t) => t.clamp(1, WEBFETCH_MAX_TIMEOUT),
+        None => limits.webfetch_default_timeout_secs,
+        Some(t) => t.clamp(1, limits.webfetch_max_timeout_secs),
     }
 }
 
 /// WebFetch 工具处理函数
 pub async fn webfetch_handler(args: Value) -> String {
+    // 下载大小上限从全局配置读取
+    let max_download_bytes = fuyao_api::get_config()
+        .tools
+        .limits
+        .webfetch_max_download_bytes;
     let url = match args.get("url").and_then(|v| v.as_str()) {
         Some(u) => u.trim().to_string(),
         None => return common::tool_error("URL 不能为空"),
@@ -175,19 +178,19 @@ pub async fn webfetch_handler(args: Value) -> String {
     if let Some(content_length) = response.headers().get("content-length")
         && let Ok(len_str) = content_length.to_str()
         && let Ok(len) = len_str.parse::<usize>()
-        && len > WEBFETCH_MAX_DOWNLOAD_BYTES
+        && len > max_download_bytes
     {
         return common::tool_error(&format!(
             "响应过大（超过 {}MB 限制）",
-            WEBFETCH_MAX_DOWNLOAD_BYTES / 1024 / 1024
+            max_download_bytes / 1024 / 1024
         ));
     }
 
     let body_bytes = response.content_length().unwrap_or(0) as usize;
-    if body_bytes > WEBFETCH_MAX_DOWNLOAD_BYTES {
+    if body_bytes > max_download_bytes {
         return common::tool_error(&format!(
             "响应过大（超过 {}MB 限制）",
-            WEBFETCH_MAX_DOWNLOAD_BYTES / 1024 / 1024
+            max_download_bytes / 1024 / 1024
         ));
     }
 
@@ -205,10 +208,10 @@ pub async fn webfetch_handler(args: Value) -> String {
         Err(e) => return common::tool_error(&format!("读取响应内容失败: {e}")),
     };
 
-    if raw_content.len() > WEBFETCH_MAX_DOWNLOAD_BYTES {
+    if raw_content.len() > max_download_bytes {
         return common::tool_error(&format!(
             "响应过大（超过 {}MB 限制）",
-            WEBFETCH_MAX_DOWNLOAD_BYTES / 1024 / 1024
+            max_download_bytes / 1024 / 1024
         ));
     }
 
@@ -273,27 +276,35 @@ fn build_request_headers() -> reqwest::header::HeaderMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WEBFETCH_MAX_OUTPUT_CHARS;
 
     #[test]
     fn validate_timeout_defaults() {
-        assert_eq!(validate_timeout(None), WEBFETCH_DEFAULT_TIMEOUT);
+        let default = fuyao_api::get_config()
+            .tools
+            .limits
+            .webfetch_default_timeout_secs;
+        assert_eq!(validate_timeout(None), default);
     }
 
     #[test]
     fn validate_timeout_clamps() {
+        let max = fuyao_api::get_config()
+            .tools
+            .limits
+            .webfetch_max_timeout_secs;
         assert_eq!(validate_timeout(Some(0)), 1);
-        assert_eq!(
-            validate_timeout(Some(WEBFETCH_MAX_TIMEOUT + 100)),
-            WEBFETCH_MAX_TIMEOUT
-        );
+        assert_eq!(validate_timeout(Some(max + 100)), max);
     }
 
     #[test]
     fn validate_pagination_from_args() {
+        let max_output = fuyao_api::get_config()
+            .tools
+            .limits
+            .webfetch_max_output_chars;
         let (offset, limit) = validate_pagination(None, None);
         assert_eq!(offset, 0);
-        assert_eq!(limit, WEBFETCH_MAX_OUTPUT_CHARS);
+        assert_eq!(limit, max_output);
     }
 
     #[tokio::test]

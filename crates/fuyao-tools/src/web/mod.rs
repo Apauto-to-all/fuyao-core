@@ -14,7 +14,6 @@ mod redirect;
 mod safety;
 mod types;
 
-use crate::config::{WEBFETCH_DEFAULT_TIMEOUT, WEBFETCH_MAX_OUTPUT_CHARS, WEBFETCH_MAX_TIMEOUT};
 use crate::registry::ToolEntry;
 use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters};
 use handler::webfetch_handler;
@@ -24,6 +23,12 @@ use std::collections::HashMap;
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
     let handler: ToolFn =
         std::sync::Arc::new(|args, _ctx| Box::pin(async move { webfetch_handler(args).await }));
+
+    // 超时/限制默认值从全局配置读取，反映到工具参数描述
+    let limits = fuyao_api::get_config().tools.limits.clone();
+    let webfetch_default_timeout = limits.webfetch_default_timeout_secs;
+    let webfetch_max_timeout = limits.webfetch_max_timeout_secs;
+    let webfetch_max_output = limits.webfetch_max_output_chars;
 
     let mut properties = HashMap::new();
     properties.insert(
@@ -51,9 +56,9 @@ pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
         ToolParameterProperty {
             kind: "integer".to_string(),
             description: format!(
-                "超时时间（秒），默认 {WEBFETCH_DEFAULT_TIMEOUT}，最大 {WEBFETCH_MAX_TIMEOUT}"
+                "超时时间（秒），默认 {webfetch_default_timeout}，最大 {webfetch_max_timeout}"
             ),
-            default: Some(serde_json::json!(WEBFETCH_DEFAULT_TIMEOUT)),
+            default: Some(serde_json::json!(webfetch_default_timeout)),
             enum_values: None,
             items: None,
         },
@@ -72,8 +77,8 @@ pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
         "limit".to_string(),
         ToolParameterProperty {
             kind: "integer".to_string(),
-            description: format!("限制返回的字符数（默认 {WEBFETCH_MAX_OUTPUT_CHARS}）"),
-            default: Some(serde_json::json!(WEBFETCH_MAX_OUTPUT_CHARS)),
+            description: format!("限制返回的字符数（默认 {webfetch_max_output}）"),
+            default: Some(serde_json::json!(webfetch_max_output)),
             enum_values: None,
             items: None,
         },

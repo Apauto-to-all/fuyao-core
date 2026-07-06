@@ -5,7 +5,6 @@
 
 pub mod bridge;
 pub mod circuit_breaker;
-pub mod config;
 pub mod connection;
 pub mod constants;
 pub mod recovery;
@@ -79,9 +78,12 @@ impl MCPManager {
         }
     }
 
-    /// 从原始 JSON 配置创建 MCP 管理器
-    pub fn from_raw_config(raw: Option<&serde_json::Value>) -> Self {
-        let configs = config::parse_mcp_servers(raw);
+    /// 从全局配置创建 MCP 管理器
+    ///
+    /// 统一从 `get_config().mcp_servers` 读取（已由加载层完成 `${VAR}` 插值）。
+    /// 调用方需先经 `init_engine`（或显式 `set_config`）注入配置。
+    pub fn from_config() -> Self {
+        let configs = fuyao_api::get_config().mcp_servers.clone();
         Self::new(configs)
     }
 
@@ -199,11 +201,12 @@ impl MCPManager {
                 continue;
             };
 
+            let mcp_cfg = fuyao_api::get_config();
             let timeout = self
                 .configs
                 .get(&tool.server_name)
                 .map(|c| c.timeout)
-                .unwrap_or(constants::DEFAULT_TOOL_TIMEOUT as u32);
+                .unwrap_or(mcp_cfg.mcp.tool_timeout_secs as u32);
 
             let handler = bridge::make_tool_call_handler(
                 conn.clone(),
@@ -505,20 +508,24 @@ mod tests {
     }
 
     #[test]
-    fn mcp_manager_from_raw_config_empty() {
-        let manager = MCPManager::from_raw_config(None);
+    fn mcp_manager_from_config_empty() {
+        // 未 set_config 时 get_config() 返回 default（mcp_servers 空）
+        let manager = MCPManager::from_config();
         assert!(manager.get_configured_servers().is_empty());
     }
 
     #[test]
-    fn mcp_manager_from_raw_config_valid() {
-        let input = serde_json::json!({
-            "test-server": {
-                "command": "npx",
-                "args": ["-y", "test-mcp"]
-            }
-        });
-        let manager = MCPManager::from_raw_config(Some(&input));
+    fn mcp_manager_new_with_servers() {
+        let mut configs = HashMap::new();
+        configs.insert(
+            "test-server".to_string(),
+            MCPServerConfig {
+                command: Some("npx".to_string()),
+                args: Some(vec!["-y".to_string(), "test-mcp".to_string()]),
+                ..Default::default()
+            },
+        );
+        let manager = MCPManager::new(configs);
         assert!(
             manager
                 .get_configured_servers()

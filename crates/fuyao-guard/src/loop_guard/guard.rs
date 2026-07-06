@@ -17,10 +17,10 @@ use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_hooks::InterceptResult;
 use tokio::sync::Mutex;
 
-use fuyao_api::LoopGuardConfig;
 use super::text_guard::TextLoopGuard;
 use super::tool_guard::ToolLoopGuard;
 use super::types::LoopSeverity;
+use fuyao_api::LoopGuardConfig;
 
 /// 输入事件发送端类型（由 SendInputFn 回调时保存）
 type InputEventSender = tokio::sync::mpsc::Sender<InputEvent>;
