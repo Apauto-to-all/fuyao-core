@@ -15,6 +15,9 @@ use glob::Pattern;
 use ignore::WalkBuilder;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// 搜索文件的核心实现
 ///
@@ -27,7 +30,13 @@ use std::path::{Path, PathBuf};
 /// - `path`: 搜索根路径
 /// - `limit`: 最大返回数量
 /// - `offset`: 跳过前 N 个结果
-fn search_files(pattern: &str, path: &str, limit: usize, offset: usize) -> GlobResult {
+fn search_files(
+    pattern: &str,
+    path: &str,
+    limit: usize,
+    offset: usize,
+    cancel: &AtomicBool,
+) -> GlobResult {
     let search_path = crate::common::expand_tilde(path);
 
     if !search_path.exists() {
@@ -67,6 +76,10 @@ fn search_files(pattern: &str, path: &str, limit: usize, offset: usize) -> GlobR
     let mut all_files: Vec<(PathBuf, u64, u64)> = Vec::new();
 
     for entry in walker.flatten() {
+        // 协作式取消：超时后由调用方置位，立即退出遍历
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
         let file_type = match entry.file_type() {
             Some(ft) => ft,
             None => continue,
@@ -152,19 +165,46 @@ pub async fn glob_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
     let pattern_owned = pattern.to_string();
     let resolved_path_clone = resolved_path.clone();
 
-    let result = tokio::task::spawn_blocking(move || {
-        search_files(&pattern_owned, &resolved_path_clone, limit, offset)
-    })
-    .await
-    .unwrap_or_else(|e| GlobResult {
-        matches: Vec::new(),
-        total_count: 0,
-        truncated: false,
-        pattern: pattern.to_string(),
-        path: resolved_path.clone(),
-        error: Some(format!("搜索任务失败: {e}")),
-        _hint: None,
+    let timeout_secs = fuyao_api::get_config().tools.limits.search_timeout_secs;
+    // 协作式取消令牌：超时后通知阻塞任务在下一文件处退出（spawn_blocking 无法强制中断线程）
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_clone = cancel.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        search_files(
+            &pattern_owned,
+            &resolved_path_clone,
+            limit,
+            offset,
+            &cancel_clone,
+        )
     });
+    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), join).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => GlobResult {
+            matches: Vec::new(),
+            total_count: 0,
+            truncated: false,
+            pattern: pattern.to_string(),
+            path: resolved_path.clone(),
+            error: Some(format!("搜索任务失败: {e}")),
+            _hint: None,
+        },
+        Err(_elapsed) => {
+            // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
+            cancel.store(true, Ordering::Release);
+            GlobResult {
+                matches: Vec::new(),
+                total_count: 0,
+                truncated: false,
+                pattern: pattern.to_string(),
+                path: resolved_path.clone(),
+                error: Some(format!(
+                    "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围或使用更具体的 pattern"
+                )),
+                _hint: None,
+            }
+        }
+    };
 
     if let Some(err) = &result.error {
         return common::tool_error(err);
