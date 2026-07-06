@@ -17,7 +17,7 @@ use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_hooks::InterceptResult;
 use tokio::sync::Mutex;
 
-use super::config::LoopGuardConfig;
+use fuyao_api::LoopGuardConfig;
 use super::text_guard::TextLoopGuard;
 use super::tool_guard::ToolLoopGuard;
 use super::types::LoopSeverity;

@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::loop_guard::config::LoopGuardConfig;
+use fuyao_api::LoopGuardConfig;
 use crate::loop_guard::detectors::{detect_tool_repetition, detect_tool_sequence_pattern};
 use crate::loop_guard::types::{LoopSeverity, ToolCallRecord};
 

@@ -5,5 +5,5 @@
 // TODO：循环防护插件有一个问题，AI连续调用触发最高级别的中断取消，后续再让其调用工具的试试，直接无工具结果，这个是有问题的
 pub mod loop_guard;
 
-pub use loop_guard::config::LoopGuardConfig;
+pub use fuyao_api::LoopGuardConfig;
 pub use loop_guard::register_loop_guard_hooks;

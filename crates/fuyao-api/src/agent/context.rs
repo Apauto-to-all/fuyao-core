@@ -53,7 +53,7 @@ pub struct AgentContext {
 /// TOML 短键名：为配置文件书写简洁，字段经 `#[serde(rename)]` 映射为
 /// `never_parallel` / `parallel_safe` / `path_scoped`（见 `[tools.runner]`）。
 /// 容器级 `#[serde(default)]` 使缺省字段回退到下方手动 `Default` impl 的硬编码值。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ToolRunnerConfig {
     /// 最大并发执行的工具数量

@@ -5,7 +5,6 @@
 //! 所有事件发送通过 SendInputFn 获取的 tx_send 实现，
 //! 不持有引擎内部 channel。
 
-pub mod config;
 mod detectors;
 mod guard;
 mod text_guard;
@@ -14,21 +13,23 @@ pub mod types;
 
 use std::sync::Arc;
 
+use fuyao_api::LoopGuardConfig;
 use fuyao_hooks::HooksRegistry;
 use tokio::sync::Mutex;
 
-use config::LoopGuardConfig;
 use guard::{LoopGuardState, make_output_intercept, make_output_observe};
 
 /// 注册循环检测钩子
 ///
 /// 在 HooksRegistry 中注册 output_observe、output_intercept 和 send_input 钩子。
-/// 使用默认配置。
+/// 配置从全局句柄 `get_config().guard.loop` 读取（由 `init_engine` 注入）；
+/// 未注入时回退 `LoopGuardConfig::default()`。
 ///
 /// # 参数
 /// - `hooks`: 钩子注册表
 pub async fn register_loop_guard_hooks(hooks: &Arc<Mutex<HooksRegistry>>) {
-    register_loop_guard_hooks_with_config(hooks, LoopGuardConfig::default()).await;
+    let config = fuyao_api::get_config().guard.loop_.clone();
+    register_loop_guard_hooks_with_config(hooks, config).await;
 }
 
 /// 注册循环检测钩子（自定义配置）
