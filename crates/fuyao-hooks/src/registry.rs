@@ -1,11 +1,10 @@
 //! Hooks 注册表与执行引擎
 //!
-//! 拦截钩子（异步串行，可取消带原因，panic 防护）+ 观察钩子（异步并发）。
+//! 拦截钩子（异步串行，可取消带原因，panic 防护）+ 观察钩子（异步串行）。
 //! 按优先级排序执行。
 
 use crate::types::*;
 use futures_util::future::FutureExt;
-use futures_util::future::join_all;
 use fuyao_api::message::OutputEvent;
 use std::panic::AssertUnwindSafe;
 
@@ -130,14 +129,15 @@ impl HooksRegistry {
         InterceptResult::Pass(current)
     }
 
-    /// 执行输出观察钩子：并发
+    /// 执行输出观察钩子：串行，panic 防护
+    ///
+    /// 按注册顺序逐个执行，单个钩子 panic 不阻塞后续钩子。
     pub async fn hook_output_observe(&self, msg: OutputEvent) {
-        let futures: Vec<_> = self
-            .output_observe
-            .iter()
-            .map(|entry| (entry.handler)(msg.clone()))
-            .collect();
-        join_all(futures).await;
+        for entry in &self.output_observe {
+            let _ = AssertUnwindSafe((entry.handler)(msg.clone()))
+                .catch_unwind()
+                .await;
+        }
     }
 
     /// 执行 LLM 错误决策钩子：串行，panic 防护，首个非 Retry 结果即返回
