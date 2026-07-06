@@ -2,6 +2,7 @@
 
 use crate::agent::AgentPaths;
 use crate::provider::ThinkingType;
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -48,12 +49,18 @@ pub struct AgentContext {
 /// 1. never_parallel_tools → 强制串行
 /// 2. path_scoped_tools → 检查路径重叠，重叠则串行，否则跳过后续检查
 /// 3. parallel_safe_tools → 在此列表则可并行，否则串行
-#[derive(Debug, Clone)]
+///
+/// TOML 短键名：为配置文件书写简洁，字段经 `#[serde(rename)]` 映射为
+/// `never_parallel` / `parallel_safe` / `path_scoped`（见 `[tools.runner]`）。
+/// 容器级 `#[serde(default)]` 使缺省字段回退到下方手动 `Default` impl 的硬编码值。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct ToolRunnerConfig {
     /// 最大并发执行的工具数量
     pub max_concurrent: u32,
 
     /// 必须串行执行的工具（如需要用户交互）
+    #[serde(rename = "never_parallel")]
     pub never_parallel_tools: HashSet<String>,
 
     /// 只读工具，无共享可变状态，可安全并行
@@ -61,12 +68,14 @@ pub struct ToolRunnerConfig {
     /// 注意：path_scoped_tools 中的工具会先做路径检查，检查通过后跳过此检查。
     /// 例如 read 同时在两个列表中，但只走 path_scoped_tools 检查路径重叠，
     /// 不会走到 parallel_safe_tools 的通用检查。
+    #[serde(rename = "parallel_safe")]
     pub parallel_safe_tools: HashSet<String>,
 
     /// 文件工具，可并行但要检查路径是否重叠
     ///
     /// 注意：这些工具会先做特殊检查（路径重叠），检查通过后跳过 parallel_safe_tools 检查。
     /// 例如 read 在此列表中，会检查路径是否重叠，重叠则串行，不重叠则可并行。
+    #[serde(rename = "path_scoped")]
     pub path_scoped_tools: HashSet<String>,
 }
 

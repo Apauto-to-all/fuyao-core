@@ -24,8 +24,8 @@
 //! let (engine, handle) = fuyao_core::init::init_engine(agent_ctx)?;
 //! ```
 
+use fuyao_api::config::{load_config, load_env};
 use fuyao_api::{AgentContext, AgentPaths};
-use fuyao_config::{load_config, load_env};
 use fuyao_provider::openai::OpenAIProvider;
 use fuyao_provider::registry::{
     agent_paths_cache_key, get_model, list_models, register_model, register_provider,

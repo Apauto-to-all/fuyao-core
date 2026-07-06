@@ -1,6 +1,11 @@
-//! Provider 配置解析
+//! Provider 配置容错解析
 //!
 //! 容错加载：跳过无效的 Provider/Model，加载有效的部分。
+//!
+//! 为何不走 serde 默认 Deserialize：TOML 区分整数 (`2`) 与浮点数 (`2.0`)，
+//! serde 的 `f64` 只接受浮点字面量，用户写 `input = 2` 时价格会被静默丢弃。
+//! `toml_number_as_f64` 同时处理两种类型，避免此问题。因此 Provider 段单独走
+//! 本模块的容错解析，`FuyaoConfig` 的 `providers` 字段以 `#[serde(skip)]` 跳过 serde。
 //!
 //! 配置文件结构示例：
 //! ```toml
@@ -13,8 +18,11 @@
 //! limit = { context = 1000000, output = 65536 }
 //! ```
 
-use fuyao_api::{Model, ModelCost, ModelLimit, PriceTier, Provider};
 use std::collections::HashMap;
+
+use crate::provider::{
+    Model, ModelCost, ModelLimit, ModelModalities, PriceTier, Provider, ProviderOptions,
+};
 
 /// 将 TOML 数值转换为 f64（兼容整数和浮点）
 ///
@@ -29,12 +37,6 @@ fn toml_number_as_f64(v: &toml::Value) -> Option<f64> {
 /// 从 TOML table 解析价格字段：
 /// - input/output/reasoning/cache：单价格（价格/M tokens）
 /// - tiers：梯度价格区间（按 tokens 数量阶梯计价）
-///
-/// # Arguments
-/// * `cost_data` - TOML table 格式的价格数据
-///
-/// # Returns
-/// ModelCost 实例，缺失字段使用 None
 fn parse_cost(cost_data: &toml::Value) -> ModelCost {
     let mut cost = ModelCost::default();
 
@@ -89,18 +91,10 @@ fn default_modalities_output() -> Vec<String> {
 
 /// 解析单个 Model 配置
 ///
-/// 从 TOML table 解析 Model：
 /// - name：必须字段，缺失则返回 None
 /// - cost：可选，缺失使用默认值
 /// - limit：可选，缺失使用默认值
 /// - modalities：可选，缺失使用 ["text"]
-///
-/// # Arguments
-/// * `_model_id` - 模型 ID（如 "qwen3.6-plus"，当前未使用）
-/// * `model_data` - TOML table 格式的 Model 数据
-///
-/// # Returns
-/// Option<Model>，name 缺失时返回 None
 fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
     let table = model_data.as_table()?;
 
@@ -171,22 +165,33 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         cost,
         limit,
         reasoning_efforts,
-        modalities: fuyao_api::ModelModalities { input, output },
+        modalities: ModelModalities { input, output },
     })
+}
+
+/// 解析 ProviderOptions
+fn parse_provider_options(table: &toml::Table) -> ProviderOptions {
+    let Some(options_table) = table.get("options").and_then(|v| v.as_table()) else {
+        return ProviderOptions::default();
+    };
+
+    let base_url = options_table
+        .get("base_url")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let api_key = options_table
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    ProviderOptions { base_url, api_key }
 }
 
 /// 解析单个 Provider 配置
 ///
-/// 从 TOML table 解析 Provider：
 /// - name：必须字段，缺失则返回 None
 /// - models：可选，遍历并解析每个 Model
-///
-/// # Arguments
-/// * `_provider_id` - Provider ID（如 "aliyun"，当前未使用）
-/// * `provider_data` - TOML table 格式的 Provider 数据
-///
-/// # Returns
-/// Option<Provider>，name 缺失时返回 None
 fn parse_provider(_provider_id: &str, provider_data: &toml::Value) -> Option<Provider> {
     let table = provider_data.as_table()?;
 
@@ -227,34 +232,9 @@ fn parse_provider(_provider_id: &str, provider_data: &toml::Value) -> Option<Pro
     })
 }
 
-/// 解析 ProviderOptions
-fn parse_provider_options(table: &toml::Table) -> fuyao_api::ProviderOptions {
-    let Some(options_table) = table.get("options").and_then(|v| v.as_table()) else {
-        return fuyao_api::ProviderOptions::default();
-    };
-
-    let base_url = options_table
-        .get("base_url")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let api_key = options_table
-        .get("api_key")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    fuyao_api::ProviderOptions { base_url, api_key }
-}
-
 /// 加载 Provider 配置
 ///
 /// 容错加载：跳过无效的 Provider/Model，加载有效的部分。
-///
-/// # Arguments
-/// * `providers_data` - TOML 格式的 Provider 数据
-///
-/// # Returns
-/// 有效的 Provider 字典
 pub fn load_providers(providers_data: &toml::Value) -> HashMap<String, Provider> {
     let empty_table = toml::Table::new();
     let table = providers_data.as_table().unwrap_or(&empty_table);

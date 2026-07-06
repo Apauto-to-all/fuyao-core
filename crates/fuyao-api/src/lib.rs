@@ -3,12 +3,14 @@
 //! 公共 trait + 类型定义，无业务逻辑依赖。
 //! 按领域组织模块：
 //! - `agent`: Agent 运行上下文、路径配置
+//! - `config`: 全局配置类型与共享句柄（单一真相源）
 //! - `message`: 消息类型（输入/输出）
 //! - `paths`: 路径系统（三层目录架构）
 //! - `provider`: 模型和供应商配置
 //! - `tool`: 工具定义和执行
 
 pub mod agent;
+pub mod config;
 pub mod error;
 pub mod mcp_types;
 pub mod message;
@@ -23,6 +25,12 @@ pub mod tool;
 
 // 导出常用类型
 pub use agent::{AgentContext, AgentPaths, ModelConfig, SharedAgentCtx, ToolRunnerConfig};
+pub use config::{
+    CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, LlmConfig,
+    LoopGuardConfig, McpGlobalConfig, RetryConfig, SessionConfig, SessionStorageConfig,
+    ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env, load_merged_config,
+    set_config,
+};
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{

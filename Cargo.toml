@@ -8,7 +8,6 @@ members = [
     "crates/fuyao-tools",
     "crates/fuyao-skills",
     "crates/fuyao-mcp",
-    "crates/fuyao-config",
     "crates/fuyao-prompt",
     "crates/fuyao-hooks",
     "crates/fuyao-guard",

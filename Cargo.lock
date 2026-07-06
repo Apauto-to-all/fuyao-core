@@ -879,21 +879,12 @@ name = "fuyao-api"
 version = "0.1.0"
 dependencies = [
  "dirs",
+ "dotenvy",
  "serde",
  "serde_json",
  "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "fuyao-config"
-version = "0.1.0"
-dependencies = [
- "dotenvy",
- "fuyao-api",
- "serde",
- "thiserror",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -904,7 +895,6 @@ dependencies = [
  "async-trait",
  "futures-util",
  "fuyao-api",
- "fuyao-config",
  "fuyao-hooks",
  "fuyao-provider",
  "serde_json",
@@ -980,7 +970,6 @@ name = "fuyao-session"
 version = "0.1.0"
 dependencies = [
  "fuyao-api",
- "fuyao-config",
  "fuyao-hooks",
  "fuyao-prompt",
  "fuyao-provider",
