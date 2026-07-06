@@ -23,9 +23,11 @@ pub mod engine;
 pub mod env;
 pub mod error;
 pub mod guard;
+pub mod hooks;
 pub mod llm;
 pub mod loader;
 pub mod mcp;
+pub mod plugins;
 pub mod providers;
 pub mod session;
 pub mod tools;
@@ -41,8 +43,10 @@ use crate::provider::Provider;
 // 聚合用子段类型（每域独立文件）
 pub use engine::EngineConfig;
 pub use guard::{GuardConfig, LoopGuardConfig};
+pub use hooks::HooksConfig;
 pub use llm::{LlmConfig, RetryConfig};
 pub use mcp::McpGlobalConfig;
+pub use plugins::PluginsConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig};
 pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig};
 
@@ -89,6 +93,12 @@ pub struct FuyaoConfig {
 
     /// 引擎通道容量
     pub engine: EngineConfig,
+
+    /// Hooks 配置（超时等）
+    pub hooks: HooksConfig,
+
+    /// Plugins 配置（插件开关）
+    pub plugins: PluginsConfig,
 }
 
 // ==================== 全局只读句柄 ====================
@@ -137,6 +147,8 @@ mod tests {
         assert_eq!(c.session.compression.threshold, 0.85);
         assert_eq!(c.mcp.tool_timeout_secs, 120);
         assert_eq!(c.engine.output_channel_capacity, 256);
+        assert_eq!(c.hooks.timeout_secs, 5);
+        assert!(c.plugins.enabled.is_empty());
     }
 
     /// get_config 未 set 时返回 default 不 panic。

@@ -2,7 +2,7 @@
 //!
 //! SessionHooksState 持有 tx_send（发送插件通知）、agent_ctx（同步 session_id）、
 //! 压缩追踪器（阈值检测 + split_session）。
-//! register_session_hooks 将 session 管理的核心钩子注册到 HooksRegistry。
+//! SessionPlugin 将 session 管理的核心钩子注册到 HooksRegistry。
 //! 与 loop_guard 的 LoopGuardState 模式一致。
 
 use super::session_context::SessionContext;
@@ -15,7 +15,7 @@ use fuyao_api::message::input::{
 use fuyao_api::message::output::AssistantMessage;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{Session, SharedAgentCtx};
-use fuyao_hooks::{BeforeLlmOutput, HooksRegistry};
+use fuyao_hooks::{BeforeLlmOutput, Plugin, SharedHooks};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -263,120 +263,133 @@ impl SessionHooksState {
     }
 }
 
-/// 注册 session 钩子到 HooksRegistry
+/// Session 管理插件
 ///
-/// 将 session 管理的核心钩子注册到钩子注册表中：
-/// - before_llm：返回消息列表（含 ensure_session 懒初始化）
-/// - output_observe：持久化输出 + 发射统计 + 压缩检测
-/// - send_input：获取 tx_send，用于发送插件通知和压缩引导消息
+/// 通过 before_llm（消息列表 + ensure_session 懒初始化）+ output_observe（持久化 + 统计 + 压缩检测）+
+/// send_input（获取 tx_send）三个钩子实现会话管理。
 ///
-/// 与 loop_guard 的 register_loop_guard_hooks 架构一致。
-pub async fn register_session_hooks(
-    hooks: &Arc<Mutex<HooksRegistry>>,
-    session_ctx: &Arc<Mutex<SessionContext>>,
-    agent_ctx: SharedAgentCtx,
-) {
-    let state = Arc::new(Mutex::new(SessionHooksState::new(
-        agent_ctx,
-        session_ctx.clone(),
-    )));
+/// 与 loop_guard 的 LoopGuardPlugin 架构一致。
+pub struct SessionPlugin {
+    state: Arc<Mutex<SessionHooksState>>,
+}
 
-    // hook: before_llm → 返回消息列表（含 ensure_session 懒初始化）+ skip_tools 信号
-    let s_before = state.clone();
-    hooks.lock().await.register_before_llm(
-        0,
-        Arc::new(move || {
-            let s = s_before.clone();
-            Box::pin(async move {
-                let guard = s.lock().await;
-                let mut ctx = guard.session_ctx.lock().await;
-                let initial_id = guard.initial_session_id();
+impl SessionPlugin {
+    /// 构造 session 管理插件
+    ///
+    /// # 参数
+    /// - `session_ctx`: Session 上下文（消息存储、持久化）
+    /// - `agent_ctx`: Agent 运行上下文（同步 session_id）
+    pub fn new(session_ctx: Arc<Mutex<SessionContext>>, agent_ctx: SharedAgentCtx) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SessionHooksState::new(agent_ctx, session_ctx))),
+        }
+    }
+}
 
-                // 懒初始化 session
-                let _ = ctx.ensure_session(initial_id.as_deref()).await;
+#[async_trait::async_trait]
+impl Plugin for SessionPlugin {
+    fn name(&self) -> &str {
+        "session"
+    }
 
-                if let Some(ref sid) = ctx.session_id {
-                    guard.sync_session_id(sid.clone());
-                }
-                BeforeLlmOutput {
-                    messages: ctx.get_messages(),
-                    // 压缩进行中时跳过工具，防止 AI 在摘要时调用工具
-                    skip_tools: guard.compression_in_progress,
-                }
-            })
-        }),
-    );
-
-    // hook: output_observe → 持久化消息 + 发射统计 + 压缩检测
-    //
-    // 严格串行：先持久化消息，再检测压缩。
-    // 确保压缩触发时最新消息已持久化到 DB。
-    let s_output = state.clone();
-    hooks
-        .lock()
-        .await
-        .register_output_observe(Arc::new(move |msg: OutputEvent| {
-            let s = s_output.clone();
-            Box::pin(async move {
-                // 阶段1：持久化消息 + 发射统计
-                let persisted = {
+    async fn register(&self, hooks: &SharedHooks) {
+        // hook: before_llm → 返回消息列表（含 ensure_session 懒初始化）+ skip_tools 信号
+        let s_before = self.state.clone();
+        hooks.lock().await.register_before_llm(
+            0,
+            Arc::new(move || {
+                let s = s_before.clone();
+                Box::pin(async move {
                     let guard = s.lock().await;
                     let mut ctx = guard.session_ctx.lock().await;
-                    let persisted = ctx.on_output(msg.clone()).await;
-                    if persisted {
-                        guard.on_output_stats(&ctx).await;
-                    }
-                    persisted
-                };
+                    let initial_id = guard.initial_session_id();
 
-                // 阶段2：压缩逻辑（仅处理 Assistant 事件且已持久化）
-                if !persisted {
-                    return;
-                }
-                if let OutputEvent::Assistant(ref data) = msg {
-                    let mut guard = s.lock().await;
-                    // 正在压缩中 → 检查是否是摘要响应（无工具调用）
-                    if guard.compression_in_progress {
-                        let has_tool_calls = data
-                            .payload
-                            .tool_calls
-                            .as_ref()
-                            .is_some_and(|tc| !tc.is_empty());
-                        if !has_tool_calls {
-                            guard.handle_compression_complete(data).await;
+                    // 懒初始化 session
+                    let _ = ctx.ensure_session(initial_id.as_deref()).await;
+
+                    if let Some(ref sid) = ctx.session_id {
+                        guard.sync_session_id(sid.clone());
+                    }
+                    BeforeLlmOutput {
+                        messages: ctx.get_messages(),
+                        // 压缩进行中时跳过工具，防止 AI 在摘要时调用工具
+                        skip_tools: guard.compression_in_progress,
+                    }
+                })
+            }),
+        );
+
+        // hook: output_observe → 持久化消息 + 发射统计 + 压缩检测
+        //
+        // 严格串行：先持久化消息，再检测压缩。
+        // 确保压缩触发时最新消息已持久化到 DB。
+        let s_output = self.state.clone();
+        hooks
+            .lock()
+            .await
+            .register_output_observe(Arc::new(move |msg: OutputEvent| {
+                let s = s_output.clone();
+                Box::pin(async move {
+                    // 阶段1：持久化消息 + 发射统计
+                    let persisted = {
+                        let guard = s.lock().await;
+                        let mut ctx = guard.session_ctx.lock().await;
+                        let persisted = ctx.on_output(msg.clone()).await;
+                        if persisted {
+                            guard.on_output_stats(&ctx).await;
                         }
+                        persisted
+                    };
+
+                    // 阶段2：压缩逻辑（仅处理 Assistant 事件且已持久化）
+                    if !persisted {
                         return;
                     }
+                    if let OutputEvent::Assistant(ref data) = msg {
+                        let mut guard = s.lock().await;
+                        // 正在压缩中 → 检查是否是摘要响应（无工具调用）
+                        if guard.compression_in_progress {
+                            let has_tool_calls = data
+                                .payload
+                                .tool_calls
+                                .as_ref()
+                                .is_some_and(|tc| !tc.is_empty());
+                            if !has_tool_calls {
+                                guard.handle_compression_complete(data).await;
+                            }
+                            return;
+                        }
 
-                    // 非压缩中 → 检测阈值，决定是否触发压缩
-                    let prompt_tokens = data.payload.prompt_tokens as usize;
-                    // 从 agent_ctx 读取当前运行时 model_id，供 tracker 解析 context_length
-                    let model_id = guard
-                        .agent_ctx
-                        .lock()
-                        .expect("Agent 上下文锁异常")
-                        .model_config
-                        .model_id
-                        .clone();
-                    if guard
-                        .tracker
-                        .should_compress(prompt_tokens, model_id.as_deref())
-                    {
-                        guard.inject_compression_guide();
+                        // 非压缩中 → 检测阈值，决定是否触发压缩
+                        let prompt_tokens = data.payload.prompt_tokens as usize;
+                        // 从 agent_ctx 读取当前运行时 model_id，供 tracker 解析 context_length
+                        let model_id = guard
+                            .agent_ctx
+                            .lock()
+                            .expect("Agent 上下文锁异常")
+                            .model_config
+                            .model_id
+                            .clone();
+                        if guard
+                            .tracker
+                            .should_compress(prompt_tokens, model_id.as_deref())
+                        {
+                            guard.inject_compression_guide();
+                        }
                     }
-                }
-            })
-        }));
+                })
+            }));
 
-    // hook: send_input → 保存 tx_send 到 state，用于发送插件通知和压缩引导消息
-    let s_send = state.clone();
-    let send_fn: fuyao_hooks::SendInputFn = Arc::new(move |tx| {
-        let s = s_send.clone();
-        Box::pin(async move {
-            s.lock().await.set_tx_send(tx);
-        })
-    });
-    hooks.lock().await.register_send_input(0, send_fn);
+        // hook: send_input → 保存 tx_send 到 state，用于发送插件通知和压缩引导消息
+        let s_send = self.state.clone();
+        let send_fn: fuyao_hooks::SendInputFn = Arc::new(move |tx| {
+            let s = s_send.clone();
+            Box::pin(async move {
+                s.lock().await.set_tx_send(tx);
+            })
+        });
+        hooks.lock().await.register_send_input(0, send_fn);
+    }
 }
 
 #[cfg(test)]

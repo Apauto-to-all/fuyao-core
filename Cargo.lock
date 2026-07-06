@@ -906,6 +906,7 @@ dependencies = [
 name = "fuyao-guard"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "fuyao-api",
  "fuyao-hooks",
  "serde_json",
@@ -916,9 +917,11 @@ dependencies = [
 name = "fuyao-hooks"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures-util",
  "fuyao-api",
  "serde_json",
+ "thiserror",
  "tokio",
 ]
 
@@ -969,6 +972,7 @@ dependencies = [
 name = "fuyao-session"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "fuyao-api",
  "fuyao-hooks",
  "fuyao-prompt",

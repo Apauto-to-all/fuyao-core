@@ -15,7 +15,6 @@ pub mod error;
 pub mod mcp_types;
 pub mod message;
 pub mod paths;
-pub mod plugin_types;
 pub mod prompt_types;
 pub mod provider;
 pub mod queue_snapshot;
@@ -26,10 +25,10 @@ pub mod tool;
 // 导出常用类型
 pub use agent::{AgentContext, AgentPaths, ModelConfig, SharedAgentCtx};
 pub use config::{
-    CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, LlmConfig,
-    LoopGuardConfig, McpGlobalConfig, RetryConfig, SessionConfig, SessionStorageConfig,
-    ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env,
-    load_merged_config, set_config,
+    CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig, LlmConfig,
+    LoopGuardConfig, McpGlobalConfig, PluginsConfig, RetryConfig, SessionConfig,
+    SessionStorageConfig, ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config,
+    load_config, load_env, load_merged_config, set_config,
 };
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
@@ -44,7 +43,6 @@ pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
     get_workspace_root,
 };
-pub use plugin_types::{InterceptPoint, ObservePoint, PluginManifest};
 pub use prompt_types::AgentDefinition;
 pub use provider::{
     Model, ModelCost, ModelLimit, ModelModalities, PriceTier, Provider, ProviderOptions,

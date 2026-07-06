@@ -12,7 +12,7 @@ pub mod store;
 pub mod todo_store;
 pub mod utils;
 
-pub use context::{SessionContext, register_session_hooks};
+pub use context::{SessionContext, SessionPlugin};
 pub use cost::calculate_cost;
 pub use error::SessionError;
 pub use manager::{SessionManager, clear_session_manager_cache, get_session_manager};

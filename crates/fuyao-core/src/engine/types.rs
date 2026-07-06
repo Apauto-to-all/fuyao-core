@@ -32,8 +32,8 @@ pub type SharedTools = Arc<
     )>,
 >;
 
-/// 共享钩子注册表
-pub type SharedHooks = Arc<tokio::sync::Mutex<fuyao_hooks::HooksRegistry>>;
+// SharedHooks 已下沉到 fuyao-hooks（Plugin trait 签名需要，避免环依赖）
+pub use fuyao_hooks::SharedHooks;
 
 /// 共享引导队列
 pub(crate) type SharedGuideQueue = Arc<std::sync::Mutex<VecDeque<QueuedUserMessage>>>;

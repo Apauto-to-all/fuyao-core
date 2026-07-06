@@ -6,4 +6,4 @@
 pub mod loop_guard;
 
 pub use fuyao_api::LoopGuardConfig;
-pub use loop_guard::register_loop_guard_hooks;
+pub use loop_guard::LoopGuardPlugin;
