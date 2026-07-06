@@ -24,12 +24,13 @@
 //! let (engine, handle) = fuyao_core::init::init_engine(agent_ctx)?;
 //! ```
 
-use fuyao_api::config::{load_config, load_env};
+use fuyao_api::config::{FuyaoConfig, load_config, load_env, set_config};
 use fuyao_api::{AgentContext, AgentPaths};
 use fuyao_provider::openai::OpenAIProvider;
 use fuyao_provider::registry::{
     agent_paths_cache_key, get_model, list_models, register_model, register_provider,
 };
+use std::sync::Arc;
 
 use crate::{Engine, EngineHandle};
 
@@ -86,18 +87,25 @@ pub enum InitError {
 pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), InitError> {
     let agent_paths = agent_ctx.agent_paths.clone();
 
-    // 1. 加载 .env 环境变量（fuyao-config 模块）
+    // 1. 加载 .env 环境变量
     load_env(&agent_paths);
 
-    // 2. 加载配置并注册 Provider/Model（带缓存，重复调用幂等）
-    ensure_registered(&agent_paths)?;
+    // 2. 加载配置（一次）：注入全局只读句柄，供所有模块 get_config 读取；
+    //    同时复用于 Provider/Model 注册与默认 model_id 推断，避免重复加载。
+    let config = load_config(&agent_paths).map_err(|e| InitError::ConfigError(e.to_string()))?;
+    if let Some(ref cfg) = config {
+        set_config(Arc::new(cfg.clone()));
+    }
 
-    // 3. 确定 model_id：显式指定 > 配置文件默认 > 第一个已注册模型
+    // 3. 注册 Provider/Model（带缓存，重复调用幂等）
+    ensure_registered(&agent_paths, config.as_ref())?;
+
+    // 4. 确定 model_id：显式指定 > 配置文件默认 > 第一个已注册模型
     let model_id = agent_ctx
         .model_config
         .model_id
         .clone()
-        .or_else(|| get_default_model_id(&agent_paths))
+        .or_else(|| get_default_model_id(&agent_paths, config.as_ref()))
         .ok_or_else(|| {
             let loaded = list_models(&agent_paths);
             InitError::NoModelWithDetail {
@@ -131,15 +139,16 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), In
 
 /// 确保指定 `agent_paths` 的 Provider/Model 已注册
 ///
-/// 带幂等缓存：先查注册表，非空则直接返回；否则从三层配置加载并注册。
-/// 重复调用不会重复加载配置。
-fn ensure_registered(agent_paths: &AgentPaths) -> Result<(), InitError> {
+/// 带幂等缓存：先查注册表，非空则直接返回；否则用 init_engine 已加载的配置注册。
+/// 不再重复调用 load_config（由调用方一次性加载后传入）。
+fn ensure_registered(
+    agent_paths: &AgentPaths,
+    config: Option<&FuyaoConfig>,
+) -> Result<(), InitError> {
     let existing = list_models(agent_paths);
     if !existing.is_empty() {
         return Ok(());
     }
-
-    let config = load_config(agent_paths).map_err(|e| InitError::ConfigError(e.to_string()))?;
 
     let Some(config) = config else {
         return Ok(());
@@ -161,15 +170,16 @@ fn ensure_registered(agent_paths: &AgentPaths) -> Result<(), InitError> {
 /// 获取默认 model_id
 ///
 /// 优先级：配置文件 `model` 字段（若在注册表中） > 已加载模型的第一个。
-fn get_default_model_id(agent_paths: &AgentPaths) -> Option<String> {
+/// 使用 init_engine 已加载的配置，不重复加载。
+fn get_default_model_id(agent_paths: &AgentPaths, config: Option<&FuyaoConfig>) -> Option<String> {
     let loaded = list_models(agent_paths);
     if loaded.is_empty() {
         return None;
     }
 
     // 配置文件的 model 字段优先，但需确认已注册（防止配置指向未注册模型）
-    if let Ok(Some(config)) = load_config(agent_paths)
-        && let Some(ref model_id) = config.model
+    if let Some(cfg) = config
+        && let Some(ref model_id) = cfg.model
     {
         let lower = model_id.to_lowercase();
         if loaded.contains_key(&lower) {
