@@ -1,6 +1,7 @@
 //! 重试策略 - 错误判断与退避计算
 
 use crate::StreamError;
+use fuyao_api::get_config;
 
 /// 判断错误是否可重试
 ///
@@ -24,12 +25,28 @@ pub fn is_retryable(e: &StreamError) -> bool {
     }
 }
 
-/// 退避起始延迟（对齐 opencode: 2秒起步）
-pub const RETRY_INITIAL_DELAY: u64 = 2000;
-/// 无响应头时的退避上限（对齐 opencode: 30秒）
-pub const RETRY_MAX_DELAY_NO_HEADERS: u64 = 30000;
-/// 有响应头时的退避上限（对齐 opencode: ~24.8天）
-pub const RETRY_MAX_DELAY: u64 = 2_147_483_647;
+/// 退避时长参数（从全局配置 `get_config().llm.retry` 读取）
+///
+/// 对应原硬编码常量：
+/// - `initial_delay_ms`：原 `RETRY_INITIAL_DELAY=2000`
+/// - `max_delay_ms`：无响应头场景上限，原 `RETRY_MAX_DELAY_NO_HEADERS=30000`
+/// - `max_delay_with_headers_ms`：有响应头场景上限，原 `RETRY_MAX_DELAY=2_147_483_647`
+struct BackoffParams {
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    max_delay_with_headers_ms: u64,
+}
+
+impl BackoffParams {
+    fn from_config() -> Self {
+        let r = &get_config().llm.retry;
+        Self {
+            initial_delay_ms: r.initial_delay_ms,
+            max_delay_ms: r.max_delay_ms,
+            max_delay_with_headers_ms: r.max_delay_with_headers_ms,
+        }
+    }
+}
 
 /// 计算退避时长（双分支策略，对齐 opencode）
 ///
@@ -39,13 +56,15 @@ pub const RETRY_MAX_DELAY: u64 = 2_147_483_647;
 /// 3. 有响应头（RateLimit/5xx）→ 指数退避，上限 ~24.8天
 /// 4. 无响应头（Timeout/Connection）→ 指数退避，上限 30s
 pub fn backoff_duration(retry: u32, error: &StreamError) -> std::time::Duration {
+    let p = BackoffParams::from_config();
+
     // 优先级 1: retry-after-ms 响应头
     if let StreamError::RateLimit {
         retry_after_ms: Some(ms),
         ..
     } = error
     {
-        return std::time::Duration::from_millis((*ms).min(RETRY_MAX_DELAY));
+        return std::time::Duration::from_millis((*ms).min(p.max_delay_with_headers_ms));
     }
 
     // 优先级 2: retry-after 响应头（秒 → 毫秒）
@@ -54,11 +73,15 @@ pub fn backoff_duration(retry: u32, error: &StreamError) -> std::time::Duration 
         ..
     } = error
     {
-        return std::time::Duration::from_millis((secs * 1000).min(RETRY_MAX_DELAY));
+        return std::time::Duration::from_millis(
+            (secs * 1000).min(p.max_delay_with_headers_ms),
+        );
     }
 
     // 优先级 3 & 4: 指数退避
-    let base = RETRY_INITIAL_DELAY.saturating_mul(2u64.saturating_pow(retry - 1));
+    let base = p
+        .initial_delay_ms
+        .saturating_mul(2u64.saturating_pow(retry - 1));
 
     // 有响应头的错误（RateLimit、5xx ApiError）→ 上限 ~24.8天
     let has_headers = matches!(
@@ -67,10 +90,10 @@ pub fn backoff_duration(retry: u32, error: &StreamError) -> std::time::Duration 
     );
 
     if has_headers {
-        std::time::Duration::from_millis(base.min(RETRY_MAX_DELAY))
+        std::time::Duration::from_millis(base.min(p.max_delay_with_headers_ms))
     } else {
         // 无响应头的错误（Timeout、Connection）→ 上限 30s
-        std::time::Duration::from_millis(base.min(RETRY_MAX_DELAY_NO_HEADERS))
+        std::time::Duration::from_millis(base.min(p.max_delay_ms))
     }
 }
 
@@ -198,7 +221,7 @@ mod tests {
         // 第31次: 2000 * 2^30 = 2147483648000ms，超过上限 → 封顶
         assert_eq!(
             backoff_duration(31, &error),
-            std::time::Duration::from_millis(RETRY_MAX_DELAY)
+            std::time::Duration::from_millis(2_147_483_647)
         );
     }
 
@@ -241,7 +264,7 @@ mod tests {
         // 第31次: 超过上限 → 封顶
         assert_eq!(
             backoff_duration(31, &error),
-            std::time::Duration::from_millis(RETRY_MAX_DELAY)
+            std::time::Duration::from_millis(2_147_483_647)
         );
     }
 }

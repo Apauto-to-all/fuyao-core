@@ -157,7 +157,9 @@ pub async fn run_stream_session(
                     if let Some(acc) = &accumulator {
                         acc.lock().expect("流式累积器锁异常").phase = StreamPhase::Backoff;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // ContextOverflow 后固定等待（时长从全局配置 get_config().llm 读取）
+                    let wait_secs = fuyao_api::get_config().llm.context_overflow_wait_secs;
+                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                     // 恢复流式阶段
                     if let Some(acc) = &accumulator {
                         acc.lock().expect("流式累积器锁异常").phase = StreamPhase::Streaming;

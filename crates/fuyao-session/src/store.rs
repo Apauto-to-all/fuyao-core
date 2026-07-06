@@ -105,10 +105,14 @@ pub struct SQLiteStore {
 
 impl SQLiteStore {
     /// 创建并初始化存储
+    ///
+    /// 连接参数（busy_timeout / max_connections）从全局配置 `get_config().session.storage` 读取。
     pub async fn new(db_path: PathBuf) -> Result<Self, SessionError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        let storage = fuyao_api::get_config().session.storage.clone();
 
         // 连接选项：启用 WAL、外键、忙等待
         let options = SqliteConnectOptions::new()
@@ -116,10 +120,10 @@ impl SQLiteStore {
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(Duration::from_secs(storage.busy_timeout_secs));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(storage.max_connections)
             .connect_with(options)
             .await?;
 

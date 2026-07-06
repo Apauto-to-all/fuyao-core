@@ -11,11 +11,13 @@ pub mod tracker;
 
 use fuyao_api::Message;
 
-/// 保留窗口上限：最多保留最近 6 条消息
-pub(crate) const MAX_RECENT_WINDOW: usize = 6;
-
-/// 保留窗口硬上限：完整性扩大后最多不超过此值
-pub(crate) const MAX_RECENT_WINDOW_HARD: usize = MAX_RECENT_WINDOW * 2;
+/// 保留窗口大小（从全局配置 `get_config().session.compression.recent_window` 读取）
+///
+/// 返回 (recent_window, hard_limit)，hard_limit = recent_window * 2。
+fn window_sizes() -> (usize, usize) {
+    let window = fuyao_api::get_config().session.compression.recent_window;
+    (window, window * 2)
+}
 
 /// 压缩系统提示词
 pub(crate) const COMPRESSION_SYSTEM_PROMPT: &str = r#"你是一个摘要代理，负责创建上下文检查点。你的输出将作为参考资料注入给另一个继续对话的助手，替换被压缩的对话历史。
@@ -64,10 +66,11 @@ pub(crate) const COMPRESSION_SYSTEM_PROMPT: &str = r#"你是一个摘要代理�
 /// 向前扩大窗口，确保 assistant+tool 块完整
 ///
 /// 从 recent_start 位置向前扫描，确保分割点处的 assistant+tool 块不被截断。
-/// 扫描范围受 MAX_RECENT_WINDOW_HARD 限制。
+/// 扫描范围受 recent_window * 2（hard_limit）限制，从全局配置读取。
 pub(crate) fn expand_for_integrity(messages: &[Message], recent_start: usize) -> usize {
     let total = messages.len();
-    let hard_limit = total.saturating_sub(MAX_RECENT_WINDOW_HARD);
+    let (_recent_window, hard_limit_abs) = window_sizes();
+    let hard_limit = total.saturating_sub(hard_limit_abs);
 
     // 边界检查
     if recent_start >= total {

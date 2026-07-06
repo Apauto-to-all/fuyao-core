@@ -24,8 +24,5 @@ pub use registry::{
     register_model, register_provider,
 };
 pub use resolver::{get_base_url, resolve_api_key};
-pub use retry::{
-    RETRY_INITIAL_DELAY, RETRY_MAX_DELAY, RETRY_MAX_DELAY_NO_HEADERS, backoff_duration,
-    is_retryable,
-};
+pub use retry::{backoff_duration, is_retryable};
 pub use stream_decoder::StreamDecoder;

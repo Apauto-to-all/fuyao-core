@@ -1,31 +1,25 @@
 //! Session 管理工具函数
 
 use fuyao_api::AgentPaths;
-use fuyao_api::config::load_config;
 use fuyao_provider::registry::get_model;
 
-/// 解析当前模型的上下文窗口大小
+/// 解析指定模型的上下文窗口大小
 ///
-/// 每次调用都动态获取，支持运行时切换模型。
+/// model_id 由调用方传入（从 `agent_ctx.model_config.model_id` 读取当前运行时模型），
+/// 不再自行加载配置文件。fallback 值从全局配置 `get_config().session.compression` 读取。
 ///
 /// # Arguments
-/// * `agent_paths` - Agent 路径配置
+/// * `model_id` - 当前模型 ID（如 "aliyun/qwen3.6-plus"），None 时直接返回 fallback
+/// * `agent_paths` - Agent 路径配置（用于查询模型注册表）
 ///
 /// # Returns
-/// 上下文窗口大小（token 数），默认 128000
-pub fn resolve_context_length(agent_paths: &AgentPaths) -> usize {
-    // 从配置中获取默认模型的 context length
-    let config = match load_config(agent_paths) {
-        Ok(Some(c)) => c,
-        _ => return 128_000,
+/// 上下文窗口大小（token 数），无法解析时返回 fallback_context
+pub fn resolve_context_length(model_id: Option<&str>, agent_paths: &AgentPaths) -> usize {
+    let fallback = fuyao_api::get_config().session.compression.fallback_context as usize;
+    let Some(id) = model_id else {
+        return fallback;
     };
-
-    let model_id = match config.model {
-        Some(id) => id,
-        None => return 128_000,
-    };
-
-    get_model(&model_id, agent_paths)
+    get_model(id, agent_paths)
         .map(|m| m.limit.context as usize)
-        .unwrap_or(128_000)
+        .unwrap_or(fallback)
 }

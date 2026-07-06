@@ -39,14 +39,16 @@ impl OpenAIProvider {
     /// 从 provider_id 和 agent_paths 创建
     ///
     /// 从注册表解析 api_key 和 base_url，构建 reqwest Client。
+    /// HTTP 超时从全局配置 `get_config().llm` 读取。
     pub fn new(provider_id: &str, agent_paths: &AgentPaths) -> Option<Self> {
         let api_key = crate::resolver::resolve_api_key(provider_id, agent_paths)?;
         let base_url = crate::resolver::get_base_url(provider_id, agent_paths)
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
+        let llm = fuyao_api::get_config().llm.clone();
         let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(llm.request_timeout_secs))
+            .connect_timeout(Duration::from_secs(llm.connect_timeout_secs))
             .build()
             .ok()?;
 

@@ -7,7 +7,7 @@
 
 use super::session_context::SessionContext;
 use crate::compressor::tracker::CompressionTracker;
-use crate::compressor::{COMPRESSION_SYSTEM_PROMPT, MAX_RECENT_WINDOW, expand_for_integrity};
+use crate::compressor::{COMPRESSION_SYSTEM_PROMPT, expand_for_integrity};
 use fuyao_api::message::input::{
     PluginEventSource, PluginMessage, PluginOrigin, PluginPayload, PluginSource, UserMessage,
     UserMessageMode, UserMessageSource, UserPayload,
@@ -219,7 +219,9 @@ impl SessionHooksState {
         let recent_messages = match guide_idx {
             Some(guide) if guide > 0 => {
                 let original = &all_messages[..guide];
-                let recent_window = std::cmp::min(MAX_RECENT_WINDOW, original.len() / 6);
+                // recent_window 从全局配置读取；保留窗口 = min(window, 原始消息数 / window)
+                let recent_window = fuyao_api::get_config().session.compression.recent_window;
+                let recent_window = std::cmp::min(recent_window, original.len() / recent_window.max(1));
                 if recent_window == 0 {
                     // 消息太少，不保留额外窗口
                     Vec::new()
@@ -347,7 +349,18 @@ pub async fn register_session_hooks(
 
                     // 非压缩中 → 检测阈值，决定是否触发压缩
                     let prompt_tokens = data.payload.prompt_tokens as usize;
-                    if guard.tracker.should_compress(prompt_tokens) {
+                    // 从 agent_ctx 读取当前运行时 model_id，供 tracker 解析 context_length
+                    let model_id = guard
+                        .agent_ctx
+                        .lock()
+                        .expect("Agent 上下文锁异常")
+                        .model_config
+                        .model_id
+                        .clone();
+                    if guard
+                        .tracker
+                        .should_compress(prompt_tokens, model_id.as_deref())
+                    {
                         guard.inject_compression_guide();
                     }
                 }
@@ -379,8 +392,8 @@ mod tests {
         let session_ctx = Arc::new(Mutex::new(SessionContext::new(AgentPaths::default())));
         let state = SessionHooksState::new(agent_ctx, session_ctx);
         assert!(!state.compression_in_progress);
-        assert!(!state.tracker.should_compress(100_000));
-        assert!(state.tracker.should_compress(110_000));
+        assert!(!state.tracker.should_compress(100_000, None));
+        assert!(state.tracker.should_compress(110_000, None));
     }
 
     #[tokio::test]
