@@ -25,7 +25,7 @@
 //! ```
 
 use fuyao_api::config::{FuyaoConfig, load_config, load_env, set_config};
-use fuyao_api::{AgentContext, AgentPaths, ToolRunnerConfig, get_config};
+use fuyao_api::{AgentContext, AgentPaths};
 use fuyao_provider::openai::OpenAIProvider;
 use fuyao_provider::registry::{
     agent_paths_cache_key, get_model, list_models, register_model, register_provider,
@@ -117,11 +117,6 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), In
     // 更新 agent_ctx 中的 model_id（确保已设置，供 Engine 内部读取）
     let mut agent_ctx = agent_ctx;
     agent_ctx.model_config.model_id = Some(model_id.clone());
-
-    // 装配 tool_runner_config：用户显式构造（非 default）优先，否则从全局配置读取
-    if agent_ctx.tool_runner_config == ToolRunnerConfig::default() {
-        agent_ctx.tool_runner_config = get_config().tools.runner.clone();
-    }
 
     // 4. 创建 Provider 实例（按 model_id 中 `/` 之前的 provider_id）
     let provider_id = model_id.split('/').next().unwrap_or("");

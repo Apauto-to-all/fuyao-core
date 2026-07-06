@@ -1,17 +1,15 @@
 //! 工具系统配置（开关 + 运行器 + 高频限制）
 //!
 //! - `enabled`：原 `FuyaoConfig.tools` 的扁平开关迁移至此子表
-//! - `runner`：引用 `agent::ToolRunnerConfig`（并发策略，定义在 agent 模块）
+//! - `runner`：工具并发策略（`ToolRunnerConfig`，本模块定义）
 //! - `limits`：迁移自 `fuyao-tools/src/config.rs` 的高频可调项
 //!
 //! 非高频项（`MAX_READ_CHARS`、各类缓存容量、`REDACT_SECRETS`、`SEARCH_EXCLUDE_DIRS`、
 //! `WEBFETCH_USER_AGENT`、`WEBFETCH_CACHE_*` 等）保持 const，不纳入。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
-
-use crate::agent::ToolRunnerConfig;
 
 /// 工具系统高频可调限制（迁移自 `fuyao-tools/src/config.rs` 高频项）
 #[derive(Debug, Clone, Deserialize)]
@@ -46,6 +44,65 @@ impl Default for ToolsLimitsConfig {
             webfetch_max_timeout_secs: 180,
             webfetch_max_output_chars: 100_000,
             webfetch_max_download_bytes: 5 * 1024 * 1024,
+        }
+    }
+}
+
+/// 工具运行器配置
+///
+/// 定义工具执行策略：并行规则、最大并发数等。
+///
+/// 判断顺序：
+/// 1. never_parallel_tools → 强制串行
+/// 2. path_scoped_tools → 检查路径重叠，重叠则串行，否则跳过后续检查
+/// 3. parallel_safe_tools → 在此列表则可并行，否则串行
+///
+/// TOML 短键名：为配置文件书写简洁，字段经 `#[serde(rename)]` 映射为
+/// `never_parallel` / `parallel_safe` / `path_scoped`（见 `[tools.runner]`）。
+/// 容器级 `#[serde(default)]` 使缺省字段回退到下方手动 `Default` impl 的硬编码值。
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ToolRunnerConfig {
+    /// 最大并发执行的工具数量
+    pub max_concurrent: u32,
+
+    /// 必须串行执行的工具（如需要用户交互）
+    #[serde(rename = "never_parallel")]
+    pub never_parallel_tools: HashSet<String>,
+
+    /// 只读工具，无共享可变状态，可安全并行
+    ///
+    /// 注意：path_scoped_tools 中的工具会先做路径检查，检查通过后跳过此检查。
+    /// 例如 read 同时在两个列表中，但只走 path_scoped_tools 检查路径重叠，
+    /// 不会走到 parallel_safe_tools 的通用检查。
+    #[serde(rename = "parallel_safe")]
+    pub parallel_safe_tools: HashSet<String>,
+
+    /// 文件工具，可并行但要检查路径是否重叠
+    ///
+    /// 注意：这些工具会先做特殊检查（路径重叠），检查通过后跳过 parallel_safe_tools 检查。
+    /// 例如 read 在此列表中，会检查路径是否重叠，重叠则串行，不重叠则可并行。
+    #[serde(rename = "path_scoped")]
+    pub path_scoped_tools: HashSet<String>,
+}
+
+impl Default for ToolRunnerConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 8,
+            never_parallel_tools: HashSet::from(["bash".to_string(), "todowrite".to_string()]),
+            parallel_safe_tools: HashSet::from([
+                "read".to_string(),
+                "glob".to_string(),
+                "grep".to_string(),
+                "skill".to_string(),
+                "webfetch".to_string(),
+            ]),
+            path_scoped_tools: HashSet::from([
+                "read".to_string(),
+                "write".to_string(),
+                "edit".to_string(),
+            ]),
         }
     }
 }
@@ -121,5 +178,34 @@ path_scoped = ["read", "write"]
         assert!(w.tools.runner.never_parallel_tools.contains("edit"));
         assert!(w.tools.runner.parallel_safe_tools.contains("glob"));
         assert!(w.tools.runner.path_scoped_tools.contains("read"));
+    }
+
+    #[test]
+    fn tool_runner_config_default_max_concurrent_is_8() {
+        let config = ToolRunnerConfig::default();
+        assert_eq!(config.max_concurrent, 8);
+    }
+
+    #[test]
+    fn tool_runner_config_default_never_parallel_contains_bash() {
+        let config = ToolRunnerConfig::default();
+        assert!(config.never_parallel_tools.contains("bash"));
+        assert!(config.never_parallel_tools.contains("todowrite"));
+    }
+
+    #[test]
+    fn tool_runner_config_default_parallel_safe_contains_read() {
+        let config = ToolRunnerConfig::default();
+        assert!(config.parallel_safe_tools.contains("read"));
+        assert!(config.parallel_safe_tools.contains("glob"));
+        assert!(config.parallel_safe_tools.contains("grep"));
+    }
+
+    #[test]
+    fn tool_runner_config_default_path_scoped_contains_file_tools() {
+        let config = ToolRunnerConfig::default();
+        assert!(config.path_scoped_tools.contains("read"));
+        assert!(config.path_scoped_tools.contains("write"));
+        assert!(config.path_scoped_tools.contains("edit"));
     }
 }

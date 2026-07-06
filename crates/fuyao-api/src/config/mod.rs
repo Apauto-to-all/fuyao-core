@@ -44,7 +44,7 @@ pub use guard::{GuardConfig, LoopGuardConfig};
 pub use llm::{LlmConfig, RetryConfig};
 pub use mcp::McpGlobalConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig};
-pub use tools::{ToolsConfig, ToolsLimitsConfig};
+pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig};
 
 // 加载相关
 pub use env::load_env;

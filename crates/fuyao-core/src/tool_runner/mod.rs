@@ -26,7 +26,9 @@ pub(crate) async fn orchestrate(
     agent_ctx: &AgentContext,
     emitter: &EventEmitter,
 ) {
-    let config = &agent_ctx.tool_runner_config;
+    // 工具并发策略从全局配置读取（`[tools.runner]`），运行期只读、不再经 AgentContext 传播
+    let runner = fuyao_api::get_config();
+    let config = &runner.tools.runner;
 
     if tool_calls.is_empty() {
         return;

@@ -24,12 +24,12 @@ pub mod skill_types;
 pub mod tool;
 
 // 导出常用类型
-pub use agent::{AgentContext, AgentPaths, ModelConfig, SharedAgentCtx, ToolRunnerConfig};
+pub use agent::{AgentContext, AgentPaths, ModelConfig, SharedAgentCtx};
 pub use config::{
     CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, LlmConfig,
     LoopGuardConfig, McpGlobalConfig, RetryConfig, SessionConfig, SessionStorageConfig,
-    ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env, load_merged_config,
-    set_config,
+    ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env,
+    load_merged_config, set_config,
 };
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
