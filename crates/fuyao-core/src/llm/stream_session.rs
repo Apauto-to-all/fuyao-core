@@ -116,35 +116,6 @@ pub async fn run_stream_session(
                         guard.usage = decoder.usage().clone();
                     }
                 }
-                Err(StreamError::ContextOverflow) => {
-                    // 上下文溢出：通知 UI 后等待重试。
-                    // 真正的压缩由 SessionPlugin 的 output_observe hook 主动触发（token 阈值检测），
-                    // 此处仅通知 + 等待；不发插件消息（无消费者，且 stream_session 非插件）。
-                    let wait_secs = fuyao_api::get_config().llm.context_overflow_wait_secs;
-                    crate::dispatch::dispatch(
-                        OutputEvent::Error(ErrorMessage {
-                            base: EventBase::default(),
-                            payload: ErrorPayload {
-                                message: format!("上下文溢出，等待 {wait_secs}秒后重试..."),
-                                recoverable: true,
-                            },
-                        }),
-                        None,
-                        emitter,
-                    )
-                    .await;
-
-                    // 标记退避阶段（中断时区分场景）
-                    if let Some(acc) = &accumulator {
-                        acc.lock().expect("流式累积器锁异常").phase = StreamPhase::Backoff;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
-                    // 恢复流式阶段
-                    if let Some(acc) = &accumulator {
-                        acc.lock().expect("流式累积器锁异常").phase = StreamPhase::Streaming;
-                    }
-                    continue 'stream;
-                }
                 Err(e) if !is_retryable(&e) => {
                     crate::dispatch::dispatch(
                         OutputEvent::Error(ErrorMessage {

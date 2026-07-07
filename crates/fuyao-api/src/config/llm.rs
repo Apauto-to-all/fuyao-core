@@ -1,7 +1,6 @@
 //! LLM 调用层配置
 //!
-//! 迁移自 `fuyao-provider/src/openai.rs`（HTTP 超时）、`retry.rs`（退避）、
-//! `fuyao-core/src/llm/stream_session.rs`（ContextOverflow 等待）的硬编码。
+//! 迁移自 `fuyao-provider/src/openai.rs`（HTTP 超时）、`retry.rs`（退避）的硬编码。
 
 use serde::Deserialize;
 
@@ -37,8 +36,6 @@ pub struct LlmConfig {
     pub request_timeout_secs: u64,
     /// HTTP 连接超时（秒），原 `openai.rs:49` = 10
     pub connect_timeout_secs: u64,
-    /// ContextOverflow 后固定等待时长（秒），原 `stream_session.rs:160` = 2
-    pub context_overflow_wait_secs: u64,
     /// 重试退避子段，对应 TOML `[llm.retry]`
     pub retry: RetryConfig,
 }
@@ -48,7 +45,6 @@ impl Default for LlmConfig {
         Self {
             request_timeout_secs: 300,
             connect_timeout_secs: 10,
-            context_overflow_wait_secs: 2,
             retry: RetryConfig::default(),
         }
     }
@@ -71,7 +67,6 @@ mod tests {
         let c = LlmConfig::default();
         assert_eq!(c.request_timeout_secs, 300);
         assert_eq!(c.connect_timeout_secs, 10);
-        assert_eq!(c.context_overflow_wait_secs, 2);
         assert_eq!(c.retry.initial_delay_ms, 2000);
         assert_eq!(c.retry.max_delay_ms, 30000);
     }
