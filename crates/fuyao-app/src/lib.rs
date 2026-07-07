@@ -12,13 +12,10 @@ use fuyao_core::EngineHandle;
 use fuyao_guard::LoopGuardPlugin;
 use fuyao_hooks::PluginHost;
 use fuyao_mcp::MCPManager;
-use fuyao_session::SessionContext;
-use tokio::sync::Mutex;
+use fuyao_session::SessionPlugin;
 
 /// 装配产物：调用方持有，用于管理生命周期
 pub struct AppContext {
-    /// Session 上下文（后续补全装配逻辑）
-    pub session_ctx: Option<Arc<Mutex<SessionContext>>>,
     /// MCP 管理器（无配置 server 时为 None）
     pub mcp_manager: Option<Arc<MCPManager>>,
     /// 插件宿主（关闭时调用 dispose_all）
@@ -49,8 +46,14 @@ pub async fn setup(handle: &EngineHandle) -> Result<AppContext, SetupError> {
     // 3. 构造插件，按 [plugins.enabled] 过滤后装入
     let mut host = PluginHost::new();
 
-    // TODO: 构造 SessionContext + SessionPlugin，按 [plugins.enabled] 过滤后装入
-    // session 插件需要 SessionContext + SessionManager，装配逻辑后续补全
+    // session 插件需要 agent_paths（构造 SessionContext）+ agent_ctx（同步 session_id / 读 model_id）
+    if is_plugin_enabled("session") {
+        let agent_ctx = handle.agent_ctx().ok_or(SetupError::NoAgentContext)?;
+        host.add(Box::new(SessionPlugin::new(
+            agent_ctx.agent_paths.clone(),
+            handle.agent_ctx_shared(),
+        )));
+    }
 
     if is_plugin_enabled("loop_guard") {
         host.add(Box::new(LoopGuardPlugin::new()));
@@ -60,7 +63,6 @@ pub async fn setup(handle: &EngineHandle) -> Result<AppContext, SetupError> {
     host.install(&handle.hooks()).await;
 
     Ok(AppContext {
-        session_ctx: None,
         mcp_manager,
         plugin_host: host,
     })

@@ -14,7 +14,7 @@ use fuyao_api::message::input::{
 };
 use fuyao_api::message::output::AssistantMessage;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{Session, SharedAgentCtx};
+use fuyao_api::{AgentPaths, Session, SharedAgentCtx};
 use fuyao_hooks::{BeforeLlmOutput, Plugin, SharedHooks};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -276,10 +276,14 @@ pub struct SessionPlugin {
 impl SessionPlugin {
     /// 构造 session 管理插件
     ///
+    /// 内部自行构造 [`SessionContext`]（会话级内存态），不向外部暴露——
+    /// SessionContext 仅供插件 hook 内部消费（喂 LLM / 持久化 / 压缩），无跨模块读需求。
+    ///
     /// # 参数
-    /// - `session_ctx`: Session 上下文（消息存储、持久化）
-    /// - `agent_ctx`: Agent 运行上下文（同步 session_id）
-    pub fn new(session_ctx: Arc<Mutex<SessionContext>>, agent_ctx: SharedAgentCtx) -> Self {
+    /// - `agent_paths`: Agent 路径配置（用于构造 SessionContext，定位 sessions_db）
+    /// - `agent_ctx`: Agent 运行上下文（同步 session_id / 读 model_id）
+    pub fn new(agent_paths: AgentPaths, agent_ctx: SharedAgentCtx) -> Self {
+        let session_ctx = Arc::new(Mutex::new(SessionContext::new(agent_paths)));
         Self {
             state: Arc::new(Mutex::new(SessionHooksState::new(agent_ctx, session_ctx))),
         }
