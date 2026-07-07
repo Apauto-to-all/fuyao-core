@@ -1,6 +1,6 @@
 //! Skills 查找
 //!
-//! 扫描三层目录发现 Skill，返回元数据列表（Tier 1）。
+//! 扫描分层目录发现 Skill（含插件 extra），返回元数据列表（Tier 1）。
 //! 使用 ignore crate 进行高性能遍历，排除特定目录。
 
 use crate::error::SkillsError;
@@ -23,9 +23,9 @@ const EXCLUDED_DIRS: &[&str] = &[
     "build",
 ];
 
-/// 在三层目录中按名称查找 SKILL.md
+/// 在分层目录中按名称查找 SKILL.md
 ///
-/// 搜索顺序：workspace → agent → global（高优先级优先）。
+/// 搜索顺序：workspace → agent → global → extra（高优先级优先）。
 ///
 /// 返回 `(skill_dir, skill_md_path)` 元组，未找到均为 `None`。
 pub fn find_skill_md_by_name(name: &str, ctx: &AgentPaths) -> (Option<PathBuf>, Option<PathBuf>) {
@@ -62,7 +62,7 @@ pub fn find_skill_md_by_name(name: &str, ctx: &AgentPaths) -> (Option<PathBuf>, 
     (None, None)
 }
 
-/// 扫描三层目录，发现所有可用 Skill（Tier 1：元数据）
+/// 扫描分层目录（含插件 extra），发现所有可用 Skill（Tier 1：元数据）
 pub fn find_all_skills(ctx: &AgentPaths) -> Result<Vec<SkillMeta>, SkillsError> {
     let skills_dirs = ctx.skills_paths().merge_exists();
     if skills_dirs.is_empty() {

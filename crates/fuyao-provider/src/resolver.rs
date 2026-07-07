@@ -85,6 +85,7 @@ mod tests {
         AgentPaths {
             agent_id: Some(format!("test/{test_name}")),
             workspace: None,
+            ..Default::default()
         }
     }
 

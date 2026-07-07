@@ -12,7 +12,7 @@ use fuyao_api::skill_types::SkillDefinition;
 
 /// 按名称加载 Skill 完整定义（Tier 2：完整内容）
 ///
-/// 搜索顺序：workspace → agent → global（高优先级优先）。
+/// 搜索顺序：workspace → agent → global → extra（高优先级优先）。
 pub fn load_skill(name: &str, ctx: &AgentPaths) -> Result<SkillDefinition, SkillsError> {
     let (skill_dir, skill_md_path) = find_skill_md_by_name(name, ctx);
     let skill_md_path = skill_md_path.ok_or_else(|| SkillsError::NotFound(name.to_string()))?;
@@ -141,6 +141,7 @@ mod tests {
         let ctx = AgentPaths {
             agent_id: None,
             workspace: Some(dir.clone()),
+            ..Default::default()
         };
         (dir, ctx)
     }

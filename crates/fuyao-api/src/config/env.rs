@@ -35,6 +35,7 @@ mod tests {
         let paths = AgentPaths {
             agent_id: Some("nonexistent_test".to_string()),
             workspace: None,
+            ..Default::default()
         };
         // 全部不存在的路径不应 panic
         load_env(&paths);

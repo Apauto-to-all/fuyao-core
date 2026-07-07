@@ -16,6 +16,12 @@ pub struct AgentPaths {
 
     /// 工作目录路径
     pub workspace: Option<PathBuf>,
+
+    /// 额外资源目录（插件根目录等），运行时由应用层填充
+    ///
+    /// 各资源类型按约定子目录解析：skills → `{dir}/skills/`，未来扩展同理。
+    /// 目前只 skills_paths() 消费它。
+    pub extra_dirs: Vec<PathBuf>,
 }
 
 impl AgentPaths {
@@ -28,6 +34,7 @@ impl AgentPaths {
                 .workspace
                 .as_ref()
                 .map(|ws| get_workspace_root(ws).join("fuyao.toml")),
+            ..Default::default()
         }
     }
 
@@ -40,6 +47,7 @@ impl AgentPaths {
                 .workspace
                 .as_ref()
                 .map(|ws| get_workspace_root(ws).join(".env")),
+            ..Default::default()
         }
     }
 
@@ -55,6 +63,7 @@ impl AgentPaths {
                 .agent_root()
                 .map(|p| p.join("sessions").join("sessions.db")),
             workspace: None,
+            ..Default::default()
         }
     }
 
@@ -76,7 +85,18 @@ impl AgentPaths {
     }
 
     /// Skills 分层路径
+    ///
+    /// 额外目录（extra_dirs）下的 `skills/` 子目录作为最低优先级来源，
+    /// 用于支持插件等提供的 Skills。
     pub fn skills_paths(&self) -> LayeredPaths {
+        // 从每个额外目录解析 skills 子目录，存在的才加入
+        let extra: Vec<PathBuf> = self
+            .extra_dirs
+            .iter()
+            .map(|d| d.join("skills"))
+            .filter(|d| d.is_dir())
+            .collect();
+
         LayeredPaths {
             global_: Some(get_fuyao_home().join("skills")),
             agent: self.agent_root().map(|p| p.join("skills")),
@@ -84,6 +104,7 @@ impl AgentPaths {
                 .workspace
                 .as_ref()
                 .map(|ws| get_workspace_root(ws).join("skills")),
+            extra,
         }
     }
 
@@ -96,6 +117,7 @@ impl AgentPaths {
                 .workspace
                 .as_ref()
                 .map(|ws| get_workspace_root(ws).join("mcp")),
+            ..Default::default()
         }
     }
 
@@ -108,6 +130,7 @@ impl AgentPaths {
                 .workspace
                 .as_ref()
                 .map(|ws| get_workspace_root(ws).join("plugins")),
+            ..Default::default()
         }
     }
 
@@ -121,6 +144,7 @@ impl AgentPaths {
             },
             agent: self.agent_root().map(|p| p.join("system.md")),
             workspace: None,
+            ..Default::default()
         }
     }
 
@@ -130,6 +154,7 @@ impl AgentPaths {
             global_: Some(get_fuyao_home().join("AGENTS.md")),
             agent: self.agent_root().map(|p| p.join("AGENTS.md")),
             workspace: self.workspace.as_ref().map(|ws| ws.join("AGENTS.md")),
+            ..Default::default()
         }
     }
 
@@ -150,6 +175,7 @@ impl AgentPaths {
             },
             agent: self.agent_root().map(|p| p.join("guard").join("audit.db")),
             workspace: None,
+            ..Default::default()
         }
     }
 
@@ -181,6 +207,7 @@ mod tests {
         let paths = AgentPaths {
             agent_id: Some("global/coder".to_string()),
             workspace: Some(PathBuf::from("/tmp/project")),
+            ..Default::default()
         };
         let cp = paths.config_paths();
         assert!(cp.global_.is_some());
@@ -200,6 +227,7 @@ mod tests {
         let paths = AgentPaths {
             agent_id: Some("global/coder".to_string()),
             workspace: None,
+            ..Default::default()
         };
         let root = paths.agent_root();
         assert!(root.is_some());
@@ -217,6 +245,7 @@ mod tests {
         let paths = AgentPaths {
             agent_id: Some("global/coder".to_string()),
             workspace: Some(PathBuf::from("/tmp/project")),
+            ..Default::default()
         };
         let key = paths.cache_key();
         assert_eq!(key, "global/coder|/tmp/project");
@@ -226,5 +255,31 @@ mod tests {
     fn agent_paths_cache_key_default() {
         let paths = AgentPaths::default();
         assert_eq!(paths.cache_key(), "|");
+    }
+
+    #[test]
+    fn agent_paths_default_has_empty_extra_dirs() {
+        let paths = AgentPaths::default();
+        assert!(paths.extra_dirs.is_empty());
+    }
+
+    #[test]
+    fn skills_paths_resolves_extra_dirs() {
+        let temp = std::env::temp_dir().join("fuyao_test_skills_extra");
+        let plugin_root = temp.join("my-plugin");
+        let skills_dir = plugin_root.join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let paths = AgentPaths {
+            extra_dirs: vec![plugin_root.clone(), temp.join("no-skills-plugin")],
+            ..Default::default()
+        };
+        let sp = paths.skills_paths();
+        // 只有 my-plugin 有 skills 子目录；no-skills-plugin 没有，被跳过
+        assert_eq!(sp.extra.len(), 1);
+        assert!(sp.extra[0].ends_with("skills"));
+        assert!(sp.extra[0].starts_with(&plugin_root));
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }

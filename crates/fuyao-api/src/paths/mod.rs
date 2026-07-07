@@ -12,7 +12,7 @@
 //! - Layer 2: Agent 目录层 (`~/.fuyao/fuyao-agents/{agent-id}/`)
 //! - Layer 3: 工作目录层 (`{workspace}/.fuyao/`)
 //!
-//! 路径优先级（从高到低）：工作目录 → Agent 目录 → 全局
+//! 路径优先级（从高到低）：工作目录 → Agent 目录 → 全局 → 额外目录（extra）
 
 mod global;
 mod layered;

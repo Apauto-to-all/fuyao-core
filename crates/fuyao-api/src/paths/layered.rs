@@ -15,14 +15,16 @@ pub struct LayeredPaths {
     pub agent: Option<PathBuf>,
     /// 工作目录层路径（{workspace}/.fuyao/ 下）
     pub workspace: Option<PathBuf>,
+    /// 额外目录（插件等），最低优先级
+    pub extra: Vec<PathBuf>,
 }
 
 impl LayeredPaths {
     /// 返回所有路径（按优先级排序，用于遍历）
     ///
-    /// 优先级：工作目录 → Agent 目录 → 全局
+    /// 优先级：工作目录 → Agent 目录 → 全局 → 额外目录（extra，最低）
     pub fn all(&self) -> Vec<&Path> {
-        let mut paths = Vec::with_capacity(3);
+        let mut paths = Vec::with_capacity(3 + self.extra.len());
         if let Some(ref p) = self.workspace {
             paths.push(p.as_path());
         }
@@ -30,6 +32,10 @@ impl LayeredPaths {
             paths.push(p.as_path());
         }
         if let Some(ref p) = self.global_ {
+            paths.push(p.as_path());
+        }
+        // 额外目录（插件等）最低优先级，放在最后
+        for p in &self.extra {
             paths.push(p.as_path());
         }
         paths
@@ -68,6 +74,7 @@ mod tests {
             global_: Some(PathBuf::from("/global")),
             agent: Some(PathBuf::from("/agent")),
             workspace: Some(PathBuf::from("/workspace")),
+            ..Default::default()
         };
         let all = paths.all();
         assert_eq!(all.len(), 3);
@@ -82,6 +89,7 @@ mod tests {
             global_: Some(PathBuf::from("/global")),
             agent: None,
             workspace: None,
+            ..Default::default()
         };
         let all = paths.all();
         assert_eq!(all.len(), 1);
@@ -103,6 +111,7 @@ mod tests {
             global_: Some(temp.clone()),
             agent: Some(PathBuf::from("/nonexistent_agent")),
             workspace: Some(PathBuf::from("/nonexistent_ws")),
+            ..Default::default()
         };
         assert_eq!(paths.first_exists(), Some(temp.clone()));
 
@@ -121,11 +130,50 @@ mod tests {
             global_: Some(sub1.clone()),
             agent: Some(PathBuf::from("/nonexistent")),
             workspace: Some(sub2.clone()),
+            ..Default::default()
         };
         let existing = paths.merge_exists();
         assert_eq!(existing.len(), 2);
         assert!(existing.contains(&sub1));
         assert!(existing.contains(&sub2));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn layered_paths_all_includes_extra_lowest_priority() {
+        let paths = LayeredPaths {
+            global_: Some(PathBuf::from("/global")),
+            agent: Some(PathBuf::from("/agent")),
+            workspace: Some(PathBuf::from("/workspace")),
+            extra: vec![PathBuf::from("/plugin1"), PathBuf::from("/plugin2")],
+        };
+        let all = paths.all();
+        assert_eq!(all.len(), 5);
+        // 优先级：workspace > agent > global > extra（最低）
+        assert_eq!(all[0], Path::new("/workspace"));
+        assert_eq!(all[1], Path::new("/agent"));
+        assert_eq!(all[2], Path::new("/global"));
+        assert_eq!(all[3], Path::new("/plugin1"));
+        assert_eq!(all[4], Path::new("/plugin2"));
+    }
+
+    #[test]
+    fn layered_paths_merge_exists_includes_extra() {
+        let temp = std::env::temp_dir().join("fuyao_test_layered_extra_merge");
+        let extra_dir = temp.join("plugin_skills");
+        std::fs::create_dir_all(&extra_dir).unwrap();
+
+        let paths = LayeredPaths {
+            global_: Some(PathBuf::from("/nonexistent_global")),
+            agent: None,
+            workspace: None,
+            extra: vec![extra_dir.clone()],
+        };
+        let existing = paths.merge_exists();
+        // 三层均不存在，只有 extra 存在
+        assert_eq!(existing.len(), 1);
+        assert!(existing.contains(&extra_dir));
 
         std::fs::remove_dir_all(&temp).ok();
     }

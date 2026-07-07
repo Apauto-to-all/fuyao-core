@@ -167,6 +167,7 @@ mod tests {
         AgentPaths {
             agent_id: Some(format!("test/{test_name}")),
             workspace: None,
+            ..Default::default()
         }
     }
 
@@ -175,6 +176,7 @@ mod tests {
         let paths = AgentPaths {
             agent_id: Some("global/coder".to_string()),
             workspace: Some(PathBuf::from("/home/user/project")),
+            ..Default::default()
         };
         let key = agent_paths_cache_key(&paths);
         assert_eq!(key, "global/coder|/home/user/project");

@@ -102,6 +102,7 @@ mod tests {
         t.set_agent_paths(AgentPaths {
             agent_id: Some("test".to_string()),
             workspace: None,
+            ..Default::default()
         });
         // 传一个不存在的 model_id，get_model 查不到 → 回退 fallback
         assert!(t.should_compress(110_000, Some("nonexistent/model")));
