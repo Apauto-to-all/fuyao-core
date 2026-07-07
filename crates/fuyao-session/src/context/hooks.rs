@@ -9,18 +9,14 @@ use super::session_context::SessionContext;
 use crate::compressor::tracker::CompressionTracker;
 use crate::compressor::{COMPRESSION_SYSTEM_PROMPT, expand_for_integrity};
 use fuyao_api::message::input::{
-    PluginEventSource, PluginMessage, PluginPayload, PluginSource, UserMessage, UserMessageMode,
-    UserMessageSource, UserPayload,
+    PluginSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::AssistantMessage;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{AgentPaths, Session, SharedAgentCtx};
-use fuyao_hooks::{BeforeLlmOutput, Plugin, SharedHooks};
+use fuyao_hooks::{BeforeLlmOutput, Plugin, PluginEmitter, SharedHooks};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-
-/// 输入事件发送端类型（由 SendInputFn 回调时保存）
-type InputEventSender = tokio::sync::mpsc::Sender<InputEvent>;
 
 /// Session 钩子层内部状态
 ///
@@ -28,8 +24,8 @@ type InputEventSender = tokio::sync::mpsc::Sender<InputEvent>;
 /// 压缩追踪器（阈值检测 + split_session），
 /// 与 loop_guard 的 LoopGuardState 模式一致。
 struct SessionHooksState {
-    /// 输入事件发送端（由 SendInputFn 回调时设置）
-    tx_send: Option<InputEventSender>,
+    /// 插件消息发送器（由 SendInputFn 回调时设置，绑定身份发 Plugin 消息 + 复用通道发 User 引导消息）
+    emitter: Option<PluginEmitter>,
     /// Agent 运行上下文引用（用于同步 session_id）
     agent_ctx: SharedAgentCtx,
     /// Session 上下文引用
@@ -48,7 +44,7 @@ impl SessionHooksState {
             tracker.set_agent_paths(ctx.agent_paths.clone());
         }
         Self {
-            tx_send: None,
+            emitter: None,
             agent_ctx,
             session_ctx,
             compression_in_progress: false,
@@ -56,9 +52,9 @@ impl SessionHooksState {
         }
     }
 
-    /// 设置输入事件发送端（由 SendInputFn 回调时调用）
-    fn set_tx_send(&mut self, tx: InputEventSender) {
-        self.tx_send = Some(tx);
+    /// 设置插件消息发送器（由 SendInputFn 回调时调用）
+    fn set_emitter(&mut self, emitter: PluginEmitter) {
+        self.emitter = Some(emitter);
     }
 
     /// 获取初始 session_id（从 agent_ctx 读取）
@@ -96,49 +92,30 @@ impl SessionHooksState {
         }
     }
 
-    /// 发送插件通知事件
+    /// 发送插件通知事件（委托 emitter，身份绑定 = Plugin::name()）
     fn emit_plugin(&self, event_type: &str, message: &str) {
-        if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::Plugin(PluginMessage {
-                base: EventBase::default(),
-                payload: PluginPayload {
-                    source: PluginEventSource {
-                        name: "session_manager".to_string(),
-                    },
-                    event_type: event_type.to_string(),
-                    data: None,
-                    error: None,
-                    message: Some(message.to_string()),
-                },
-            }));
+        if let Some(ref e) = self.emitter {
+            e.emit_message(event_type, message);
         }
     }
 
     /// 发送累积统计插件事件（供 TUI 统计栏消费）
     fn emit_cumulative_stats(&self, session: &Session) {
-        if let Some(ref tx) = self.tx_send {
+        if let Some(ref e) = self.emitter {
             let cost = session.messages.last().map(|m| m.cost).unwrap_or(0.0);
-            let _ = tx.try_send(InputEvent::Plugin(PluginMessage {
-                base: EventBase::default(),
-                payload: PluginPayload {
-                    source: PluginEventSource {
-                        name: "session_manager".into(),
-                    },
-                    event_type: "cumulative_stats".into(),
-                    data: Some(serde_json::json!({
-                        "message_count": session.message_count,
-                        "tool_call_count": session.tool_call_count,
-                        "total_prompt_tokens": session.total_prompt_tokens,
-                        "total_completion_tokens": session.total_completion_tokens,
-                        "total_reasoning_tokens": session.total_reasoning_tokens,
-                        "total_cached_tokens": session.total_cached_tokens,
-                        "cost": cost,
-                        "total_cost": session.total_cost,
-                    })),
-                    error: None,
-                    message: None,
-                },
-            }));
+            e.emit_data(
+                "cumulative_stats",
+                serde_json::json!({
+                    "message_count": session.message_count,
+                    "tool_call_count": session.tool_call_count,
+                    "total_prompt_tokens": session.total_prompt_tokens,
+                    "total_completion_tokens": session.total_completion_tokens,
+                    "total_reasoning_tokens": session.total_reasoning_tokens,
+                    "total_cached_tokens": session.total_cached_tokens,
+                    "cost": cost,
+                    "total_cost": session.total_cost,
+                }),
+            );
         }
     }
 
@@ -154,8 +131,8 @@ impl SessionHooksState {
 
     /// 注入压缩引导消息到引擎 Guide 队列
     fn inject_compression_guide(&mut self) {
-        if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::User(UserMessage {
+        if let Some(ref e) = self.emitter {
+            let _ = e.sender().try_send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
                 payload: UserPayload {
                     content: COMPRESSION_SYSTEM_PROMPT.to_string(),
@@ -382,12 +359,15 @@ impl Plugin for SessionPlugin {
                 })
             }));
 
-        // hook: send_input → 保存 tx_send 到 state，用于发送插件通知和压缩引导消息
+        // hook: send_input → 用插件身份构造 emitter 注入 state，后续发 Plugin 通知和压缩引导消息
         let s_send = self.state.clone();
+        let identity = self.identity();
         let send_fn: fuyao_hooks::SendInputFn = Arc::new(move |tx| {
             let s = s_send.clone();
+            let id = identity.clone();
             Box::pin(async move {
-                s.lock().await.set_tx_send(tx);
+                let emitter = PluginEmitter::new(id, tx);
+                s.lock().await.set_emitter(emitter);
             })
         });
         hooks.lock().await.register_send_input(0, send_fn);
@@ -398,6 +378,7 @@ impl Plugin for SessionPlugin {
 mod tests {
     use super::*;
     use fuyao_api::AgentPaths;
+    use fuyao_api::message::input::PluginEventSource;
 
     #[test]
     fn session_hooks_state_new_initializes_tracker() {
@@ -418,7 +399,12 @@ mod tests {
         let agent_ctx = Arc::new(std::sync::Mutex::new(fuyao_api::AgentContext::default()));
         let session_ctx = Arc::new(Mutex::new(SessionContext::new(AgentPaths::default())));
         let mut state = SessionHooksState::new(agent_ctx, session_ctx);
-        state.set_tx_send(tx);
+        state.set_emitter(PluginEmitter::new(
+            PluginEventSource {
+                name: "session".into(),
+            },
+            tx,
+        ));
 
         assert!(!state.compression_in_progress);
         state.inject_compression_guide();

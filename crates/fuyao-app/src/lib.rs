@@ -36,6 +36,9 @@ pub enum SetupError {
     #[error(transparent)]
     /// 引擎初始化失败（配置加载、Provider 创建、模型校验等）
     Init(#[from] InitError),
+    #[error(transparent)]
+    /// 插件装配失败（重名等）
+    PluginInstall(#[from] fuyao_hooks::PluginInstallError),
 }
 
 /// 一键启动：init_engine → setup，返回可直接使用的 `(Engine, EngineHandle, AppContext)`
@@ -80,8 +83,8 @@ pub async fn setup(handle: &EngineHandle) -> Result<AppContext, SetupError> {
         host.add(Box::new(LoopGuardPlugin::new()));
     }
 
-    // 4. 统一装配
-    host.install(&handle.hooks()).await;
+    // 4. 统一装配（重名插件返回 Err 使 setup 失败）
+    host.install(&handle.hooks()).await?;
 
     Ok(AppContext {
         mcp_manager,

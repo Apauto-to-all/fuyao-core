@@ -13,7 +13,7 @@ pub mod types;
 
 use std::sync::Arc;
 
-use fuyao_hooks::{Plugin, SharedHooks};
+use fuyao_hooks::{Plugin, PluginEmitter, SharedHooks};
 use tokio::sync::Mutex;
 
 use guard::{LoopGuardState, make_output_intercept, make_output_observe};
@@ -55,12 +55,15 @@ impl Plugin for LoopGuardPlugin {
         let observe = make_output_observe(self.state.clone());
         let intercept = make_output_intercept(self.state.clone());
 
-        // send_input：保存 tx_send 到 state，后续用于发送中断、注入消息、插件通知
+        // send_input：用插件身份构造 emitter 注入 state，后续发 Plugin/Interrupt/User 消息
         let send_state = self.state.clone();
+        let identity = self.identity();
         let send_fn: fuyao_hooks::SendInputFn = Arc::new(move |tx| {
             let s = send_state.clone();
+            let id = identity.clone();
             Box::pin(async move {
-                s.lock().await.set_tx_send(tx);
+                let emitter = PluginEmitter::new(id, tx);
+                s.lock().await.set_emitter(emitter);
             })
         });
 

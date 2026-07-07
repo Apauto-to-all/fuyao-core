@@ -8,21 +8,18 @@
 use std::sync::Arc;
 
 use fuyao_api::message::input::{
-    InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource, PluginMessage,
-    PluginPayload, PluginSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
+    InterruptMessage, InterruptPayload, InterruptSource, PluginSource, UserMessage,
+    UserMessageMode, UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::{ChunkMessage, ToolCallMessage, ToolResultMessage};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_hooks::InterceptResult;
+use fuyao_hooks::{InterceptResult, PluginEmitter};
 use tokio::sync::Mutex;
 
 use super::text_guard::TextLoopGuard;
 use super::tool_guard::ToolLoopGuard;
 use super::types::LoopSeverity;
 use fuyao_api::LoopGuardConfig;
-
-/// 输入事件发送端类型（由 SendInputFn 回调时保存）
-type InputEventSender = tokio::sync::mpsc::Sender<InputEvent>;
 
 /// LoopGuard 协调状态
 pub(crate) struct LoopGuardState {
@@ -40,8 +37,8 @@ pub(crate) struct LoopGuardState {
     interrupt_count: usize,
     /// 是否已终止（防止重复触发，轮次重置时清空）
     aborted: bool,
-    /// 输入事件发送端（由 SendInputFn 回调时设置，用于发送所有输入事件）
-    tx_send: Option<InputEventSender>,
+    /// 插件消息发送器（由 SendInputFn 回调时设置，绑定身份发 Plugin 消息 + 复用通道发 Interrupt/User）
+    emitter: Option<PluginEmitter>,
 }
 
 impl LoopGuardState {
@@ -57,33 +54,21 @@ impl LoopGuardState {
             pending_severity: None,
             interrupt_count: 0,
             aborted: false,
-            tx_send: None,
+            emitter: None,
         }
     }
 
-    /// 设置输入事件发送端（由 SendInputFn 回调时调用）
-    pub fn set_tx_send(&mut self, tx: InputEventSender) {
-        self.tx_send = Some(tx);
+    /// 设置插件消息发送器（由 SendInputFn 回调时调用）
+    pub fn set_emitter(&mut self, emitter: PluginEmitter) {
+        self.emitter = Some(emitter);
     }
 
     /// 发送插件通知事件
     ///
-    /// 通过 tx_send 发送 InputEvent::Plugin，引擎主循环收到后
-    /// 转发为 OutputEvent::Plugin 通知 UI。
+    /// 委托 emitter（绑定身份），引擎主循环收到后转发为 OutputEvent::Plugin 通知 UI。
     fn emit_plugin(&self, event_type: &str, message: &str) {
-        if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::Plugin(PluginMessage {
-                base: EventBase::default(),
-                payload: PluginPayload {
-                    source: PluginEventSource {
-                        name: "loop_guard".to_string(),
-                    },
-                    event_type: event_type.to_string(),
-                    data: None,
-                    error: None,
-                    message: Some(message.to_string()),
-                },
-            }));
+        if let Some(ref e) = self.emitter {
+            e.emit_message(event_type, message);
         }
     }
 
@@ -91,8 +76,8 @@ impl LoopGuardState {
     ///
     /// 通过 tx_send 发送 InputEvent::Interrupt，由引擎主循环统一处理。
     fn send_interrupt(&self, reason: String) {
-        if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::Interrupt(InterruptMessage {
+        if let Some(ref e) = self.emitter {
+            let _ = e.sender().try_send(InputEvent::Interrupt(InterruptMessage {
                 base: EventBase::default(),
                 payload: InterruptPayload {
                     reason,
@@ -107,14 +92,14 @@ impl LoopGuardState {
     /// 通过 tx_send 发送 InputEvent::User（source = Plugin），
     /// 引擎收到后注入对话历史，供下次 LLM 调用时 AI 看到引导消息。
     fn send_inject_message(&self, content: String) {
-        if let Some(ref tx) = self.tx_send {
-            let _ = tx.try_send(InputEvent::User(UserMessage {
+        if let Some(ref e) = self.emitter {
+            let _ = e.sender().try_send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
                 payload: UserPayload {
                     content,
                     mode: UserMessageMode::Guide,
                     source: UserMessageSource::Plugin(PluginSource {
-                        name: "loop_guard".to_string(),
+                        name: e.identity().name.clone(),
                     }),
                 },
             }));
@@ -285,6 +270,7 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuyao_api::message::input::PluginEventSource;
     use fuyao_api::message::output::{
         ChunkPayload, ToolCallPayload, ToolResultPayload, UserMessage as OutputUserMessage,
         UserPayload as OutputUserPayload,
@@ -326,7 +312,12 @@ mod tests {
     fn emit_plugin_sends_event() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        state.set_tx_send(tx);
+        state.set_emitter(PluginEmitter::new(
+            PluginEventSource {
+                name: "loop_guard".into(),
+            },
+            tx,
+        ));
         state.emit_plugin("loop_warn", "测试通知");
         let event = rx.try_recv().unwrap();
         match event {
@@ -518,7 +509,12 @@ mod tests {
     fn send_interrupt_sends_input_event() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        state.set_tx_send(tx);
+        state.set_emitter(PluginEmitter::new(
+            PluginEventSource {
+                name: "loop_guard".into(),
+            },
+            tx,
+        ));
         state.send_interrupt("循环检测".to_string());
         let event = rx.try_recv().unwrap();
         match event {
@@ -533,12 +529,17 @@ mod tests {
     /// 完整升级链路集成测试：Warn → Inject → Interrupt ×3 → Abort
     #[test]
     fn full_escalation_chain() {
-        let (tx_send, _rx_send) = tokio::sync::mpsc::channel(16);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let mut state = LoopGuardState::new(LoopGuardConfig {
             tool_repeat_threshold: 4,
             ..Default::default()
         });
-        state.set_tx_send(tx_send);
+        state.set_emitter(PluginEmitter::new(
+            PluginEventSource {
+                name: "loop_guard".into(),
+            },
+            tx,
+        ));
 
         // 1-3 次相同调用：不触发
         for i in 0..3 {
@@ -645,14 +646,19 @@ mod tests {
     /// 插件注入后 AI 继续重复工具，应立即被检测到
     #[tokio::test]
     async fn plugin_message_keeps_detection_hot() {
-        let (tx_send, _rx_send) = tokio::sync::mpsc::channel(16);
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let state = Arc::new(Mutex::new(LoopGuardState::new(LoopGuardConfig {
             tool_repeat_threshold: 3,
             ..Default::default()
         })));
         {
             let mut guard = state.lock().await;
-            guard.set_tx_send(tx_send);
+            guard.set_emitter(PluginEmitter::new(
+                PluginEventSource {
+                    name: "loop_guard".into(),
+                },
+                tx,
+            ));
         }
 
         let observe = make_output_observe(state.clone());
