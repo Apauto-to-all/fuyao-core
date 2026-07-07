@@ -108,19 +108,6 @@ impl AgentPaths {
         }
     }
 
-    /// MCP 分层路径
-    pub fn mcp_paths(&self) -> LayeredPaths {
-        LayeredPaths {
-            global_: Some(get_fuyao_home().join("mcp")),
-            agent: self.agent_root().map(|p| p.join("mcp")),
-            workspace: self
-                .workspace
-                .as_ref()
-                .map(|ws| get_workspace_root(ws).join("mcp")),
-            ..Default::default()
-        }
-    }
-
     /// 插件分层路径
     pub fn plugins_paths(&self) -> LayeredPaths {
         LayeredPaths {
@@ -163,20 +150,6 @@ impl AgentPaths {
         self.agent_id
             .as_deref()
             .map(|id| get_agent_root(id, self.workspace.as_deref()))
-    }
-
-    /// Guard 审计数据库分层路径（audit.db）
-    pub fn guard_db_paths(&self) -> LayeredPaths {
-        LayeredPaths {
-            global_: if self.agent_id.is_none() {
-                Some(get_fuyao_home().join("guard").join("audit.db"))
-            } else {
-                None
-            },
-            agent: self.agent_root().map(|p| p.join("guard").join("audit.db")),
-            workspace: None,
-            ..Default::default()
-        }
     }
 
     /// 生成缓存 key（用于 Provider/Model 注册表）
