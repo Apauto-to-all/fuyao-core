@@ -10,7 +10,7 @@ pub mod output;
 pub use event_base::EventBase;
 // 共享枚举/结构（无方向语义，输入输出共享）导出到 message 根
 pub use input::{
-    InterruptSource, PluginEventSource, PluginOrigin, PluginSource, SystemSource, UserMessageMode,
+    InterruptSource, PluginEventSource, PluginSource, SystemSource, UserMessageMode,
     UserMessageSource,
 };
 // 事件 enum 导出

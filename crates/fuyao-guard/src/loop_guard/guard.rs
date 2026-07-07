@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use fuyao_api::message::input::{
     InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource, PluginMessage,
-    PluginOrigin, PluginPayload, PluginSource, UserMessage, UserMessageMode, UserMessageSource,
-    UserPayload,
+    PluginPayload, PluginSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::{ChunkMessage, ToolCallMessage, ToolResultMessage};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
@@ -77,7 +76,6 @@ impl LoopGuardState {
                 base: EventBase::default(),
                 payload: PluginPayload {
                     source: PluginEventSource {
-                        origin: PluginOrigin::Internal,
                         name: "loop_guard".to_string(),
                     },
                     event_type: event_type.to_string(),

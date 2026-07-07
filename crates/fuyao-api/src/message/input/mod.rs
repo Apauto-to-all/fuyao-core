@@ -15,7 +15,7 @@ mod user;
 
 // envelope / payload 在 input 层导出（外部通过 input::UserMessage 等路径访问）
 pub use interrupt::{InterruptMessage, InterruptPayload, InterruptSource};
-pub use plugin::{PluginEventSource, PluginMessage, PluginOrigin, PluginPayload};
+pub use plugin::{PluginEventSource, PluginMessage, PluginPayload};
 pub use user::{
     PluginSource, SystemSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
@@ -109,7 +109,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "loop_guard".into(),
                 },
                 event_type: "loop_warn".into(),

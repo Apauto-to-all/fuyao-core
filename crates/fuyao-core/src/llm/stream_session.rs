@@ -10,7 +10,7 @@ use crate::engine::EventEmitter;
 use crate::interrupt::{StreamAccumulator, StreamPhase};
 use futures_util::{StreamExt, pin_mut};
 use fuyao_api::SharedAgentCtx;
-use fuyao_api::message::input::{PluginEventSource, PluginOrigin};
+use fuyao_api::message::input::PluginEventSource;
 use fuyao_api::message::output::{
     ErrorMessage, ErrorPayload, PluginMessage, PluginPayload, ToolCallMessage, ToolCallPayload,
 };
@@ -126,7 +126,6 @@ pub async fn run_stream_session(
                             base: EventBase::default(),
                             payload: PluginPayload {
                                 source: PluginEventSource {
-                                    origin: PluginOrigin::Internal,
                                     name: "stream_session".to_string(),
                                 },
                                 event_type: "context_overflow".to_string(),

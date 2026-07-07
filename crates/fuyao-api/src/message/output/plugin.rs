@@ -1,7 +1,7 @@
 //! 插件事件
 //!
 //! 注：与 `input::PluginMessage` 字段当前完全一致，但故意独立定义、不共享类型（见方案第八节）。
-//! PluginEventSource / PluginOrigin 为插件事件通用来源类型（无方向语义），
+//! PluginEventSource 为插件事件通用来源类型（无方向语义），
 //! 定义在 input 侧，输出侧 use 引用（类似 InterruptSource 的共享处理）。
 
 use crate::message::EventBase;
@@ -19,7 +19,7 @@ pub struct PluginMessage {
 /// 插件事件载荷
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginPayload {
-    /// 来源插件（强类型 {origin, name}）
+    /// 来源插件（强类型 {name}）
     pub source: PluginEventSource,
     /// 事件类型（插件自定义字符串标识）
     pub event_type: String,
@@ -35,7 +35,7 @@ pub struct PluginPayload {
 mod tests {
     use super::*;
     use crate::message::EventBase;
-    use crate::message::input::{PluginEventSource, PluginOrigin};
+    use crate::message::input::PluginEventSource;
 
     #[test]
     fn plugin_holds_source_and_type() {
@@ -43,7 +43,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "session_mgr".into(),
                 },
                 event_type: "compressed".into(),
@@ -62,7 +61,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "test".into(),
                 },
                 event_type: "custom".into(),
@@ -80,7 +78,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "test".into(),
                 },
                 event_type: "error".into(),
@@ -98,7 +95,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "test".into(),
                 },
                 event_type: "info".into(),
@@ -116,7 +112,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::External,
                     name: "test".into(),
                 },
                 event_type: "info".into(),
@@ -137,7 +132,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "test".into(),
                 },
                 event_type: "info".into(),

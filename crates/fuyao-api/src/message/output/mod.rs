@@ -69,7 +69,7 @@ pub enum OutputEvent {
 mod tests {
     use super::*;
     use crate::message::EventBase;
-    use crate::message::input::{InterruptSource, PluginEventSource, PluginOrigin};
+    use crate::message::input::{InterruptSource, PluginEventSource};
 
     #[test]
     fn turn_start_variant() {
@@ -166,7 +166,6 @@ mod tests {
             base: EventBase::default(),
             payload: PluginPayload {
                 source: PluginEventSource {
-                    origin: PluginOrigin::Internal,
                     name: "test".into(),
                 },
                 event_type: "custom".into(),

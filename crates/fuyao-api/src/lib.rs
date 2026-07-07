@@ -33,8 +33,8 @@ pub use config::{
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
-    EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginOrigin,
-    PluginSource, QueueUpdateKind, SystemSource, UserMessageMode, UserMessageSource,
+    EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginSource,
+    QueueUpdateKind, SystemSource, UserMessageMode, UserMessageSource,
 };
 pub use paths::parallel::{
     canonicalize_path, extract_path_from_args, paths_overlap, should_parallelize,

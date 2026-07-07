@@ -9,8 +9,8 @@ use super::session_context::SessionContext;
 use crate::compressor::tracker::CompressionTracker;
 use crate::compressor::{COMPRESSION_SYSTEM_PROMPT, expand_for_integrity};
 use fuyao_api::message::input::{
-    PluginEventSource, PluginMessage, PluginOrigin, PluginPayload, PluginSource, UserMessage,
-    UserMessageMode, UserMessageSource, UserPayload,
+    PluginEventSource, PluginMessage, PluginPayload, PluginSource, UserMessage, UserMessageMode,
+    UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::AssistantMessage;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
@@ -103,7 +103,6 @@ impl SessionHooksState {
                 base: EventBase::default(),
                 payload: PluginPayload {
                     source: PluginEventSource {
-                        origin: PluginOrigin::Internal,
                         name: "session_manager".to_string(),
                     },
                     event_type: event_type.to_string(),
@@ -123,7 +122,6 @@ impl SessionHooksState {
                 base: EventBase::default(),
                 payload: PluginPayload {
                     source: PluginEventSource {
-                        origin: PluginOrigin::Internal,
                         name: "session_manager".into(),
                     },
                     event_type: "cumulative_stats".into(),
