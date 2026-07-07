@@ -106,7 +106,7 @@ pub struct FuyaoConfig {
 /// 全局配置存储：加载一次后存入，之后只读
 static CONFIG: OnceLock<Arc<FuyaoConfig>> = OnceLock::new();
 
-/// 注入全局配置（仅 `init_engine` 启动早期调用一次）
+/// 注入全局配置（仅应用装配启动早期调用一次，如 `fuyao_app::init_engine`）
 ///
 /// 重复调用视为编程错误，直接 panic：配置应只加载一次，重复 set 说明初始化流程出错。
 pub fn set_config(config: Arc<FuyaoConfig>) {

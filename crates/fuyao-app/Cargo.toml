@@ -10,6 +10,7 @@ fuyao-core = { path = "../fuyao-core" }
 fuyao-guard = { path = "../fuyao-guard" }
 fuyao-hooks = { path = "../fuyao-hooks" }
 fuyao-mcp = { path = "../fuyao-mcp" }
+fuyao-provider = { path = "../fuyao-provider" }
 fuyao-session = { path = "../fuyao-session" }
 fuyao-tools = { path = "../fuyao-tools" }
 serde_json.workspace = true

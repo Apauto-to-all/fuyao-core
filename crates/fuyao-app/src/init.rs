@@ -1,4 +1,4 @@
-//! 引擎初始化 —— SDK 开箱装配入口
+//! 引擎初始化 —— 应用层装配入口
 //!
 //! 封装从 [`AgentContext`] 到可用 `((Engine, EngineHandle))` 的完整初始化流程：
 //! 1. 加载 `.env` 环境变量（三层目录）
@@ -8,7 +8,7 @@
 //! 5. 验证模型存在于注册表
 //! 6. 创建 [`Engine`]，返回 `((Engine, EngineHandle))`
 //!
-//! 典型用法：
+//! 典型用法（推荐用 [`crate::start`] 一行启动，自动串联 `init_engine` + `setup`）：
 //! ```ignore
 //! use fuyao_api::{AgentContext, ModelConfig, ThinkingType};
 //!
@@ -21,18 +21,17 @@
 //!     },
 //!     ..Default::default()
 //! };
-//! let (engine, handle) = fuyao_core::init::init_engine(agent_ctx)?;
+//! let (engine, handle) = fuyao_app::init_engine(agent_ctx)?;
 //! ```
 
 use fuyao_api::config::{FuyaoConfig, load_config, load_env, set_config};
 use fuyao_api::{AgentContext, AgentPaths};
+use fuyao_core::{Engine, EngineHandle};
 use fuyao_provider::openai::OpenAIProvider;
 use fuyao_provider::registry::{
     agent_paths_cache_key, get_model, list_models, register_model, register_provider,
 };
 use std::sync::Arc;
-
-use crate::{Engine, EngineHandle};
 
 /// 初始化错误
 ///
@@ -69,7 +68,7 @@ pub enum InitError {
     ConfigError(String),
 }
 
-/// 初始化引擎 —— SDK 开箱装配入口
+/// 初始化引擎 —— 应用层装配入口
 ///
 /// 从 [`AgentContext`] 出发，一气呵成完成：环境变量加载 → 配置注册 →
 /// model_id 确定 → Provider 创建 → 模型校验 → Engine 装配，返回可直接使用的

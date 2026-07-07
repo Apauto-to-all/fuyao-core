@@ -81,7 +81,7 @@ impl MCPManager {
     /// 从全局配置创建 MCP 管理器
     ///
     /// 统一从 `get_config().mcp_servers` 读取（已由加载层完成 `${VAR}` 插值）。
-    /// 调用方需先经 `init_engine`（或显式 `set_config`）注入配置。
+    /// 调用方需先经应用装配（fuyao-app 的 `init_engine` / `start`，或显式 `set_config`）注入配置。
     pub fn from_config() -> Self {
         let configs = fuyao_api::get_config().mcp_servers.clone();
         Self::new(configs)

@@ -23,7 +23,7 @@ use guard::{LoopGuardState, make_output_intercept, make_output_observe};
 /// 通过 output_observe（检测累积）+ output_intercept（注入警告/替换内容）+
 /// send_input（获取 tx_send）三个钩子实现循环检测。
 ///
-/// 配置从全局句柄 `get_config().guard.loop_` 读取（由 `init_engine` 注入）；
+/// 配置从全局句柄 `get_config().guard.loop_` 读取（由应用装配层 `init_engine` / `set_config` 注入）；
 /// 未注入时回退 `LoopGuardConfig::default()`。
 pub struct LoopGuardPlugin {
     state: Arc<Mutex<LoopGuardState>>,

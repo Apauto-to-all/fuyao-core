@@ -1,8 +1,12 @@
 //! Fuyao 应用装配入口
 //!
-//! 一键装配：注册内置工具 + MCP 工具 + 内置插件，返回 [`AppContext`]。
-//! 应用层（fuyao-cli / fuyao-tui）只需依赖 fuyao-app，一行 [`setup`] 完成装配。
+//! 一键装配：初始化引擎 + 注册内置工具 + MCP 工具 + 内置插件。
+//! 应用层（fuyao-cli / fuyao-tui）只需依赖 fuyao-app：
+//! - [`start`]：一行启动，自动串联 `init_engine` + `setup`，返回
+//!   `(Engine, EngineHandle, AppContext)`。
+//! - [`init_engine`] + [`setup`]：分步装配，供需要介入中间过程的场景使用。
 
+mod init;
 mod mcp;
 mod tools;
 
@@ -13,6 +17,8 @@ use fuyao_guard::LoopGuardPlugin;
 use fuyao_hooks::PluginHost;
 use fuyao_mcp::MCPManager;
 use fuyao_session::SessionPlugin;
+
+pub use init::{InitError, init_engine};
 
 /// 装配产物：调用方持有，用于管理生命周期
 pub struct AppContext {
@@ -27,6 +33,21 @@ pub struct AppContext {
 pub enum SetupError {
     #[error("缺少 AgentContext")]
     NoAgentContext,
+    #[error(transparent)]
+    /// 引擎初始化失败（配置加载、Provider 创建、模型校验等）
+    Init(#[from] InitError),
+}
+
+/// 一键启动：init_engine → setup，返回可直接使用的 `(Engine, EngineHandle, AppContext)`
+///
+/// 这是绝大多数应用推荐的入口：一行完成引擎装配 + 工具/MCP/插件注册。
+/// 需要在两步之间介入（如动态注册工具）时，改用 [`init_engine`] + [`setup`] 分步装配。
+pub async fn start(
+    agent_ctx: fuyao_api::AgentContext,
+) -> Result<(fuyao_core::Engine, EngineHandle, AppContext), SetupError> {
+    let (engine, handle) = init_engine(agent_ctx)?;
+    let app_ctx = setup(&handle).await?;
+    Ok((engine, handle, app_ctx))
 }
 
 /// 一键装配：注册工具 + MCP + 内置插件（按 [plugins.enabled] 过滤）
