@@ -11,7 +11,7 @@ pub fn is_retryable(e: &StreamError) -> bool {
     match e {
         StreamError::RateLimit { .. } | StreamError::Timeout | StreamError::Connection(_) => true,
         StreamError::ApiError(msg) => {
-            // 5xx 服务端错误视为可重试（对齐 opencode）
+            // 5xx 服务端错误视为可重试
             msg.contains("529")
                 || msg.contains("500")
                 || msg.contains("502")
@@ -48,7 +48,7 @@ impl BackoffParams {
     }
 }
 
-/// 计算退避时长（双分支策略，对齐 opencode）
+/// 计算退避时长（双分支策略）
 ///
 /// 优先级：
 /// 1. retry-after-ms 响应头
