@@ -7,5 +7,5 @@
 pub mod context;
 pub mod paths;
 
-pub use context::{AgentContext, ModelConfig, SharedAgentCtx};
+pub use context::{AgentConfig, AgentContext, ModelConfig, SharedAgentCtx};
 pub use paths::AgentPaths;

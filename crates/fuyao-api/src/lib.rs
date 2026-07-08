@@ -23,7 +23,7 @@ pub mod skill_types;
 pub mod tool;
 
 // 导出常用类型
-pub use agent::{AgentContext, AgentPaths, ModelConfig, SharedAgentCtx};
+pub use agent::{AgentConfig, AgentContext, AgentPaths, ModelConfig, SharedAgentCtx};
 pub use config::{
     CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig, LlmConfig,
     LoopGuardConfig, McpGlobalConfig, PluginsConfig, RetryConfig, SessionConfig,

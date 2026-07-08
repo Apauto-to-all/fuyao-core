@@ -53,16 +53,19 @@ use crate::sections::{
     build_instructions_section, build_project_context_section, build_skills_section,
     build_tool_guidance_section,
 };
-use fuyao_api::AgentPaths;
+use fuyao_api::{AgentConfig, AgentPaths};
 
 /// 构建所有 section
 ///
 /// 按顺序调用各层构建函数，返回 (中文标题, 内容) 列表。
-pub fn build_all_sections(agent_paths: &AgentPaths) -> Vec<(String, String)> {
+pub fn build_all_sections(
+    agent_paths: &AgentPaths,
+    agent_config: &AgentConfig,
+) -> Vec<(String, String)> {
     let mut sections: Vec<(String, String)> = Vec::new();
 
-    // Layer 1: Agent 身份（从 agents/default.md 加载，覆盖内置默认）
-    let content = build_agent_identity_section(agent_paths);
+    // Layer 1: Agent 身份（从 agents/{definition}.md 加载，覆盖内置默认）
+    let content = build_agent_identity_section(agent_paths, agent_config);
     if !content.is_empty() {
         sections.push(("Agent 定义".to_string(), content));
     }
@@ -122,9 +125,9 @@ fn sections_to_prompt(sections: Vec<(String, String)>) -> String {
 /// 构建系统提示词
 ///
 /// 分层组装各 section，返回完整系统提示词。
-/// Layer 1（Agent 身份）从 `agents/default.md` 加载，覆盖内置默认。
-pub fn build_system_prompt(agent_paths: &AgentPaths) -> String {
-    sections_to_prompt(build_all_sections(agent_paths))
+/// Layer 1（Agent 身份）从 `agents/{definition}.md` 加载，definition 由 agent_config 提供。
+pub fn build_system_prompt(agent_paths: &AgentPaths, agent_config: &AgentConfig) -> String {
+    sections_to_prompt(build_all_sections(agent_paths, agent_config))
 }
 
 #[cfg(test)]
@@ -134,7 +137,7 @@ mod tests {
     #[test]
     fn build_all_sections_returns_non_empty() {
         let ctx = AgentPaths::default();
-        let sections = build_all_sections(&ctx);
+        let sections = build_all_sections(&ctx, &AgentConfig::default());
         assert!(!sections.is_empty());
         // 应该包含 Agent 定义和环境
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
@@ -145,7 +148,7 @@ mod tests {
     #[test]
     fn build_system_prompt_returns_non_empty() {
         let ctx = AgentPaths::default();
-        let prompt = build_system_prompt(&ctx);
+        let prompt = build_system_prompt(&ctx, &AgentConfig::default());
         assert!(!prompt.is_empty());
         assert!(prompt.contains("# Agent 定义"));
         assert!(prompt.contains("# 环境"));
@@ -155,7 +158,7 @@ mod tests {
     #[test]
     fn build_system_prompt_contains_datetime() {
         let ctx = AgentPaths::default();
-        let prompt = build_system_prompt(&ctx);
+        let prompt = build_system_prompt(&ctx, &AgentConfig::default());
         assert!(prompt.contains("当前时间："));
     }
 
@@ -163,7 +166,7 @@ mod tests {
     fn build_all_sections_order_is_correct() {
         // 默认无 instructions/，补充指令 section 不出现；验证其余顺序
         let ctx = AgentPaths::default();
-        let sections = build_all_sections(&ctx);
+        let sections = build_all_sections(&ctx, &AgentConfig::default());
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
         // 期望顺序：Agent 定义 → 项目上下文 → 工具使用指南 → 技能 skills → 环境
         let agent_idx = titles.iter().position(|t| *t == "Agent 定义").unwrap();
@@ -193,7 +196,7 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let sections = build_all_sections(&ctx);
+        let sections = build_all_sections(&ctx, &AgentConfig::default());
 
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
         let instr_idx = titles

@@ -15,15 +15,20 @@
 
 use crate::loader::load_agent_definition_from_agent_paths;
 use chrono::Local;
-use fuyao_api::AgentPaths;
+use fuyao_api::{AgentConfig, AgentPaths};
 use fuyao_skills::find_all_skills;
 use std::path::PathBuf;
 
 /// 构建 Agent 身份 section（Layer 1）
 ///
-/// 从 `agents/default.md` 加载系统提示词（本期固定加载默认定义）。
-pub fn build_agent_identity_section(agent_paths: &AgentPaths) -> String {
-    let agent_def = load_agent_definition_from_agent_paths(agent_paths);
+/// 从 `agents/{definition}.md` 加载系统提示词。
+/// definition 由 agent_config.definition 提供，None 时加载 `"default"`。
+pub fn build_agent_identity_section(
+    agent_paths: &AgentPaths,
+    agent_config: &AgentConfig,
+) -> String {
+    let def_name = agent_config.definition.as_deref().unwrap_or("default");
+    let agent_def = load_agent_definition_from_agent_paths(agent_paths, def_name);
     agent_def.system_prompt
 }
 
@@ -263,9 +268,34 @@ mod tests {
     #[test]
     fn build_agent_identity_section_returns_default() {
         let ctx = AgentPaths::default();
-        let section = build_agent_identity_section(&ctx);
+        let section = build_agent_identity_section(&ctx, &AgentConfig::default());
         assert!(!section.is_empty());
         assert!(section.contains("Fuyao"));
+    }
+
+    #[test]
+    fn build_agent_identity_section_respects_definition_choice() {
+        // definition = Some("reviewer") → 加载 agents/reviewer.md（若存在）
+        let temp = std::env::temp_dir().join("fuyao_test_sections_def_choice");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("reviewer.md"),
+            "---\nname: 审查员\n---\n你是代码审查专家",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let config = AgentConfig {
+            definition: Some("reviewer".to_string()),
+        };
+        let section = build_agent_identity_section(&ctx, &config);
+        assert!(section.contains("代码审查专家"));
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]

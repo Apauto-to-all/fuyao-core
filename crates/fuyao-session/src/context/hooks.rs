@@ -161,9 +161,12 @@ impl SessionHooksState {
             _ => return,
         };
 
-        let agent_paths = {
+        let (agent_paths, agent_config) = {
             let agent_ctx = self.agent_ctx.lock().expect("Agent 上下文锁异常");
-            agent_ctx.agent_paths.clone()
+            (
+                agent_ctx.agent_paths.clone(),
+                agent_ctx.agent_config.clone(),
+            )
         };
 
         let mut ctx = self.session_ctx.lock().await;
@@ -215,7 +218,7 @@ impl SessionHooksState {
         compressed_messages.extend(recent_messages);
 
         // 生成新系统提示词
-        let new_system_prompt = fuyao_prompt::build_system_prompt(&agent_paths);
+        let new_system_prompt = fuyao_prompt::build_system_prompt(&agent_paths, &agent_config);
 
         // 执行 split_session
         let Some(ref mgr) = ctx.session_manager else {
@@ -256,9 +259,13 @@ impl SessionPlugin {
     ///
     /// # 参数
     /// - `agent_paths`: Agent 路径配置（用于构造 SessionContext，定位 sessions_db）
-    /// - `agent_ctx`: Agent 运行上下文（同步 session_id / 读 model_id）
+    /// - `agent_ctx`: Agent 运行上下文（同步 session_id / 读 model_id / 读 agent_config）
     pub fn new(agent_paths: AgentPaths, agent_ctx: SharedAgentCtx) -> Self {
-        let session_ctx = Arc::new(Mutex::new(SessionContext::new(agent_paths)));
+        let agent_config = {
+            let ctx = agent_ctx.lock().expect("Agent 上下文锁异常");
+            ctx.agent_config.clone()
+        };
+        let session_ctx = Arc::new(Mutex::new(SessionContext::new(agent_paths, agent_config)));
         Self {
             state: Arc::new(Mutex::new(SessionHooksState::new(agent_ctx, session_ctx))),
         }
@@ -377,6 +384,7 @@ impl Plugin for SessionPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuyao_api::AgentConfig;
     use fuyao_api::AgentPaths;
     use fuyao_api::message::input::PluginEventSource;
 
@@ -386,7 +394,10 @@ mod tests {
             agent_paths: AgentPaths::default(),
             ..Default::default()
         }));
-        let session_ctx = Arc::new(Mutex::new(SessionContext::new(AgentPaths::default())));
+        let session_ctx = Arc::new(Mutex::new(SessionContext::new(
+            AgentPaths::default(),
+            AgentConfig::default(),
+        )));
         let state = SessionHooksState::new(agent_ctx, session_ctx);
         assert!(!state.compression_in_progress);
         assert!(!state.tracker.should_compress(100_000, None));
@@ -397,7 +408,10 @@ mod tests {
     async fn inject_compression_guide_sends_message() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(10);
         let agent_ctx = Arc::new(std::sync::Mutex::new(fuyao_api::AgentContext::default()));
-        let session_ctx = Arc::new(Mutex::new(SessionContext::new(AgentPaths::default())));
+        let session_ctx = Arc::new(Mutex::new(SessionContext::new(
+            AgentPaths::default(),
+            AgentConfig::default(),
+        )));
         let mut state = SessionHooksState::new(agent_ctx, session_ctx);
         state.set_emitter(PluginEmitter::new(
             PluginEventSource {
@@ -429,7 +443,10 @@ mod tests {
     #[tokio::test]
     async fn inject_compression_guide_no_panic_without_sender() {
         let agent_ctx = Arc::new(std::sync::Mutex::new(fuyao_api::AgentContext::default()));
-        let session_ctx = Arc::new(Mutex::new(SessionContext::new(AgentPaths::default())));
+        let session_ctx = Arc::new(Mutex::new(SessionContext::new(
+            AgentPaths::default(),
+            AgentConfig::default(),
+        )));
         let mut state = SessionHooksState::new(agent_ctx, session_ctx);
 
         // 没有 tx_send，inject 不应该 panic

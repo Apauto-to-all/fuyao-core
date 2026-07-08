@@ -6,7 +6,7 @@
 use crate::SessionManager;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output;
-use fuyao_api::{AgentPaths, Message, Session};
+use fuyao_api::{AgentConfig, AgentPaths, Message, Session};
 use std::sync::Arc;
 
 /// 会话上下文（内部状态）
@@ -17,6 +17,8 @@ pub struct SessionContext {
     messages: Vec<Message>,
     /// Agent 路径配置
     agent_paths: AgentPaths,
+    /// Agent 运行配置（definition 选择等，用于构建系统提示词）
+    agent_config: AgentConfig,
     /// Session 管理器
     pub(crate) session_manager: Option<Arc<SessionManager>>,
     /// 模型 ID（用于消息标记）
@@ -25,11 +27,12 @@ pub struct SessionContext {
 
 impl SessionContext {
     /// 创建新的会话上下文
-    pub fn new(agent_paths: AgentPaths) -> Self {
+    pub fn new(agent_paths: AgentPaths, agent_config: AgentConfig) -> Self {
         Self {
             session_id: None,
             messages: Vec::new(),
             agent_paths,
+            agent_config,
             session_manager: None,
             model_id: None,
         }
@@ -86,7 +89,8 @@ impl SessionContext {
         }
 
         // 优先级3：创建新 session
-        let system_prompt = fuyao_prompt::build_system_prompt(&self.agent_paths);
+        let system_prompt =
+            fuyao_prompt::build_system_prompt(&self.agent_paths, &self.agent_config);
         let session = mgr
             .create(
                 None,
@@ -310,7 +314,8 @@ impl SessionContext {
         }
 
         // 构建系统提示词
-        let system_prompt = fuyao_prompt::build_system_prompt(&self.agent_paths);
+        let system_prompt =
+            fuyao_prompt::build_system_prompt(&self.agent_paths, &self.agent_config);
 
         // 创建新 session
         let session = mgr
@@ -376,7 +381,7 @@ mod tests {
 
     #[test]
     fn session_context_new() {
-        let ctx = SessionContext::new(AgentPaths::default());
+        let ctx = SessionContext::new(AgentPaths::default(), AgentConfig::default());
         assert!(ctx.session_id.is_none());
         assert!(ctx.messages.is_empty());
     }

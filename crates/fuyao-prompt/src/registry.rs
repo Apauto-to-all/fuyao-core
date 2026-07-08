@@ -416,14 +416,14 @@ impl AgentRegistry {
         Ok(())
     }
 
-    /// 加载默认 Agent（来自 `{fuyao_home}/`）
+    /// 加载默认 Agent（来自 `{fuyao_home}/agents/default.md`）
     ///
-    /// - system.md：`{fuyao_home}/system.md` 存在则解析，否则用硬编码 `DEFAULT_FUYAO_AGENT`
+    /// - 定义文件：`{fuyao_home}/agents/default.md` 存在则解析，否则用硬编码 `DEFAULT_FUYAO_AGENT`
     /// - fuyao.toml：`{fuyao_home}/fuyao.toml` 存在则解析 model/tools/mcp_servers
     fn load_default_agent(&self) -> Option<AgentInfo> {
-        // 解析 system.md（缺失则用硬编码默认 Agent）
+        // 解析定义文件（缺失则用硬编码默认 Agent）
         let (name, description, system_prompt) =
-            match load_agent_definition(&self.fuyao_home.join("system.md")) {
+            match load_agent_definition(&self.fuyao_home.join("agents").join("default.md")) {
                 Some(def) => (def.name, def.description, def.system_prompt),
                 None => (
                     DEFAULT_FUYAO_AGENT.name.clone(),
