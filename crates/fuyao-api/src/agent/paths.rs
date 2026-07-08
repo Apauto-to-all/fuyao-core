@@ -5,11 +5,10 @@ use std::path::PathBuf;
 
 /// Agent 三层目录的身份证明
 ///
-/// 携带 agent_id 和 workspace，为各模块提供三层路径解析能力。
+/// 携带 agent_id、workspace 和 fuyao_home，为各模块提供三层路径解析能力。
+/// `fuyao_home` 构造时注入一次，所有路径方法读 `self.fuyao_home`（纯函数，零全局状态）。
 /// 不可变模型，切换 workspace 时创建新实例。
-///
-/// 对应 Python 的 `fuyao.types.AgentPaths`。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AgentPaths {
     /// Agent 标识符，如 "global/coder"、"workspace/coder"
     pub agent_id: Option<String>,
@@ -24,13 +23,31 @@ pub struct AgentPaths {
     /// - agents 定义 → `{dir}/agents/`
     /// - 补充指令 → `{dir}/instructions/`
     pub extra_dirs: Vec<PathBuf>,
+
+    /// 全局基准路径（~/.fuyao），构造时注入一次
+    ///
+    /// 所有路径方法读此字段而非 `get_fuyao_home()`，使路径解析成为纯函数。
+    /// `Default` 内部调用 `get_fuyao_home()`，现有 `AgentPaths::default()` 零回归。
+    /// 测试可直接赋值实现 per-instance 隔离，无需操纵环境变量。
+    pub fuyao_home: PathBuf,
+}
+
+impl Default for AgentPaths {
+    fn default() -> Self {
+        Self {
+            agent_id: None,
+            workspace: None,
+            extra_dirs: Vec::new(),
+            fuyao_home: get_fuyao_home(),
+        }
+    }
 }
 
 impl AgentPaths {
     /// 配置文件分层路径（fuyao.toml）
     pub fn config_paths(&self) -> LayeredPaths {
         LayeredPaths {
-            global_: Some(get_fuyao_home().join("fuyao.toml")),
+            global_: Some(self.fuyao_home.join("fuyao.toml")),
             agent: self.agent_root().map(|p| p.join("fuyao.toml")),
             workspace: self
                 .workspace
@@ -43,7 +60,7 @@ impl AgentPaths {
     /// 环境变量文件分层路径（.env）
     pub fn env_paths(&self) -> LayeredPaths {
         LayeredPaths {
-            global_: Some(get_fuyao_home().join(".env")),
+            global_: Some(self.fuyao_home.join(".env")),
             agent: self.agent_root().map(|p| p.join(".env")),
             workspace: self
                 .workspace
@@ -57,7 +74,7 @@ impl AgentPaths {
     pub fn sessions_db_paths(&self) -> LayeredPaths {
         LayeredPaths {
             global_: if self.agent_id.is_none() {
-                Some(get_fuyao_home().join("sessions").join("sessions.db"))
+                Some(self.fuyao_home.join("sessions").join("sessions.db"))
             } else {
                 None
             },
@@ -100,7 +117,7 @@ impl AgentPaths {
             .collect();
 
         LayeredPaths {
-            global_: Some(get_fuyao_home().join("skills")),
+            global_: Some(self.fuyao_home.join("skills")),
             agent: self.agent_root().map(|p| p.join("skills")),
             workspace: self
                 .workspace
@@ -113,7 +130,7 @@ impl AgentPaths {
     /// 插件分层路径
     pub fn plugins_paths(&self) -> LayeredPaths {
         LayeredPaths {
-            global_: Some(get_fuyao_home().join("plugins")),
+            global_: Some(self.fuyao_home.join("plugins")),
             agent: self.agent_root().map(|p| p.join("plugins")),
             workspace: self
                 .workspace
@@ -146,7 +163,7 @@ impl AgentPaths {
             .collect();
 
         LayeredPaths {
-            global_: Some(get_fuyao_home().join("agents").join(&file_name)),
+            global_: Some(self.fuyao_home.join("agents").join(&file_name)),
             agent: None,
             workspace: self
                 .workspace
@@ -174,7 +191,7 @@ impl AgentPaths {
             .collect();
 
         LayeredPaths {
-            global_: Some(get_fuyao_home().join("instructions")),
+            global_: Some(self.fuyao_home.join("instructions")),
             agent: self.agent_root().map(|p| p.join("instructions")),
             workspace: self
                 .workspace
@@ -187,7 +204,7 @@ impl AgentPaths {
     /// AGENTS.md 分层路径（项目上下文）
     pub fn agents_md_paths(&self) -> LayeredPaths {
         LayeredPaths {
-            global_: Some(get_fuyao_home().join("AGENTS.md")),
+            global_: Some(self.fuyao_home.join("AGENTS.md")),
             agent: self.agent_root().map(|p| p.join("AGENTS.md")),
             workspace: self.workspace.as_ref().map(|ws| ws.join("AGENTS.md")),
             ..Default::default()
@@ -399,6 +416,37 @@ mod tests {
         let ip = paths.instructions_paths();
         assert_eq!(ip.extra.len(), 1);
         assert!(ip.extra[0].starts_with(&plugin_a));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn agent_paths_default_has_nonempty_fuyao_home() {
+        let paths = AgentPaths::default();
+        assert!(!paths.fuyao_home.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn injected_fuyao_home_used_by_path_methods() {
+        let temp = std::env::temp_dir().join("fuyao_test_injected_home");
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let paths = AgentPaths {
+            fuyao_home: temp.clone(),
+            ..Default::default()
+        };
+
+        // config_paths 应使用注入的 home
+        let cp = paths.config_paths();
+        assert_eq!(cp.global_, Some(temp.join("fuyao.toml")));
+
+        // agents_def_paths 应使用注入的 home
+        let ap = paths.agents_def_paths("default");
+        assert_eq!(ap.global_, Some(temp.join("agents").join("default.md")));
+
+        // agents_md_paths 应使用注入的 home
+        let amp = paths.agents_md_paths();
+        assert_eq!(amp.global_, Some(temp.join("AGENTS.md")));
 
         std::fs::remove_dir_all(&temp).ok();
     }

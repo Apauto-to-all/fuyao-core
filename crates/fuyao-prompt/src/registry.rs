@@ -7,7 +7,7 @@
 
 use crate::default::DEFAULT_FUYAO_AGENT;
 use crate::loader::load_agent_definition;
-use fuyao_api::{get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir};
+use fuyao_api::get_workspace_agents_dir;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -130,14 +130,20 @@ pub enum RegistryError {
 pub struct AgentRegistry {
     /// 工作目录（用于扫描项目层 Agent）
     workspace: Option<PathBuf>,
+    /// 全局基准路径（~/.fuyao），构造时注入
+    fuyao_home: PathBuf,
 }
 
 impl AgentRegistry {
     /// 创建 AgentRegistry
     ///
     /// `workspace` 为 None 时只扫描全局层。
-    pub fn new(workspace: Option<PathBuf>) -> Self {
-        Self { workspace }
+    /// `fuyao_home` 为全局基准路径，扫描 `{fuyao_home}/fuyao-agents/` 和加载默认 Agent。
+    pub fn new(workspace: Option<PathBuf>, fuyao_home: PathBuf) -> Self {
+        Self {
+            workspace,
+            fuyao_home,
+        }
     }
 
     /// 列举 Agent（全局 + 项目合并 + 默认 Agent），支持分页、来源过滤与关键字搜索
@@ -159,7 +165,11 @@ impl AgentRegistry {
         let mut results: HashMap<String, AgentInfo> = HashMap::new();
 
         // 全局层
-        self.scan_dir(&get_fuyao_agents_dir(), AgentSource::Global, &mut results);
+        self.scan_dir(
+            &self.fuyao_home.join("fuyao-agents"),
+            AgentSource::Global,
+            &mut results,
+        );
 
         // 项目层（覆盖同名全局）
         if let Some(ref ws) = self.workspace {
@@ -172,7 +182,7 @@ impl AgentRegistry {
 
         // 默认 Agent（来自 ~/.fuyao/，仅在无 scope 过滤时纳入）
         if scope.is_none()
-            && let Some(default_agent) = load_default_agent()
+            && let Some(default_agent) = self.load_default_agent()
         {
             results.insert("default".to_string(), default_agent);
         }
@@ -227,7 +237,7 @@ impl AgentRegistry {
     pub fn get(&self, id: &str) -> Option<AgentInfo> {
         // 默认 Agent
         if id == "default" {
-            return load_default_agent();
+            return self.load_default_agent();
         }
 
         // 解析前缀
@@ -241,7 +251,7 @@ impl AgentRegistry {
 
         // 定位目录
         let dir = match source {
-            AgentSource::Global => get_fuyao_agents_dir().join(name),
+            AgentSource::Global => self.fuyao_home.join("fuyao-agents").join(name),
             AgentSource::Workspace => {
                 let ws = self.workspace.as_ref()?;
                 get_workspace_agents_dir(ws).join(name)
@@ -386,7 +396,7 @@ impl AgentRegistry {
     /// 解析 `{source}/{name}` → 物理路径（CRUD 专用，直接映射，不自动 resolve）
     fn agent_dir(&self, source: AgentSource, name: &str) -> Result<PathBuf, RegistryError> {
         let base = match source {
-            AgentSource::Global => get_fuyao_agents_dir(),
+            AgentSource::Global => self.fuyao_home.join("fuyao-agents"),
             AgentSource::Workspace => {
                 let ws = self
                     .workspace
@@ -404,6 +414,38 @@ impl AgentRegistry {
             return Err(RegistryError::DefaultForbidden);
         }
         Ok(())
+    }
+
+    /// 加载默认 Agent（来自 `{fuyao_home}/`）
+    ///
+    /// - system.md：`{fuyao_home}/system.md` 存在则解析，否则用硬编码 `DEFAULT_FUYAO_AGENT`
+    /// - fuyao.toml：`{fuyao_home}/fuyao.toml` 存在则解析 model/tools/mcp_servers
+    fn load_default_agent(&self) -> Option<AgentInfo> {
+        // 解析 system.md（缺失则用硬编码默认 Agent）
+        let (name, description, system_prompt) =
+            match load_agent_definition(&self.fuyao_home.join("system.md")) {
+                Some(def) => (def.name, def.description, def.system_prompt),
+                None => (
+                    DEFAULT_FUYAO_AGENT.name.clone(),
+                    DEFAULT_FUYAO_AGENT.description.clone(),
+                    DEFAULT_FUYAO_AGENT.system_prompt.clone(),
+                ),
+            };
+
+        // 解析 fuyao.toml（可选）
+        let (model, tools, mcp_servers) = parse_fuyao_toml(&self.fuyao_home.join("fuyao.toml"));
+
+        Some(AgentInfo {
+            id: "default".to_string(),
+            name,
+            description,
+            source: AgentSource::Global,
+            system_prompt,
+            model,
+            tools,
+            mcp_servers,
+            profiles: Vec::new(),
+        })
     }
 }
 
@@ -531,51 +573,9 @@ fn is_windows_reserved(name: &str) -> bool {
             .is_some_and(|s| matches!(s, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 
-/// 加载默认 Agent（来自 ~/.fuyao/）
-///
-/// - system.md：`~/.fuyao/system.md` 存在则解析，否则用硬编码 `DEFAULT_FUYAO_AGENT`
-/// - fuyao.toml：`~/.fuyao/fuyao.toml` 存在则解析 model/tools/mcp_servers
-fn load_default_agent() -> Option<AgentInfo> {
-    let home = get_fuyao_home();
-
-    // 解析 system.md（缺失则用硬编码默认 Agent）
-    let (name, description, system_prompt) = match load_agent_definition(&home.join("system.md")) {
-        Some(def) => (def.name, def.description, def.system_prompt),
-        None => (
-            DEFAULT_FUYAO_AGENT.name.clone(),
-            DEFAULT_FUYAO_AGENT.description.clone(),
-            DEFAULT_FUYAO_AGENT.system_prompt.clone(),
-        ),
-    };
-
-    // 解析 fuyao.toml（可选）
-    let (model, tools, mcp_servers) = parse_fuyao_toml(&home.join("fuyao.toml"));
-
-    Some(AgentInfo {
-        id: "default".to_string(),
-        name,
-        description,
-        source: AgentSource::Global,
-        system_prompt,
-        model,
-        tools,
-        mcp_servers,
-        profiles: Vec::new(),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
-
-    /// FUYAO_HOME 是进程级共享状态，并行测试会竞争，需串行化所有操作它的测试
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// 获取环境变量串行化守卫（测试函数开头调用）
-    fn env_guard() -> MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     #[test]
     fn agent_source_serializes_pascal_case() {
@@ -591,24 +591,33 @@ mod tests {
 
     #[test]
     fn registry_list_empty_no_panic() {
-        let registry = AgentRegistry::new(None);
+        let temp = std::env::temp_dir().join("fuyao_test_registry_empty");
+        std::fs::create_dir_all(&temp).unwrap();
+        let registry = AgentRegistry::new(None, temp.clone());
         // list 接受分页参数，空目录不 panic
         let paged = registry.list(1, 10, None, None);
         assert_eq!(paged.page, 1);
         assert_eq!(paged.size, 10);
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_get_returns_none_for_no_prefix() {
-        let registry = AgentRegistry::new(None);
+        let temp = std::env::temp_dir().join("fuyao_test_registry_no_prefix");
+        std::fs::create_dir_all(&temp).unwrap();
+        let registry = AgentRegistry::new(None, temp.clone());
         assert!(registry.get("noprefix").is_none());
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_get_returns_none_for_nonexistent() {
-        let registry = AgentRegistry::new(None);
+        let temp = std::env::temp_dir().join("fuyao_test_registry_nonexistent");
+        std::fs::create_dir_all(&temp).unwrap();
+        let registry = AgentRegistry::new(None, temp.clone());
         assert!(registry.get("global/nonexistent_xyz").is_none());
         assert!(registry.get("workspace/nonexistent_xyz").is_none());
+        std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
@@ -674,7 +683,6 @@ command = "node"
 
     #[test]
     fn registry_list_prefix_default_paging() {
-        let _guard = env_guard();
         // 创建临时全局 Agent 目录结构
         let temp = std::env::temp_dir().join("fuyao_test_registry_prefix");
         let global_agents = temp.join("fuyao-agents").join("coder");
@@ -698,12 +706,8 @@ command = "node"
         // 全局 fuyao.toml（默认 Agent 的 model 来源）
         std::fs::write(temp.join("fuyao.toml"), "model = \"aliyun/qwen3.6-plus\"\n").unwrap();
 
-        // 用 FUYAO_HOME 环境变量指向临时目录
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(None);
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(None, temp.clone());
 
         // 全部（含默认 Agent）：coder 带前缀，且包含 default
         let all = registry.list(1, 10, None, None);
@@ -747,15 +751,11 @@ command = "node"
         assert_eq!(page1.items.len(), 1);
         assert_eq!(page1.total, 2);
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_list_project_overrides_global() {
-        let _guard = env_guard();
         // 项目层同名 Agent 覆盖全局层（id 前缀变 workspace/）
         let temp = std::env::temp_dir().join("fuyao_test_registry_override");
         let global_agents = temp.join("fuyao-agents").join("coder");
@@ -776,11 +776,8 @@ command = "node"
         )
         .unwrap();
 
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(Some(ws));
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(Some(ws), temp.clone());
         let all = registry.list(1, 10, None, None);
 
         // coder 被项目层覆盖 → id 为 workspace/coder，name 为项目开发
@@ -794,9 +791,6 @@ command = "node"
         // 不应同时存在 global/coder
         assert!(!all.items.iter().any(|a| a.id == "global/coder"));
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
@@ -844,17 +838,13 @@ command = "node"
 
     #[test]
     fn registry_list_no_systemmd_fills_default() {
-        let _guard = env_guard();
         // 空文件夹（无 system.md）→ list 返回，name=文件夹名，system_prompt=默认提示词
         let temp = std::env::temp_dir().join("fuyao_test_registry_empty_folder");
         let empty_agent = temp.join("fuyao-agents").join("blank");
         std::fs::create_dir_all(&empty_agent).unwrap();
 
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(None);
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(None, temp.clone());
         let all = registry.list(1, 10, None, None);
 
         let blank = all
@@ -866,15 +856,11 @@ command = "node"
         assert!(blank.description.is_empty());
         assert!(!blank.system_prompt.is_empty());
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_list_q_filter_matches_folder_name() {
-        let _guard = env_guard();
         // q 仅匹配文件夹名（去前缀），大小写不敏感
         let temp = std::env::temp_dir().join("fuyao_test_registry_q");
         let agents = temp.join("fuyao-agents");
@@ -891,11 +877,8 @@ command = "node"
         )
         .unwrap();
 
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(None);
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(None, temp.clone());
 
         // q="cod" → 仅 coder
         let filtered = registry.list(1, 10, None, Some("cod"));
@@ -911,25 +894,18 @@ command = "node"
         let filtered = registry.list(1, 10, None, Some("zzz"));
         assert!(filtered.items.is_empty());
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_crud_create_and_conflict() {
-        let _guard = env_guard();
         let temp = std::env::temp_dir().join("fuyao_test_registry_crud_create");
         // 清理上次失败运行可能残留的目录
         std::fs::remove_dir_all(&temp).ok();
         std::fs::create_dir_all(temp.join("fuyao-agents")).unwrap();
 
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(None);
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(None, temp.clone());
 
         // 创建空文件夹
         registry
@@ -947,25 +923,18 @@ command = "node"
         let err = registry.create(AgentSource::Global, "a/b").unwrap_err();
         assert!(matches!(err, RegistryError::InvalidName(_)));
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_crud_read_content() {
-        let _guard = env_guard();
         let temp = std::env::temp_dir().join("fuyao_test_registry_crud_read");
         let agent_dir = temp.join("fuyao-agents").join("reader");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("system.md"), "---\nname: r\n---\nbody").unwrap();
 
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(None);
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(None, temp.clone());
 
         // 读取：system.md 有内容，fuyao.toml 不存在 → 空串
         let content = registry
@@ -986,24 +955,17 @@ command = "node"
             .unwrap_err();
         assert!(matches!(err, RegistryError::DefaultForbidden));
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
     fn registry_crud_write_content() {
-        let _guard = env_guard();
         let temp = std::env::temp_dir().join("fuyao_test_registry_crud_write");
         let agent_dir = temp.join("fuyao-agents").join("writer");
         std::fs::create_dir_all(&agent_dir).unwrap();
 
-        unsafe {
-            std::env::set_var("FUYAO_HOME", &temp);
-        }
-
-        let registry = AgentRegistry::new(None);
+        // 注入 fuyao_home 指向临时目录
+        let registry = AgentRegistry::new(None, temp.clone());
 
         // 写入 system.md（文件不存在则创建）
         registry
@@ -1045,9 +1007,6 @@ command = "node"
             .unwrap_err();
         assert!(matches!(err, RegistryError::DefaultForbidden));
 
-        unsafe {
-            std::env::remove_var("FUYAO_HOME");
-        }
         std::fs::remove_dir_all(&temp).ok();
     }
 

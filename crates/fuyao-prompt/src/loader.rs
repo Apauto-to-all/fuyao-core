@@ -154,7 +154,6 @@ mod tests {
     #[test]
     fn load_agent_definition_from_agent_paths_loads_default_md() {
         // 通过 extra_dirs 注入 agents/default.md，验证覆盖 DEFAULT_FUYAO_AGENT
-        // （不用 FUYAO_HOME，避免并发测试环境变量竞争）
         let temp = std::env::temp_dir().join("fuyao_test_loader_default_extra");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
