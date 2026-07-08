@@ -1,8 +1,8 @@
 //! Prompt 类型定义
 //!
-//! Agent 定义等核心类型，从 system.md 文件解析。
+//! Agent 定义等核心类型，从 `agents/*.md` 文件解析。
 
-/// Agent 定义（从 system.md 文件解析）
+/// Agent 定义（从 `agents/*.md` 文件解析）
 ///
 /// 只包含纯身份和提示词信息。
 /// 模型和工具配置由 fuyao.toml 三层配置管理。

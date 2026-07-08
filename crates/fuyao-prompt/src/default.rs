@@ -1,7 +1,7 @@
 //! 默认 Fuyao Agent 定义
 //!
 //! 框架内置的默认 Agent，硬编码确保框架稳定性。
-//! 用户可通过 ~/.fuyao/system.md 覆盖此定义。
+//! 用户可通过 `agents/default.md` 覆盖此定义。
 
 use fuyao_api::prompt_types::AgentDefinition;
 use std::sync::LazyLock;

@@ -1,19 +1,21 @@
 //! 系统提示词组装器
 //!
-//! 负责分层组装系统提示词。
+//! 负责分层组装系统提示词，明确分为「覆盖区 + 补充区」两部分：
+//! - 覆盖区：Agent 定义（`agents/default.md` 正文，覆盖内置默认）
+//! - 补充区：项目上下文（AGENTS.md）+ 补充指令（`instructions/` 文件夹）
 //!
-//! 系统提示词由 Agent 模块管理，每次对话动态构建。
-//! 各层 section 根据当前上下文实时生成。
+//! 系统提示词由 Agent 模块管理，会话创建时构建一次并冻结进数据库（前缀缓存要求）。
 //!
 //! 组装方式：
-//! - 使用 Markdown 标题分隔各模块
+//! - 使用 Markdown 一级标题分隔各 section
 //! - 项目上下文按三层加载，用子标题区分来源
+//! - 补充指令每个文件用 `## {完整路径}` 作标题
 //!
 //! 最终结构：
 //! ```text
 //! # Agent 定义
 //!
-//! [Agent 系统提示词]
+//! [agents/default.md 正文，覆盖内置默认]
 //!
 //! # 项目上下文
 //!
@@ -26,6 +28,20 @@
 //! ## 全局层
 //! [全局 AGENTS.md 内容]
 //!
+//! # 工具使用指南
+//! [硬编码工具使用原则]
+//!
+//! # 技能 skills
+//! [可用 skills 索引]
+//!
+//! # 补充指令
+//!
+//! ## {完整路径1}
+//! [instructions/ 文件1 正文]
+//!
+//! ## {完整路径2}
+//! [instructions/ 文件2 正文]
+//!
 //! # 环境
 //!
 //! 当前时间：2026-04-22 19:30
@@ -34,7 +50,8 @@
 
 use crate::sections::{
     build_agent_identity_section, build_datetime_section, build_environment_section,
-    build_project_context_section, build_skills_section, build_tool_guidance_section,
+    build_instructions_section, build_project_context_section, build_skills_section,
+    build_tool_guidance_section,
 };
 use fuyao_api::AgentPaths;
 
@@ -44,13 +61,13 @@ use fuyao_api::AgentPaths;
 pub fn build_all_sections(agent_paths: &AgentPaths) -> Vec<(String, String)> {
     let mut sections: Vec<(String, String)> = Vec::new();
 
-    // Layer 1: Agent 身份（从 agent_paths 加载 system.md）
+    // Layer 1: Agent 身份（从 agents/default.md 加载，覆盖内置默认）
     let content = build_agent_identity_section(agent_paths);
     if !content.is_empty() {
         sections.push(("Agent 定义".to_string(), content));
     }
 
-    // Layer 2: 项目上下文（已包含多级子标题）
+    // Layer 2: 项目上下文（AGENTS.md，已包含多级子标题）
     let content = build_project_context_section(agent_paths);
     if !content.is_empty() {
         sections.push(("项目上下文".to_string(), content));
@@ -69,6 +86,12 @@ pub fn build_all_sections(agent_paths: &AgentPaths) -> Vec<(String, String)> {
     let content = build_skills_section(agent_paths);
     if !content.is_empty() {
         sections.push(("技能 skills".to_string(), content));
+    }
+
+    // Layer 5.5: 补充指令（instructions/ 文件夹全量拼接）
+    let content = build_instructions_section(agent_paths);
+    if !content.is_empty() {
+        sections.push(("补充指令".to_string(), content));
     }
 
     // Layer 6+7: 环境（时间 + 运行环境合为一节）
@@ -99,7 +122,7 @@ fn sections_to_prompt(sections: Vec<(String, String)>) -> String {
 /// 构建系统提示词
 ///
 /// 分层组装各 section，返回完整系统提示词。
-/// Layer 1（Agent 身份）从 agent_paths 加载 system.md。
+/// Layer 1（Agent 身份）从 `agents/default.md` 加载，覆盖内置默认。
 pub fn build_system_prompt(agent_paths: &AgentPaths) -> String {
     sections_to_prompt(build_all_sections(agent_paths))
 }
@@ -134,5 +157,61 @@ mod tests {
         let ctx = AgentPaths::default();
         let prompt = build_system_prompt(&ctx);
         assert!(prompt.contains("当前时间："));
+    }
+
+    #[test]
+    fn build_all_sections_order_is_correct() {
+        // 默认无 instructions/，补充指令 section 不出现；验证其余顺序
+        let ctx = AgentPaths::default();
+        let sections = build_all_sections(&ctx);
+        let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
+        // 期望顺序：Agent 定义 → 项目上下文 → 工具使用指南 → 技能 skills → 环境
+        let agent_idx = titles.iter().position(|t| *t == "Agent 定义").unwrap();
+        let env_idx = titles.iter().position(|t| *t == "环境").unwrap();
+        assert!(agent_idx < env_idx);
+        // 工具指南在 skills 前
+        if let (Some(tool_idx), Some(skills_idx)) = (
+            titles.iter().position(|t| *t == "工具使用指南"),
+            titles.iter().position(|t| *t == "技能 skills"),
+        ) {
+            assert!(tool_idx < skills_idx);
+            assert!(skills_idx < env_idx);
+        }
+    }
+
+    #[test]
+    fn build_all_sections_includes_instructions_when_present() {
+        // 有 instructions/ 时，补充指令应出现在 skills 之后、环境之前
+        // 通过 extra_dirs 注入，避免环境变量竞争
+        let temp = std::env::temp_dir().join("fuyao_test_builder_instructions");
+        let plugin = temp.join("plugin");
+        let instr_dir = plugin.join("instructions");
+        std::fs::create_dir_all(&instr_dir).unwrap();
+        std::fs::write(instr_dir.join("rule.md"), "补充规则内容").unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let sections = build_all_sections(&ctx);
+
+        let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
+        let instr_idx = titles
+            .iter()
+            .position(|t| *t == "补充指令")
+            .expect("补充指令 section 应存在");
+        let skills_idx = titles.iter().position(|t| *t == "技能 skills");
+        let env_idx = titles
+            .iter()
+            .position(|t| *t == "环境")
+            .expect("环境 section 应存在");
+        // 补充指令在环境之前
+        assert!(instr_idx < env_idx);
+        // 若 skills 存在，补充指令在 skills 之后
+        if let Some(si) = skills_idx {
+            assert!(si < instr_idx);
+        }
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }

@@ -19,8 +19,10 @@ pub struct AgentPaths {
 
     /// 额外资源目录（插件根目录等），运行时由应用层填充
     ///
-    /// 各资源类型按约定子目录解析：skills → `{dir}/skills/`，未来扩展同理。
-    /// 目前只 skills_paths() 消费它。
+    /// 各资源类型按约定子目录解析：
+    /// - skills → `{dir}/skills/`
+    /// - agents 定义 → `{dir}/agents/`
+    /// - 补充指令 → `{dir}/instructions/`
     pub extra_dirs: Vec<PathBuf>,
 }
 
@@ -121,17 +123,64 @@ impl AgentPaths {
         }
     }
 
-    /// Agent 系统提示词分层路径（system.md）
-    pub fn system_md_paths(&self) -> LayeredPaths {
+    /// Agent 定义文件分层路径（`agents/{name}.md`）
+    ///
+    /// 集中定义库，按 name 匹配单个定义文件。三层优先级（不含 agent 层）：
+    /// - workspace: `{workspace}/.fuyao/agents/{name}.md`
+    /// - global: `~/.fuyao/agents/{name}.md`
+    /// - extra: `{插件根}/agents/{name}.md`（仅保留存在的文件）
+    ///
+    /// 不用 agent 层：agent_root 是独立 Agent 的数据隔离目录（sessions/config/provider），
+    /// 定义库与 agent_id 隔离体系正交，不应塞进每个独立 Agent 的数据目录。
+    ///
+    /// 调用方用 `first_exists()` 取首个命中。本期 name 固定为 `"default"`。
+    pub fn agents_def_paths(&self, name: &str) -> LayeredPaths {
+        let file_name = format!("{name}.md");
+
+        // extra：插件根下的 agents/{name}.md，仅保留存在的文件
+        let extra: Vec<PathBuf> = self
+            .extra_dirs
+            .iter()
+            .map(|d| d.join("agents").join(&file_name))
+            .filter(|p| p.is_file())
+            .collect();
+
         LayeredPaths {
-            global_: if self.agent_id.is_none() {
-                Some(get_fuyao_home().join("system.md"))
-            } else {
-                None
-            },
-            agent: self.agent_root().map(|p| p.join("system.md")),
-            workspace: None,
-            ..Default::default()
+            global_: Some(get_fuyao_home().join("agents").join(&file_name)),
+            agent: None,
+            workspace: self
+                .workspace
+                .as_ref()
+                .map(|ws| get_workspace_root(ws).join("agents").join(&file_name)),
+            extra,
+        }
+    }
+
+    /// 补充指令目录分层路径（`instructions/`）
+    ///
+    /// 四层优先级，仿 `skills_paths` 结构。每个目录下所有 `*.md` 全量拼接进补充区：
+    /// - workspace: `{workspace}/.fuyao/instructions/`
+    /// - agent: `{agent_root}/instructions/`
+    /// - global: `~/.fuyao/instructions/`
+    /// - extra: `{插件根}/instructions/`（仅保留存在的目录）
+    ///
+    /// 调用方用 `merge_exists()` 取所有存在的目录，逐一扫描 `*.md`。
+    pub fn instructions_paths(&self) -> LayeredPaths {
+        let extra: Vec<PathBuf> = self
+            .extra_dirs
+            .iter()
+            .map(|d| d.join("instructions"))
+            .filter(|d| d.is_dir())
+            .collect();
+
+        LayeredPaths {
+            global_: Some(get_fuyao_home().join("instructions")),
+            agent: self.agent_root().map(|p| p.join("instructions")),
+            workspace: self
+                .workspace
+                .as_ref()
+                .map(|ws| get_workspace_root(ws).join("instructions")),
+            extra,
         }
     }
 
@@ -252,6 +301,104 @@ mod tests {
         assert_eq!(sp.extra.len(), 1);
         assert!(sp.extra[0].ends_with("skills"));
         assert!(sp.extra[0].starts_with(&plugin_root));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn agents_def_paths_returns_layered_with_name() {
+        let paths = AgentPaths {
+            workspace: Some(PathBuf::from("/tmp/project")),
+            ..Default::default()
+        };
+        let ap = paths.agents_def_paths("default");
+        // global 层
+        assert!(ap.global_.is_some());
+        assert!(ap.global_.as_ref().unwrap().ends_with("agents/default.md"));
+        // workspace 层
+        assert!(ap.workspace.is_some());
+        assert!(
+            ap.workspace
+                .as_ref()
+                .unwrap()
+                .ends_with(".fuyao/agents/default.md")
+        );
+        // agent 层不用
+        assert!(ap.agent.is_none());
+    }
+
+    #[test]
+    fn agents_def_paths_no_agent_layer_regardless_of_agent_id() {
+        // 即使有 agent_id，agents 定义也不走 agent 层（与 agent_id 隔离体系正交）
+        let paths = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            ..Default::default()
+        };
+        let ap = paths.agents_def_paths("default");
+        assert!(ap.agent.is_none());
+        assert!(ap.global_.is_some());
+    }
+
+    #[test]
+    fn agents_def_paths_extra_filters_existing_files() {
+        let temp = std::env::temp_dir().join("fuyao_test_agents_def_extra");
+        let plugin_a = temp.join("plugin-a");
+        let plugin_b = temp.join("plugin-b");
+        // plugin-a 有 agents/default.md
+        std::fs::create_dir_all(plugin_a.join("agents")).unwrap();
+        std::fs::write(plugin_a.join("agents").join("default.md"), "# A").unwrap();
+        // plugin-b 有 agents/ 但没有 default.md
+        std::fs::create_dir_all(plugin_b.join("agents")).unwrap();
+
+        let paths = AgentPaths {
+            extra_dirs: vec![plugin_a.clone(), plugin_b.clone()],
+            ..Default::default()
+        };
+        let ap = paths.agents_def_paths("default");
+        // 只有 plugin-a 的 default.md 存在，plugin-b 被过滤
+        assert_eq!(ap.extra.len(), 1);
+        assert!(ap.extra[0].starts_with(&plugin_a));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn instructions_paths_returns_four_layers() {
+        let paths = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            workspace: Some(PathBuf::from("/tmp/project")),
+            ..Default::default()
+        };
+        let ip = paths.instructions_paths();
+        // 四层齐全
+        assert!(ip.global_.is_some());
+        assert!(ip.agent.is_some());
+        assert!(ip.workspace.is_some());
+        assert!(ip.global_.as_ref().unwrap().ends_with("instructions"));
+        assert!(ip.agent.as_ref().unwrap().ends_with("instructions"));
+        assert!(
+            ip.workspace
+                .as_ref()
+                .unwrap()
+                .ends_with(".fuyao/instructions")
+        );
+    }
+
+    #[test]
+    fn instructions_paths_extra_filters_existing_dirs() {
+        let temp = std::env::temp_dir().join("fuyao_test_instructions_extra");
+        let plugin_a = temp.join("plugin-a");
+        let plugin_b = temp.join("plugin-b");
+        std::fs::create_dir_all(plugin_a.join("instructions")).unwrap();
+        // plugin-b 没有 instructions 目录
+
+        let paths = AgentPaths {
+            extra_dirs: vec![plugin_a.clone(), plugin_b.clone()],
+            ..Default::default()
+        };
+        let ip = paths.instructions_paths();
+        assert_eq!(ip.extra.len(), 1);
+        assert!(ip.extra[0].starts_with(&plugin_a));
 
         std::fs::remove_dir_all(&temp).ok();
     }

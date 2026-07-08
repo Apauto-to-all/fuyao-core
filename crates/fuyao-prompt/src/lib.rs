@@ -1,10 +1,10 @@
 //! Prompt 模块
 //!
-//! 系统提示词分层构建。
-//! - `loader`: Agent 定义加载（system.md + frontmatter 解析）
+//! 系统提示词分层构建，明确分为「覆盖区 + 补充区」。
+//! - `loader`: Agent 定义加载（`agents/default.md` + frontmatter 解析）
 //! - `registry`: Agent 注册表（扫描目录、列举/查询 Agent）
-//! - `default`: 默认 Agent 定义（system.md 不存在时使用）
-//! - `sections`: 7 层 section 构建
+//! - `default`: 默认 Agent 定义（`agents/default.md` 不存在时使用）
+//! - `sections`: 分层 section 构建（含补充指令 `instructions/`）
 //! - `builder`: `build_system_prompt()` 组装器
 
 pub mod builder;

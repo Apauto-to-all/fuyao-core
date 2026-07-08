@@ -17,10 +17,11 @@ use crate::loader::load_agent_definition_from_agent_paths;
 use chrono::Local;
 use fuyao_api::AgentPaths;
 use fuyao_skills::find_all_skills;
+use std::path::PathBuf;
 
 /// 构建 Agent 身份 section（Layer 1）
 ///
-/// 从 agent_paths 加载 system.md 获取系统提示词。
+/// 从 `agents/default.md` 加载系统提示词（本期固定加载默认定义）。
 pub fn build_agent_identity_section(agent_paths: &AgentPaths) -> String {
     let agent_def = load_agent_definition_from_agent_paths(agent_paths);
     agent_def.system_prompt
@@ -70,6 +71,60 @@ pub fn build_project_context_section(agent_paths: &AgentPaths) -> String {
     let parts: Vec<String> = contexts
         .iter()
         .map(|(layer_name, content)| format!("## {layer_name}\n\n{content}"))
+        .collect();
+
+    parts.join("\n\n")
+}
+
+/// 构建补充指令 section
+///
+/// 扫描 `instructions/` 文件夹（四层优先级：workspace → agent → global → extra），
+/// 每个目录下所有 `*.md` 全量拼接，每个文件用 `## {完整路径}` 作标题区分。
+///
+/// 文件格式为纯 md 正文（不支持 frontmatter）。
+/// 空内容则返回空字符串（section 被跳过）。
+pub fn build_instructions_section(agent_paths: &AgentPaths) -> String {
+    let paths = agent_paths.instructions_paths();
+    let existing_dirs = paths.merge_exists();
+
+    if existing_dirs.is_empty() {
+        return String::new();
+    }
+
+    // 收集所有 (完整路径, 正文) 条目，按目录优先级 + 目录内文件名排序
+    let mut entries: Vec<(String, String)> = Vec::new();
+
+    for dir in &existing_dirs {
+        // 读目录下所有 *.md 文件
+        let mut md_files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "md"))
+                .collect(),
+            Err(_) => continue,
+        };
+        // 目录内按文件名排序
+        md_files.sort();
+
+        for file_path in md_files {
+            if let Ok(content) = std::fs::read_to_string(&file_path) {
+                let content = content.trim().to_string();
+                if !content.is_empty() {
+                    entries.push((file_path.to_string_lossy().to_string(), content));
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return String::new();
+    }
+
+    // 每个文件用完整路径作标题，正文拼接
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(path, content)| format!("## {path}\n\n{content}"))
         .collect();
 
     parts.join("\n\n")
@@ -211,5 +266,66 @@ mod tests {
         let section = build_agent_identity_section(&ctx);
         assert!(!section.is_empty());
         assert!(section.contains("Fuyao"));
+    }
+
+    #[test]
+    fn build_instructions_section_empty_for_default() {
+        // 默认无 instructions 目录，应返回空
+        let ctx = AgentPaths::default();
+        let section = build_instructions_section(&ctx);
+        assert!(section.is_empty());
+    }
+
+    #[test]
+    fn build_instructions_section_loads_multiple_md() {
+        // 通过 extra_dirs 注入 instructions/ 下两个 md，验证全量拼接 + 完整路径标题 + 排序
+        let temp = std::env::temp_dir().join("fuyao_test_instructions_section");
+        let plugin = temp.join("plugin");
+        let instr_dir = plugin.join("instructions");
+        std::fs::create_dir_all(&instr_dir).unwrap();
+        std::fs::write(instr_dir.join("b-git.md"), "Git 规范内容").unwrap();
+        std::fs::write(instr_dir.join("a-rust.md"), "Rust 规范内容").unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let section = build_instructions_section(&ctx);
+
+        // 非空，包含两个文件的正文
+        assert!(!section.is_empty());
+        assert!(section.contains("Rust 规范内容"));
+        assert!(section.contains("Git 规范内容"));
+        // 按文件名排序：a-rust 在 b-git 前
+        let rust_pos = section.find("Rust 规范内容").unwrap();
+        let git_pos = section.find("Git 规范内容").unwrap();
+        assert!(rust_pos < git_pos);
+        // 标题用完整路径（包含 a-rust.md）
+        assert!(section.contains("a-rust.md"));
+        assert!(section.contains("b-git.md"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn build_instructions_section_skips_empty_md() {
+        // 空内容的 md 文件应被跳过
+        let temp = std::env::temp_dir().join("fuyao_test_instructions_empty");
+        let plugin = temp.join("plugin");
+        let instr_dir = plugin.join("instructions");
+        std::fs::create_dir_all(&instr_dir).unwrap();
+        std::fs::write(instr_dir.join("empty.md"), "   \n\n  ").unwrap();
+        std::fs::write(instr_dir.join("real.md"), "有内容").unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let section = build_instructions_section(&ctx);
+
+        assert!(section.contains("有内容"));
+        assert!(!section.contains("empty.md"));
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }
