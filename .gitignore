@@ -25,6 +25,3 @@ rustc-ice-*.txt
 
 # nul
 nul
-
-# 忽视 docs 目录
-docs/
