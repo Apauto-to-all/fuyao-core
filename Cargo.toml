@@ -62,3 +62,7 @@ rmcp = { version = "1", features = [
     "transport-streamable-http-client-reqwest",
     "reqwest",
 ] }
+# 日志依赖
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"

@@ -7,6 +7,7 @@
 //! - [`init_engine`] + [`setup`]：分步装配，供需要介入中间过程的场景使用。
 
 mod init;
+mod logging;
 mod mcp;
 mod tools;
 
@@ -19,6 +20,7 @@ use fuyao_mcp::MCPManager;
 use fuyao_session::SessionPlugin;
 
 pub use init::{InitError, init_engine};
+pub use logging::LogGuard;
 
 /// 装配产物：调用方持有，用于管理生命周期
 pub struct AppContext {
@@ -26,6 +28,11 @@ pub struct AppContext {
     pub mcp_manager: Option<Arc<MCPManager>>,
     /// 插件宿主（关闭时调用 dispose_all）
     pub plugin_host: PluginHost,
+    /// 日志 guard：drop 时 flush 文件缓冲，须存活到引擎结束。
+    ///
+    /// `start` 路径下由 `init_engine` 初始化并注入；`init_engine + setup` 分步装配时
+    /// 为空默认值（真正的 guard 在 `init_engine` 返回值里，由调用方自行持有）。
+    pub log_guard: LogGuard,
 }
 
 /// 装配错误
@@ -43,13 +50,14 @@ pub enum SetupError {
 
 /// 一键启动：init_engine → setup，返回可直接使用的 `(Engine, EngineHandle, AppContext)`
 ///
-/// 这是绝大多数应用推荐的入口：一行完成引擎装配 + 工具/MCP/插件注册。
+/// 这是绝大多数应用推荐的入口：一行完成引擎装配 + 工具/MCP/插件注册 + 日志初始化。
 /// 需要在两步之间介入（如动态注册工具）时，改用 [`init_engine`] + [`setup`] 分步装配。
 pub async fn start(
     agent_ctx: fuyao_api::AgentContext,
 ) -> Result<(fuyao_core::Engine, EngineHandle, AppContext), SetupError> {
-    let (engine, handle) = init_engine(agent_ctx)?;
-    let app_ctx = setup(&handle).await?;
+    let (engine, handle, log_guard) = init_engine(agent_ctx)?;
+    let mut app_ctx = setup(&handle).await?;
+    app_ctx.log_guard = log_guard;
     Ok((engine, handle, app_ctx))
 }
 
@@ -89,6 +97,7 @@ pub async fn setup(handle: &EngineHandle) -> Result<AppContext, SetupError> {
     Ok(AppContext {
         mcp_manager,
         plugin_host: host,
+        log_guard: LogGuard::default(),
     })
 }
 

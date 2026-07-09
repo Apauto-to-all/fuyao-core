@@ -1,12 +1,14 @@
 //! 引擎初始化 —— 应用层装配入口
 //!
-//! 封装从 [`AgentContext`] 到可用 `((Engine, EngineHandle))` 的完整初始化流程：
+//! 封装从 [`AgentContext`] 到可用 `((Engine, EngineHandle, LogGuard))` 的完整初始化流程：
 //! 1. 加载 `.env` 环境变量（三层目录）
-//! 2. 加载三层 TOML 配置并注册 Provider/Model 到注册表
-//! 3. 确定 `model_id`（显式指定 > 配置文件 `model` 字段 > 第一个已注册模型）
-//! 4. 创建 [`OpenAIProvider`] 实例（按 `provider_id`）
-//! 5. 验证模型存在于注册表
-//! 6. 创建 [`Engine`]，返回 `((Engine, EngineHandle))`
+//! 2. 加载三层 TOML 配置
+//! 3. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
+//! 4. 注册 Provider/Model 到注册表（带缓存，重复调用幂等）
+//! 5. 确定 `model_id`（显式指定 > 配置文件 `model` 字段 > 第一个已注册模型）
+//! 6. 创建 [`OpenAIProvider`] 实例（按 `provider_id`）
+//! 7. 验证模型存在于注册表
+//! 8. 创建 [`Engine`]，返回 `((Engine, EngineHandle, LogGuard))`
 //!
 //! 典型用法（推荐用 [`crate::start`] 一行启动，自动串联 `init_engine` + `setup`）：
 //! ```ignore
@@ -21,9 +23,10 @@
 //!     },
 //!     ..Default::default()
 //! };
-//! let (engine, handle) = fuyao_app::init_engine(agent_ctx)?;
+//! let (engine, handle, _log_guard) = fuyao_app::init_engine(agent_ctx)?;
 //! ```
 
+use crate::logging::LogGuard;
 use fuyao_api::config::{FuyaoConfig, load_config, load_env, set_config};
 use fuyao_api::{AgentContext, AgentPaths};
 use fuyao_core::{Engine, EngineHandle};
@@ -71,8 +74,11 @@ pub enum InitError {
 /// 初始化引擎 —— 应用层装配入口
 ///
 /// 从 [`AgentContext`] 出发，一气呵成完成：环境变量加载 → 配置注册 →
-/// model_id 确定 → Provider 创建 → 模型校验 → Engine 装配，返回可直接使用的
-/// `((Engine, EngineHandle))`。
+/// 日志初始化 → model_id 确定 → Provider 创建 → 模型校验 → Engine 装配，
+/// 返回可直接使用的 `((Engine, EngineHandle, LogGuard))`。
+///
+/// 返回的 `LogGuard` 须存活到引擎结束（drop 时 flush 文件日志缓冲）；
+/// 经 [`crate::start`] 一键启动时自动注入 `AppContext` 持有。
 ///
 /// # 参数
 /// - `agent_ctx`：Agent 运行时上下文，至少应填充 `agent_paths`（决定三层目录）；
@@ -83,7 +89,7 @@ pub enum InitError {
 /// - [`InitError::ProviderNotFoundWithDetail`]：Provider 创建失败（API Key 缺失等）
 /// - [`InitError::ModelInfoFailed`]：model_id 在注册表中不存在
 /// - [`InitError::ConfigError`]：配置文件加载失败
-pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), InitError> {
+pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle, LogGuard), InitError> {
     let agent_paths = agent_ctx.agent_paths.clone();
 
     // 1. 加载 .env 环境变量
@@ -96,10 +102,18 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), In
         set_config(Arc::new(cfg.clone()));
     }
 
-    // 3. 注册 Provider/Model（带缓存，重复调用幂等）
+    // 3. 初始化日志：配置加载后 subscriber 尽早接管，guard 随返回值传出供 AppContext 持有。
+    //    文件层失败时自动降级为纯 stderr，不阻断启动（日志是辅助设施）。
+    let logging_config = config
+        .as_ref()
+        .map(|c| c.logging.clone())
+        .unwrap_or_default();
+    let log_guard = crate::logging::init_logging(&logging_config, &agent_paths);
+
+    // 4. 注册 Provider/Model（带缓存，重复调用幂等）
     ensure_registered(&agent_paths, config.as_ref())?;
 
-    // 4. 确定 model_id：显式指定 > 配置文件默认 > 第一个已注册模型
+    // 5. 确定 model_id：显式指定 > 配置文件默认 > 第一个已注册模型
     let model_id = agent_ctx
         .model_config
         .model_id
@@ -117,7 +131,7 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), In
     let mut agent_ctx = agent_ctx;
     agent_ctx.model_config.model_id = Some(model_id.clone());
 
-    // 4. 创建 Provider 实例（按 model_id 中 `/` 之前的 provider_id）
+    // 6. 创建 Provider 实例（按 model_id 中 `/` 之前的 provider_id）
     let provider_id = model_id.split('/').next().unwrap_or("");
     let provider = OpenAIProvider::new(provider_id, &agent_paths).ok_or_else(|| {
         let loaded = list_models(&agent_paths);
@@ -127,13 +141,14 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle), In
         }
     })?;
 
-    // 5. 验证模型存在于注册表（防止 provider_id 存在但 model_id 拼写错误）
+    // 7. 验证模型存在于注册表（防止 provider_id 存在但 model_id 拼写错误）
     if get_model(&model_id, &agent_paths).is_none() {
         return Err(InitError::ModelInfoFailed(model_id));
     }
 
-    // 6. 创建 Engine，返回 (Engine, EngineHandle)
-    Ok(Engine::new(Box::new(provider), agent_ctx))
+    // 8. 创建 Engine，返回 (Engine, EngineHandle, LogGuard)
+    let (engine, handle) = Engine::new(Box::new(provider), agent_ctx);
+    Ok((engine, handle, log_guard))
 }
 
 /// 确保指定 `agent_paths` 的 Provider/Model 已注册

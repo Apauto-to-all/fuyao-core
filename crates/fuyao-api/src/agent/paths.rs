@@ -103,6 +103,20 @@ impl AgentPaths {
             .expect("sessions_db_path 计算失败：agent 和 global 均为 None")
     }
 
+    /// 日志目录路径（永远有效）
+    ///
+    /// 选址对齐 `sessions_db_path`：日志随独立 Agent 隔离，与 sessions 同域。
+    /// - 有 agent_id → Agent 层 `{agent_root}/logs/`
+    /// - 无 agent_id → 全局层 `~/.fuyao/logs/`
+    ///
+    /// workspace 层不参与（与 sessions.db 一致）。目录由 `init_logging` 按需创建。
+    pub fn logs_dir(&self) -> PathBuf {
+        match self.agent_root() {
+            Some(root) => root.join("logs"),
+            None => self.fuyao_home.join("logs"),
+        }
+    }
+
     /// Skills 分层路径
     ///
     /// 额外目录（extra_dirs）下的 `skills/` 子目录作为最低优先级来源，
@@ -259,6 +273,28 @@ mod tests {
         let paths = AgentPaths::default();
         let db_path = paths.sessions_db_path();
         assert!(db_path.to_string_lossy().contains("sessions.db"));
+    }
+
+    #[test]
+    fn logs_dir_without_agent_id_uses_global_layer() {
+        let paths = AgentPaths {
+            fuyao_home: PathBuf::from("/tmp/home"),
+            ..Default::default()
+        };
+        assert_eq!(paths.logs_dir(), paths.fuyao_home.join("logs"));
+    }
+
+    #[test]
+    fn logs_dir_with_agent_id_uses_agent_root() {
+        let paths = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            fuyao_home: PathBuf::from("/tmp/home"),
+            ..Default::default()
+        };
+        let expected = paths.agent_root().unwrap().join("logs");
+        assert_eq!(paths.logs_dir(), expected);
+        // 落在 agent_root 下而非全局 home 根
+        assert!(paths.logs_dir().starts_with(paths.agent_root().unwrap()));
     }
 
     #[test]

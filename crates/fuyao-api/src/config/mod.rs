@@ -2,7 +2,7 @@
 //!
 //! 本模块是整个配置系统的唯一实现入口，集中管理：
 //! - **类型定义**：所有 `*Config` 子段（按域分文件：`llm`、`guard`、`session`、`mcp`、
-//!   `tools`、`engine`）
+//!   `tools`、`engine`、`logging`）
 //! - **聚合结构**：`FuyaoConfig`，对应 `fuyao.toml` 顶层
 //! - **加载逻辑**：三层合并加载（`loader`）、Provider 容错解析（`providers`）、
 //!   环境变量加载（`env`）
@@ -26,6 +26,7 @@ pub mod guard;
 pub mod hooks;
 pub mod llm;
 pub mod loader;
+pub mod logging;
 pub mod mcp;
 pub mod plugins;
 pub mod providers;
@@ -45,6 +46,7 @@ pub use engine::EngineConfig;
 pub use guard::{GuardConfig, LoopGuardConfig};
 pub use hooks::HooksConfig;
 pub use llm::{LlmConfig, RetryConfig};
+pub use logging::{LogRotation, LoggingConfig};
 pub use mcp::McpGlobalConfig;
 pub use plugins::PluginsConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig};
@@ -99,6 +101,9 @@ pub struct FuyaoConfig {
 
     /// Plugins 配置（插件开关）
     pub plugins: PluginsConfig,
+
+    /// 日志（级别 / stderr 开关 / 轮转），由 `fuyao-app::init_logging` 消费
+    pub logging: LoggingConfig,
 }
 
 // ==================== 全局只读句柄 ====================
@@ -149,6 +154,9 @@ mod tests {
         assert_eq!(c.engine.output_channel_capacity, 256);
         assert_eq!(c.hooks.timeout_secs, 5);
         assert!(c.plugins.enabled.is_empty());
+        assert_eq!(c.logging.level, "info");
+        assert!(c.logging.console);
+        assert_eq!(c.logging.rotation, LogRotation::Daily);
     }
 
     /// get_config 未 set 时返回 default 不 panic。
@@ -161,5 +169,6 @@ mod tests {
         assert_eq!(c.llm.request_timeout_secs, 300);
         assert_eq!(c.engine.output_channel_capacity, 256);
         assert!(c.providers.is_empty());
+        assert_eq!(c.logging.level, "info");
     }
 }
