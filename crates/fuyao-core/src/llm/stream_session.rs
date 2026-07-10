@@ -203,12 +203,14 @@ pub async fn run_stream_session(
         break;
     }
 
-    // 流结束后，从 decoder 取出有效的工具调用并推送 ToolCall 事件
-    // TODO: ToolCall 事件与 AssistantMessage 中的 tool_calls 存在部分冲突：
-    // output_intercept 修改 ToolCall 事件后，AssistantMessage 中的 tool_calls 不会同步更新，
-    // 引擎实际执行的工具调用仍使用原始数据。后续需重构解决此冲突。
-    let tool_calls = decoder.take_tool_calls();
-    for tc in &tool_calls {
+    // 流结束后，从 decoder 取出工具调用，逐个经拦截管道生成"最终消息"
+    //
+    // 工具调用消息经过 output_intercept 拦截后，拦截结果（可能被插件修改参数）
+    // 作为"最终消息"统一用于下游消费：CLI 显示、AssistantMessage 存储、工具执行。
+    // 被 Block 的工具调用跳过（不执行、不存储），保证三者数据一致。
+    let raw_tool_calls = decoder.take_tool_calls();
+    let mut effective_tool_calls = Vec::with_capacity(raw_tool_calls.len());
+    for tc in &raw_tool_calls {
         let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
             Ok(v) => v,
             Err(_) => {
@@ -226,8 +228,23 @@ pub async fn run_stream_session(
             },
         });
 
-        // 统一事件发送
-        crate::dispatch::dispatch(event, None, emitter).await;
+        // 拦截 → 捕获最终消息 → 发送（CLI 渲染 + 观察钩子）
+        match crate::dispatch::dispatch_intercept(event, None, emitter).await {
+            Some(intercepted) => {
+                // 从拦截后的最终消息提取工具调用数据，供执行与存储使用
+                if let OutputEvent::ToolCall(msg) = &intercepted {
+                    effective_tool_calls.push(ProviderToolCallData {
+                        id: msg.payload.tool_call_id.clone(),
+                        name: msg.payload.tool_name.clone(),
+                        arguments: msg.payload.tool_args.to_string(),
+                    });
+                }
+                crate::dispatch::deliver(emitter, intercepted).await;
+            }
+            None => {
+                // 被 Block：跳过此工具调用（不执行、不存储）
+            }
+        }
     }
 
     let usage = decoder.usage().clone();
@@ -250,7 +267,221 @@ pub async fn run_stream_session(
     Ok(StreamResult {
         text: accumulated_text,
         reasoning: accumulated_reasoning,
-        tool_calls,
+        tool_calls: effective_tool_calls,
         usage,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use futures_util::stream;
+    use fuyao_api::AgentContext;
+    use fuyao_hooks::{HooksRegistry, InterceptResult, SharedHooks};
+    use fuyao_provider::{BoxStream, ChatResponse, FinishReason, Provider, StreamEvent};
+    use tokio::sync::mpsc;
+
+    /// Mock Provider：返回预设的 StreamEvent 序列
+    struct MockProvider {
+        events: Vec<StreamEvent>,
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn stream_chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+            _options: StreamOptions,
+        ) -> BoxStream<Result<StreamEvent, StreamError>> {
+            let events: Vec<Result<StreamEvent, StreamError>> =
+                self.events.clone().into_iter().map(Ok).collect();
+            Box::pin(stream::iter(events))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+        ) -> Result<ChatResponse, StreamError> {
+            Err(StreamError::ApiError("mock: chat 不支持".into()))
+        }
+    }
+
+    /// 构造含单个工具调用（git status）的事件序列
+    fn tool_call_events() -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ToolCallChunk {
+                index: 0,
+                id: Some("tc1".into()),
+                name: Some("git".into()),
+                args_delta: Some(r#"{"command":"status"}"#.into()),
+            },
+            StreamEvent::Done {
+                usage: StreamUsage::default(),
+                finish_reason: FinishReason::ToolCalls,
+            },
+        ]
+    }
+
+    /// 构造 EventEmitter + 后台 drain（防止 channel 满阻塞 send）
+    fn make_emitter(hooks: SharedHooks) -> EventEmitter {
+        let (tx, mut rx) = mpsc::channel(128);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        EventEmitter::new(tx, hooks)
+    }
+
+    /// 空 hooks（无拦截钩子）
+    fn empty_hooks() -> SharedHooks {
+        Arc::new(tokio::sync::Mutex::new(HooksRegistry::new()))
+    }
+
+    /// 无拦截钩子：StreamResult 保持 LLM 原始工具调用
+    #[tokio::test]
+    async fn no_intercept_passes_original() {
+        let provider = MockProvider {
+            events: tool_call_events(),
+        };
+        let agent_ctx = Arc::new(std::sync::Mutex::new(AgentContext::default()));
+        let emitter = make_emitter(empty_hooks());
+
+        let result = run_stream_session(
+            &provider,
+            ChatRequest::default(),
+            &agent_ctx,
+            None,
+            &emitter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "git");
+        assert_eq!(result.tool_calls[0].id, "tc1");
+    }
+
+    /// 拦截修改工具名：StreamResult 使用修改后的值
+    #[tokio::test]
+    async fn intercept_modifies_tool_name() {
+        let hooks = empty_hooks();
+        {
+            let mut h = hooks.lock().await;
+            h.register_output_intercept(
+                0,
+                Arc::new(|event: &OutputEvent| {
+                    if let OutputEvent::ToolCall(msg) = event {
+                        let mut modified = msg.clone();
+                        modified.payload.tool_name = "rtk git".to_string();
+                        InterceptResult::Pass(OutputEvent::ToolCall(modified))
+                    } else {
+                        InterceptResult::Pass(event.clone())
+                    }
+                }),
+            );
+        }
+
+        let provider = MockProvider {
+            events: tool_call_events(),
+        };
+        let agent_ctx = Arc::new(std::sync::Mutex::new(AgentContext::default()));
+        let emitter = make_emitter(hooks);
+
+        let result = run_stream_session(
+            &provider,
+            ChatRequest::default(),
+            &agent_ctx,
+            None,
+            &emitter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "rtk git");
+    }
+
+    /// 拦截阻止工具调用：StreamResult 中不包含被阻止的调用
+    #[tokio::test]
+    async fn intercept_blocks_tool_call() {
+        let hooks = empty_hooks();
+        {
+            let mut h = hooks.lock().await;
+            h.register_output_intercept(
+                0,
+                Arc::new(|event: &OutputEvent| {
+                    if let OutputEvent::ToolCall(_) = event {
+                        InterceptResult::Block("测试阻止".to_string())
+                    } else {
+                        InterceptResult::Pass(event.clone())
+                    }
+                }),
+            );
+        }
+
+        let provider = MockProvider {
+            events: tool_call_events(),
+        };
+        let agent_ctx = Arc::new(std::sync::Mutex::new(AgentContext::default()));
+        let emitter = make_emitter(hooks);
+
+        let result = run_stream_session(
+            &provider,
+            ChatRequest::default(),
+            &agent_ctx,
+            None,
+            &emitter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.tool_calls.is_empty());
+    }
+
+    /// 拦截修改工具参数：StreamResult 使用修改后的参数
+    #[tokio::test]
+    async fn intercept_modifies_tool_args() {
+        let hooks = empty_hooks();
+        {
+            let mut h = hooks.lock().await;
+            h.register_output_intercept(
+                0,
+                Arc::new(|event: &OutputEvent| {
+                    if let OutputEvent::ToolCall(msg) = event {
+                        let mut modified = msg.clone();
+                        modified.payload.tool_args =
+                            serde_json::json!({"command": "log --oneline"});
+                        InterceptResult::Pass(OutputEvent::ToolCall(modified))
+                    } else {
+                        InterceptResult::Pass(event.clone())
+                    }
+                }),
+            );
+        }
+
+        let provider = MockProvider {
+            events: tool_call_events(),
+        };
+        let agent_ctx = Arc::new(std::sync::Mutex::new(AgentContext::default()));
+        let emitter = make_emitter(hooks);
+
+        let result = run_stream_session(
+            &provider,
+            ChatRequest::default(),
+            &agent_ctx,
+            None,
+            &emitter,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["command"], "log --oneline");
+    }
 }
