@@ -59,10 +59,13 @@ impl SessionHooksState {
 
     /// 获取初始 session_id（从 agent_ctx 读取）
     fn initial_session_id(&self) -> Option<String> {
-        self.agent_ctx
-            .lock()
-            .ok()
-            .and_then(|ac| ac.session_id.clone())
+        match self.agent_ctx.lock() {
+            Ok(ac) => ac.session_id.clone(),
+            Err(_) => {
+                tracing::warn!("Agent 上下文锁中毒，跳过 session_id 读取");
+                None
+            }
+        }
     }
 
     /// 统一更新 session_id，同步到 AgentContext 并发送插件通知
@@ -70,7 +73,10 @@ impl SessionHooksState {
         let old_id = {
             let mut agent_ctx = match self.agent_ctx.lock() {
                 Ok(ctx) => ctx,
-                Err(_) => return,
+                Err(_) => {
+                    tracing::warn!("Agent 上下文锁中毒，跳过 session_id 同步");
+                    return;
+                }
             };
             let old = agent_ctx.session_id.clone();
             agent_ctx.session_id = Some(new_id.clone());
@@ -132,7 +138,7 @@ impl SessionHooksState {
     /// 注入压缩引导消息到引擎 Guide 队列
     fn inject_compression_guide(&mut self) {
         if let Some(ref e) = self.emitter {
-            let _ = e.sender().try_send(InputEvent::User(UserMessage {
+            let send_result = e.sender().try_send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
                 payload: UserPayload {
                     content: COMPRESSION_SYSTEM_PROMPT.to_string(),
@@ -142,7 +148,11 @@ impl SessionHooksState {
                     }),
                 },
             }));
-            self.compression_in_progress = true;
+            if send_result.is_err() {
+                tracing::warn!("压缩引导消息入队失败");
+            } else {
+                self.compression_in_progress = true;
+            }
         }
     }
 
@@ -238,7 +248,9 @@ impl SessionHooksState {
                     "压缩完成，已切换到新会话"
                 );
                 self.sync_session_id(new_id.clone());
-                let _ = ctx.switch_session(new_id).await;
+                if let Err(e) = ctx.switch_session(new_id).await {
+                    tracing::warn!(cause = %e, "压缩后切换会话上下文失败");
+                }
             }
             Err(e) => {
                 tracing::warn!(session_id = %session_id, cause = %e, "压缩分裂失败，保留旧会话继续对话");

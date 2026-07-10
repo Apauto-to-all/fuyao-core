@@ -202,7 +202,9 @@ impl Engine {
                             },
                         }),
                         Some(Box::new(move || {
-                            let _ = tx.try_send(TurnCommand::Interrupt(data));
+                            if let Err(e) = tx.try_send(TurnCommand::Interrupt(data)) {
+                                tracing::warn!(cause = ?e, "中断命令投递失败");
+                            }
                         })),
                         &self.emitter,
                     )
@@ -227,15 +229,19 @@ impl Engine {
                     .await;
                 }
                 InputEvent::Shutdown(_) => {
-                    let _ = self.tx_command.send(TurnCommand::Stop).await;
+                    if let Err(e) = self.tx_command.send(TurnCommand::Stop).await {
+                        tracing::warn!(cause = %e, "停止命令投递失败");
+                    }
                     break;
                 }
             }
         }
 
         // 等待 TurnExecutor 退出
-        if let Some(handle) = self.turn_handle.take() {
-            let _ = handle.await;
+        if let Some(handle) = self.turn_handle.take()
+            && let Err(join_err) = handle.await
+        {
+            tracing::error!(cause = %join_err, is_panic = join_err.is_panic(), "TurnExecutor 任务异常退出");
         }
     }
 }

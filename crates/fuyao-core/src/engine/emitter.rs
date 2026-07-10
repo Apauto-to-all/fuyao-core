@@ -26,7 +26,9 @@ impl EventEmitter {
 
     /// 发送事件到 CLI 渲染通道
     pub async fn send(&self, event: OutputEvent) {
-        let _ = self.tx_event.send(event).await;
+        if self.tx_event.send(event).await.is_err() {
+            tracing::warn!("输出事件发送失败，输出通道已关闭");
+        }
     }
 
     /// 获取 hooks 引用（供 dispatch 管道和 Engine 使用）

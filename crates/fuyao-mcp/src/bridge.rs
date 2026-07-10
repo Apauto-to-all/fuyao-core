@@ -396,7 +396,10 @@ async fn wait_and_retry(
                 None
             }
         }
-        Err(_) => None,
+        Err(e) => {
+            tracing::warn!(tool = %tool_name, cause = %e, "MCP 恢复后重试仍失败");
+            None
+        }
     }
 }
 

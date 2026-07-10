@@ -114,9 +114,6 @@ impl MCPConnection {
         let mut shutdown_rx = self.shutdown_rx.clone();
         let client = self.client.clone();
 
-        let error_result: Arc<Mutex<Option<ConnectionError>>> = Arc::new(Mutex::new(None));
-        let error_clone = error_result.clone();
-
         let handle = tokio::spawn(async move {
             let mcp_cfg = fuyao_api::get_config();
             let mcp = &mcp_cfg.mcp;
@@ -155,8 +152,11 @@ impl MCPConnection {
                             backoff = (backoff * 2).min(mcp.max_backoff_secs);
 
                             if *shutdown_rx.borrow() {
-                                let mut err = error_clone.lock().await;
-                                *err = Some(e);
+                                tracing::warn!(
+                                    server = %server_name,
+                                    cause = %e,
+                                    "MCP server 连接因 shutdown 中止"
+                                );
                                 break;
                             }
                             continue;

@@ -114,12 +114,13 @@ impl MCPManager {
     ) -> Result<(), MCPManagerError> {
         let mut conn = MCPConnection::new(server_name.to_string(), config.clone());
 
-        conn.start()
-            .await
-            .map_err(|e| MCPManagerError::ServerStartFailed {
+        if let Err(e) = conn.start().await {
+            tracing::error!(server = %server_name, cause = %e, "MCP server 启动失败");
+            return Err(MCPManagerError::ServerStartFailed {
                 server: server_name.to_string(),
                 reason: e.to_string(),
-            })?;
+            });
+        }
 
         // 发现工具并注册
         let tools = conn.tools.clone();
@@ -269,10 +270,18 @@ impl MCPManager {
             .as_ref()
             .ok_or_else(|| MCPManagerError::ServerNotConnected(server_name.clone()))?;
 
-        let result = conn
-            .call_tool(&original_name, arguments)
-            .await
-            .map_err(|e| MCPManagerError::CallFailed(e.to_string()))?;
+        let result = match conn.call_tool(&original_name, arguments).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    server = %server_name,
+                    tool = %original_name,
+                    cause = %e,
+                    "MCP 工具调用失败"
+                );
+                return Err(MCPManagerError::CallFailed(e.to_string()));
+            }
+        };
 
         // 处理结果
         if result.is_error.unwrap_or(false) {
@@ -282,6 +291,12 @@ impl MCPManager {
                 .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
                 .collect::<Vec<&str>>()
                 .join("");
+            tracing::warn!(
+                server = %server_name,
+                tool = %original_name,
+                cause = %error_text,
+                "MCP 工具调用失败"
+            );
             return Err(MCPManagerError::CallFailed(security::sanitize_error(
                 &error_text,
             )));

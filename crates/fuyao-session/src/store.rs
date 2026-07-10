@@ -75,7 +75,13 @@ struct MessageRow {
 
 impl From<MessageRow> for Message {
     fn from(r: MessageRow) -> Self {
-        let tool_calls = r.tool_calls.and_then(|s| serde_json::from_str(&s).ok());
+        let tool_calls = r.tool_calls.and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(cause = %e, "tool_calls 反序列化失败，已丢弃");
+                None
+            }
+        });
         Message {
             id: r.id,
             session_id: r.session_id,
@@ -141,6 +147,7 @@ impl SQLiteStore {
                 .await?;
         }
 
+        tracing::info!(db_path = %db_path.display(), "会话存储初始化完成");
         Ok(Self { db_path, pool })
     }
 

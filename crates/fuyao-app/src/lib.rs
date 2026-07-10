@@ -59,7 +59,10 @@ pub async fn start(
         tracing::error!(cause = %e, "引擎初始化失败");
         e
     })?;
-    let mut app_ctx = setup(&handle).await?;
+    let mut app_ctx = setup(&handle).await.map_err(|e| {
+        tracing::error!(cause = %e, "引擎装配失败 (setup)");
+        e
+    })?;
     app_ctx.log_guard = log_guard;
     Ok((engine, handle, app_ctx))
 }

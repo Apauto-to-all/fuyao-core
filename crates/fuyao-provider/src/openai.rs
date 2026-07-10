@@ -41,16 +41,28 @@ impl OpenAIProvider {
     /// 从注册表解析 api_key 和 base_url，构建 reqwest Client。
     /// HTTP 超时从全局配置 `get_config().llm` 读取。
     pub fn new(provider_id: &str, agent_paths: &AgentPaths) -> Option<Self> {
-        let api_key = crate::resolver::resolve_api_key(provider_id, agent_paths)?;
+        let api_key = match crate::resolver::resolve_api_key(provider_id, agent_paths) {
+            Some(key) => key,
+            None => {
+                tracing::warn!(provider = %provider_id, "Provider 创建失败：未解析到 API Key");
+                return None;
+            }
+        };
         let base_url = crate::resolver::get_base_url(provider_id, agent_paths)
             .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
 
         let llm = fuyao_api::get_config().llm.clone();
-        let client = Client::builder()
+        let client = match Client::builder()
             .timeout(Duration::from_secs(llm.request_timeout_secs))
             .connect_timeout(Duration::from_secs(llm.connect_timeout_secs))
             .build()
-            .ok()?;
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(provider = %provider_id, cause = %e, "Provider 创建失败：HTTP 客户端构建失败");
+                return None;
+            }
+        };
 
         Some(Self {
             client,

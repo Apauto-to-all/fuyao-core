@@ -32,7 +32,7 @@ pub struct EngineHandle {
 impl EngineHandle {
     /// 发送用户消息
     pub async fn send_message(&self, content: String) {
-        let _ = self
+        let result = self
             .tx_input
             .send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
@@ -43,6 +43,9 @@ impl EngineHandle {
                 },
             }))
             .await;
+        if result.is_err() {
+            tracing::warn!("用户消息发送失败，引擎输入通道已关闭");
+        }
     }
 
     /// 中断当前轮次（通过输入通道发送 Interrupt 事件）
@@ -50,7 +53,7 @@ impl EngineHandle {
     /// 唯一入口原则：所有中断都走 InputEvent::Interrupt，
     /// InputDispatcher 收到后转发给 TurnExecutor。
     pub fn cancel(&self) {
-        let _ = self
+        let result = self
             .tx_input
             .try_send(InputEvent::Interrupt(InterruptMessage {
                 base: EventBase::default(),
@@ -59,16 +62,22 @@ impl EngineHandle {
                     source: InterruptSource::User,
                 },
             }));
+        if result.is_err() {
+            tracing::warn!("中断请求发送失败");
+        }
     }
 
     /// 关闭引擎
     pub async fn shutdown(&self) {
-        let _ = self
+        let result = self
             .tx_input
             .send(InputEvent::Shutdown(ShutdownMessage {
                 base: EventBase::default(),
             }))
             .await;
+        if result.is_err() {
+            tracing::warn!("关闭请求发送失败");
+        }
     }
 
     /// 接收下一个事件
@@ -146,7 +155,9 @@ impl EngineHandle {
 
     /// 发送插件事件
     pub fn emit_plugin_event(&self, event: OutputEvent) {
-        let _ = self.tx_event.try_send(event);
+        if self.tx_event.try_send(event).is_err() {
+            tracing::warn!("插件事件发送失败");
+        }
     }
 
     /// 非阻塞尝试接收事件

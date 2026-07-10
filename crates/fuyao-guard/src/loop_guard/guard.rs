@@ -96,7 +96,7 @@ impl LoopGuardState {
     /// 引擎收到后注入对话历史，供下次 LLM 调用时 AI 看到引导消息。
     fn send_inject_message(&self, content: String) {
         if let Some(ref e) = self.emitter {
-            let _ = e.sender().try_send(InputEvent::User(UserMessage {
+            let result = e.sender().try_send(InputEvent::User(UserMessage {
                 base: EventBase::default(),
                 payload: UserPayload {
                     content,
@@ -106,6 +106,9 @@ impl LoopGuardState {
                     }),
                 },
             }));
+            if result.is_err() {
+                tracing::warn!("循环检测引导消息投递失败");
+            }
         }
     }
 
@@ -156,6 +159,11 @@ impl LoopGuardState {
                     self.send_interrupt(r.message);
                 }
                 LoopSeverity::Interrupt => {
+                    tracing::info!(
+                        interrupt_count = self.interrupt_count,
+                        message = %r.message,
+                        "循环检测触发中断 (Interrupt)"
+                    );
                     self.interrupt_count += 1;
                     self.emit_plugin("loop_interrupt", &r.message);
                     self.pending_inject = r.message.clone();
@@ -192,6 +200,11 @@ impl LoopGuardState {
                     self.send_interrupt(r.message);
                 }
                 LoopSeverity::Interrupt => {
+                    tracing::info!(
+                        interrupt_count = self.interrupt_count,
+                        message = %r.message,
+                        "循环检测触发中断 (Interrupt)"
+                    );
                     self.interrupt_count += 1;
                     self.emit_plugin("loop_interrupt", &r.message);
                     self.pending_inject = r.message.clone();

@@ -117,8 +117,10 @@ impl SessionContext {
     /// 下次 ensure_session() 时会创建新 session。
     pub async fn reset_session(&mut self) -> Result<(), crate::SessionError> {
         // 结束当前会话
-        if let (Some(current_id), Some(mgr)) = (&self.session_id, &self.session_manager) {
-            let _ = mgr.end_session(current_id, "user_switch").await;
+        if let (Some(current_id), Some(mgr)) = (&self.session_id, &self.session_manager)
+            && let Err(e) = mgr.end_session(current_id, "user_switch").await
+        {
+            tracing::warn!(session_id = %current_id, cause = %e, "会话结束失败");
         }
 
         // 清空状态
@@ -316,8 +318,10 @@ impl SessionContext {
             .ok_or_else(|| crate::SessionError::InvalidState("SessionManager 未初始化".into()))?;
 
         // 结束当前会话
-        if let Some(ref current_id) = self.session_id {
-            let _ = mgr.end_session(current_id, "user_switch").await;
+        if let Some(ref current_id) = self.session_id
+            && let Err(e) = mgr.end_session(current_id, "user_switch").await
+        {
+            tracing::warn!(session_id = %current_id, cause = %e, "会话结束失败");
         }
 
         // 构建系统提示词
