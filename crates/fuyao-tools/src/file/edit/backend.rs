@@ -519,7 +519,11 @@ fn generate_unified_diff(old: &str, new: &str, from_file: &str, to_file: &str) -
 
 /// 检查编辑操作的物理安全（敏感路径检查）
 fn check_edit_safety(path: &str) -> Option<String> {
-    check_sensitive_path(path, "修改")
+    let err = check_sensitive_path(path, "修改");
+    if let Some(ref e) = err {
+        tracing::warn!(path = %path, action = "修改", reason = %e, "拒绝操作敏感路径");
+    }
+    err
 }
 
 #[cfg(test)]

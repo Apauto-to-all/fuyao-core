@@ -66,6 +66,7 @@ pub async fn webfetch_handler(args: Value) -> String {
     // 2. 安全检查
     let safety_result = check_url_safety(&url).await;
     if !safety_result.safe {
+        tracing::warn!(url = %url, "阻断 SSRF 危险 URL");
         return common::tool_error(
             safety_result
                 .message

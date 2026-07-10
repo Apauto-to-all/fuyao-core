@@ -50,6 +50,7 @@ pub fn write_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
     let resolved_path_obj = resolve_path(path, workspace.as_deref());
 
     if let Some(err) = check_sensitive_path(path, "写入") {
+        tracing::warn!(path = %path, action = "写入", reason = %err, "拒绝操作敏感路径");
         let err_json = serde_json::json!({
             "error": err,
             "path": path,

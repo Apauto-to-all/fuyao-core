@@ -55,7 +55,10 @@ pub enum SetupError {
 pub async fn start(
     agent_ctx: fuyao_api::AgentContext,
 ) -> Result<(fuyao_core::Engine, EngineHandle, AppContext), SetupError> {
-    let (engine, handle, log_guard) = init_engine(agent_ctx)?;
+    let (engine, handle, log_guard) = init_engine(agent_ctx).map_err(|e| {
+        tracing::error!(cause = %e, "引擎初始化失败");
+        e
+    })?;
     let mut app_ctx = setup(&handle).await?;
     app_ctx.log_guard = log_guard;
     Ok((engine, handle, app_ctx))
@@ -71,6 +74,7 @@ pub async fn start(
 pub async fn setup(handle: &EngineHandle) -> Result<AppContext, SetupError> {
     // 1. 注册内置工具
     tools::register_builtin_tools(handle);
+    tracing::info!(tools = handle.tools_schema().len(), "内置工具注册完成");
 
     // 2. 注册 MCP 工具
     let mcp_manager = mcp::register_mcp_tools(handle).await;
@@ -93,6 +97,7 @@ pub async fn setup(handle: &EngineHandle) -> Result<AppContext, SetupError> {
 
     // 4. 统一装配（重名插件返回 Err 使 setup 失败）
     host.install(&handle.hooks()).await?;
+    tracing::info!(plugins = ?host.list(), "插件装配完成");
 
     Ok(AppContext {
         mcp_manager,

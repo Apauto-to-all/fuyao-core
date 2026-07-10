@@ -77,13 +77,16 @@ impl LoopGuardState {
     /// 通过 tx_send 发送 InputEvent::Interrupt，由引擎主循环统一处理。
     fn send_interrupt(&self, reason: String) {
         if let Some(ref e) = self.emitter {
-            let _ = e.sender().try_send(InputEvent::Interrupt(InterruptMessage {
+            let result = e.sender().try_send(InputEvent::Interrupt(InterruptMessage {
                 base: EventBase::default(),
                 payload: InterruptPayload {
                     reason,
                     source: InterruptSource::Hook,
                 },
             }));
+            if result.is_err() {
+                tracing::warn!("循环检测中断消息投递失败");
+            }
         }
     }
 
@@ -142,6 +145,11 @@ impl LoopGuardState {
             self.pending_severity = Some(r.severity);
             match r.severity {
                 LoopSeverity::Abort => {
+                    tracing::warn!(
+                        interrupt_count = self.interrupt_count,
+                        message = %r.message,
+                        "循环检测触发终止 (Abort)"
+                    );
                     self.pending_inject = r.message.clone();
                     self.emit_plugin("loop_abort", &r.message);
                     self.aborted = true;
@@ -173,6 +181,11 @@ impl LoopGuardState {
             self.pending_severity = Some(r.severity);
             match r.severity {
                 LoopSeverity::Abort => {
+                    tracing::warn!(
+                        interrupt_count = self.interrupt_count,
+                        message = %r.message,
+                        "循环检测触发终止 (Abort)"
+                    );
                     self.pending_inject = r.message.clone();
                     self.emit_plugin("loop_abort", &r.message);
                     self.aborted = true;

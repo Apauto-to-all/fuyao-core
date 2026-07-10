@@ -26,6 +26,7 @@ pub(crate) async fn bash_impl(args: Value, ctx: &ToolCallContext) -> String {
     // 2. 安全检查
     let security_result = check_command_safety(&raw_command);
     if security_result.blocked {
+        tracing::warn!(command = %raw_command, reason = %security_result.reason, "阻止执行危险命令");
         return crate::common::tool_error(&security_result.reason);
     }
 
