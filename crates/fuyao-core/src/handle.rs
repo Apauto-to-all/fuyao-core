@@ -180,7 +180,7 @@ impl EngineHandle {
         }
 
         let guide = {
-            let q = self.guide_queue.lock().expect("引导队列锁异常");
+            let q = self.guide_queue.lock().unwrap_or_else(|e| e.into_inner());
             q.iter()
                 .map(|q| QueueSnapshotItem {
                     id: q.message.base.id.clone(),
@@ -190,7 +190,7 @@ impl EngineHandle {
                 .collect::<Vec<_>>()
         };
         let pending = {
-            let q = self.pending_queue.lock().expect("排队队列锁异常");
+            let q = self.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
             q.iter()
                 .map(|q| QueueSnapshotItem {
                     id: q.message.base.id.clone(),

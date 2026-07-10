@@ -62,7 +62,7 @@ pub async fn run_stream_session(
     'stream: loop {
         // 一次锁取全 model_config（AgentContext 是 Arc<Mutex>，禁止重复加锁）
         let (current_model_id, thinking_type, reasoning_effort) = {
-            let g = agent_ctx.lock().expect("Agent 上下文锁异常");
+            let g = agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
             (
                 g.model_config
                     .model_id
@@ -110,7 +110,7 @@ pub async fn run_stream_session(
 
                     // 同步共享累积器（供中断时读取部分结果）
                     if let Some(acc) = &accumulator {
-                        let mut guard = acc.lock().expect("流式累积器锁异常");
+                        let mut guard = acc.lock().unwrap_or_else(|e| e.into_inner());
                         guard.text = accumulated_text.clone();
                         guard.reasoning = accumulated_reasoning.clone();
                         guard.tool_calls = decoder.peek_tool_calls();
@@ -165,12 +165,13 @@ pub async fn run_stream_session(
                         LlmErrorAction::Retry => {
                             // 标记退避阶段（中断时区分场景）
                             if let Some(acc) = &accumulator {
-                                acc.lock().expect("流式累积器锁异常").phase = StreamPhase::Backoff;
+                                acc.lock().unwrap_or_else(|e| e.into_inner()).phase =
+                                    StreamPhase::Backoff;
                             }
                             tokio::time::sleep(backoff).await;
                             // 恢复流式阶段
                             if let Some(acc) = &accumulator {
-                                acc.lock().expect("流式累积器锁异常").phase =
+                                acc.lock().unwrap_or_else(|e| e.into_inner()).phase =
                                     StreamPhase::Streaming;
                             }
                             continue 'stream;
@@ -249,7 +250,7 @@ pub async fn run_stream_session(
 
     let usage = decoder.usage().clone();
     let model_id = {
-        let g = agent_ctx.lock().expect("Agent 上下文锁异常");
+        let g = agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
         g.model_config
             .model_id
             .clone()

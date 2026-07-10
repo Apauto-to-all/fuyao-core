@@ -40,7 +40,7 @@ impl SessionHooksState {
     fn new(agent_ctx: SharedAgentCtx, session_ctx: Arc<Mutex<SessionContext>>) -> Self {
         let mut tracker = CompressionTracker::new();
         {
-            let ctx = agent_ctx.lock().expect("Agent 上下文锁异常");
+            let ctx = agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
             tracker.set_agent_paths(ctx.agent_paths.clone());
         }
         Self {
@@ -172,7 +172,7 @@ impl SessionHooksState {
         };
 
         let (agent_paths, agent_config) = {
-            let agent_ctx = self.agent_ctx.lock().expect("Agent 上下文锁异常");
+            let agent_ctx = self.agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
             (
                 agent_ctx.agent_paths.clone(),
                 agent_ctx.agent_config.clone(),
@@ -280,7 +280,7 @@ impl SessionPlugin {
     /// - `agent_ctx`: Agent 运行上下文（同步 session_id / 读 model_id / 读 agent_config）
     pub fn new(agent_paths: AgentPaths, agent_ctx: SharedAgentCtx) -> Self {
         let agent_config = {
-            let ctx = agent_ctx.lock().expect("Agent 上下文锁异常");
+            let ctx = agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
             ctx.agent_config.clone()
         };
         let session_ctx = Arc::new(Mutex::new(SessionContext::new(agent_paths, agent_config)));
@@ -370,7 +370,7 @@ impl Plugin for SessionPlugin {
                         let prompt_tokens = data.payload.prompt_tokens as usize;
                         // 从 agent_ctx 读取当前运行时 model_id + session_id（一次锁取）
                         let (model_id, session_id) = {
-                            let g = guard.agent_ctx.lock().expect("Agent 上下文锁异常");
+                            let g = guard.agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
                             (g.model_config.model_id.clone(), g.session_id.clone())
                         };
                         let threshold = fuyao_api::get_config().session.compression.threshold;

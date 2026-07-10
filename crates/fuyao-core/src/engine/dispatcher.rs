@@ -111,7 +111,7 @@ impl Engine {
 
     /// 注册工具
     pub fn register_tool(&self, name: String, schema: serde_json::Value, handler: ToolFn) {
-        let mut tools = self.tools.lock().expect("工具注册表锁异常");
+        let mut tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
         tools.0.insert(name, handler);
         tools.1.push(schema);
     }
@@ -176,8 +176,16 @@ impl Engine {
                     self.queue_notify.notify_one();
 
                     // ④ 通知 UI 队列长度变化（入队事件，复用消息 base.id 便于 UI 配对）
-                    let guide_count = self.guide_queue.lock().expect("引导队列锁异常").len();
-                    let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
+                    let guide_count = self
+                        .guide_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    let pending_count = self
+                        .pending_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
                     let _ = self
                         .emitter
                         .send(OutputEvent::QueueUpdate(output::QueueUpdateMessage {
@@ -321,7 +329,7 @@ mod tests {
 
         // 通过 EngineHandle 的公有接口验证工具注册结果
         let tools = handle.tools_shared();
-        let guard = tools.lock().expect("工具注册表锁异常");
+        let guard = tools.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(guard.0.len(), 1);
         assert_eq!(guard.1.len(), 1);
     }

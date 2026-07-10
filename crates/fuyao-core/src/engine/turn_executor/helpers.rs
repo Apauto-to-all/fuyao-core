@@ -62,10 +62,14 @@ impl TurnExecutor {
         let (tools_handlers, tools_schema) = if skip_tools {
             (HashMap::new(), Vec::new())
         } else {
-            let tools = self.tools.lock().expect("工具注册表锁异常");
+            let tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
             (tools.0.clone(), tools.1.clone())
         };
-        let agent_ctx = self.agent_ctx.lock().expect("Agent 上下文锁异常").clone();
+        let agent_ctx = self
+            .agent_ctx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         (request, tools_handlers, tools_schema, agent_ctx)
     }
@@ -91,13 +95,25 @@ impl TurnExecutor {
     /// 用于 ReAct 循环中"队列有新消息"时主动消费，避免消息卡在队列导致死循环。
     /// 返回 true 表示消费到消息（已 deliver），false 表示队列空。
     pub(super) async fn consume_next_message(&self) -> bool {
-        let next = self.guide_queue.lock().expect("引导队列锁异常").pop_front();
+        let next = self
+            .guide_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
         if let Some(queued) = next {
             let msg_base = queued.message.base.clone();
             crate::dispatch::deliver(&self.emitter, OutputEvent::User(queued.message)).await;
             // 通知 UI 队列长度变化（消费事件，复用 base.id）
-            let guide_count = self.guide_queue.lock().expect("引导队列锁异常").len();
-            let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
+            let guide_count = self
+                .guide_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            let pending_count = self
+                .pending_queue
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
             let _ = self
                 .emitter
                 .send(OutputEvent::QueueUpdate(QueueUpdateMessage {
@@ -128,19 +144,27 @@ impl TurnExecutor {
         // 锁顺序：先 pending 后 guide，与 InputDispatcher 单锁不冲突，无死锁风险
         // 用块作用域确保锁在 await 之前释放（async 中 drop 不可靠）
         {
-            let mut pending = self.pending_queue.lock().expect("排队队列锁异常");
+            let mut pending = self.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
             if pending.is_empty() {
                 return;
             }
-            let mut guide = self.guide_queue.lock().expect("引导队列锁异常");
+            let mut guide = self.guide_queue.lock().unwrap_or_else(|e| e.into_inner());
             while let Some(q) = pending.pop_front() {
                 guide.push_back(q);
             }
         }
 
         // 通知 UI 队列长度变化（转移事件，批量操作 base.id 用默认值）
-        let guide_count = self.guide_queue.lock().expect("引导队列锁异常").len();
-        let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
+        let guide_count = self
+            .guide_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let pending_count = self
+            .pending_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
         let _ = self
             .emitter
             .send(OutputEvent::QueueUpdate(QueueUpdateMessage {

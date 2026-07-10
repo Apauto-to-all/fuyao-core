@@ -34,7 +34,7 @@ impl TurnExecutor {
 
             // 从引导队列取一条消息
             let msg = {
-                let mut q = self.guide_queue.lock().expect("引导队列锁异常");
+                let mut q = self.guide_queue.lock().unwrap_or_else(|e| e.into_inner());
                 q.pop_front()
             };
 
@@ -45,8 +45,16 @@ impl TurnExecutor {
                     crate::dispatch::deliver(&self.emitter, OutputEvent::User(queued.message))
                         .await;
                     // 通知 UI 队列长度变化（消费事件，复用 base.id 让 UI 知道哪条消息被消费了）
-                    let guide_count = self.guide_queue.lock().expect("引导队列锁异常").len();
-                    let pending_count = self.pending_queue.lock().expect("排队队列锁异常").len();
+                    let guide_count = self
+                        .guide_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
+                    let pending_count = self
+                        .pending_queue
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .len();
                     let _ = self
                         .emitter
                         .send(OutputEvent::QueueUpdate(QueueUpdateMessage {
@@ -117,7 +125,10 @@ impl TurnExecutor {
             let (request, tools_handlers, tools_schema, agent_ctx) = self.prepare_request().await;
 
             // 重置累积器
-            accumulator.lock().expect("流式累积器锁异常").clear();
+            accumulator
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
 
             // ── 流式会话 + 中断 select! ──
             let stream_outcome = tokio::select! {
@@ -221,7 +232,7 @@ impl TurnExecutor {
                 StreamOutcome::Interrupted(data) => {
                     // 先克隆数据再释放锁，避免 MutexGuard 跨 await（不 Send）
                     let (phase, text, reasoning, tool_calls, usage) = {
-                        let acc = accumulator.lock().expect("流式累积器锁异常");
+                        let acc = accumulator.lock().unwrap_or_else(|e| e.into_inner());
                         let phase = match acc.phase {
                             StreamPhase::Streaming => Phase::Streaming,
                             StreamPhase::Backoff => Phase::Backoff,

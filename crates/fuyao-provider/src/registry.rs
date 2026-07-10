@@ -37,7 +37,7 @@ pub fn agent_paths_cache_key(agent_paths: &AgentPaths) -> String {
 /// * `provider` - Provider 配置
 /// * `agent_paths_key` - agent_paths 缓存 key
 pub fn register_provider(provider_id: &str, provider: Provider, agent_paths_key: &str) {
-    let mut cache = PROVIDER_CACHE.lock().expect("Provider 缓存锁异常");
+    let mut cache = PROVIDER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if !cache.contains_key(agent_paths_key) {
         cache.insert(agent_paths_key.to_string(), HashMap::new());
     }
@@ -54,7 +54,7 @@ pub fn register_provider(provider_id: &str, provider: Provider, agent_paths_key:
 /// * `model` - Model 配置
 /// * `agent_paths_key` - agent_paths 缓存 key
 pub fn register_model(full_id: &str, model: Model, agent_paths_key: &str) {
-    let mut cache = MODEL_CACHE.lock().expect("Model 缓存锁异常");
+    let mut cache = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     if !cache.contains_key(agent_paths_key) {
         cache.insert(agent_paths_key.to_string(), HashMap::new());
     }
@@ -73,7 +73,7 @@ pub fn register_model(full_id: &str, model: Model, agent_paths_key: &str) {
 /// # Returns
 /// Provider 如果找到，否则 None
 pub fn get_provider(provider_id: &str, agent_paths: &AgentPaths) -> Option<Provider> {
-    let cache = PROVIDER_CACHE.lock().expect("Provider 缓存锁异常");
+    let cache = PROVIDER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let key = agent_paths_cache_key(agent_paths);
     cache
         .get(&key)
@@ -89,7 +89,7 @@ pub fn get_provider(provider_id: &str, agent_paths: &AgentPaths) -> Option<Provi
 /// # Returns
 /// Model 如果找到，否则 None
 pub fn get_model(full_id: &str, agent_paths: &AgentPaths) -> Option<Model> {
-    let cache = MODEL_CACHE.lock().expect("Model 缓存锁异常");
+    let cache = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let key = agent_paths_cache_key(agent_paths);
     cache
         .get(&key)
@@ -104,7 +104,7 @@ pub fn get_model(full_id: &str, agent_paths: &AgentPaths) -> Option<Model> {
 /// # Returns
 /// full_id -> Model 的字典
 pub fn list_models(agent_paths: &AgentPaths) -> HashMap<String, Model> {
-    let cache = MODEL_CACHE.lock().expect("Model 缓存锁异常");
+    let cache = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let key = agent_paths_cache_key(agent_paths);
     cache.get(&key).cloned().unwrap_or_default()
 }
@@ -117,7 +117,7 @@ pub fn list_models(agent_paths: &AgentPaths) -> HashMap<String, Model> {
 /// # Returns
 /// Provider ID -> Provider 的字典
 pub fn list_providers(agent_paths: &AgentPaths) -> HashMap<String, Provider> {
-    let cache = PROVIDER_CACHE.lock().expect("Provider 缓存锁异常");
+    let cache = PROVIDER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let key = agent_paths_cache_key(agent_paths);
     cache.get(&key).cloned().unwrap_or_default()
 }
@@ -129,11 +129,11 @@ pub fn list_providers(agent_paths: &AgentPaths) -> HashMap<String, Provider> {
 pub fn clear_cache(agent_paths: &AgentPaths) {
     let key = agent_paths_cache_key(agent_paths);
     {
-        let mut cache = PROVIDER_CACHE.lock().expect("Provider 缓存锁异常");
+        let mut cache = PROVIDER_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&key);
     }
     {
-        let mut cache = MODEL_CACHE.lock().expect("Model 缓存锁异常");
+        let mut cache = MODEL_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.remove(&key);
     }
 }

@@ -74,7 +74,7 @@ pub fn check_dedup(
     limit: usize,
     task_id: &str,
 ) -> Option<serde_json::Value> {
-    let tracker = TRACKER.lock().unwrap();
+    let tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
     let task_data = tracker.get(task_id)?;
     let key = (resolved_path.to_string(), offset, limit);
     let cached_mtime = task_data.dedup.get(&key)?;
@@ -95,7 +95,7 @@ pub fn check_dedup(
 ///
 /// 更新读取历史、去重缓存、时间戳三组数据。超出容量时自动淘汰最旧条目。
 pub fn record_read(path: &str, resolved_path: &str, offset: usize, limit: usize, task_id: &str) {
-    let mut tracker = TRACKER.lock().unwrap();
+    let mut tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
     let task_data = tracker
         .entry(task_id.to_string())
         .or_insert_with(TaskData::new);
@@ -124,7 +124,7 @@ pub fn update_read_timestamp(filepath: &str, task_id: &str) {
         None => return,
     };
 
-    let mut tracker = TRACKER.lock().unwrap();
+    let mut tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
     let task_data = tracker
         .entry(task_id.to_string())
         .or_insert_with(TaskData::new);
@@ -140,7 +140,7 @@ pub fn check_file_staleness(filepath: &str, task_id: &str) -> Option<String> {
     let resolved = expanded.to_string_lossy().to_string();
 
     let read_mtime = {
-        let tracker = TRACKER.lock().unwrap();
+        let tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
         tracker
             .get(task_id)?
             .read_timestamps
@@ -164,7 +164,7 @@ pub fn check_file_staleness(filepath: &str, task_id: &str) -> Option<String> {
 /// 在上下文压缩后调用，因为原始内容已被摘要。
 #[allow(dead_code)]
 pub fn reset_file_dedup(task_id: Option<&str>) {
-    let mut tracker = TRACKER.lock().unwrap();
+    let mut tracker = TRACKER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(tid) = task_id {
         if let Some(task_data) = tracker.get_mut(tid) {
             task_data.dedup.clear();
