@@ -6,7 +6,7 @@
 use crate::error::SkillsError;
 use crate::helpers::{find_first_non_heading, parse_skill_frontmatter};
 use fuyao_api::AgentPaths;
-use fuyao_api::skill_types::SkillMeta;
+use fuyao_api::SkillMeta;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 

@@ -13,15 +13,6 @@ pub enum LoopSeverity {
     Abort,
 }
 
-/// 循环类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoopType {
-    /// 工具调用循环
-    Tool,
-    /// 文本内容重复
-    Text,
-}
-
 /// 工具调用历史记录
 #[derive(Debug, Clone)]
 pub struct ToolCallRecord {

@@ -27,11 +27,11 @@
 //! ```
 
 use crate::logging::LogGuard;
-use fuyao_api::config::{FuyaoConfig, load_config, load_env, set_config};
 use fuyao_api::{AgentContext, AgentPaths};
+use fuyao_api::{FuyaoConfig, load_config, load_env, set_config};
 use fuyao_core::{Engine, EngineHandle};
-use fuyao_provider::openai::OpenAIProvider;
-use fuyao_provider::registry::{
+use fuyao_provider::OpenAIProvider;
+use fuyao_provider::{
     agent_paths_cache_key, get_model, list_models, register_model, register_provider,
 };
 use std::sync::Arc;

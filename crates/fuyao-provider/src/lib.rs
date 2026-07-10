@@ -3,14 +3,14 @@
 //! 供应商注册表、API Key 解析器、Provider 工厂、Provider trait 抽象。
 //! 基于 reqwest 自建 HTTP 客户端，不依赖 async-openai。
 
-pub mod client;
-pub mod error;
-pub mod openai;
-pub mod provider;
-pub mod registry;
-pub mod resolver;
-pub mod retry;
-pub mod stream_decoder;
+mod client;
+mod error;
+mod openai;
+mod provider;
+mod registry;
+mod resolver;
+mod retry;
+mod stream_decoder;
 
 pub use client::{ClientError, create_provider, create_provider_with_model, parse_model_id};
 pub use error::ProviderError;

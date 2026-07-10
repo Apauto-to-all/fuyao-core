@@ -8,7 +8,7 @@ use crate::helpers::{
     find_first_non_heading, parse_skill_frontmatter, scan_linked_files, truncate_skill_fields,
 };
 use fuyao_api::AgentPaths;
-use fuyao_api::skill_types::SkillDefinition;
+use fuyao_api::SkillDefinition;
 
 /// 按名称加载 Skill 完整定义（Tier 2：完整内容）
 ///

@@ -3,12 +3,12 @@
 //! MCPManager 是顶层编排器，管理多个 MCP Server 的连接生命周期，
 //! 提供工具发现、注册、调用的统一接口。
 
-pub mod bridge;
-pub mod circuit_breaker;
-pub mod connection;
-pub mod constants;
-pub mod recovery;
-pub mod security;
+mod bridge;
+mod circuit_breaker;
+mod connection;
+mod constants;
+mod recovery;
+mod security;
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -7,12 +7,12 @@
 //! - `loader`: 按需加载 Skill 完整内容和关联文件
 //! - `helpers`: frontmatter 解析、关联文件扫描
 
-pub mod error;
-pub mod finder;
-pub mod helpers;
-pub mod loader;
+mod error;
+mod finder;
+mod helpers;
+mod loader;
 
 pub use error::SkillsError;
 pub use finder::{find_all_skills, find_skill_md_by_name};
-pub use fuyao_api::skill_types::{SkillDefinition, SkillMeta};
+pub use fuyao_api::{SkillDefinition, SkillMeta};
 pub use loader::{load_skill, load_skill_file};

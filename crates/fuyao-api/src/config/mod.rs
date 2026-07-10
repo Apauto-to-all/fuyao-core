@@ -56,7 +56,6 @@ pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig};
 pub use env::load_env;
 pub use error::ConfigError;
 pub use loader::{load_config, load_merged_config};
-pub use providers::load_providers;
 
 /// Fuyao 全局配置聚合
 ///

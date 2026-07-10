@@ -91,7 +91,8 @@ pub fn check_breaker(server_name: &str) -> Option<String> {
 }
 
 /// 重置所有熔断器状态（测试用）
-pub fn reset_all() {
+#[cfg(test)]
+pub(crate) fn reset_all() {
     let mut state = recover_or_lock(&BREAKER_STATE);
     state.error_counts.clear();
     state.opened_at.clear();

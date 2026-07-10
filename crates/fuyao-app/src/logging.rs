@@ -8,8 +8,7 @@
 
 use std::io;
 
-use fuyao_api::config::LogRotation;
-use fuyao_api::{AgentPaths, LoggingConfig};
+use fuyao_api::{AgentPaths, LogRotation, LoggingConfig};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::RollingFileAppender;
 use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};

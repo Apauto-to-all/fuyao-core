@@ -7,14 +7,14 @@
 //!
 //! 包含路径规范化工具函数。
 
-use crate::ToolRunnerConfig;
+use fuyao_api::ToolRunnerConfig;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// 工具调用信息（轻量级，用于并行判断）
-pub struct ToolCallInfo {
-    pub name: String,
-    pub arguments: String,
+pub(crate) struct ToolCallInfo {
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 /// 判断工具调用批次是否可以并行执行
@@ -24,7 +24,7 @@ pub struct ToolCallInfo {
 /// 2. 含 never_parallel_tools → 串行
 /// 3. path_scoped_tools 检查路径重叠 → 重叠则串行
 /// 4. 其余工具不在 parallel_safe_tools → 串行
-pub fn should_parallelize(tool_calls: &[ToolCallInfo], config: &ToolRunnerConfig) -> bool {
+pub(crate) fn should_parallelize(tool_calls: &[ToolCallInfo], config: &ToolRunnerConfig) -> bool {
     if tool_calls.len() <= 1 {
         return false;
     }
@@ -62,7 +62,7 @@ pub fn should_parallelize(tool_calls: &[ToolCallInfo], config: &ToolRunnerConfig
 }
 
 /// 从工具参数中提取路径
-pub fn extract_path_from_args(args: &Value) -> Option<PathBuf> {
+pub(crate) fn extract_path_from_args(args: &Value) -> Option<PathBuf> {
     let raw_path = args.get("path").and_then(|v| v.as_str())?;
     let trimmed = raw_path.trim();
     if trimmed.is_empty() {
@@ -91,7 +91,7 @@ pub fn extract_path_from_args(args: &Value) -> Option<PathBuf> {
 }
 
 /// 规范化路径（不要求文件存在，仅处理 `.`/`..` 和分隔符）
-pub fn canonicalize_path(path: &Path) -> PathBuf {
+pub(crate) fn canonicalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
         match component {
@@ -113,7 +113,7 @@ pub fn canonicalize_path(path: &Path) -> PathBuf {
 }
 
 /// 判断两个路径是否重叠（同一目录或子目录）
-pub fn paths_overlap(left: &Path, right: &Path) -> bool {
+pub(crate) fn paths_overlap(left: &Path, right: &Path) -> bool {
     let left_parts: Vec<_> = left.components().collect();
     let right_parts: Vec<_> = right.components().collect();
 
@@ -128,7 +128,7 @@ pub fn paths_overlap(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ToolRunnerConfig;
+    use fuyao_api::ToolRunnerConfig;
 
     fn make_tool_call(_id: &str, name: &str, args: &str) -> ToolCallInfo {
         ToolCallInfo {

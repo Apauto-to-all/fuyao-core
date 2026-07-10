@@ -13,8 +13,8 @@ pub struct SkillMetaItem {
     pub description: String,
 }
 
-impl From<&fuyao_api::skill_types::SkillMeta> for SkillMetaItem {
-    fn from(meta: &fuyao_api::skill_types::SkillMeta) -> Self {
+impl From<&fuyao_api::SkillMeta> for SkillMetaItem {
+    fn from(meta: &fuyao_api::SkillMeta) -> Self {
         Self {
             name: meta.name.clone(),
             description: meta.description.clone(),

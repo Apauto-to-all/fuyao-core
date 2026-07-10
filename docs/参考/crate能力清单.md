@@ -1,6 +1,8 @@
 # crate 能力清单
 
 > 11 个 crate 的职责、依赖与公开 API 概要。详细 API 签名见 `cargo doc --workspace`。
+>
+> **可见性策略**：各 crate 内部模块均私有（`mod`），仅通过根层 `pub use` 导出公开符号。SDK 用户只依赖根层路径（如 `fuyao_api::AgentContext`），不可深入内部模块。
 
 ## 依赖层次
 
@@ -56,7 +58,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：提示词分层构建 + Agent 定义注册表
 - **内部依赖**：api, skills
-- **公开 API**：`build_system_prompt` / `build_all_sections`；`load_agent_definition` / `load_agent_definition_from_agent_paths`；`AgentRegistry` + `AgentInfo` / `PagedAgents` / `UpdateContentRequest`；sections 一族 `build_*_section` 函数
+- **公开 API**：`build_system_prompt`；`load_agent_definition` / `load_agent_definition_from_agent_paths`；`AgentRegistry` + `AgentInfo` / `PagedAgents` / `UpdateContentRequest`；`PromptError`
 
 ## fuyao-guard（L2 构建）
 
@@ -80,7 +82,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：内置工具集 + 安全防护
 - **内部依赖**：api, prompt, skills, session
-- **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`；安全 `check_sensitive_path` / `check_command_safety` / `redact_sensitive_text`
+- **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`；`ToolError`
 - **内置工具**：read / write / edit / bash / grep / glob / webfetch / skill / todowrite
 
 ## fuyao-app（L4 装配）

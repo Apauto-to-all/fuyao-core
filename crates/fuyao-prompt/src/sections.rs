@@ -180,7 +180,8 @@ pub fn build_tool_guidance_section() -> String {
 /// 构建 Memory 快照 section（Layer 4）
 ///
 /// 从 Memory store 获取快照。
-/// 当前为 stub，未来功能。
+// TODO: 当前为 stub，Memory 系统实现后启用
+#[allow(dead_code)]
 pub fn build_memory_section() -> String {
     String::new()
 }

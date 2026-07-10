@@ -5,12 +5,12 @@
 //!
 //! 装配入口（init_engine / 一键 start）已上移至 fuyao-app，core 只负责引擎内核。
 
-pub mod dispatch;
-pub mod engine;
-pub mod handle;
-pub mod interrupt;
-pub mod llm;
-pub mod tool_runner;
+mod dispatch;
+mod engine;
+mod handle;
+mod interrupt;
+mod llm;
+mod tool_runner;
 
 pub use engine::{Engine, SharedHooks, SharedTools};
 // SharedAgentCtx 现在定义在 fuyao_api 中，此处重新导出保持兼容

@@ -13,11 +13,11 @@ use fuyao_api::SharedAgentCtx;
 use fuyao_api::message::output::{ErrorMessage, ErrorPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::LlmErrorAction;
-use fuyao_provider::retry::{backoff_duration, is_retryable};
 use fuyao_provider::{
     ChatRequest, Provider as LlmProvider, StreamDecoder, StreamError, StreamOptions, StreamUsage,
     ToolCallData as ProviderToolCallData,
 };
+use fuyao_provider::{backoff_duration, is_retryable};
 use std::sync::{Arc, Mutex};
 
 /// 流式会话最终结果

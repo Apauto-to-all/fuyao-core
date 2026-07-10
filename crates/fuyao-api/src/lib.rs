@@ -9,18 +9,18 @@
 //! - `provider`: 模型和供应商配置
 //! - `tool`: 工具定义和执行
 
-pub mod agent;
-pub mod config;
-pub mod error;
-pub mod mcp_types;
+mod agent;
+mod config;
+mod error;
+mod mcp_types;
 pub mod message;
-pub mod paths;
-pub mod prompt_types;
-pub mod provider;
-pub mod queue_snapshot;
-pub mod session_types;
-pub mod skill_types;
-pub mod tool;
+mod paths;
+mod prompt_types;
+mod provider;
+mod queue_snapshot;
+mod session_types;
+mod skill_types;
+mod tool;
 
 // 导出常用类型
 pub use agent::{AgentConfig, AgentContext, AgentPaths, ModelConfig, SharedAgentCtx};
@@ -35,9 +35,6 @@ pub use mcp_types::MCPServerConfig;
 pub use message::{
     EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginSource,
     QueueUpdateKind, SystemSource, UserMessageMode, UserMessageSource,
-};
-pub use paths::parallel::{
-    canonicalize_path, extract_path_from_args, paths_overlap, should_parallelize,
 };
 pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,

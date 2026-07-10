@@ -61,27 +61,6 @@ fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// 从 args 中提取 workspace 路径
-///
-/// 已废弃：上下文现在通过 `ToolCallContext` 直接传入 handler。
-/// 此函数仅用于兼容旧代码，新代码应使用 `ctx.workspace()`。
-pub fn get_workspace(args: &serde_json::Value) -> Option<PathBuf> {
-    args.get("_workspace")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-}
-
-/// 从 args 中提取 session_id（作为 task_id）
-///
-/// 已废弃：上下文现在通过 `ToolCallContext` 直接传入 handler。
-/// 此函数仅用于兼容旧代码，新代码应使用 `ctx.task_id()`。
-pub fn get_task_id(args: &serde_json::Value) -> String {
-    args.get("_session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default")
-        .to_string()
-}
-
 /// 返回 JSON 格式的错误信息
 pub fn tool_error(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()

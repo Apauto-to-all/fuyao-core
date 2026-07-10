@@ -34,9 +34,6 @@ pub enum ConnectionError {
     #[error("MCP server '{server}' 初始连接失败: {reason}")]
     InitialConnectFailed { server: String, reason: String },
 
-    #[error("MCP server '{server}' 连接超时")]
-    ConnectTimeout { server: String },
-
     #[error("stdio 传输需要 'command' 配置")]
     MissingCommand,
 

@@ -3,7 +3,7 @@
 //! 框架内置的默认 Agent，硬编码确保框架稳定性。
 //! 用户可通过 `agents/default.md` 覆盖此定义。
 
-use fuyao_api::prompt_types::AgentDefinition;
+use fuyao_api::AgentDefinition;
 use std::sync::LazyLock;
 
 /// 默认系统提示词

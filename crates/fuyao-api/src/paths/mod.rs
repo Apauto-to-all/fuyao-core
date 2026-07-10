@@ -16,7 +16,6 @@
 
 mod global;
 mod layered;
-pub mod parallel;
 mod workspace;
 
 pub use layered::LayeredPaths;

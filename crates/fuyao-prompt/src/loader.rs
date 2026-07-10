@@ -4,8 +4,8 @@
 //! 定义文件集中在 `agents/` 文件夹管理，由 AgentConfig.definition 指定加载哪个定义。
 
 use crate::default::DEFAULT_FUYAO_AGENT;
+use fuyao_api::AgentDefinition;
 use fuyao_api::AgentPaths;
-use fuyao_api::prompt_types::AgentDefinition;
 use regex::Regex;
 use std::path::Path;
 

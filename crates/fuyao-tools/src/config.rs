@@ -21,12 +21,6 @@ pub const READ_TIMESTAMPS_CAP: usize = 1000;
 /// 是否脱敏敏感信息
 pub const REDACT_SECRETS: bool = true;
 
-/// 默认搜索限制
-pub const SEARCH_DEFAULT_LIMIT: usize = 50;
-
-/// 最大搜索限制
-pub const SEARCH_MAX_LIMIT: usize = 100;
-
 /// 搜索排除目录
 pub const SEARCH_EXCLUDE_DIRS: &[&str] = &[
     ".venv",

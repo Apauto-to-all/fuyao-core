@@ -2,15 +2,15 @@
 //!
 //! SQLite 持久化、缓存、Todo 管理、上下文压缩。
 
-pub mod compressor;
-pub mod context;
-pub mod cost;
-pub mod error;
-pub mod manager;
-pub mod schema;
-pub mod store;
-pub mod todo_store;
-pub mod utils;
+mod compressor;
+mod context;
+mod cost;
+mod error;
+mod manager;
+mod schema;
+mod store;
+mod todo_store;
+mod utils;
 
 pub use context::{SessionContext, SessionPlugin};
 pub use cost::calculate_cost;

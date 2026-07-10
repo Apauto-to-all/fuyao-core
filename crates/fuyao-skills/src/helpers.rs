@@ -2,7 +2,7 @@
 //!
 //! 纯工具函数：frontmatter 解析、关联文件扫描。
 
-use fuyao_api::skill_types::{LINKED_SUBDIRS, SkillDefinition};
+use fuyao_api::{LINKED_SUBDIRS, SkillDefinition};
 use std::collections::HashMap;
 use std::path::Path;
 

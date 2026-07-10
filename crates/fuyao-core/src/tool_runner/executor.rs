@@ -5,7 +5,8 @@
 //! - `execute_parallel`: JoinSet + Semaphore 并发执行
 //! - `execute_single_tool`: 单工具执行
 
-use fuyao_api::{AgentContext, ToolCallContext, ToolFn, ToolRunnerConfig, should_parallelize};
+use super::parallel::{ToolCallInfo, should_parallelize};
+use fuyao_api::{AgentContext, ToolCallContext, ToolFn, ToolRunnerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -27,7 +28,7 @@ pub(crate) async fn execute_tools(
 ) -> Vec<ToolExecResult> {
     let call_infos: Vec<_> = tool_calls
         .iter()
-        .map(|tc| fuyao_api::paths::parallel::ToolCallInfo {
+        .map(|tc| ToolCallInfo {
             name: tc.name.clone(),
             arguments: tc.arguments.clone(),
         })

@@ -9,14 +9,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuyao_api::{
-    ToolCallContext, ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters, ToolSchema,
-};
+use fuyao_api::{ToolCallContext, ToolFn};
 use serde_json::Value;
 
 use crate::circuit_breaker::{bump_error, check_breaker, reset_error};
 use crate::connection::MCPConnection;
-use crate::security::{normalize_mcp_input_schema, sanitize_error, sanitize_mcp_name_component};
+use crate::security::{sanitize_error, sanitize_mcp_name_component};
 
 /// 构建 MCP 工具前缀名
 ///
@@ -36,156 +34,6 @@ pub fn should_register_tool(tool_name: &str, tools_filter: &HashMap<String, bool
         return true;
     }
     tools_filter.get(tool_name).copied().unwrap_or(true)
-}
-
-/// MCP 工具桥接结果
-pub struct BridgedTool {
-    /// 前缀名（mcp_server_tool）
-    pub prefixed_name: String,
-    /// OpenAI function schema
-    pub schema: ToolDefinition,
-    /// 工具执行器
-    pub handler: ToolFn,
-}
-
-/// 从 MCP 工具的 input_schema 构建 ToolSchema
-fn build_tool_schema(prefixed_name: &str, description: &str, input_schema: &Value) -> ToolSchema {
-    let normalized = normalize_mcp_input_schema(input_schema);
-
-    let mut properties = HashMap::new();
-    let mut required = Vec::new();
-
-    if let Some(props) = normalized.get("properties").and_then(|v| v.as_object()) {
-        for (name, prop_value) in props {
-            let kind = prop_value
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("string")
-                .to_string();
-
-            let desc = prop_value
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let default = prop_value.get("default").cloned();
-
-            let enum_values = prop_value
-                .get("enum")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                        .collect::<Vec<_>>()
-                });
-
-            let items = prop_value
-                .get("items")
-                .and_then(|v| v.as_object())
-                .map(|obj| {
-                    obj.iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect::<HashMap<String, Value>>()
-                });
-
-            properties.insert(
-                name.clone(),
-                ToolParameterProperty {
-                    kind,
-                    description: desc,
-                    default,
-                    enum_values,
-                    items,
-                },
-            );
-        }
-    }
-
-    if let Some(req) = normalized.get("required").and_then(|v| v.as_array()) {
-        for item in req {
-            if let Some(s) = item.as_str() {
-                required.push(s.to_string());
-            }
-        }
-    }
-
-    ToolSchema {
-        name: prefixed_name.to_string(),
-        description: description.to_string(),
-        parameters: ToolParameters {
-            kind: "object".to_string(),
-            properties,
-            required,
-        },
-    }
-}
-
-/// 构建 MCP Server 的工具列表
-///
-/// 不触碰全局 ToolRegistry，只返回工具数据，
-/// 由调用方决定如何注册。
-pub fn build_server_tools(
-    server_name: &str,
-    connection: &MCPConnection,
-    config: &fuyao_api::MCPServerConfig,
-) -> Vec<BridgedTool> {
-    let tools_filter = &config.tools;
-    let tool_timeout = config.timeout;
-    let server_name_owned = server_name.to_string();
-
-    let mut result = Vec::new();
-
-    for mcp_tool in &connection.tools {
-        let raw_name = &mcp_tool.name;
-
-        if !should_register_tool(raw_name, tools_filter) {
-            continue;
-        }
-
-        let prefixed_name = build_prefixed_name(server_name, raw_name);
-
-        let description = mcp_tool
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("MCP tool {raw_name} from {server_name}"));
-
-        let schema = build_tool_schema(&prefixed_name, &description, &mcp_tool.input_schema);
-
-        let tool_definition = ToolDefinition {
-            kind: "function".to_string(),
-            function: schema,
-        };
-
-        // 构建占位 handler（实际调用在 MCPManager 层面完成）
-        let tool_name = raw_name.clone();
-        let srv_name = server_name_owned.clone();
-
-        let handler: ToolFn = Arc::new(move |_args: Value, _ctx: ToolCallContext| {
-            let tool_name = tool_name.clone();
-            let srv_name = srv_name.clone();
-            let timeout_secs = tool_timeout;
-
-            Box::pin(async move {
-                if let Some(msg) = check_breaker(&srv_name) {
-                    return serde_json::json!({"error": msg}).to_string();
-                }
-
-                // 占位：实际调用在 make_tool_call_handler 中完成
-                let _ = (tool_name, timeout_secs);
-                serde_json::json!({"error": "bridge handler: 需要通过 MCPConnection 调用"})
-                    .to_string()
-            })
-        });
-
-        result.push(BridgedTool {
-            prefixed_name,
-            schema: tool_definition,
-            handler,
-        });
-    }
-
-    result
 }
 
 /// 构建带 MCPConnection 引用的工具 handler
@@ -448,29 +296,5 @@ mod tests {
         let mut filter = HashMap::new();
         filter.insert("other".to_string(), true);
         assert!(should_register_tool("search", &filter));
-    }
-
-    #[test]
-    fn build_tool_schema_basic() {
-        let input = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "搜索关键词"}
-            },
-            "required": ["query"]
-        });
-        let schema = build_tool_schema("mcp_server_search", "搜索工具", &input);
-        assert_eq!(schema.name, "mcp_server_search");
-        assert_eq!(schema.description, "搜索工具");
-        assert!(schema.parameters.properties.contains_key("query"));
-        assert!(schema.parameters.required.contains(&"query".to_string()));
-    }
-
-    #[test]
-    fn build_tool_schema_empty_input() {
-        let input = serde_json::Value::Null;
-        let schema = build_tool_schema("mcp_server_tool", "工具", &input);
-        assert_eq!(schema.name, "mcp_server_tool");
-        assert!(!schema.parameters.properties.is_empty() || schema.parameters.kind == "object");
     }
 }

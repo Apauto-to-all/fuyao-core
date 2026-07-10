@@ -1,7 +1,7 @@
 //! Session 管理工具函数
 
 use fuyao_api::AgentPaths;
-use fuyao_provider::registry::get_model;
+use fuyao_provider::get_model;
 
 /// 解析指定模型的上下文窗口大小
 ///

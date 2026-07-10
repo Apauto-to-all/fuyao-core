@@ -7,12 +7,12 @@
 //! - `sections`: 分层 section 构建（含补充指令 `instructions/`）
 //! - `builder`: `build_system_prompt()` 组装器
 
-pub mod builder;
-pub mod default;
-pub mod error;
-pub mod loader;
-pub mod registry;
-pub mod sections;
+mod builder;
+mod default;
+mod error;
+mod loader;
+mod registry;
+mod sections;
 
 pub use builder::build_system_prompt;
 pub use error::PromptError;

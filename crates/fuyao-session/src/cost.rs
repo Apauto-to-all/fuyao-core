@@ -4,7 +4,7 @@
 //! 从 fuyao-provider 移入，聚合在 session 模块下。
 
 use fuyao_api::AgentPaths;
-use fuyao_api::provider::PriceTier;
+use fuyao_api::PriceTier;
 use fuyao_provider::get_model;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;

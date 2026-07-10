@@ -7,6 +7,7 @@
 //! 工具调用的拦截/观察统一通过 EventEmitter 处理。
 
 pub(crate) mod executor;
+mod parallel;
 
 use crate::engine::EventEmitter;
 use fuyao_api::message::output::{ToolResultMessage, ToolResultPayload};
