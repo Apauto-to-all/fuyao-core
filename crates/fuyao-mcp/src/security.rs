@@ -51,7 +51,7 @@ pub fn build_safe_env(user_env: Option<&HashMap<String, String>>) -> HashMap<Str
 
 /// 脱敏错误信息中的凭证模式
 ///
-/// 替换常见的 token、key、password 等敏感信息为 [REDACTED]。
+/// 替换常见的 token、key、password 等敏感信息为 `[REDACTED]`。
 pub fn sanitize_error(text: &str) -> String {
     let pattern = Regex::new(concat!(
         r"(?i)(?:ghp_[A-Za-z0-9_]{1,255}",

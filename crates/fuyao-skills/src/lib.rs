@@ -1,6 +1,6 @@
 //! Skills 模块
 //!
-//! 符合 Agent Skills 官方规范 (https://agentskills.io/specification)
+//! 符合 Agent Skills 官方规范 (<https://agentskills.io/specification>)
 //!
 //! 提供 Skill 发现、加载、解析功能。
 //! - `finder`: 扫描三层目录发现 Skill

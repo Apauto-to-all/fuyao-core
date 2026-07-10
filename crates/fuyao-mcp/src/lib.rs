@@ -58,7 +58,7 @@ pub struct RegisteredTool {
 type ConnectionEntry = Arc<Mutex<Option<MCPConnection>>>;
 
 /// 管理多个 MCP Server 的连接、工具发现和调用。
-/// 通过 Arc<Mutex> 实现内部可变性，支持并发访问。
+/// 通过 `Arc<Mutex>` 实现内部可变性，支持并发访问。
 pub struct MCPManager {
     /// Server 连接映射
     connections: Arc<Mutex<HashMap<String, ConnectionEntry>>>,

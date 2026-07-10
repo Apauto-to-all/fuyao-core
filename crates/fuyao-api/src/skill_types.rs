@@ -1,6 +1,6 @@
 //! Skills 类型定义
 //!
-//! 符合 Agent Skills 官方规范 (https://agentskills.io/specification)
+//! 符合 Agent Skills 官方规范 (<https://agentskills.io/specification>)
 
 use std::collections::HashMap;
 

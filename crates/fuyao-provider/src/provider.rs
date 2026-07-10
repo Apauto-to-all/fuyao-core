@@ -132,7 +132,7 @@ pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 /// LLM Provider 统一抽象
 ///
 /// 所有 LLM 供应商实现此 trait。
-/// stream_chat 返回 BoxStream<StreamEvent>，Engine 层统一消费。
+/// stream_chat 返回 `BoxStream<StreamEvent>`，Engine 层统一消费。
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// 流式对话，返回增量事件流

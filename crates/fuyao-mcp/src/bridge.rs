@@ -190,7 +190,7 @@ pub fn build_server_tools(
 
 /// 构建带 MCPConnection 引用的工具 handler
 ///
-/// 由于 ToolFn 需要是 'static 的，通过 Arc<Mutex<Option<MCPConnection>>> 传递连接。
+/// 由于 ToolFn 需要是 'static 的，通过 `Arc<Mutex<Option<MCPConnection>>>` 传递连接。
 pub fn make_tool_call_handler(
     connection: Arc<tokio::sync::Mutex<Option<MCPConnection>>>,
     tool_name: String,

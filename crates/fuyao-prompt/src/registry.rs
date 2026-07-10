@@ -42,9 +42,9 @@ pub struct AgentInfo {
     pub system_prompt: String,
     /// 模型配置（fuyao.toml model 字段）
     pub model: Option<String>,
-    /// 工具配置（fuyao.toml [tools] 表的 key 列表）
+    /// 工具配置（fuyao.toml `[tools]` 表的 key 列表）
     pub tools: Vec<String>,
-    /// MCP 服务器引用（fuyao.toml [mcp_servers] 表的 key 列表）
+    /// MCP 服务器引用（fuyao.toml `[mcp_servers]` 表的 key 列表）
     pub mcp_servers: Vec<String>,
     /// Profile 列表（profiles/*.md 文件名，无 .md 后缀）
     pub profiles: Vec<String>,

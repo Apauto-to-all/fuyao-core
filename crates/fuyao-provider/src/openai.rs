@@ -31,7 +31,7 @@ pub struct OpenAIProvider {
     client: Client,
     /// API 密钥
     api_key: String,
-    /// API 基础 URL（如 https://api.openai.com/v1）
+    /// API 基础 URL（如 <https://api.openai.com/v1>）
     base_url: String,
 }
 
