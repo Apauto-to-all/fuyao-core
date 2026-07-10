@@ -1020,7 +1020,7 @@ mod tests {
             }]
         });
         let events = extract_stream_events(&chunk);
-        assert!(events.len() >= 1);
+        assert!(!events.is_empty());
         assert!(
             matches!(&events[0], StreamEvent::ToolCallChunk { id, name, args_delta, .. }
                 if id.as_deref() == Some("call_1")

@@ -428,11 +428,11 @@ mod tests {
     #[test]
     fn toml_number_as_f64_handles_integer_and_float() {
         let int_val: toml::Value = 42.into();
-        let float_val: toml::Value = 3.14.into();
+        let float_val: toml::Value = 2.5.into();
         let str_val: toml::Value = "hello".into();
 
         assert_eq!(toml_number_as_f64(&int_val), Some(42.0));
-        assert_eq!(toml_number_as_f64(&float_val), Some(3.14));
+        assert_eq!(toml_number_as_f64(&float_val), Some(2.5));
         assert_eq!(toml_number_as_f64(&str_val), None);
     }
 

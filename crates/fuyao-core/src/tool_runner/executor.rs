@@ -242,8 +242,10 @@ mod tests {
             .map(|i| make_tool_call(&i.to_string(), "test_tool", "{}"))
             .collect();
         let agent_ctx = AgentContext::default();
-        let mut config = ToolRunnerConfig::default();
-        config.max_concurrent = 2;
+        let config = ToolRunnerConfig {
+            max_concurrent: 2,
+            ..Default::default()
+        };
 
         let results = execute_parallel(&calls, &handlers, &agent_ctx, &config).await;
         assert_eq!(results.len(), 10);

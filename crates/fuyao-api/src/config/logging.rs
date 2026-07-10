@@ -130,6 +130,7 @@ rotation = "weekly"
 "#;
         #[derive(Deserialize)]
         struct Wrap {
+            #[allow(dead_code)]
             logging: LoggingConfig,
         }
         assert!(toml::from_str::<Wrap>(toml_str).is_err());
