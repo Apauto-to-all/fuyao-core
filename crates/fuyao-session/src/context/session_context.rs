@@ -175,7 +175,8 @@ impl SessionContext {
     async fn handle_user_message(&mut self, data: &output::UserMessage) -> bool {
         // 首次用户消息触发 session 懒初始化
         let initial_id = None; // 新建场景无初始 id
-        if self.ensure_session(initial_id).await.is_err() {
+        if let Err(e) = self.ensure_session(initial_id).await {
+            tracing::warn!(cause = %e, "会话初始化失败，用户消息未持久化");
             return false;
         }
 
@@ -186,9 +187,11 @@ impl SessionContext {
         // DB 持久化
         if let (Some(session_id), Some(mgr)) = (&self.session_id, &self.session_manager) {
             let msg = Message::user(data.payload.content.clone());
-            mgr.add_message(session_id, msg, &self.agent_paths)
-                .await
-                .is_ok()
+            let result = mgr.add_message(session_id, msg, &self.agent_paths).await;
+            if let Err(ref e) = result {
+                tracing::warn!(session_id = %session_id, role = "user", cause = %e, "消息持久化失败");
+            }
+            result.is_ok()
         } else {
             false
         }
@@ -235,9 +238,11 @@ impl SessionContext {
 
         // DB 持久化（cost 自动计算并累加到 session 级别）
         if let (Some(session_id), Some(mgr)) = (&self.session_id, &self.session_manager) {
-            mgr.add_message(session_id, msg, &self.agent_paths)
-                .await
-                .is_ok()
+            let result = mgr.add_message(session_id, msg, &self.agent_paths).await;
+            if let Err(ref e) = result {
+                tracing::warn!(session_id = %session_id, role = "assistant", cause = %e, "消息持久化失败");
+            }
+            result.is_ok()
         } else {
             false
         }
@@ -258,9 +263,11 @@ impl SessionContext {
 
         // DB 持久化（非 assistant 消息，cost 保持 0）
         if let (Some(session_id), Some(mgr)) = (&self.session_id, &self.session_manager) {
-            mgr.add_message(session_id, msg, &self.agent_paths)
-                .await
-                .is_ok()
+            let result = mgr.add_message(session_id, msg, &self.agent_paths).await;
+            if let Err(ref e) = result {
+                tracing::warn!(session_id = %session_id, role = "tool", cause = %e, "消息持久化失败");
+            }
+            result.is_ok()
         } else {
             false
         }

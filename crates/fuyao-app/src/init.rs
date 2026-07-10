@@ -148,6 +148,11 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle, Log
 
     // 8. 创建 Engine，返回 (Engine, EngineHandle, LogGuard)
     let (engine, handle) = Engine::new(Box::new(provider), agent_ctx);
+    tracing::info!(
+        model_id = %model_id,
+        console = logging_config.console,
+        "引擎初始化完成"
+    );
     Ok((engine, handle, log_guard))
 }
 

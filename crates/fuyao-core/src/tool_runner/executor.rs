@@ -111,14 +111,27 @@ async fn execute_single_tool(
         }
     };
 
-    let args: serde_json::Value =
-        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+    let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+        Ok(v) => v,
+        Err(_) => {
+            let raw: String = tc.arguments.chars().take(200).collect();
+            tracing::warn!(tool = %tc.name, raw = %raw, "工具参数 JSON 解析失败");
+            serde_json::Value::Null
+        }
+    };
     let ctx = ToolCallContext {
         session_id: agent_ctx.session_id.clone(),
         agent_paths: Some(agent_ctx.agent_paths.clone()),
     };
 
+    let started = std::time::Instant::now();
     let content = handler(args, ctx).await;
+
+    tracing::info!(
+        tool = %tc.name,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "工具调用完成"
+    );
 
     ToolExecResult {
         tool_call_id: tc.id.clone(),

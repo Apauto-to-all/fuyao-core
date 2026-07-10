@@ -13,7 +13,7 @@ mod plugin;
 mod registry;
 mod types;
 
-pub use plugin::{Plugin, PluginEmitter, PluginError, PluginHost, PluginInstallError};
+pub use plugin::{Plugin, PluginEmitter, PluginHost, PluginInstallError};
 pub use registry::HooksRegistry;
 pub use types::{
     BeforeLlmFn, BeforeLlmOutput, InterceptResult, LlmErrorAction, OnLlmErrorFn, OutputInterceptFn,

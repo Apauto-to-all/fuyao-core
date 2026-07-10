@@ -231,11 +231,17 @@ impl SessionHooksState {
         {
             Ok(new_session) => {
                 let new_id = new_session.id;
+                tracing::info!(
+                    old_session_id = %session_id,
+                    new_session_id = %new_id,
+                    message_count = new_session.messages.len(),
+                    "压缩完成，已切换到新会话"
+                );
                 self.sync_session_id(new_id.clone());
                 let _ = ctx.switch_session(new_id).await;
             }
-            Err(_) => {
-                // split 失败不中断对话，下次超过阈值会重新触发
+            Err(e) => {
+                tracing::warn!(session_id = %session_id, cause = %e, "压缩分裂失败，保留旧会话继续对话");
             }
         }
     }
@@ -291,7 +297,9 @@ impl Plugin for SessionPlugin {
                     let initial_id = guard.initial_session_id();
 
                     // 懒初始化 session
-                    let _ = ctx.ensure_session(initial_id.as_deref()).await;
+                    if let Err(e) = ctx.ensure_session(initial_id.as_deref()).await {
+                        tracing::warn!(cause = %e, "before_llm 会话初始化失败，以空上下文调用 LLM");
+                    }
 
                     if let Some(ref sid) = ctx.session_id {
                         guard.sync_session_id(sid.clone());
@@ -348,18 +356,22 @@ impl Plugin for SessionPlugin {
 
                         // 非压缩中 → 检测阈值，决定是否触发压缩
                         let prompt_tokens = data.payload.prompt_tokens as usize;
-                        // 从 agent_ctx 读取当前运行时 model_id，供 tracker 解析 context_length
-                        let model_id = guard
-                            .agent_ctx
-                            .lock()
-                            .expect("Agent 上下文锁异常")
-                            .model_config
-                            .model_id
-                            .clone();
+                        // 从 agent_ctx 读取当前运行时 model_id + session_id（一次锁取）
+                        let (model_id, session_id) = {
+                            let g = guard.agent_ctx.lock().expect("Agent 上下文锁异常");
+                            (g.model_config.model_id.clone(), g.session_id.clone())
+                        };
+                        let threshold = fuyao_api::get_config().session.compression.threshold;
                         if guard
                             .tracker
                             .should_compress(prompt_tokens, model_id.as_deref())
                         {
+                            tracing::warn!(
+                                usage = prompt_tokens,
+                                threshold = threshold,
+                                session_id = ?session_id,
+                                "上下文压缩触发"
+                            );
                             guard.inject_compression_guide();
                         }
                     }

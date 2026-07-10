@@ -96,6 +96,7 @@ impl TurnExecutor {
 
         // 共享累积器：stream_session 写入，中断时读取部分结果
         let accumulator = Arc::new(Mutex::new(StreamAccumulator::new()));
+        let mut actions = 0u32;
 
         'react: loop {
             // 检查是否已有待处理的命令（上一轮中断可能残留）
@@ -151,6 +152,7 @@ impl TurnExecutor {
                     let has_tool_calls = !result.tool_calls.is_empty();
 
                     if has_tool_calls {
+                        actions += result.tool_calls.len() as u32;
                         // 发出 AssistantMessage（含工具调用）
                         crate::llm::event_builder::emit_assistant_message(
                             &self.emitter,
@@ -211,6 +213,7 @@ impl TurnExecutor {
                         if self.consume_next_message().await {
                             continue 'react;
                         } else {
+                            tracing::info!(actions = actions, "ReAct 轮次完成");
                             break;
                         }
                     }

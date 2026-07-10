@@ -3,6 +3,7 @@
 //! 拦截钩子（异步串行，可取消带原因，panic 防护）+ 观察钩子（异步串行）。
 //! 按优先级排序执行。
 
+use crate::plugin::panic_payload_to_string;
 use crate::types::*;
 use futures_util::future::FutureExt;
 use fuyao_api::message::OutputEvent;
@@ -129,8 +130,20 @@ impl HooksRegistry {
                         result.skip_tools = true;
                     }
                 }
-                _ => {
-                    // panic / 超时 → 跳过
+                Some(Err(payload)) => {
+                    tracing::warn!(
+                        hook = "before_llm",
+                        recovered = true,
+                        cause = %panic_payload_to_string(&*payload),
+                        "钩子执行 panic 已恢复"
+                    );
+                }
+                None => {
+                    tracing::warn!(
+                        hook = "before_llm",
+                        timeout_secs = self.hook_timeout.as_secs(),
+                        "钩子执行超时已跳过"
+                    );
                 }
             }
         }
@@ -144,7 +157,14 @@ impl HooksRegistry {
             match std::panic::catch_unwind(AssertUnwindSafe(|| (entry.handler)(&current))) {
                 Ok(InterceptResult::Pass(modified)) => current = modified,
                 Ok(InterceptResult::Block(reason)) => return InterceptResult::Block(reason),
-                Err(_) => {}
+                Err(payload) => {
+                    tracing::warn!(
+                        hook = "output_intercept",
+                        recovered = true,
+                        cause = %panic_payload_to_string(&*payload),
+                        "钩子执行 panic 已恢复"
+                    );
+                }
             }
         }
         InterceptResult::Pass(current)
@@ -156,7 +176,20 @@ impl HooksRegistry {
     pub async fn hook_output_observe(&self, msg: OutputEvent) {
         for entry in &self.output_observe {
             let handler_fut = AssertUnwindSafe((entry.handler)(msg.clone())).catch_unwind();
-            let _ = self.run_hook_with_timeout(handler_fut).await;
+            match self.run_hook_with_timeout(handler_fut).await {
+                Some(Ok(())) => {}
+                Some(Err(payload)) => tracing::warn!(
+                    hook = "output_observe",
+                    recovered = true,
+                    cause = %panic_payload_to_string(&*payload),
+                    "钩子执行 panic 已恢复"
+                ),
+                None => tracing::warn!(
+                    hook = "output_observe",
+                    timeout_secs = self.hook_timeout.as_secs(),
+                    "钩子执行超时已跳过"
+                ),
+            }
         }
     }
 
@@ -169,7 +202,15 @@ impl HooksRegistry {
             {
                 Ok(LlmErrorAction::Retry) => continue,
                 Ok(action) => return action,
-                Err(_) => continue,
+                Err(payload) => {
+                    tracing::warn!(
+                        hook = "on_llm_error",
+                        recovered = true,
+                        cause = %panic_payload_to_string(&*payload),
+                        "钩子执行 panic 已恢复"
+                    );
+                    continue;
+                }
             }
         }
         LlmErrorAction::Retry
@@ -186,7 +227,20 @@ impl HooksRegistry {
         self.ensure_sorted();
         for entry in &self.send_input {
             let handler_fut = AssertUnwindSafe((entry.handler)(tx.clone())).catch_unwind();
-            let _ = self.run_hook_with_timeout(handler_fut).await;
+            match self.run_hook_with_timeout(handler_fut).await {
+                Some(Ok(())) => {}
+                Some(Err(payload)) => tracing::warn!(
+                    hook = "send_input",
+                    recovered = true,
+                    cause = %panic_payload_to_string(&*payload),
+                    "钩子执行 panic 已恢复"
+                ),
+                None => tracing::warn!(
+                    hook = "send_input",
+                    timeout_secs = self.hook_timeout.as_secs(),
+                    "钩子执行超时已跳过"
+                ),
+            }
         }
     }
 }

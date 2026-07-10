@@ -27,3 +27,4 @@ url.workspace = true
 htmd.workspace = true
 reqwest.workspace = true
 scraper.workspace = true
+tracing.workspace = true

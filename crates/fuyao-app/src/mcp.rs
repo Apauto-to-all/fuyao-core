@@ -17,10 +17,15 @@ pub async fn register_mcp_tools(handle: &EngineHandle) -> Option<Arc<MCPManager>
     }
 
     let manager = Arc::new(MCPManager::from_config());
-    let (_, fail_count, failures) = manager.start_all().await;
+    let (success, fail_count, failures) = manager.start_all().await;
 
     if fail_count > 0 {
-        eprintln!("MCP 启动失败 {fail_count} 个: {failures:?}");
+        tracing::warn!(
+            failed = fail_count,
+            total = success + fail_count,
+            servers = ?failures.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            "MCP server 启动部分失败"
+        );
     }
 
     for (name, schema, handler) in manager.get_tool_entries().await {

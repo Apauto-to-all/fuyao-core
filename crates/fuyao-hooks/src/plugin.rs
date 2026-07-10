@@ -108,19 +108,6 @@ impl PluginEmitter {
     }
 }
 
-/// 插件错误
-///
-/// install / dispose_all 内部捕获 panic 后构造此类型记录日志，**不向上抛**。
-#[derive(Debug, thiserror::Error)]
-pub enum PluginError {
-    /// register 阶段失败（含 panic 转译）
-    #[error("插件 register 失败: {0}")]
-    Register(String),
-    /// dispose 阶段失败
-    #[error("插件 dispose 失败: {0}")]
-    Dispose(String),
-}
-
 /// 插件装配错误（install 阶段）
 #[derive(Debug, thiserror::Error)]
 pub enum PluginInstallError {
@@ -130,7 +117,7 @@ pub enum PluginInstallError {
 }
 
 /// 把 panic payload（`Box<dyn Any + Send>`）转为可读 String
-fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -173,7 +160,7 @@ impl PluginHost {
     /// 装配：遍历所有插件调用 register。
     ///
     /// - **重名硬失败**：core 不接受任何重名，检测到重名立即返回 `Err`
-    /// - **register panic 防护**：单个插件 register 崩溃不阻塞其他插件（eprintln + 继续）
+    /// - **register panic 防护**：单个插件 register 崩溃不阻塞其他插件（tracing warn + 继续）
     pub async fn install(&self, hooks: &SharedHooks) -> Result<(), PluginInstallError> {
         let mut seen = std::collections::HashSet::new();
         for plugin in &self.plugins {
@@ -188,12 +175,12 @@ impl PluginHost {
             {
                 Ok(()) => {}
                 Err(payload) => {
-                    eprintln!(
-                        "{}",
-                        PluginError::Register(format!(
-                            "插件 {name}: {}",
-                            panic_payload_to_string(&*payload)
-                        ))
+                    tracing::warn!(
+                        plugin = %name,
+                        phase = "register",
+                        recovered = true,
+                        cause = %panic_payload_to_string(&*payload),
+                        "插件回调 panic 已恢复"
                     );
                 }
             }
@@ -208,12 +195,12 @@ impl PluginHost {
             match AssertUnwindSafe(plugin.dispose()).catch_unwind().await {
                 Ok(()) => {}
                 Err(payload) => {
-                    eprintln!(
-                        "{}",
-                        PluginError::Dispose(format!(
-                            "插件 {name}: {}",
-                            panic_payload_to_string(&*payload)
-                        ))
+                    tracing::warn!(
+                        plugin = %name,
+                        phase = "dispose",
+                        recovered = true,
+                        cause = %panic_payload_to_string(&*payload),
+                        "插件回调 panic 已恢复"
                     );
                 }
             }

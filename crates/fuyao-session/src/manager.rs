@@ -74,6 +74,7 @@ impl SessionManager {
         let session = Session::new(title, system_prompt);
         self.store.create(&session).await?;
         self.update_cache(&session);
+        tracing::info!(session_id = %session.id, "会话创建");
         Ok(session)
     }
 
@@ -90,6 +91,7 @@ impl SessionManager {
         session.parent_session_id = parent_session_id;
         self.store.create(&session).await?;
         self.update_cache(&session);
+        tracing::info!(session_id = %session.id, "会话创建");
         Ok(session)
     }
 
@@ -227,6 +229,7 @@ impl SessionManager {
         session.ended_at = Some(now);
         session.end_reason = Some(end_reason.to_string());
         self.save(&session).await?;
+        tracing::info!(session_id = %session_id, end_reason = %end_reason, "会话结束");
         Ok(Some(session))
     }
 

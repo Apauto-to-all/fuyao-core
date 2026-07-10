@@ -100,16 +100,27 @@ impl EngineHandle {
     /// handle.set_agent_ctx(ctx);
     /// ```
     pub fn set_agent_ctx(&self, ctx: AgentContext) {
-        if let Ok(mut c) = self.agent_ctx.lock() {
-            *c = ctx;
+        match self.agent_ctx.lock() {
+            Ok(mut c) => {
+                let from = c.model_config.model_id.clone();
+                let to = ctx.model_config.model_id.clone();
+                if from != to {
+                    tracing::info!(from = ?from, to = ?to, "运行时 model 切换");
+                }
+                *c = ctx;
+            }
+            Err(_) => tracing::error!("Agent 上下文锁中毒，set_agent_ctx 未生效"),
         }
     }
 
     /// 注册工具
     pub fn register_tool(&self, name: &str, schema: serde_json::Value, handler: ToolFn) {
-        if let Ok(mut tools) = self.tools.lock() {
-            tools.0.insert(name.to_string(), handler);
-            tools.1.push(schema);
+        match self.tools.lock() {
+            Ok(mut tools) => {
+                tools.0.insert(name.to_string(), handler);
+                tools.1.push(schema);
+            }
+            Err(_) => tracing::error!(tool = %name, "工具注册表锁中毒，工具注册未生效"),
         }
     }
 

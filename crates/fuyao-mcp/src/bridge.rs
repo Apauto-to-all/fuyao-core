@@ -210,13 +210,14 @@ pub fn make_tool_call_handler(
             }
 
             // 执行 MCP 调用
+            let started = std::time::Instant::now();
             let call_result = tokio::time::timeout(
                 Duration::from_secs(timeout_secs as u64),
                 do_call(&conn, &tool_name, args.clone()),
             )
             .await;
 
-            match call_result {
+            let result = match call_result {
                 Ok(Ok(result)) => {
                     if let Ok(parsed) = serde_json::from_str::<Value>(&result) {
                         if parsed.get("error").is_some() {
@@ -230,18 +231,48 @@ pub fn make_tool_call_handler(
                 Ok(Err(err_msg)) => {
                     // 检测 Auth 错误并尝试恢复
                     if crate::recovery::is_auth_error_str(&err_msg) {
+                        tracing::warn!(
+                            server = %server_name,
+                            tool = %tool_name,
+                            kind = "auth",
+                            "MCP 调用遇到可恢复错误，触发重连"
+                        );
                         notify_reconnect(&conn);
                         let retry_result = wait_and_retry(&conn, &tool_name, &args).await;
                         if let Some(result) = retry_result {
+                            reset_error(&server_name);
+                            tracing::info!(
+                                name = %server_name,
+                                tool = %tool_name,
+                                ok = !result.contains("\"error\""),
+                                recovered = true,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "MCP 工具调用完成"
+                            );
                             return result;
                         }
                     }
 
                     // 检测 Session 过期并尝试恢复
                     if crate::recovery::is_session_expired_error_str(&err_msg) {
+                        tracing::warn!(
+                            server = %server_name,
+                            tool = %tool_name,
+                            kind = "session",
+                            "MCP 调用遇到可恢复错误，触发重连"
+                        );
                         notify_reconnect(&conn);
                         let retry_result = wait_and_retry(&conn, &tool_name, &args).await;
                         if let Some(result) = retry_result {
+                            reset_error(&server_name);
+                            tracing::info!(
+                                name = %server_name,
+                                tool = %tool_name,
+                                ok = !result.contains("\"error\""),
+                                recovered = true,
+                                elapsed_ms = started.elapsed().as_millis() as u64,
+                                "MCP 工具调用完成"
+                            );
                             return result;
                         }
                     }
@@ -259,7 +290,16 @@ pub fn make_tool_call_handler(
                     })
                     .to_string()
                 }
-            }
+            };
+
+            tracing::info!(
+                name = %server_name,
+                tool = %tool_name,
+                ok = !result.contains("\"error\""),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "MCP 工具调用完成"
+            );
+            result
         })
     })
 }

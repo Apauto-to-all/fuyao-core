@@ -144,6 +144,13 @@ impl MCPConnection {
 
                         if initial_retries < mcp.max_initial_connect_retries {
                             initial_retries += 1;
+                            tracing::warn!(
+                                server = %server_name,
+                                attempt = initial_retries,
+                                backoff_secs = backoff,
+                                cause = %e,
+                                "MCP server 初始连接失败，重试中"
+                            );
                             tokio::time::sleep(Duration::from_secs(backoff)).await;
                             backoff = (backoff * 2).min(mcp.max_backoff_secs);
 
@@ -161,9 +168,22 @@ impl MCPConnection {
 
                         retries += 1;
                         if retries > mcp.max_reconnect_retries {
+                            tracing::error!(
+                                server = %server_name,
+                                attempts = retries,
+                                cause = %e,
+                                "MCP server 重连耗尽，已放弃"
+                            );
                             break;
                         }
 
+                        tracing::warn!(
+                            server = %server_name,
+                            attempt = retries,
+                            backoff_secs = backoff,
+                            cause = %e,
+                            "MCP server 重连中"
+                        );
                         tokio::time::sleep(Duration::from_secs(backoff)).await;
                         backoff = (backoff * 2).min(mcp.max_backoff_secs);
                     }

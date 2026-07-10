@@ -666,6 +666,7 @@ impl Provider for OpenAIProvider {
     }
 
     async fn chat(&self, request: ChatRequest, model: &str) -> Result<ChatResponse, StreamError> {
+        let started = std::time::Instant::now();
         let options = ProviderStreamOptions::default();
         let body = self.build_request_body(request, model, &options, false);
         let response = self.send_request(body).await?;
@@ -721,6 +722,15 @@ impl Provider for OpenAIProvider {
             },
             None => StreamUsage::default(),
         };
+
+        tracing::info!(
+            model = %model,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            tokens_in = usage.prompt_tokens,
+            tokens_out = usage.completion_tokens,
+            thinking = usage.completion_reasoning_tokens.unwrap_or(0) > 0,
+            "LLM 请求完成"
+        );
 
         Ok(ChatResponse {
             content: choice.message.content,

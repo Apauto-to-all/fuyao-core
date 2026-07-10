@@ -57,6 +57,7 @@ pub async fn run_stream_session(
     let mut retry_count = 0u32;
     let mut accumulated_text = String::new();
     let mut accumulated_reasoning = String::new();
+    let started = std::time::Instant::now();
 
     'stream: loop {
         // 一次锁取全 model_config（AgentContext 是 Arc<Mutex>，禁止重复加锁）
@@ -117,6 +118,7 @@ pub async fn run_stream_session(
                     }
                 }
                 Err(e) if !is_retryable(&e) => {
+                    tracing::warn!(reason = %e, "LLM 请求不可恢复失败");
                     crate::dispatch::dispatch(
                         OutputEvent::Error(ErrorMessage {
                             base: EventBase::default(),
@@ -133,6 +135,13 @@ pub async fn run_stream_session(
                 }
                 Err(e) => {
                     retry_count += 1;
+                    let backoff = backoff_duration(retry_count, &e);
+                    tracing::warn!(
+                        attempt = retry_count,
+                        reason = %e,
+                        retry_after_ms = backoff.as_millis() as u64,
+                        "LLM 请求重试"
+                    );
 
                     crate::dispatch::dispatch(
                         OutputEvent::Error(ErrorMessage {
@@ -158,7 +167,7 @@ pub async fn run_stream_session(
                             if let Some(acc) = &accumulator {
                                 acc.lock().expect("流式累积器锁异常").phase = StreamPhase::Backoff;
                             }
-                            tokio::time::sleep(backoff_duration(retry_count, &e)).await;
+                            tokio::time::sleep(backoff).await;
                             // 恢复流式阶段
                             if let Some(acc) = &accumulator {
                                 acc.lock().expect("流式累积器锁异常").phase =
@@ -167,6 +176,11 @@ pub async fn run_stream_session(
                             continue 'stream;
                         }
                         LlmErrorAction::Abort => {
+                            tracing::warn!(
+                                attempt = retry_count,
+                                reason = %e,
+                                "LLM 请求被钩子中止"
+                            );
                             crate::dispatch::dispatch(
                                 OutputEvent::Error(ErrorMessage {
                                     base: EventBase::default(),
@@ -195,8 +209,14 @@ pub async fn run_stream_session(
     // 引擎实际执行的工具调用仍使用原始数据。后续需重构解决此冲突。
     let tool_calls = decoder.take_tool_calls();
     for tc in &tool_calls {
-        let args: serde_json::Value =
-            serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+        let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+            Ok(v) => v,
+            Err(_) => {
+                let raw: String = tc.arguments.chars().take(200).collect();
+                tracing::warn!(tool = %tc.name, raw = %raw, "工具参数 JSON 解析失败");
+                serde_json::Value::Null
+            }
+        };
         let event = OutputEvent::ToolCall(ToolCallMessage {
             base: EventBase::default(),
             payload: ToolCallPayload {
@@ -210,10 +230,27 @@ pub async fn run_stream_session(
         crate::dispatch::dispatch(event, None, emitter).await;
     }
 
+    let usage = decoder.usage().clone();
+    let model_id = {
+        let g = agent_ctx.lock().expect("Agent 上下文锁异常");
+        g.model_config
+            .model_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    tracing::info!(
+        model = %model_id,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        tokens_in = usage.prompt_tokens,
+        tokens_out = usage.completion_tokens,
+        thinking = usage.completion_reasoning_tokens.unwrap_or(0) > 0,
+        "LLM 请求完成"
+    );
+
     Ok(StreamResult {
         text: accumulated_text,
         reasoning: accumulated_reasoning,
         tool_calls,
-        usage: decoder.usage().clone(),
+        usage,
     })
 }

@@ -139,6 +139,8 @@ impl MCPManager {
             }
         }
 
+        tracing::info!(name = %server_name, tools = tools.len(), "MCP server 启动");
+
         Ok(())
     }
 

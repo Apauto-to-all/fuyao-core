@@ -11,3 +11,4 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 regex = { workspace = true }
 http = { workspace = true }
+tracing.workspace = true

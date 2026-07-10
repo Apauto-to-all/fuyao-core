@@ -40,6 +40,14 @@ pub fn bump_error(server_name: &str) {
         .or_insert(0);
     *count += 1;
     if *count >= threshold {
+        // 仅在熔断器从关闭→打开的瞬间记日志，避免每次失败重复记
+        if *count == threshold {
+            tracing::warn!(
+                name = %server_name,
+                consecutive_failures = *count,
+                "MCP server 熔断"
+            );
+        }
         state
             .opened_at
             .insert(server_name.to_string(), Instant::now());

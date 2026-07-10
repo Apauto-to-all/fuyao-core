@@ -936,6 +936,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -947,6 +948,7 @@ dependencies = [
  "fuyao-hooks",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -959,6 +961,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -972,6 +975,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1002,6 +1006,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1018,6 +1023,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1058,6 +1064,7 @@ dependencies = [
  "strsim",
  "thiserror",
  "tokio",
+ "tracing",
  "unicode-normalization",
  "url",
 ]

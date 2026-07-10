@@ -23,8 +23,14 @@ pub(crate) async fn emit_assistant_message(
             tool_calls_data
                 .iter()
                 .map(|tc| {
-                    let args: serde_json::Value =
-                        serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                    let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let raw: String = tc.arguments.chars().take(200).collect();
+                            tracing::warn!(tool = %tc.name, raw = %raw, "工具参数 JSON 解析失败");
+                            serde_json::Value::Null
+                        }
+                    };
                     ToolCallPayload {
                         tool_call_id: tc.id.clone(),
                         tool_name: tc.name.clone(),
