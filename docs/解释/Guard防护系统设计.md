@@ -61,7 +61,7 @@ Warn → Inject → Interrupt → Abort
 | **Warn** | 第 threshold 次 | emit_plugin 通知 + 设 pending_warn（ToolResult 前追加警告） |
 | **Inject** | 再犯 | emit_plugin + 设 pending_inject（ToolResult 内容替换为拦截消息） |
 | **Interrupt** | 继续犯 | send_interrupt（中断当前轮）+ send_inject_message（注入引导消息到对话历史）|
-| **Abort** | interrupt_count ≥ 3 | aborted=true + send_interrupt（彻底终止，不再注入引导） |
+| **Abort** | interrupt_count ≥ 3 | send_interrupt（彻底终止，不再注入引导） |
 
 > 工具路径有 Inject 级别，文本路径只有 Warn → Interrupt（无 Inject）。
 
@@ -89,8 +89,6 @@ Guard 按用户消息来源区分重置范围：
 1. **文本检测仅对流式生效**：只处理 Chunk 事件，不处理 Assistant（最终聚合消息）。非流式 Provider 不触发文本检测。
 
 2. **streaming_check_interval 单位**：配置注释写"每隔 N 个字符"，实现用的是 `String::len()`（字节长度）。对 UTF-8 中文，实际约每 N/3 个字符检查一次。
-
-3. **aborted 标志未读**（已知 TODO）：`aborted` 布尔标志只被 SET 和 RESET，从未在生产代码路径中被 READ 作为条件判断。Abort 触发后 Guard 自身不再阻断后续工具调用。空工具结果的问题源于中断机制与工具执行生命周期的交互，不在 guard crate 内部。
 
 ## 关键设计决策
 

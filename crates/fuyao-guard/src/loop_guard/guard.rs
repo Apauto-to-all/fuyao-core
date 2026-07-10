@@ -35,8 +35,6 @@ pub(crate) struct LoopGuardState {
     pending_severity: Option<LoopSeverity>,
     /// 中断次数计数器
     interrupt_count: usize,
-    /// 是否已终止（防止重复触发，轮次重置时清空）
-    aborted: bool,
     /// 插件消息发送器（由 SendInputFn 回调时设置，绑定身份发 Plugin 消息 + 复用通道发 Interrupt/User）
     emitter: Option<PluginEmitter>,
 }
@@ -53,7 +51,6 @@ impl LoopGuardState {
             pending_inject: String::new(),
             pending_severity: None,
             interrupt_count: 0,
-            aborted: false,
             emitter: None,
         }
     }
@@ -117,7 +114,6 @@ impl LoopGuardState {
     /// 清空所有跨轮次残留状态（含 interrupt_count），
     /// 确保新对话从干净状态开始检测。
     pub fn reset_turn(&mut self) {
-        self.aborted = false;
         self.pending_warn.clear();
         self.pending_inject.clear();
         self.pending_severity = None;
@@ -155,7 +151,6 @@ impl LoopGuardState {
                     );
                     self.pending_inject = r.message.clone();
                     self.emit_plugin("loop_abort", &r.message);
-                    self.aborted = true;
                     self.send_interrupt(r.message);
                 }
                 LoopSeverity::Interrupt => {
@@ -196,7 +191,6 @@ impl LoopGuardState {
                     );
                     self.pending_inject = r.message.clone();
                     self.emit_plugin("loop_abort", &r.message);
-                    self.aborted = true;
                     self.send_interrupt(r.message);
                 }
                 LoopSeverity::Interrupt => {
@@ -357,18 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn abort_sets_aborted_flag() {
+    fn reset_turn_clears_all_state() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        assert!(!state.aborted);
-        // 模拟 Abort 级别处理
-        state.aborted = true;
-        assert!(state.aborted);
-    }
-
-    #[test]
-    fn reset_turn_clears_aborted() {
-        let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        state.aborted = true;
         state.pending_warn = "警告".to_string();
         state.pending_inject = "注入".to_string();
         state.pending_severity = Some(LoopSeverity::Abort);
@@ -377,7 +361,6 @@ mod tests {
             .tool_guard
             .handle_tool_call("bash", r#"{"command":"ls"}"#, 0);
         state.reset_turn();
-        assert!(!state.aborted);
         assert!(state.pending_warn.is_empty());
         assert!(state.pending_inject.is_empty());
         assert!(state.pending_severity.is_none());
@@ -582,40 +565,34 @@ mod tests {
         assert!(!state.pending_warn.is_empty());
         assert!(state.pending_inject.is_empty());
         assert_eq!(state.interrupt_count, 0);
-        assert!(!state.aborted);
 
         // 第 5 次：Inject（tool_escalation=2）
         state.pending_warn.clear();
         state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
         assert!(!state.pending_inject.is_empty());
         assert_eq!(state.interrupt_count, 0);
-        assert!(!state.aborted);
 
         // 第 6 次：Interrupt（tool_escalation=3），interrupt_count=1
         state.pending_inject.clear();
         state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
         assert!(!state.pending_inject.is_empty());
         assert_eq!(state.interrupt_count, 1);
-        assert!(!state.aborted);
 
         // 第 7 次：Interrupt（tool_escalation=4），interrupt_count=2
         state.pending_inject.clear();
         state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
         assert_eq!(state.interrupt_count, 2);
-        assert!(!state.aborted);
 
         // 第 8 次：Interrupt（tool_escalation=5），interrupt_count=3
         state.pending_inject.clear();
         state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
         assert_eq!(state.interrupt_count, 3);
-        assert!(!state.aborted);
 
         // 第 9 次：Abort（interrupt_count=3 >= 3，Interrupt 升级为 Abort）
         state.pending_inject.clear();
         state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
         assert_eq!(state.interrupt_count, 3);
         assert!(!state.pending_inject.is_empty());
-        assert!(state.aborted);
     }
 
     /// 插件注入消息不应重置 tool_history，确保检测保持"热"状态
@@ -775,6 +752,5 @@ mod tests {
         assert_eq!(guard.interrupt_count, 0, "用户消息应清空 interrupt_count");
         assert!(guard.pending_warn.is_empty());
         assert!(guard.pending_inject.is_empty());
-        assert!(!guard.aborted);
     }
 }
