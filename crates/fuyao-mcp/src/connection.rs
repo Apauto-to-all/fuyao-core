@@ -371,7 +371,8 @@ impl MCPConnection {
 
     /// 断开连接
     pub async fn disconnect(&mut self) {
-        self.shutdown_tx.send(true).expect("shutdown 通道发送失败");
+        // 接收端可能已 drop（Task 已结束），忽略发送失败
+        let _ = self.shutdown_tx.send(true);
         self.lifecycle_notify.notify_one();
 
         if let Some(handle) = self.task_handle.take() {

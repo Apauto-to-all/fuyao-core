@@ -177,10 +177,11 @@ pub fn reset_file_dedup(task_id: Option<&str>) {
 }
 
 fn get_mtime(path: &str) -> Option<i64> {
-    use std::os::windows::fs::MetadataExt;
     std::fs::metadata(path)
         .ok()
-        .map(|m| m.last_write_time() as i64)
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
 }
 
 #[cfg(test)]

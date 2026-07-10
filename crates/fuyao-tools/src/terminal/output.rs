@@ -76,15 +76,17 @@ pub fn truncate_output(text: &str) -> String {
         return text.to_string();
     }
 
-    let head_chars = (max_chars as f64 * 0.4) as usize;
-    let tail_chars = max_chars - head_chars;
-    let omitted = text.len() - head_chars - tail_chars;
+    // 调整到 UTF-8 字符边界，避免多字节字符中间切片 panic
+    let head_target = (max_chars as f64 * 0.4) as usize;
+    let head_end = text.ceil_char_boundary(head_target);
+    let tail_start = text.ceil_char_boundary(text.len().saturating_sub(max_chars - head_target));
+    let omitted = tail_start.saturating_sub(head_end);
 
     format!(
         "{}\n\n... [输出已截断 - 省略 {omitted} 字符 (总长 {})] ...\n\n{}",
-        &text[..head_chars],
+        &text[..head_end],
         text.len(),
-        &text[text.len() - tail_chars..]
+        &text[tail_start..]
     )
 }
 

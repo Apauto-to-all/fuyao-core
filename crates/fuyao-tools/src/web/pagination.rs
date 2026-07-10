@@ -41,8 +41,11 @@ pub fn apply_pagination(content: &str, offset: usize, limit: usize) -> Paginatio
         };
     }
 
+    // 调整到 UTF-8 字符边界，避免多字节字符中间切片 panic
+    let safe_offset = content.ceil_char_boundary(offset);
     let end_pos = (offset + limit).min(total_length);
-    let paginated_content = content[offset..end_pos].to_string();
+    let safe_end = content.ceil_char_boundary(end_pos);
+    let paginated_content = content[safe_offset..safe_end].to_string();
 
     let has_more = end_pos < total_length;
     let next_offset = if has_more { Some(end_pos) } else { None };

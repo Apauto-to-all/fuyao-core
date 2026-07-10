@@ -11,12 +11,14 @@ pub fn is_retryable(e: &StreamError) -> bool {
     match e {
         StreamError::RateLimit { .. } | StreamError::Timeout | StreamError::Connection(_) => true,
         StreamError::ApiError(msg) => {
-            // 5xx 服务端错误视为可重试
-            msg.contains("529")
-                || msg.contains("500")
-                || msg.contains("502")
-                || msg.contains("503")
-                || msg.contains("504")
+            // 消息格式："HTTP {code}: {body}"
+            // 提取首个 3 位数字作为状态码，避免 body 中恰好包含 "500" 等导致 4xx 误判
+            let digits: String = msg
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take(3)
+                .collect();
+            matches!(digits.as_str(), "500" | "502" | "503" | "504" | "529")
         }
         // ContextOverflow 不重试，应触发压缩
         StreamError::ContextOverflow
@@ -148,6 +150,25 @@ mod tests {
         )));
         assert!(!is_retryable(&StreamError::ApiError(
             "404 Not Found".to_string()
+        )));
+    }
+
+    #[test]
+    fn is_retryable_5xx_with_http_prefix() {
+        // 生产环境消息格式："HTTP {code}: {body}"
+        assert!(is_retryable(&StreamError::ApiError(
+            "HTTP 500: Internal Server Error".to_string()
+        )));
+        assert!(is_retryable(&StreamError::ApiError(
+            "HTTP 503: Service Unavailable".to_string()
+        )));
+    }
+
+    #[test]
+    fn is_not_retryable_4xx_with_5xx_in_body() {
+        // 状态码是 400 但 body 中包含 "500"，不应误判为可重试
+        assert!(!is_retryable(&StreamError::ApiError(
+            "HTTP 400: Error processing 500 items".to_string()
         )));
     }
 
