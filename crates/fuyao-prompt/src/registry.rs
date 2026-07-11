@@ -7,7 +7,7 @@
 
 use crate::default::DEFAULT_FUYAO_AGENT;
 use crate::loader::load_agent_definition;
-use fuyao_api::get_workspace_agents_dir;
+use fuyao_api::{AgentMode, get_workspace_agents_dir};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,8 @@ pub struct AgentInfo {
     pub name: String,
     /// 能力描述（system.md frontmatter）
     pub description: String,
+    /// 使用模式：主代理 / 子代理 / 全部（system.md frontmatter mode 字段）
+    pub mode: AgentMode,
     /// 来源层
     pub source: AgentSource,
     /// 完整系统提示词（system.md body）
@@ -310,15 +312,16 @@ impl AgentRegistry {
             .to_string();
 
         // 解析 system.md（缺失或读取失败 → 用全局默认提示词填充）
-        let (name, description, system_prompt) = match load_agent_definition(&dir.join("system.md"))
-        {
-            Some(def) => (def.name, def.description, def.system_prompt),
-            None => (
-                folder_name,
-                String::new(),
-                DEFAULT_FUYAO_AGENT.system_prompt.clone(),
-            ),
-        };
+        let (name, description, system_prompt, mode) =
+            match load_agent_definition(&dir.join("system.md")) {
+                Some(def) => (def.name, def.description, def.system_prompt, def.mode),
+                None => (
+                    folder_name,
+                    String::new(),
+                    DEFAULT_FUYAO_AGENT.system_prompt.clone(),
+                    DEFAULT_FUYAO_AGENT.mode,
+                ),
+            };
 
         // 解析 fuyao.toml（可选）
         let (model, tools, mcp_servers) = parse_fuyao_toml(&dir.join("fuyao.toml"));
@@ -330,6 +333,7 @@ impl AgentRegistry {
             id: id.to_string(),
             name,
             description,
+            mode,
             source,
             system_prompt,
             model,
@@ -422,13 +426,14 @@ impl AgentRegistry {
     /// - fuyao.toml：`{fuyao_home}/fuyao.toml` 存在则解析 model/tools/mcp_servers
     fn load_default_agent(&self) -> Option<AgentInfo> {
         // 解析定义文件（缺失则用硬编码默认 Agent）
-        let (name, description, system_prompt) =
+        let (name, description, system_prompt, mode) =
             match load_agent_definition(&self.fuyao_home.join("agents").join("default.md")) {
-                Some(def) => (def.name, def.description, def.system_prompt),
+                Some(def) => (def.name, def.description, def.system_prompt, def.mode),
                 None => (
                     DEFAULT_FUYAO_AGENT.name.clone(),
                     DEFAULT_FUYAO_AGENT.description.clone(),
                     DEFAULT_FUYAO_AGENT.system_prompt.clone(),
+                    DEFAULT_FUYAO_AGENT.mode,
                 ),
             };
 
@@ -439,6 +444,7 @@ impl AgentRegistry {
             id: "default".to_string(),
             name,
             description,
+            mode,
             source: AgentSource::Global,
             system_prompt,
             model,

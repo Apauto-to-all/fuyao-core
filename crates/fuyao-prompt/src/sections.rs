@@ -13,6 +13,7 @@
 //! | 6 | 日期时间 | ✅ 已实现 |
 //! | 7 | 运行环境 | ✅ 已实现 |
 
+use crate::default::DEFAULT_FUYAO_AGENT;
 use crate::loader::load_agent_definition_from_agent_paths;
 use chrono::Local;
 use fuyao_api::{AgentConfig, AgentPaths};
@@ -29,6 +30,15 @@ pub fn build_agent_identity_section(
 ) -> String {
     let def_name = agent_config.definition.as_deref().unwrap_or("default");
     let agent_def = load_agent_definition_from_agent_paths(agent_paths, def_name);
+    // 校验:子代理模式的定义不能用作主代理,回退默认定义
+    if !agent_def.mode.is_usable_as_primary() {
+        tracing::error!(
+            definition = def_name,
+            mode = ?agent_def.mode,
+            "Agent 定义标记为子代理模式,不能用作主代理,回退默认定义"
+        );
+        return DEFAULT_FUYAO_AGENT.system_prompt.clone();
+    }
     agent_def.system_prompt
 }
 
@@ -295,6 +305,30 @@ mod tests {
         };
         let section = build_agent_identity_section(&ctx, &config);
         assert!(section.contains("代码审查专家"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn build_agent_identity_section_rejects_subagent_mode() {
+        // mode: subagent 的定义不能用作主代理,应回退 DEFAULT_FUYAO_AGENT
+        let temp = std::env::temp_dir().join("fuyao_test_sections_subagent_mode");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("default.md"),
+            "---\nname: sub\ndescription: sub\nmode: subagent\n---\n你是子代理,不应作主代理",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let section = build_agent_identity_section(&ctx, &AgentConfig::default());
+        // subagent 被拒,回退默认(含 "Fuyao"),不含子代理提示词
+        assert!(section.contains("Fuyao"));
+        assert!(!section.contains("不应作主代理"));
 
         std::fs::remove_dir_all(&temp).ok();
     }

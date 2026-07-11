@@ -40,7 +40,7 @@ pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
     get_workspace_root,
 };
-pub use prompt_types::AgentDefinition;
+pub use prompt_types::{AgentDefinition, AgentMode};
 pub use provider::{
     Model, ModelCost, ModelLimit, ModelModalities, PriceTier, Provider, ProviderOptions,
     ThinkingType,

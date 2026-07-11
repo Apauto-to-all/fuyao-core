@@ -3,7 +3,7 @@
 //! 框架内置的默认 Agent，硬编码确保框架稳定性。
 //! 用户可通过 `agents/default.md` 覆盖此定义。
 
-use fuyao_api::AgentDefinition;
+use fuyao_api::{AgentDefinition, AgentMode};
 use std::sync::LazyLock;
 
 /// 默认系统提示词
@@ -35,6 +35,7 @@ pub static DEFAULT_FUYAO_AGENT: LazyLock<AgentDefinition> = LazyLock::new(|| Age
     description: "Fuyao 默认助手".to_string(),
     version: "1.0.0".to_string(),
     author: "Fuyao".to_string(),
+    mode: AgentMode::All,
     system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
     source_path: None,
 });

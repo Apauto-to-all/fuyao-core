@@ -4,8 +4,8 @@
 //! 定义文件集中在 `agents/` 文件夹管理，由 AgentConfig.definition 指定加载哪个定义。
 
 use crate::default::DEFAULT_FUYAO_AGENT;
-use fuyao_api::AgentDefinition;
 use fuyao_api::AgentPaths;
+use fuyao_api::{AgentDefinition, AgentMode};
 use regex::Regex;
 use std::path::Path;
 
@@ -38,12 +38,18 @@ pub fn load_agent_definition(file_path: &Path) -> Option<AgentDefinition> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let mode = frontmatter
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(AgentMode::from)
+        .unwrap_or_default();
 
     Some(AgentDefinition {
         name,
         description,
         version,
         author,
+        mode,
         system_prompt: body.trim().to_string(),
         source_path: Some(file_path.to_string_lossy().to_string()),
     })
@@ -218,5 +224,33 @@ mod tests {
         let def = load_agent_definition_from_agent_paths(&ctx, "default");
         // 无 agents/default.md → 回退默认，与 agent_id 无关
         assert_eq!(def.name, "fuyao");
+    }
+
+    #[test]
+    fn load_agent_definition_parses_mode() {
+        let temp = std::env::temp_dir().join("fuyao_test_loader_mode");
+        std::fs::create_dir_all(&temp).unwrap();
+        let md = temp.join("test.md");
+
+        // subagent 模式
+        std::fs::write(
+            &md,
+            "---\nname: sub\ndescription: sub\nmode: subagent\n---\n你是子代理",
+        )
+        .unwrap();
+        let def = load_agent_definition(&md).unwrap();
+        assert_eq!(def.mode, fuyao_api::AgentMode::Subagent);
+
+        // primary 模式
+        std::fs::write(&md, "---\nname: main\nmode: primary\n---\n你是主代理").unwrap();
+        let def = load_agent_definition(&md).unwrap();
+        assert_eq!(def.mode, fuyao_api::AgentMode::Primary);
+
+        // 未指定 mode 默认 All
+        std::fs::write(&md, "---\nname: any\n---\n任意").unwrap();
+        let def = load_agent_definition(&md).unwrap();
+        assert_eq!(def.mode, fuyao_api::AgentMode::All);
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }
