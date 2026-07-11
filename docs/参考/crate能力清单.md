@@ -28,7 +28,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：公共类型 + 配置系统 + 路径系统
 - **内部依赖**：无
-- **公开 API**：`AgentContext` / `AgentConfig` / `AgentPaths` / `ModelConfig` / `SharedAgentCtx`；`FuyaoConfig` 及全子配置；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`；`EventBase` / `InputEvent` / `OutputEvent` 及消息族；`Provider` trait / `Model`；`Session` / `Message` / `TodoItem`；`ToolDefinition` / `ToolResult` / `ToolCallContext`；`SkillDefinition` / `SkillMeta`；`AgentDefinition`；`MCPServerConfig`；`ApiError`
+- **公开 API**：`AgentContext` / `AgentConfig` / `AgentPaths` / `ModelConfig` / `SharedAgentCtx`；`FuyaoConfig` 及全子配置；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`；`EventBase` / `InputEvent` / `OutputEvent` 及消息族；`Provider` trait / `Model`；`Session` / `Message` / `TodoItem`；`ToolDefinition` / `ToolResult` / `ToolCallContext`；`SkillDefinition` / `SkillMeta`；`AgentDefinition` / `AgentMode`；`MCPServerConfig`；`ApiError`
 
 ## fuyao-provider（L1 能力）
 
