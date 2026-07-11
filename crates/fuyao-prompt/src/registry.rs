@@ -467,9 +467,13 @@ fn parse_fuyao_toml(path: &Path) -> (Option<String>, Vec<String>, Vec<String>) {
         return (None, Vec::new(), Vec::new()); // 解析失败 → 空配置
     };
 
-    // model：顶层字符串字段
+    // model：[models.default] 的 model 字段（默认模型）
     let model = table
-        .get("model")
+        .get("models")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("default"))
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("model"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -641,7 +645,8 @@ mod tests {
         let toml_path = temp.join("fuyao.toml");
         std::fs::write(
             &toml_path,
-            r#"model = "deepseek/deepseek-v4-flash"
+            r#"[models.default]
+model = "deepseek/deepseek-v4-flash"
 
 [tools]
 read = true
@@ -700,7 +705,7 @@ command = "node"
         .unwrap();
         std::fs::write(
             global_agents.join("fuyao.toml"),
-            "model = \"deepseek/deepseek-v4-flash\"\n",
+            "[models.default]\nmodel = \"deepseek/deepseek-v4-flash\"\n",
         )
         .unwrap();
 
@@ -710,7 +715,11 @@ command = "node"
         std::fs::write(profiles_dir.join("python.md"), "# Python guide").unwrap();
 
         // 全局 fuyao.toml（默认 Agent 的 model 来源）
-        std::fs::write(temp.join("fuyao.toml"), "model = \"aliyun/qwen3.6-plus\"\n").unwrap();
+        std::fs::write(
+            temp.join("fuyao.toml"),
+            "[models.default]\nmodel = \"aliyun/qwen3.6-plus\"\n",
+        )
+        .unwrap();
 
         // 注入 fuyao_home 指向临时目录
         let registry = AgentRegistry::new(None, temp.clone());
@@ -993,7 +1002,7 @@ command = "node"
                 AgentSource::Global,
                 "writer",
                 AgentFile::FuyaoToml,
-                "model = \"deepseek/deepseek-v4-flash\"\n",
+                "[models.default]\nmodel = \"deepseek/deepseek-v4-flash\"\n",
             )
             .unwrap();
         assert!(agent_dir.join("fuyao.toml").exists());

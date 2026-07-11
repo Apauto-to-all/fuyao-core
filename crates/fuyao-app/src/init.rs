@@ -5,7 +5,7 @@
 //! 2. 加载三层 TOML 配置
 //! 3. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
 //! 4. 注册 Provider/Model 到注册表（带缓存，重复调用幂等）
-//! 5. 确定 `model_id`（显式指定 > 配置文件 `model` 字段 > 第一个已注册模型）
+//! 5. 确定 `model_id`（显式指定 > 配置文件 `[models.default]` > 第一个已注册模型）
 //! 6. 创建 [`OpenAIProvider`] 实例（按 `provider_id`）
 //! 7. 验证模型存在于注册表
 //! 8. 创建 [`Engine`]，返回 `((Engine, EngineHandle, LogGuard))`
@@ -82,7 +82,7 @@ pub enum InitError {
 ///
 /// # 参数
 /// - `agent_ctx`：Agent 运行时上下文，至少应填充 `agent_paths`（决定三层目录）；
-///   若填充 `model_id` 则优先使用，否则按配置文件 `model` 字段 / 第一个已注册模型回退。
+///   若填充 `model_id` 则优先使用，否则按配置文件 `[models.default]` / 第一个已注册模型回退。
 ///
 /// # 错误
 /// - [`InitError::NoModelWithDetail`]：未指定 `model_id` 且注册表为空
@@ -188,7 +188,7 @@ fn ensure_registered(
 
 /// 获取默认 model_id
 ///
-/// 优先级：配置文件 `model` 字段（若在注册表中） > 已加载模型的第一个。
+/// 优先级：配置文件 `[models.default]`（若在注册表中） > 已加载模型的第一个。
 /// 使用 init_engine 已加载的配置，不重复加载。
 fn get_default_model_id(agent_paths: &AgentPaths, config: Option<&FuyaoConfig>) -> Option<String> {
     let loaded = list_models(agent_paths);
@@ -196,13 +196,13 @@ fn get_default_model_id(agent_paths: &AgentPaths, config: Option<&FuyaoConfig>) 
         return None;
     }
 
-    // 配置文件的 model 字段优先，但需确认已注册（防止配置指向未注册模型）
+    // 配置文件的 [models.default] 优先，但需确认已注册（防止配置指向未注册模型）
     if let Some(cfg) = config
-        && let Some(ref model_id) = cfg.model
+        && let Some(model_ref) = cfg.models.get("default")
     {
-        let lower = model_id.to_lowercase();
+        let lower = model_ref.model.to_lowercase();
         if loaded.contains_key(&lower) {
-            return Some(model_id.clone());
+            return Some(model_ref.model.clone());
         }
     }
 

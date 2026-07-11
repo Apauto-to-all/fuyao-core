@@ -28,6 +28,7 @@ pub mod llm;
 pub mod loader;
 pub mod logging;
 pub mod mcp;
+pub mod models;
 pub mod plugins;
 pub mod providers;
 pub mod session;
@@ -48,6 +49,7 @@ pub use hooks::HooksConfig;
 pub use llm::{LlmConfig, RetryConfig};
 pub use logging::{LogRotation, LoggingConfig};
 pub use mcp::McpGlobalConfig;
+pub use models::ModelRef;
 pub use plugins::PluginsConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig};
 pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig};
@@ -67,8 +69,8 @@ pub use loader::{load_config, load_merged_config};
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct FuyaoConfig {
-    /// 默认模型（格式：provider_id/model_id）
-    pub model: Option<String>,
+    /// 多模型选择（按用途标签，如 default / fast）
+    pub models: HashMap<String, ModelRef>,
 
     /// Provider 配置字典，key 为 Provider ID
     #[serde(skip)]
@@ -141,7 +143,7 @@ mod tests {
     #[test]
     fn fuyao_config_default_subsections_match_their_defaults() {
         let c = FuyaoConfig::default();
-        assert!(c.model.is_none());
+        assert!(c.models.is_empty());
         assert!(c.providers.is_empty());
         assert!(c.mcp_servers.is_empty());
         assert!(c.tools.enabled.is_empty());
