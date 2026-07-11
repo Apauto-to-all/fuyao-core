@@ -21,6 +21,7 @@ name = "deepseek-v4-flash"
 context = 128000
 output = 8192
 
+[models.default]
 model = "deepseek/deepseek-v4-flash"
 ```
 

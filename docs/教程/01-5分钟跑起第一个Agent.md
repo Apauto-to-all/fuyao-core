@@ -12,6 +12,7 @@
 在项目根创建 `fuyao.toml`：
 
 ```toml
+[models.default]
 model = "deepseek/deepseek-v4-flash"
 
 [providers.deepseek]

@@ -198,7 +198,7 @@ fn get_default_model_id(agent_paths: &AgentPaths, config: Option<&FuyaoConfig>) 
 
     // 配置文件的 [models.default] 优先，但需确认已注册（防止配置指向未注册模型）
     if let Some(cfg) = config
-        && let Some(model_ref) = cfg.models.get("default")
+        && let Some(model_ref) = cfg.models.default.as_ref()
     {
         let lower = model_ref.model.to_lowercase();
         if loaded.contains_key(&lower) {

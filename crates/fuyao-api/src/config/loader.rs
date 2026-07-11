@@ -274,7 +274,7 @@ terminal_default_timeout_secs = 240
 
         // models.default：workspace 覆盖 global
         assert_eq!(
-            cfg.models.get("default").map(|m| m.model.as_str()),
+            cfg.models.default.as_ref().map(|m| m.model.as_str()),
             Some("workspace/model")
         );
         // llm.request_timeout_secs 来自 global（无更高优先级覆盖）

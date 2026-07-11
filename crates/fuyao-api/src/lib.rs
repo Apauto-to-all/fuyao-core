@@ -26,8 +26,8 @@ mod tool;
 pub use agent::{AgentConfig, AgentContext, AgentPaths, ModelConfig, SharedAgentCtx};
 pub use config::{
     CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig, LlmConfig,
-    LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef, PluginsConfig,
-    RetryConfig, SessionConfig, SessionStorageConfig, ToolRunnerConfig, ToolsConfig,
+    LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef, ModelSelection,
+    PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig, ToolRunnerConfig, ToolsConfig,
     ToolsLimitsConfig, get_config, load_config, load_env, load_merged_config, set_config,
 };
 pub use error::ApiError;

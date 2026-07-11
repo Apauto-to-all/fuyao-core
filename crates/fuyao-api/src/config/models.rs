@@ -7,6 +7,9 @@
 //! - `default`：默认模型（主对话）。未显式指定 model_id 时使用。
 //! - `fast`：轻量任务模型（标题生成、压缩总结等）。便宜快速，不可用时回退 `default`。
 //!
+//! 标签固定为 `default` / `fast`，配置未知标签会加载报错（`deny_unknown_fields`），
+//! 避免死配置。加新标签时在 [`ModelSelection`] 加 `Option<ModelRef>` 字段，TOML 格式不变。
+//!
 //! # 配置示例
 //! ```toml
 //! [models.default]
@@ -29,6 +32,22 @@ pub struct ModelRef {
     pub model: String,
 }
 
+/// 多模型选择（固定标签）
+///
+/// 对应 `fuyao.toml` 中 `[models]` 段。标签固定为 `default` / `fast`，
+/// 配置未知标签会加载报错（`deny_unknown_fields`），避免配了不生效的死配置。
+///
+/// 加新标签时在此结构体加 `Option<ModelRef>` 字段，TOML 格式不变。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelSelection {
+    /// 默认模型（主对话）。未显式指定 model_id 时使用
+    pub default: Option<ModelRef>,
+
+    /// 轻量任务模型（标题生成、压缩总结等）。不可用时回退 `default`
+    pub fast: Option<ModelRef>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,9 +58,16 @@ mod tests {
         assert!(r.model.is_empty());
     }
 
-    /// [models.default] 子段反序列化为 HashMap<String, ModelRef>
     #[test]
-    fn model_ref_deserialize_from_subsection() {
+    fn model_selection_default_is_all_none() {
+        let s = ModelSelection::default();
+        assert!(s.default.is_none());
+        assert!(s.fast.is_none());
+    }
+
+    /// [models.default] / [models.fast] 反序列化
+    #[test]
+    fn model_selection_deserialize() {
         let toml_str = r#"
 [models.default]
 model = "deepseek/deepseek-v4-flash"
@@ -51,10 +77,44 @@ model = "deepseek/deepseek-v4-flash"
 "#;
         #[derive(Deserialize)]
         struct Wrapper {
-            models: std::collections::HashMap<String, ModelRef>,
+            models: ModelSelection,
         }
         let w: Wrapper = toml::from_str(toml_str).unwrap();
-        assert_eq!(w.models["default"].model, "deepseek/deepseek-v4-flash");
-        assert_eq!(w.models["fast"].model, "deepseek/deepseek-v4-flash");
+        assert_eq!(
+            w.models.default.unwrap().model,
+            "deepseek/deepseek-v4-flash"
+        );
+        assert_eq!(w.models.fast.unwrap().model, "deepseek/deepseek-v4-flash");
+    }
+
+    /// 只配 default，fast 缺失 → fast 为 None
+    #[test]
+    fn model_selection_deserialize_partial() {
+        let toml_str = r#"
+[models.default]
+model = "deepseek/deepseek-v4-flash"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            models: ModelSelection,
+        }
+        let w: Wrapper = toml::from_str(toml_str).unwrap();
+        assert!(w.models.default.is_some());
+        assert!(w.models.fast.is_none());
+    }
+
+    /// 未知标签报错（deny_unknown_fields）
+    #[test]
+    fn model_selection_rejects_unknown_tag() {
+        let toml_str = r#"
+[models.vision]
+model = "deepseek/deepseek-v4-flash"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            models: ModelSelection,
+        }
+        let result: Result<Wrapper, _> = toml::from_str(toml_str);
+        assert!(result.is_err());
     }
 }
