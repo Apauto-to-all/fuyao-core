@@ -51,7 +51,7 @@ pub use logging::{LogRotation, LoggingConfig};
 pub use mcp::McpGlobalConfig;
 pub use models::{ModelRef, ModelSelection};
 pub use plugins::PluginsConfig;
-pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig};
+pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig, TitleConfig};
 pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig};
 
 // 加载相关

@@ -9,6 +9,7 @@ mod error;
 mod manager;
 mod schema;
 mod store;
+mod title_generator;
 mod todo_store;
 mod utils;
 
@@ -17,4 +18,5 @@ pub use cost::calculate_cost;
 pub use error::SessionError;
 pub use manager::{SessionManager, clear_session_manager_cache, get_session_manager};
 pub use store::SQLiteStore;
+pub use title_generator::maybe_generate_title;
 pub use todo_store::TodoStore;

@@ -8,6 +8,7 @@
 use super::session_context::SessionContext;
 use crate::compressor::tracker::CompressionTracker;
 use crate::compressor::{COMPRESSION_SYSTEM_PROMPT, expand_for_integrity};
+use crate::title_generator::maybe_generate_title;
 use fuyao_api::message::input::{
     PluginSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
@@ -257,6 +258,65 @@ impl SessionHooksState {
             }
         }
     }
+
+    /// 首轮对话后自动重命名（fire-and-forget）
+    ///
+    /// 仅在首轮（user 消息数 == 1）触发，spawn 异步生成标题并写回 DB。
+    /// 生成失败或非首轮则跳过，不阻塞主对话。标题模型优先级：fast → 当前引擎模型 → 放弃。
+    async fn try_auto_title(&self, assistant_data: &AssistantMessage) {
+        // 开关关闭时直接跳过
+        if !fuyao_api::get_config().session.title.enabled {
+            return;
+        }
+        // 一次锁 session_ctx：取 user 消息 + session_manager
+        let (user_msg, mgr) = {
+            let ctx = self.session_ctx.lock().await;
+            let messages = ctx.get_messages();
+            let user_count = messages.iter().filter(|m| m.role == "user").count();
+            if user_count != 1 {
+                return;
+            }
+            let user_msg = messages
+                .iter()
+                .find(|m| m.role == "user")
+                .and_then(|m| m.content.clone());
+            (user_msg, ctx.session_manager.clone())
+        };
+        let Some(user_msg) = user_msg else {
+            return;
+        };
+        let Some(mgr) = mgr else {
+            return;
+        };
+        let assistant_msg = assistant_data.payload.content.clone().unwrap_or_default();
+        // 从 agent_ctx 取 session_id + model_id + agent_paths（一次锁取）
+        let (session_id, model_id, agent_paths) = {
+            let g = self.agent_ctx.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                g.session_id.clone(),
+                g.model_config.model_id.clone(),
+                g.agent_paths.clone(),
+            )
+        };
+        let (Some(sid), Some(mid)) = (session_id, model_id) else {
+            return;
+        };
+        // fire-and-forget：不阻塞 hook，生成失败静默放弃
+        tokio::spawn(async move {
+            match maybe_generate_title(&user_msg, &assistant_msg, &mid, &agent_paths).await {
+                Some(title) => match mgr.set_session_title(&sid, &title).await {
+                    Ok(true) => {
+                        tracing::info!(session_id = %sid, title = %title, "会话自动重命名完成");
+                    }
+                    Ok(false) => {
+                        tracing::debug!(session_id = %sid, "会话不存在，跳过重命名");
+                    }
+                    Err(e) => tracing::warn!(cause = %e, "自动重命名写入失败"),
+                },
+                None => tracing::debug!("会话自动重命名跳过（生成失败）"),
+            }
+        });
+    }
 }
 
 /// Session 管理插件
@@ -386,6 +446,9 @@ impl Plugin for SessionPlugin {
                             );
                             guard.inject_compression_guide();
                         }
+
+                        // 首轮后尝试自动重命名（fire-and-forget，不阻塞）
+                        guard.try_auto_title(data).await;
                     }
                 })
             }));

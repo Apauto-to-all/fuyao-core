@@ -249,6 +249,23 @@ impl SQLiteStore {
         Ok(())
     }
 
+    /// 更新会话标题（轻量，只改 title 列）
+    ///
+    /// 用于自动重命名场景，避免全量 update 的开销与竞态。
+    /// 返回是否找到并更新了会话。
+    pub async fn set_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<bool, SessionError> {
+        let result = sqlx::query("UPDATE sessions SET title = ?1 WHERE id = ?2")
+            .bind(title)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// 删除会话
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
         sqlx::query("DELETE FROM todos WHERE session_id = ?1")
@@ -471,5 +488,31 @@ mod tests {
             loaded.messages[0].tool_calls.as_ref().unwrap()[0]["id"],
             "call_1"
         );
+    }
+
+    #[tokio::test]
+    async fn store_set_session_title() {
+        let store = temp_store().await;
+        let session = Session::new(Some("原标题".to_string()), None);
+        store.create(&session).await.unwrap();
+
+        let updated = store
+            .set_session_title(&session.id, "新标题")
+            .await
+            .unwrap();
+        assert!(updated);
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.title, Some("新标题".to_string()));
+    }
+
+    #[tokio::test]
+    async fn store_set_session_title_missing_returns_false() {
+        let store = temp_store().await;
+        let updated = store
+            .set_session_title("nonexistent", "标题")
+            .await
+            .unwrap();
+        assert!(!updated);
     }
 }

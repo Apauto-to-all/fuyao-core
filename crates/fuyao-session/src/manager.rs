@@ -129,6 +129,32 @@ impl SessionManager {
         Ok(())
     }
 
+    /// 更新会话标题（轻量，只改 title 列 + 同步缓存）
+    pub async fn set_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<bool, SessionError> {
+        let updated = self.store.set_session_title(session_id, title).await?;
+        if updated {
+            // 同步缓存（若命中的是该 session）
+            let cached_id = self
+                .cached_session_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if cached_id.as_deref() == Some(session_id) {
+                let mut cached = self
+                    .cached_session
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if let Some(ref mut s) = *cached {
+                    s.title = Some(title.to_string());
+                }
+            }
+        }
+        Ok(updated)
+    }
+
     /// 删除会话
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
         let deleted = self.store.delete(session_id).await?;

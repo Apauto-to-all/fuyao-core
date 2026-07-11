@@ -46,6 +46,28 @@ impl Default for SessionStorageConfig {
     }
 }
 
+/// 会话标题自动生成配置
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TitleConfig {
+    /// 是否启用自动生成标题
+    pub enabled: bool,
+    /// 输入截断长度（字符数），用户消息与 AI 回答各截取前 N 字符喂给 LLM
+    pub snippet_max_chars: usize,
+    /// 标题最大长度（字符数），超长截断并加省略号
+    pub max_len: usize,
+}
+
+impl Default for TitleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            snippet_max_chars: 500,
+            max_len: 80,
+        }
+    }
+}
+
 /// 会话聚合配置
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -54,6 +76,8 @@ pub struct SessionConfig {
     pub compression: CompressionConfig,
     /// 存储子段，对应 TOML `[session.storage]`
     pub storage: SessionStorageConfig,
+    /// 标题自动生成子段，对应 TOML `[session.title]`
+    pub title: TitleConfig,
 }
 
 #[cfg(test)]
@@ -73,6 +97,14 @@ mod tests {
         let c = SessionStorageConfig::default();
         assert_eq!(c.busy_timeout_secs, 5);
         assert_eq!(c.max_connections, 5);
+    }
+
+    #[test]
+    fn title_config_defaults() {
+        let c = TitleConfig::default();
+        assert!(c.enabled);
+        assert_eq!(c.snippet_max_chars, 500);
+        assert_eq!(c.max_len, 80);
     }
 
     #[test]
