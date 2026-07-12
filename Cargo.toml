@@ -66,3 +66,7 @@ rmcp = { version = "1", features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+# 测试依赖
+rstest = "0.26"
+tempfile = "3"
+pretty_assertions = "1"

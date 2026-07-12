@@ -112,6 +112,8 @@ model = "deepseek/deepseek-v4-flash"
 "#;
         #[derive(Deserialize)]
         struct Wrapper {
+            // 此测试仅断言反序列化失败，字段不会被读取；保留以匹配 TOML 的 `models` 键结构
+            #[expect(dead_code)]
             models: ModelSelection,
         }
         let result: Result<Wrapper, _> = toml::from_str(toml_str);
