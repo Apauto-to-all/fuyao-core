@@ -5,10 +5,6 @@ use thiserror::Error;
 /// Session 错误
 #[derive(Debug, Error)]
 pub enum SessionError {
-    /// 数据库错误
-    #[error("数据库错误: {0}")]
-    Database(String),
-
     /// IO 错误
     #[error("IO 错误: {0}")]
     IoError(#[from] std::io::Error),

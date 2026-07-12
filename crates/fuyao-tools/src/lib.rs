@@ -4,7 +4,6 @@
 
 mod common;
 mod config;
-mod error;
 mod file;
 mod redact;
 mod registry;
@@ -13,5 +12,4 @@ mod terminal;
 mod todo;
 mod web;
 
-pub use error::ToolError;
 pub use registry::{ToolEntry, all_tool_names, all_tools, get_tool};

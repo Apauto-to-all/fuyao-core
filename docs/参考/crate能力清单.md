@@ -82,7 +82,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：内置工具集 + 安全防护
 - **内部依赖**：api, prompt, skills, session
-- **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`；`ToolError`
+- **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`
 - **内置工具**：read / write / edit / bash / grep / glob / webfetch / skill / todowrite
 
 ## fuyao-app（L4 装配）

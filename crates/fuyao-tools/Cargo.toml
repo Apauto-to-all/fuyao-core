@@ -10,7 +10,6 @@ fuyao-skills = { path = "../fuyao-skills" }
 fuyao-session = { path = "../fuyao-session" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 regex = { workspace = true }
 fancy-regex = { workspace = true }

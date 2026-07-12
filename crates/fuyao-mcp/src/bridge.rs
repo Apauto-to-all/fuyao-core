@@ -83,10 +83,14 @@ pub fn make_tool_call_handler(
                             server = %server_name,
                             tool = %tool_name,
                             kind = "auth",
+                            attempt = 1u8,
+                            recovered = false,
+                            cause = %err_msg,
                             "MCP 调用遇到可恢复错误，触发重连"
                         );
                         notify_reconnect(&conn);
-                        let retry_result = wait_and_retry(&conn, &tool_name, &args).await;
+                        let retry_result =
+                            wait_and_retry(&conn, &server_name, &tool_name, &args).await;
                         if let Some(result) = retry_result {
                             reset_error(&server_name);
                             tracing::info!(
@@ -107,10 +111,14 @@ pub fn make_tool_call_handler(
                             server = %server_name,
                             tool = %tool_name,
                             kind = "session",
+                            attempt = 1u8,
+                            recovered = false,
+                            cause = %err_msg,
                             "MCP 调用遇到可恢复错误，触发重连"
                         );
                         notify_reconnect(&conn);
-                        let retry_result = wait_and_retry(&conn, &tool_name, &args).await;
+                        let retry_result =
+                            wait_and_retry(&conn, &server_name, &tool_name, &args).await;
                         if let Some(result) = retry_result {
                             reset_error(&server_name);
                             tracing::info!(
@@ -221,6 +229,7 @@ fn notify_reconnect(conn: &Arc<tokio::sync::Mutex<Option<MCPConnection>>>) {
 /// 等待 session 恢复后重试调用
 async fn wait_and_retry(
     conn: &Arc<tokio::sync::Mutex<Option<MCPConnection>>>,
+    server_name: &str,
     tool_name: &str,
     args: &Value,
 ) -> Option<String> {
@@ -234,7 +243,7 @@ async fn wait_and_retry(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    // 重试调用
+    // 重试调用（attempt=2 表示这是第二次尝试）
     match do_call(conn, tool_name, args.clone()).await {
         Ok(result) => {
             let parsed: serde_json::Value = serde_json::from_str(&result).unwrap_or_default();
@@ -245,7 +254,14 @@ async fn wait_and_retry(
             }
         }
         Err(e) => {
-            tracing::warn!(tool = %tool_name, cause = %e, "MCP 恢复后重试仍失败");
+            tracing::warn!(
+                server = %server_name,
+                tool = %tool_name,
+                attempt = 2u8,
+                recovered = false,
+                cause = %e,
+                "MCP 恢复后重试仍失败"
+            );
             None
         }
     }
