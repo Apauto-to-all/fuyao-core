@@ -227,10 +227,9 @@ async fn grep_no_match_returns_empty_result() {
 
 #[tokio::test]
 async fn edit_replace_modifies_file_content() {
-    // 使用 ASCII 内容验证 replace 模式装配链路
-    // （edit 模糊匹配器对多字节字符存在 char boundary 缺陷，为已知源码问题，单独记录）
+    // 真实中文内容验证 replace 模式（多字节 char boundary panic 已修复）
     let ws = TempDir::new().unwrap();
-    fs::write(ws.path().join("target.txt"), "old line\nsecond line\n").unwrap();
+    fs::write(ws.path().join("target.txt"), "旧内容\n第二行\n").unwrap();
     let ctx = make_ctx(ws.path().to_path_buf());
 
     let entry = get_tool("edit").unwrap();
@@ -239,20 +238,48 @@ async fn edit_replace_modifies_file_content() {
         json!({
             "mode": "replace",
             "path": "target.txt",
-            "old_string": "old line",
-            "new_string": "new line"
+            "old_string": "旧内容",
+            "new_string": "新内容"
         }),
         &ctx,
     )
     .await;
 
     let written = fs::read_to_string(ws.path().join("target.txt")).unwrap();
-    assert!(written.contains("new line"), "edit 后应含新内容：{written}");
+    assert!(written.contains("新内容"), "edit 后应含新内容：{written}");
     assert!(
-        !written.contains("old line"),
+        !written.contains("旧内容"),
         "edit 后不应含旧内容：{written}"
     );
     let _ = result;
+}
+
+#[tokio::test]
+async fn edit_replace_multibyte_replace_all() {
+    // 多次出现的中文，replace_all=true：验证多字节字符下批量替换不 panic
+    let ws = TempDir::new().unwrap();
+    fs::write(ws.path().join("multi.txt"), "你好世界\n你好朋友\n").unwrap();
+    let ctx = make_ctx(ws.path().to_path_buf());
+
+    let entry = get_tool("edit").unwrap();
+    let _result = call_tool(
+        &entry.handler,
+        json!({
+            "mode": "replace",
+            "path": "multi.txt",
+            "old_string": "你好",
+            "new_string": "您好",
+            "replace_all": true
+        }),
+        &ctx,
+    )
+    .await;
+
+    let written = fs::read_to_string(ws.path().join("multi.txt")).unwrap();
+    assert_eq!(
+        written, "您好世界\n您好朋友\n",
+        "replace_all 应替换所有中文匹配"
+    );
 }
 
 // ============================================================================

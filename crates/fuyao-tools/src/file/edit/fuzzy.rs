@@ -106,25 +106,70 @@ pub fn fuzzy_find_and_replace(
 }
 
 /// 应用替换（从后向前替换，避免位置偏移）
+///
+/// 防御性处理：各匹配策略返回的字节位置可能因归一化映射而非字符边界
+/// （尤其中文等多字节字符），切片前先修正到最近的字符边界，避免 panic。
 fn apply_replacements(content: &str, matches: &[(usize, usize)], new_string: &str) -> String {
     let mut sorted: Vec<(usize, usize)> = matches.to_vec();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     let mut result = content.to_string();
     for (start, end) in sorted {
-        result = format!("{}{}{}", &result[..start], new_string, &result[end..]);
+        // 修正到字符边界：从 start 向前回退到最近的字符起始字节
+        let safe_start = floor_char_boundary(&result, start);
+        // 从 end 向前回退到最近的字符起始字节（end 可能超过 len，先 clamp）
+        let clamped_end = end.min(result.len());
+        let safe_end = floor_char_boundary(&result, clamped_end);
+        if safe_start >= safe_end {
+            // 退化情况：跳过，避免空范围或负范围
+            continue;
+        }
+        result = format!(
+            "{}{}{}",
+            &result[..safe_start],
+            new_string,
+            &result[safe_end..]
+        );
     }
     result
 }
 
+/// 将字节索引回退到最近的字符边界（floor 方向）
+///
+/// 给定任意字节索引，返回 <= 它的最大字符边界。
+/// 用于修正非字符边界的切片索引，避免 panic。
+fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    // s.is_char_boundary(idx) 为 true 当 idx 是 UTF-8 字符的起始字节
+    while !s.is_char_boundary(idx) && idx > 0 {
+        idx -= 1;
+    }
+    idx
+}
+
 /// 策略 1: 精确匹配
+///
+/// 返回所有非重叠匹配的 (start, end) 字节范围。start/end 均为字符边界：
+/// - `abs_pos` 由 `str::find` 返回，天然是字符边界
+/// - `abs_pos + pattern.len()` 是 pattern 末尾，精确匹配保证字节对齐，也是字符边界
+/// - 推进 `start` 时按下一个字符的 UTF-8 长度前进（而非固定 +1 字节），
+///   避免落在多字节字符中间导致 `content[start..]` 切片 panic
 fn strategy_exact(content: &str, pattern: &str) -> Vec<(usize, usize)> {
     let mut matches = Vec::new();
     let mut start = 0;
     while let Some(pos) = content[start..].find(pattern) {
         let abs_pos = start + pos;
         matches.push((abs_pos, abs_pos + pattern.len()));
-        start = abs_pos + 1;
+        // 按字符推进：跳过匹配起点的这一个字符，保证 start 落在字符边界
+        // （+1 字节在多字节字符上会落到字符中间，下次切片会 panic）
+        let next_char_len = content[abs_pos..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        start = abs_pos + next_char_len;
     }
     matches
 }
@@ -598,5 +643,92 @@ mod tests {
         let (_, count, _, err) = fuzzy_find_and_replace(content, "xyz", "abc", false);
         assert_eq!(count, 0);
         assert!(err.is_some());
+    }
+
+    // ========================================================================
+    // 多字节字符（中文）安全测试 —— 修复 char boundary panic 的回归测试
+    // ========================================================================
+
+    #[test]
+    fn exact_match_multibyte_single_occurrence() {
+        // 修复前：strategy_exact 的 start = abs_pos + 1 会落在 '旧' 字节中间，下次切片 panic
+        let content = "旧内容\n第二行\n";
+        let (new_content, count, _, err) =
+            fuzzy_find_and_replace(content, "旧内容", "新内容", false);
+        assert!(err.is_none(), "单次替换不应报错：{err:?}");
+        assert_eq!(count, 1);
+        assert!(new_content.contains("新内容"));
+        assert!(!new_content.contains("旧内容"));
+    }
+
+    #[test]
+    fn exact_match_multibyte_multiple_occurrences_replace_all() {
+        // 多次出现的中文，replace_all=true：strategy_exact 需按字符推进遍历全部匹配
+        let content = "你好世界\n你好朋友\n";
+        let (new_content, count, _, err) = fuzzy_find_and_replace(content, "你好", "您好", true);
+        assert!(err.is_none());
+        assert_eq!(count, 2);
+        assert_eq!(new_content, "您好世界\n您好朋友\n");
+    }
+
+    #[test]
+    fn exact_match_multibyte_multiple_without_replace_all_errors() {
+        // 多次出现但不指定 replace_all：应返回错误（而非 panic）
+        let content = "你好\n你好\n";
+        let (_, count, _, err) = fuzzy_find_and_replace(content, "你好", "您好", false);
+        assert_eq!(count, 0);
+        assert!(err.is_some());
+        assert!(err.unwrap().contains("2 处匹配"));
+    }
+
+    #[test]
+    fn exact_match_multibyte_overlapping_safe() {
+        // 重叠场景（如 "aa" 在 "aaa" 中）：中文等价场景验证推进逻辑不越界不 panic
+        // "的的的" 中查找 "的的"：按字符推进找到 2 个重叠匹配（位置 0 和 3）
+        let content = "的的的";
+        let (new_content, count, _, err) = fuzzy_find_and_replace(content, "的的", "一次", true);
+        assert!(err.is_none());
+        assert_eq!(count, 2, "按字符推进找到 2 个重叠匹配");
+        // 从后向前替换：先替换 (3,9) → "的一次"，再替换 (0,6)→"一次" 的原范围
+        // "的的的"[0..6]="的的" 替换为 "一次"，但前一步已改 result[0..6] 仍是 "的的"
+        assert!(new_content.contains("一次"));
+    }
+
+    #[test]
+    fn apply_replacements_with_non_boundary_indices() {
+        // 直接测 apply_replacements 对非字符边界索引的防御性修正
+        // "旧字" 中 '旧' 占字节 0..3，故意传 start=1（字符中间字节）
+        let content = "旧字";
+        // 索引 (1, 3) 非字符边界：start=1 回退到 0，end=3 已是边界
+        // → 替换 result[0..3]="旧" 为 "新"，结果 "新字"（非 panic）
+        let result = apply_replacements(content, &[(1, 3)], "新");
+        assert_eq!(
+            result, "新字",
+            "非边界索引应被修正到边界后正常替换，不 panic"
+        );
+    }
+
+    #[test]
+    fn floor_char_boundary_basic() {
+        // '旧' = 3 字节 (E6 97 A7)，'字' = 3 字节 (E5 AD 97)
+        let s = "旧字"; // 字节：0,1,2 = 旧；3,4,5 = 字
+        assert_eq!(floor_char_boundary(s, 0), 0); // 已是边界
+        assert_eq!(floor_char_boundary(s, 1), 0); // 回退到 0
+        assert_eq!(floor_char_boundary(s, 2), 0); // 回退到 0
+        assert_eq!(floor_char_boundary(s, 3), 3); // 已是边界
+        assert_eq!(floor_char_boundary(s, 4), 3); // 回退到 3
+        assert_eq!(floor_char_boundary(s, 6), 6); // 末尾
+        assert_eq!(floor_char_boundary(s, 100), 6); // 超长 clamp 到末尾
+    }
+
+    #[test]
+    fn exact_match_mixed_ascii_and_multibyte() {
+        // 混合 ASCII + 中文，验证边界推进在混合场景下正确
+        let content = "fn 你好() {}\n你好世界\n";
+        let (new_content, count, _, err) = fuzzy_find_and_replace(content, "你好", "Hello", true);
+        assert!(err.is_none());
+        assert_eq!(count, 2);
+        assert!(new_content.contains("fn Hello()"));
+        assert!(new_content.contains("Hello世界"));
     }
 }
