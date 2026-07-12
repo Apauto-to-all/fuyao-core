@@ -120,6 +120,20 @@ pub struct ToolsConfig {
     pub limits: ToolsLimitsConfig,
 }
 
+impl ToolsConfig {
+    /// 判断指定工具是否被显式禁用
+    ///
+    /// 统一工具开关判定逻辑（供注册漏斗 `register_tool` 调用，覆盖所有工具来源）：
+    /// - 显式 `false`：返回 `true`（被禁用）
+    /// - 未列出或显式 `true`：返回 `false`（默认启用）
+    ///
+    /// 抽为纯方法而非内联在 `register_tool`：`set_config` 是 `OnceLock`（重复 set panic），
+    /// 内联将无法在不污染全局状态的前提下测试过滤分支。
+    pub fn is_tool_disabled(&self, name: &str) -> bool {
+        self.enabled.get(name) == Some(&false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +171,23 @@ terminal_default_timeout_secs = 240
         // 缺省
         assert_eq!(w.tools.limits.search_timeout_secs, 60);
         assert_eq!(w.tools.runner.max_concurrent, 8);
+    }
+
+    /// `is_tool_disabled` 三种情况：显式 false / 显式 true / 未列出
+    #[test]
+    fn is_tool_disabled_semantics() {
+        let mut cfg = ToolsConfig::default();
+        cfg.enabled.insert("bash".to_string(), false);
+        cfg.enabled.insert("grep".to_string(), true);
+
+        // 显式 false → 被禁用
+        assert!(cfg.is_tool_disabled("bash"));
+        // 显式 true → 未禁用
+        assert!(!cfg.is_tool_disabled("grep"));
+        // 未列出 → 默认启用
+        assert!(!cfg.is_tool_disabled("read"));
+        // 空 enabled → 一切默认启用
+        assert!(!ToolsConfig::default().is_tool_disabled("any"));
     }
 
     /// tools.runner 反序列化（验证 TOML 短键名 never_parallel 等映射正确）

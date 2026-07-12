@@ -14,7 +14,7 @@ use crate::engine::types::{
 use crate::handle::{EngineHandle, HandleParams, new_handle};
 use fuyao_api::message::output;
 use fuyao_api::message::{InputEvent, OutputEvent, QueueUpdateKind, UserMessageMode};
-use fuyao_api::{AgentContext, SharedAgentCtx, ToolFn};
+use fuyao_api::{AgentContext, SharedAgentCtx};
 use fuyao_provider::Provider as LlmProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,8 +29,6 @@ pub struct Engine {
     pub(crate) tx_command: mpsc::Sender<TurnCommand>,
     /// 统一事件发送器
     pub(crate) emitter: EventEmitter,
-    /// 共享工具注册表
-    pub(crate) tools: SharedTools,
     /// 引导队列
     pub(crate) guide_queue: SharedGuideQueue,
     /// 排队队列
@@ -88,7 +86,6 @@ impl Engine {
             tx_input: tx_input.clone(),
             tx_command,
             emitter,
-            tools: shared_tools.clone(),
             guide_queue: guide_queue.clone(),
             pending_queue: pending_queue.clone(),
             queue_notify: queue_notify.clone(),
@@ -107,13 +104,6 @@ impl Engine {
         });
 
         (engine, handle)
-    }
-
-    /// 注册工具
-    pub fn register_tool(&self, name: String, schema: serde_json::Value, handler: ToolFn) {
-        let mut tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
-        tools.0.insert(name, handler);
-        tools.1.push(schema);
     }
 
     /// InputDispatcher 主循环：持续监听输入消息并分发
@@ -315,12 +305,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_register_tool() {
+    async fn handle_register_tool() {
         let provider = Box::new(MockProvider);
-        let (engine, handle) = Engine::new(provider, test_agent_ctx());
+        let (_engine, handle) = Engine::new(provider, test_agent_ctx());
 
-        engine.register_tool(
-            "test_tool".to_string(),
+        // 通过 EngineHandle 公有接口注册工具（统一漏斗入口）
+        handle.register_tool(
+            "test_tool",
             serde_json::json!({"type": "function", "function": {"name": "test_tool"}}),
             Arc::new(|_args, _ctx: fuyao_api::ToolCallContext| {
                 Box::pin(async { "ok".to_string() })
@@ -328,10 +319,37 @@ mod tests {
         );
 
         // 通过 EngineHandle 的公有接口验证工具注册结果
-        let tools = handle.tools_shared();
-        let guard = tools.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(guard.0.len(), 1);
-        assert_eq!(guard.1.len(), 1);
+        let schemas = handle.tools_schema();
+        assert_eq!(schemas.len(), 1);
+    }
+
+    /// 验证：同名工具重复注册时跳过，schema 列表不重复（先到先得）
+    /// 防止 handler 被静默覆盖、发给 LLM 的工具清单出现重复项
+    #[tokio::test]
+    async fn handle_register_tool_duplicate_skipped() {
+        let provider = Box::new(MockProvider);
+        let (_engine, handle) = Engine::new(provider, test_agent_ctx());
+
+        let schema = serde_json::json!({"type": "function", "function": {"name": "dup_tool"}});
+
+        handle.register_tool(
+            "dup_tool",
+            schema.clone(),
+            Arc::new(|_args, _ctx: fuyao_api::ToolCallContext| {
+                Box::pin(async { "first".to_string() })
+            }),
+        );
+        handle.register_tool(
+            "dup_tool",
+            schema,
+            Arc::new(|_args, _ctx: fuyao_api::ToolCallContext| {
+                Box::pin(async { "second".to_string() })
+            }),
+        );
+
+        // 先到先得：schema 列表仅一条，第二次注册被跳过
+        let schemas = handle.tools_schema();
+        assert_eq!(schemas.len(), 1, "重复注册不应追加 schema");
     }
 
     /// 验证：User 输出事件复用输入事件的 base.id 与时间戳

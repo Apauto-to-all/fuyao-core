@@ -4,15 +4,11 @@ use fuyao_core::EngineHandle;
 
 /// 注册内置工具到 EngineHandle
 ///
-/// 遍历 fuyao-tools 静态工具表，按 `[tools.enabled]` 过滤：
-/// - 显式 `false`：跳过
-/// - 未列出或 `true`：注册
+/// 遍历 fuyao-tools 静态工具表，逐一调用 `register_tool`。
+/// 工具开关过滤已下沉到 `EngineHandle::register_tool` 漏斗统一处理
+/// （覆盖内置 / MCP / 插件所有来源），此处不再重复过滤。
 pub fn register_builtin_tools(handle: &EngineHandle) {
-    let enabled = &fuyao_api::get_config().tools.enabled;
     for (name, entry) in fuyao_tools::all_tools() {
-        if enabled.get(*name) == Some(&false) {
-            continue;
-        }
         let schema = serde_json::to_value(&entry.definition).unwrap_or_else(|_| {
             serde_json::json!({
                 "type": "function",

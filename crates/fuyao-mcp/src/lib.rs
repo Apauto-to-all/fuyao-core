@@ -90,12 +90,17 @@ impl MCPManager {
     /// 启动所有 MCP Server 连接
     ///
     /// 对每个配置的 server 尝试连接，失败的 server 记录错误但不阻塞其他 server。
+    /// `enabled = false` 的 server 跳过（不连接、不发现工具）。
     /// 返回 (成功数, 失败数, 失败信息列表)。
     pub async fn start_all(&self) -> (usize, usize, Vec<(String, String)>) {
         let mut success = 0;
         let mut failures = Vec::new();
 
         for (name, cfg) in &self.configs {
+            if !cfg.enabled {
+                tracing::info!(server = %name, "MCP server 被配置禁用，跳过启动");
+                continue;
+            }
             match self.start_server(name, cfg.clone()).await {
                 Ok(()) => success += 1,
                 Err(e) => failures.push((name.clone(), e.to_string())),

@@ -123,9 +123,24 @@ impl EngineHandle {
     }
 
     /// 注册工具
+    ///
+    /// 统一工具开关漏斗：所有工具来源（内置 / MCP / 插件）经此注册，
+    /// 受 `[tools.enabled]` 统一控制——显式 `false` 的工具直接跳过。
+    /// MCP 工具因有 `mcp_server_tool` 前缀，用户通常改用
+    /// `[mcp_servers.<name>.tools]` 按单 server 控制粒度。
     pub fn register_tool(&self, name: &str, schema: serde_json::Value, handler: ToolFn) {
+        if fuyao_api::get_config().tools.is_tool_disabled(name) {
+            tracing::debug!(tool = %name, "工具被配置禁用，跳过注册");
+            return;
+        }
         match self.tools.lock() {
             Ok(mut tools) => {
+                // 先到先得：同名工具已存在则跳过，避免 handler 被静默覆盖
+                // 同时防止 schema 列表出现重复项污染发给 LLM 的工具清单
+                if tools.0.contains_key(name) {
+                    tracing::warn!(tool = %name, "工具名重复，跳过注册（先到先得）");
+                    return;
+                }
                 tools.0.insert(name.to_string(), handler);
                 tools.1.push(schema);
             }
@@ -136,11 +151,6 @@ impl EngineHandle {
     /// 获取工具 schema 列表
     pub fn tools_schema(&self) -> Vec<serde_json::Value> {
         self.tools.lock().map(|t| t.1.clone()).unwrap_or_default()
-    }
-
-    /// 获取共享工具注册表（用于插件加载）
-    pub fn tools_shared(&self) -> SharedTools {
-        self.tools.clone()
     }
 
     /// 获取共享 Agent 上下文（用于插件加载）
