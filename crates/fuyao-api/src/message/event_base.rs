@@ -8,13 +8,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 事件基类
 ///
 /// 嵌入到每个事件数据 struct 中作为 `base` 字段。
-/// 包含唯一 ID 和时间戳，后续可扩展 source、trace_id 等字段。
+/// 包含唯一 ID、时间戳、会话标识，后续可扩展 source、trace_id 等字段。
+///
+/// `session_id` 是多 session 并发的全程标签：入口消息和出口事件的结构都带它，
+/// 从入口到出口一路跟随，消费者据此分流。
+/// 引擎级事件（如全局 Shutdown）可为 `None`；会话相关事件必须为 `Some`。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventBase {
     /// 事件唯一 ID（UUID v4）
     pub id: String,
     /// 事件时间戳（Unix 纪元秒，含小数）
     pub timestamp: f64,
+    /// 会话标识（多 session 全程标签）
+    ///
+    /// `None` 表示事件未归属到特定 session（引擎级事件，如全局 Shutdown）。
+    /// 缺该字段的旧 JSON 反序列化为 `None`；`None` 序列化时不输出该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 impl Default for EventBase {
@@ -22,6 +32,7 @@ impl Default for EventBase {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             timestamp: current_timestamp(),
+            session_id: None,
         }
     }
 }
@@ -88,5 +99,44 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         base.update_timestamp();
         assert!(base.timestamp > original_ts);
+    }
+
+    #[test]
+    fn session_id_defaults_to_none() {
+        let base = EventBase::default();
+        assert!(base.session_id.is_none());
+    }
+
+    /// 验证：session_id = None 时序列化不输出该字段（保持输出干净）
+    #[test]
+    fn session_id_none_skipped_in_serialization() {
+        let base = EventBase::default();
+        let json = serde_json::to_string(&base).expect("序列化失败");
+        assert!(
+            !json.contains("session_id"),
+            "None 的 session_id 不应出现在序列化输出中: {json}"
+        );
+    }
+
+    /// 验证：session_id = Some 时正常序列化 / 反序列化（round-trip）
+    #[test]
+    fn session_id_some_round_trip() {
+        let base = EventBase {
+            session_id: Some("sess-123".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&base).expect("序列化失败");
+        let decoded: EventBase = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(decoded.session_id.as_deref(), Some("sess-123"));
+    }
+
+    /// 验证：缺 session_id 字段的旧 JSON 反序列化为 None（向后兼容）
+    #[test]
+    fn session_id_missing_field_decodes_as_none() {
+        let old_json = r#"{"id":"abc","timestamp":1.5}"#;
+        let decoded: EventBase = serde_json::from_str(old_json).expect("反序列化失败");
+        assert_eq!(decoded.id, "abc");
+        assert!((decoded.timestamp - 1.5).abs() < f64::EPSILON);
+        assert!(decoded.session_id.is_none());
     }
 }
