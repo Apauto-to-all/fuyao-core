@@ -5,7 +5,6 @@
 //!
 //! - `User`: 用户消息（envelope {base, payload}）
 //! - `Interrupt`: 中断信号（envelope {base, payload}）
-//! - `Shutdown`: 关闭引擎（envelope {base}，无 payload）
 //! - `Plugin`: 插件通知（envelope {base, payload}）
 
 // 子模块：每种事件类型独立文件
@@ -20,17 +19,6 @@ pub use user::{
     PluginSource, SystemSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
 
-use crate::message::EventBase;
-
-/// 关闭引擎事件 envelope（无 payload，仅 base）
-///
-/// 用户退出应用或关闭引擎时发送。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ShutdownMessage {
-    /// 事件元信息（id/timestamp）
-    pub base: EventBase,
-}
-
 /// 输入事件（UI → Engine）
 ///
 /// envelope 每变体自带 base（在 envelope struct 内），enum 保持穷尽匹配。
@@ -41,8 +29,6 @@ pub enum InputEvent {
     User(UserMessage),
     /// 中断：用户取消或中断当前操作
     Interrupt(InterruptMessage),
-    /// 关闭引擎：用户退出应用或关闭引擎
-    Shutdown(ShutdownMessage),
     /// 插件通知：插件通过 SendInputFn 发送的通知（警告、状态等）
     /// 引擎收到后转发为 OutputEvent::Plugin 通知 UI
     Plugin(PluginMessage),
@@ -89,17 +75,6 @@ mod tests {
                 assert_eq!(msg.payload.source, InterruptSource::User);
             }
             _ => panic!("应为 Interrupt 变体"),
-        }
-    }
-
-    #[test]
-    fn shutdown_event_has_base_only() {
-        let event = InputEvent::Shutdown(ShutdownMessage {
-            base: EventBase::default(),
-        });
-        match &event {
-            InputEvent::Shutdown(msg) => assert!(msg.base.timestamp > 0.0),
-            _ => panic!("应为 Shutdown 变体"),
         }
     }
 

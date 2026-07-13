@@ -12,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// `session_id` 是多 session 并发的全程标签：入口消息和出口事件的结构都带它，
 /// 从入口到出口一路跟随，消费者据此分流。
-/// 引擎级事件（如全局 Shutdown）可为 `None`；会话相关事件必须为 `Some`。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventBase {
     /// 事件唯一 ID（UUID v4）
@@ -21,7 +20,7 @@ pub struct EventBase {
     pub timestamp: f64,
     /// 会话标识（多 session 全程标签）
     ///
-    /// `None` 表示事件未归属到特定 session（引擎级事件，如全局 Shutdown）。
+    /// `None` 表示事件未归属到特定 session。
     /// 缺该字段的旧 JSON 反序列化为 `None`；`None` 序列化时不输出该字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
