@@ -13,7 +13,7 @@ pub enum SessionError {
     #[error("sqlx 错误: {0}")]
     SqlxError(#[from] sqlx::Error),
 
-    /// 无效状态（如 SessionManager 未初始化）
+    /// 无效状态（如 SessionStore 未初始化）
     #[error("无效状态: {0}")]
     InvalidState(String),
 

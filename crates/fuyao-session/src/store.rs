@@ -1,11 +1,11 @@
 //! SQLite 存储层
 //!
-//! 使用 sqlx（async）+ SqlitePool 连接池。
-//! 原生 async，无需 spawn_blocking 包装。
+//! 使用 sqlx（async）+ SqlitePool 连接池，原生 async，无需 spawn_blocking 包装。
+//! SessionStore 是 session 持久化的唯一入口，持有连接池供外部（如引擎层）共享。
 
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
-use fuyao_api::{Message, Session};
+use fuyao_api::{Message, Session, SessionStorageConfig};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::path::PathBuf;
@@ -103,22 +103,27 @@ impl From<MessageRow> for Message {
     }
 }
 
-/// SQLite 存储层
-pub struct SQLiteStore {
+/// 会话存储层
+///
+/// 持有 SqlitePool 连接池，提供 Session + Message 的 CRUD。
+/// 连接池可经 [`pool`](Self::pool) 对外共享，供引擎层或兄弟模块复用同一连接池。
+pub struct SessionStore {
     db_path: PathBuf,
     pool: SqlitePool,
 }
 
-impl SQLiteStore {
+impl SessionStore {
     /// 创建并初始化存储
     ///
-    /// 连接参数（busy_timeout / max_connections）从全局配置 `get_config().session.storage` 读取。
-    pub async fn new(db_path: PathBuf) -> Result<Self, SessionError> {
+    /// 连接参数（busy_timeout / max_connections）由调用方显式传入，
+    /// 不读全局配置，避免全局状态污染（测试隔离友好）。
+    pub async fn new(
+        db_path: PathBuf,
+        storage: SessionStorageConfig,
+    ) -> Result<Self, SessionError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
-        let storage = fuyao_api::get_config().session.storage.clone();
 
         // 连接选项：启用 WAL、外键、忙等待
         let options = SqliteConnectOptions::new()
@@ -156,7 +161,7 @@ impl SQLiteStore {
         &self.db_path
     }
 
-    /// 获取连接池引用（供 TodoStore 共享同一连接池）
+    /// 获取连接池引用（供引擎层或兄弟模块共享同一连接池）
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
@@ -249,29 +254,8 @@ impl SQLiteStore {
         Ok(())
     }
 
-    /// 更新会话标题（轻量，只改 title 列）
-    ///
-    /// 用于自动重命名场景，避免全量 update 的开销与竞态。
-    /// 返回是否找到并更新了会话。
-    pub async fn set_session_title(
-        &self,
-        session_id: &str,
-        title: &str,
-    ) -> Result<bool, SessionError> {
-        let result = sqlx::query("UPDATE sessions SET title = ?1 WHERE id = ?2")
-            .bind(title)
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     /// 删除会话
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
-        sqlx::query("DELETE FROM todos WHERE session_id = ?1")
-            .bind(session_id)
-            .execute(&self.pool)
-            .await?;
         sqlx::query("DELETE FROM messages WHERE session_id = ?1")
             .bind(session_id)
             .execute(&self.pool)
@@ -372,13 +356,20 @@ impl SQLiteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::{Message, Session};
+    use fuyao_api::{Message, Session, SessionStorageConfig};
+    use tempfile::tempdir;
 
-    async fn temp_store() -> SQLiteStore {
-        let dir = std::env::temp_dir()
-            .join("fuyao_session_test")
-            .join(uuid::Uuid::new_v4().to_string());
-        SQLiteStore::new(dir.join("test.db")).await.unwrap()
+    /// 构造临时存储（隔离的临时目录，测试结束自动清理）
+    async fn temp_store() -> SessionStore {
+        let dir = tempdir().expect("创建临时目录失败");
+        let db_path = dir.path().join("test.db");
+        // 需要 leak 保活：tempdir 的 TempDir drop 时会删除目录，
+        // 但 async 测试里 SessionStore 跨 await 持有路径，dir 必须存活到测试结束。
+        // 这里用 forget 让目录留到进程结束（测试进程短生命周期，可接受）。
+        std::mem::forget(dir);
+        SessionStore::new(db_path, SessionStorageConfig::default())
+            .await
+            .expect("创建存储失败")
     }
 
     #[tokio::test]
@@ -488,31 +479,5 @@ mod tests {
             loaded.messages[0].tool_calls.as_ref().unwrap()[0]["id"],
             "call_1"
         );
-    }
-
-    #[tokio::test]
-    async fn store_set_session_title() {
-        let store = temp_store().await;
-        let session = Session::new(Some("原标题".to_string()), None);
-        store.create(&session).await.unwrap();
-
-        let updated = store
-            .set_session_title(&session.id, "新标题")
-            .await
-            .unwrap();
-        assert!(updated);
-
-        let loaded = store.get(&session.id).await.unwrap().unwrap();
-        assert_eq!(loaded.title, Some("新标题".to_string()));
-    }
-
-    #[tokio::test]
-    async fn store_set_session_title_missing_returns_false() {
-        let store = temp_store().await;
-        let updated = store
-            .set_session_title("nonexistent", "标题")
-            .await
-            .unwrap();
-        assert!(!updated);
     }
 }

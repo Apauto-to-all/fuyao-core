@@ -1,4 +1,7 @@
 //! SQLite DDL + 版本管理
+//!
+//! 当前仅含 sessions + messages 两张表。
+//! todos 表属工具层（fuyao-tools）职责，后续由该 crate 自带 schema，不在此处维护。
 
 /// 当前 schema 版本
 pub const SCHEMA_VERSION: i32 = 1;
@@ -45,19 +48,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning             TEXT
 );
 
-CREATE TABLE IF NOT EXISTS todos (
-    id          TEXT NOT NULL,
-    session_id  TEXT NOT NULL REFERENCES sessions(id),
-    content     TEXT NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'pending',
-    sort_order  INTEGER NOT NULL DEFAULT 0,
-    created_at  REAL NOT NULL,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (id, session_id)
-);
-
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);
 "#;
