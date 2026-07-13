@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 fuyao-api = { path = "../fuyao-api" }
 fuyao-provider = { path = "../fuyao-provider" }
+fuyao-session = { path = "../fuyao-session" }
 fuyao-hooks = { path = "../fuyao-hooks" }
 tokio = { workspace = true }
 serde_json = { workspace = true }

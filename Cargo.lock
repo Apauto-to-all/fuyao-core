@@ -889,6 +889,7 @@ dependencies = [
  "fuyao-api",
  "fuyao-hooks",
  "fuyao-provider",
+ "fuyao-session",
  "serde_json",
  "thiserror",
  "tokio",
