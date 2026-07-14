@@ -8,15 +8,21 @@
 
 pub(crate) mod types;
 
-use crate::engine::types::{QueuedMessage, SessionHandle};
+use crate::engine::types::{QueuedUserMessage, SessionHandle, SharedQueue};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
+use fuyao_api::message::input::InterruptMessage;
+use fuyao_api::message::output::{
+    PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
+};
+use fuyao_api::{
+    EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams, UserMessageMode,
+};
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, Notify, mpsc};
 pub use types::SessionId;
 
 /// 引擎
@@ -107,13 +113,16 @@ impl Engine {
         let session_id = session.id.clone();
         let messages = std::mem::take(&mut session.messages);
 
-        // 建 session 专属数据队列 + 中断通道 + spawn 执行流 task
-        let (tx_queue, rx_queue) = mpsc::channel::<QueuedMessage>(64);
-        let (tx_interrupt, rx_interrupt) =
-            mpsc::channel::<fuyao_api::message::input::InterruptMessage>(8);
+        // 建 session 专属双队列 + notify + 中断通道 + spawn 执行流 task
+        let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
+        let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(Notify::new());
+        let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             session_id.clone(),
-            rx_queue,
+            Arc::clone(&guide),
+            Arc::clone(&pending),
+            Arc::clone(&notify),
             rx_interrupt,
             // task 接管 session（含 system_prompt + messages）
             Session {
@@ -131,7 +140,9 @@ impl Engine {
         self.sessions.lock().await.insert(
             session_id.clone(),
             SessionHandle {
-                tx_queue,
+                guide,
+                pending,
+                notify,
                 tx_interrupt,
                 task,
             },
@@ -155,13 +166,16 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        // 建 session 专属数据队列 + 中断通道 + spawn 执行流 task
-        let (tx_queue, rx_queue) = mpsc::channel::<QueuedMessage>(64);
-        let (tx_interrupt, rx_interrupt) =
-            mpsc::channel::<fuyao_api::message::input::InterruptMessage>(8);
+        // 建 session 专属双队列 + notify + 中断通道 + spawn 执行流 task
+        let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
+        let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
+        let notify = Arc::new(Notify::new());
+        let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             id.clone(),
-            rx_queue,
+            Arc::clone(&guide),
+            Arc::clone(&pending),
+            Arc::clone(&notify),
             rx_interrupt,
             session,
             Arc::clone(&self.store),
@@ -175,7 +189,9 @@ impl Engine {
         self.sessions.lock().await.insert(
             id.clone(),
             SessionHandle {
-                tx_queue,
+                guide,
+                pending,
+                notify,
                 tx_interrupt,
                 task,
             },
@@ -210,30 +226,53 @@ impl Engine {
             .get(id)
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        // 数据通道与中断通道分离：Interrupt 走独立通道（select! 中断点监听），
-        // User / Plugin 走数据队列（主循环消费）
         match event {
+            InputEvent::User(user_msg) => {
+                // User 按 mode 分流入 guide / pending 队列
+                let queued = QueuedUserMessage {
+                    content: user_msg.payload.content,
+                    params,
+                };
+                match user_msg.payload.mode {
+                    UserMessageMode::Guide => handle
+                        .guide
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(queued),
+                    UserMessageMode::Pending => handle
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_back(queued),
+                }
+                // 两种 mode 都 notify：guide 入队唤醒消费，pending 入队唤醒 drain（覆盖 AI 空闲只发 Pending）
+                handle.notify.notify_one();
+            }
             InputEvent::Interrupt(interrupt_msg) => {
+                // 中断走独立通道（select! 中断点监听）
                 handle
                     .tx_interrupt
                     .send(interrupt_msg)
                     .await
                     .map_err(|_| EngineError::Shutdown)?;
             }
-            InputEvent::User(_) | InputEvent::Plugin(_) => {
-                // MessageParams 只对 User 有意义，Plugin 入队时 params 置 None
-                let params_for_queue = match &event {
-                    InputEvent::User(_) => Some(params),
-                    _ => None,
-                };
-                handle
-                    .tx_queue
-                    .send(QueuedMessage {
-                        event,
-                        params: params_for_queue,
-                    })
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+            InputEvent::Plugin(plugin_msg) => {
+                // 插件通知不进队列，直接转发为 OutputEvent::Plugin（不参与 ReAct）
+                let mut base = plugin_msg.base;
+                base.session_id = Some(id.clone());
+                let _ = self
+                    .tx_event
+                    .send(OutputEvent::Plugin(OutputPluginMessage {
+                        base,
+                        payload: OutputPluginPayload {
+                            source: plugin_msg.payload.source,
+                            event_type: plugin_msg.payload.event_type,
+                            data: plugin_msg.payload.data,
+                            error: plugin_msg.payload.error,
+                            message: plugin_msg.payload.message,
+                        },
+                    }))
+                    .await;
             }
         }
 
