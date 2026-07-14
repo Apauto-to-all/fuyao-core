@@ -2,13 +2,20 @@
 //!
 //! 两层分离的引擎层：启动一次，装配能力（provider / store / 出口通道）；
 //! 多个对话按需创建，各自独立跑交互。
+//!
+//! 并发模型：每 session 一个独立 tokio task（异步并发）。
+//! Engine 持调度表，各 task 并发跑，同 session 内单 task 串行。
 
-mod types;
+pub(crate) mod types;
 
+use crate::engine::types::{QueuedMessage, SessionHandle};
 use crate::error::EngineError;
+use crate::react;
 use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
-use fuyao_provider::Provider;
+use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 pub use types::SessionId;
 
 /// 引擎
@@ -23,46 +30,94 @@ pub use types::SessionId;
 /// - [`send`](Self::send)：入事件（单一入口）
 /// - [`recv`](Self::recv)：出事件（单一出口）
 /// - [`shutdown`](Self::shutdown)：关闭引擎（独立方法，不走消息流）
-#[allow(dead_code)]
 pub struct Engine {
-    /// 会话存储层（引擎持有 DB 句柄，所有 session 共享同一连接池）
-    store: SessionStore,
+    /// 会话存储层（Arc 共享给各 session task）
+    store: Arc<SessionStore>,
 
-    /// LLM 提供者（引擎级共享，所有 session 用同一个 provider 实例）
-    provider: Box<dyn Provider>,
+    /// LLM 提供者（Arc 共享给各 session task）
+    provider: Arc<dyn fuyao_provider::Provider>,
 
-    /// 活跃 session 调度表（session_id → 内存态 Session）
-    ///
-    /// 活跃 session 的历史在内存；不活跃的只在数据库。
-    /// 创建/恢复时进入此表，结束后移除（移除时机后续补）。
-    sessions: std::collections::HashMap<SessionId, Session>,
+    /// 活跃 session 调度表（session_id → SessionHandle）
+    sessions: Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
 
-    /// 事件出口通道（单一出口）
-    ///
-    /// 所有 session 的产出事件从此通道流出，每条事件带 session_id 标签。
-    tx_event: tokio::sync::mpsc::Sender<OutputEvent>,
+    /// 事件出口通道发送端（单一出口，各 task 往这发）
+    tx_event: mpsc::Sender<OutputEvent>,
+
+    /// 事件出口通道接收端（recv 用，Mutex 包裹因为 Engine 可跨 await 持有）
+    rx_event: Mutex<mpsc::Receiver<OutputEvent>>,
+
+    /// Agent 三层目录（引擎级，create_session 构建系统提示词用）
+    agent_paths: fuyao_api::AgentPaths,
 }
 
 impl Engine {
     /// 启动引擎（动作一）
     ///
-    /// 构造即启动：装配 provider、持有 DB 句柄、建立出口通道。
+    /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider、建立出口通道。
     /// 启动完成后才可创建/恢复对话。
-    ///
-    /// 当前为骨架，内部逻辑后续填充。
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(_params: EngineParams, _provider: Box<dyn Provider>) -> Self {
-        todo!("引擎启动：装配 store（用 params.agent_paths 解析 db_path）+ 建出口通道")
+    pub async fn new(params: EngineParams, provider: Arc<dyn fuyao_provider::Provider>) -> Self {
+        // 用 agent_paths 解析 db_path，打开数据库
+        let db_path = params.agent_paths.sessions_db_path();
+        let store = SessionStore::new(db_path)
+            .await
+            .expect("打开会话数据库失败");
+
+        // 建出口通道（单一出口）
+        // TODO: 通道容量从配置读取（第二步先用固定值）
+        let (tx_event, rx_event) = mpsc::channel(256);
+
+        Self {
+            store: Arc::new(store),
+            provider,
+            sessions: Mutex::new(std::collections::HashMap::new()),
+            tx_event,
+            rx_event: Mutex::new(rx_event),
+            agent_paths: params.agent_paths,
+        }
     }
 
     /// 创建对话（动作二）
     ///
-    /// 从零创建一个新 Session：生成编号、登记进调度表。
+    /// 从零创建一个新 Session：构建系统提示词、生成编号、登记进调度表、落库。
     /// `SessionParams` 创建时定死且不可变（Agent 配置改了会冲掉前缀缓存）。
     ///
     /// 返回新 session id。
-    pub async fn create_session(&self, _params: SessionParams) -> Result<SessionId, EngineError> {
-        todo!("创建新 Session：生成 id + 构建系统提示词 + 登记进调度表 + 落库")
+    pub async fn create_session(&self, params: SessionParams) -> Result<SessionId, EngineError> {
+        // 构建系统提示词（Agent 配置决定人格）
+        let system_prompt = build_system_prompt(&self.agent_paths, &params.agent_config);
+
+        // 创建 Session（8 位 UUID）
+        let mut session = Session::new(None, Some(system_prompt));
+
+        // 落库
+        self.store.create(&session).await?;
+
+        let session_id = session.id.clone();
+        let messages = std::mem::take(&mut session.messages);
+
+        // 建 session 专属消息队列 + spawn 执行流 task
+        let (tx, rx) = mpsc::channel::<QueuedMessage>(64);
+        let task = tokio::spawn(react::run_session(
+            session_id.clone(),
+            rx,
+            // task 接管 session（含 system_prompt + messages）
+            Session {
+                messages,
+                ..session
+            },
+            Arc::clone(&self.store),
+            Arc::clone(&self.provider),
+            self.tx_event.clone(),
+        ));
+
+        // 登记进调度表
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), SessionHandle { tx, task });
+
+        tracing::info!(session_id = %session_id, "创建对话");
+        Ok(session_id)
     }
 
     /// 恢复对话（动作三）
@@ -71,8 +126,33 @@ impl Engine {
     /// 装进内存，重新登记进调度表。
     ///
     /// session id 不在数据库 → 同步返回 `Err(SessionNotFound)`。
-    pub async fn resume_session(&self, _id: &SessionId) -> Result<(), EngineError> {
-        todo!("恢复 Session：从 store 加载历史 + 装进内存 + 登记进调度表")
+    pub async fn resume_session(&self, id: &SessionId) -> Result<(), EngineError> {
+        // 从数据库加载
+        let session = self
+            .store
+            .get(id)
+            .await?
+            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+
+        // 建 session 专属消息队列 + spawn 执行流 task
+        let (tx, rx) = mpsc::channel::<QueuedMessage>(64);
+        let task = tokio::spawn(react::run_session(
+            id.clone(),
+            rx,
+            session,
+            Arc::clone(&self.store),
+            Arc::clone(&self.provider),
+            self.tx_event.clone(),
+        ));
+
+        // 登记进调度表
+        self.sessions
+            .lock()
+            .await
+            .insert(id.clone(), SessionHandle { tx, task });
+
+        tracing::info!(session_id = %id, "恢复对话");
+        Ok(())
     }
 
     /// 入事件（单一入口）
@@ -91,11 +171,31 @@ impl Engine {
     /// 仅 `User` 变体使用，其他变体忽略此参数。
     pub async fn send(
         &self,
-        _id: &SessionId,
-        _event: InputEvent,
-        _params: MessageParams,
+        id: &SessionId,
+        event: InputEvent,
+        params: MessageParams,
     ) -> Result<(), EngineError> {
-        todo!("入事件：校验 session id 在调度表 → 按变体分流（入队/中断/转发）")
+        let sessions = self.sessions.lock().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+
+        // MessageParams 只对 User 有意义，其他变体入队时 params 置 None
+        let params_for_queue = match &event {
+            InputEvent::User(_) => Some(params),
+            _ => None,
+        };
+
+        handle
+            .tx
+            .send(QueuedMessage {
+                event,
+                params: params_for_queue,
+            })
+            .await
+            .map_err(|_| EngineError::Shutdown)?;
+
+        Ok(())
     }
 
     /// 关闭引擎
@@ -108,9 +208,12 @@ impl Engine {
     /// - 等待所有活跃 session 的当前执行完成或优雅中断
     /// - 落库未持久化的状态
     /// - 关闭 DB 连接、释放资源
-    // TODO: 实现引擎关闭流程（停止调度 + 落库 + 释放资源）
+    // TODO: 实现引擎关闭流程（drop 所有 session task + 落库 + 释放资源）
     pub async fn shutdown(&self) {
-        todo!("引擎关闭：停止调度 + 落库 + 释放资源")
+        // 第二步：清空调度表，drop 所有 SessionHandle（task 句柄 drop 不 abort，但通道关闭后 task 自然退出）
+        let mut sessions = self.sessions.lock().await;
+        sessions.clear();
+        tracing::info!("引擎关闭（session 调度表已清空）");
     }
 
     /// 出事件（单一出口）
@@ -120,6 +223,6 @@ impl Engine {
     ///
     /// 返回 `None` 表示引擎已关闭、通道已断。
     pub async fn recv(&self) -> Option<OutputEvent> {
-        todo!("从出口通道取下一条事件")
+        self.rx_event.lock().await.recv().await
     }
 }

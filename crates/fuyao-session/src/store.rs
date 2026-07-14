@@ -5,7 +5,7 @@
 
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
-use fuyao_api::{Message, Session, SessionStorageConfig};
+use fuyao_api::{Message, Session};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::path::PathBuf;
@@ -115,15 +115,13 @@ pub struct SessionStore {
 impl SessionStore {
     /// 创建并初始化存储
     ///
-    /// 连接参数（busy_timeout / max_connections）由调用方显式传入，
-    /// 不读全局配置，避免全局状态污染（测试隔离友好）。
-    pub async fn new(
-        db_path: PathBuf,
-        storage: SessionStorageConfig,
-    ) -> Result<Self, SessionError> {
+    /// 连接参数（busy_timeout / max_connections）从全局配置 `get_config().session.storage` 读取。
+    pub async fn new(db_path: PathBuf) -> Result<Self, SessionError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        let storage = fuyao_api::get_config().session.storage.clone();
 
         // 连接选项：启用 WAL、外键、忙等待
         let options = SqliteConnectOptions::new()
@@ -356,7 +354,7 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::{Message, Session, SessionStorageConfig};
+    use fuyao_api::{Message, Session};
     use tempfile::tempdir;
 
     /// 构造临时存储（隔离的临时目录，测试结束自动清理）
@@ -367,9 +365,7 @@ mod tests {
         // 但 async 测试里 SessionStore 跨 await 持有路径，dir 必须存活到测试结束。
         // 这里用 forget 让目录留到进程结束（测试进程短生命周期，可接受）。
         std::mem::forget(dir);
-        SessionStore::new(db_path, SessionStorageConfig::default())
-            .await
-            .expect("创建存储失败")
+        SessionStore::new(db_path).await.expect("创建存储失败")
     }
 
     #[tokio::test]

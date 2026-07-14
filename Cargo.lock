@@ -888,6 +888,7 @@ dependencies = [
  "futures-util",
  "fuyao-api",
  "fuyao-hooks",
+ "fuyao-prompt",
  "fuyao-provider",
  "fuyao-session",
  "serde_json",

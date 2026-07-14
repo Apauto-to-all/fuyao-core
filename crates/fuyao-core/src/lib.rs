@@ -10,11 +10,12 @@
 //! - 入事件（[`Engine::send`]，单一入口，对话级事件）
 //! - 出事件（[`Engine::recv`]，单一出口，出所有 OutputEvent）
 //! - 关闭引擎（[`Engine::shutdown`]，独立方法，不走消息流）
-//!
-//! 当前为骨架阶段，四个动作的签名已定，内部逻辑后续逐步填充。
 
+mod emit;
 mod engine;
 mod error;
+mod react;
+mod stream;
 
 pub use engine::{Engine, SessionId};
 pub use error::EngineError;
