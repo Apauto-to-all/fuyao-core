@@ -11,6 +11,7 @@ pub(crate) mod types;
 use crate::engine::types::{QueuedMessage, SessionHandle};
 use crate::error::EngineError;
 use crate::react;
+use crate::tool_registry::ToolRegistry;
 use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
@@ -37,6 +38,9 @@ pub struct Engine {
     /// LLM 提供者（Arc 共享给各 session task）
     provider: Arc<dyn fuyao_provider::Provider>,
 
+    /// 工具注册表（引擎级共享，所有 session task 共用同一份）
+    tools: Arc<ToolRegistry>,
+
     /// 活跃 session 调度表（session_id → SessionHandle）
     sessions: Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
 
@@ -46,16 +50,23 @@ pub struct Engine {
     /// 事件出口通道接收端（recv 用，Mutex 包裹因为 Engine 可跨 await 持有）
     rx_event: Mutex<mpsc::Receiver<OutputEvent>>,
 
-    /// Agent 三层目录（引擎级，create_session 构建系统提示词用）
-    agent_paths: fuyao_api::AgentPaths,
+    /// 引擎启动参数（引擎级，含 agent_paths 等，后续可拓展）
+    params: EngineParams,
 }
 
 impl Engine {
     /// 启动引擎（动作一）
     ///
-    /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider、建立出口通道。
-    /// 启动完成后才可创建/恢复对话。
-    pub async fn new(params: EngineParams, provider: Arc<dyn fuyao_provider::Provider>) -> Self {
+    /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider 与工具注册表、
+    /// 建立出口通道。启动完成后才可创建/恢复对话。
+    ///
+    /// `tools` 由装配方注入（如从 `fuyao_tools::all_tools()` 转换），引擎持有后
+    /// 所有 session task 共享同一份工具表。
+    pub async fn new(
+        params: EngineParams,
+        provider: Arc<dyn fuyao_provider::Provider>,
+        tools: ToolRegistry,
+    ) -> Self {
         // 用 agent_paths 解析 db_path，打开数据库
         let db_path = params.agent_paths.sessions_db_path();
         let store = SessionStore::new(db_path)
@@ -69,10 +80,11 @@ impl Engine {
         Self {
             store: Arc::new(store),
             provider,
+            tools: Arc::new(tools),
             sessions: Mutex::new(std::collections::HashMap::new()),
             tx_event,
             rx_event: Mutex::new(rx_event),
-            agent_paths: params.agent_paths,
+            params,
         }
     }
 
@@ -84,7 +96,7 @@ impl Engine {
     /// 返回新 session id。
     pub async fn create_session(&self, params: SessionParams) -> Result<SessionId, EngineError> {
         // 构建系统提示词（Agent 配置决定人格）
-        let system_prompt = build_system_prompt(&self.agent_paths, &params.agent_config);
+        let system_prompt = build_system_prompt(&self.params.agent_paths, &params.agent_config);
 
         // 创建 Session（8 位 UUID）
         let mut session = Session::new(None, Some(system_prompt));
@@ -95,11 +107,14 @@ impl Engine {
         let session_id = session.id.clone();
         let messages = std::mem::take(&mut session.messages);
 
-        // 建 session 专属消息队列 + spawn 执行流 task
-        let (tx, rx) = mpsc::channel::<QueuedMessage>(64);
+        // 建 session 专属数据队列 + 中断通道 + spawn 执行流 task
+        let (tx_queue, rx_queue) = mpsc::channel::<QueuedMessage>(64);
+        let (tx_interrupt, rx_interrupt) =
+            mpsc::channel::<fuyao_api::message::input::InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             session_id.clone(),
-            rx,
+            rx_queue,
+            rx_interrupt,
             // task 接管 session（含 system_prompt + messages）
             Session {
                 messages,
@@ -107,14 +122,20 @@ impl Engine {
             },
             Arc::clone(&self.store),
             Arc::clone(&self.provider),
+            Arc::clone(&self.tools),
+            self.params.agent_paths.clone(),
             self.tx_event.clone(),
         ));
 
         // 登记进调度表
-        self.sessions
-            .lock()
-            .await
-            .insert(session_id.clone(), SessionHandle { tx, task });
+        self.sessions.lock().await.insert(
+            session_id.clone(),
+            SessionHandle {
+                tx_queue,
+                tx_interrupt,
+                task,
+            },
+        );
 
         tracing::info!(session_id = %session_id, "创建对话");
         Ok(session_id)
@@ -134,22 +155,31 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        // 建 session 专属消息队列 + spawn 执行流 task
-        let (tx, rx) = mpsc::channel::<QueuedMessage>(64);
+        // 建 session 专属数据队列 + 中断通道 + spawn 执行流 task
+        let (tx_queue, rx_queue) = mpsc::channel::<QueuedMessage>(64);
+        let (tx_interrupt, rx_interrupt) =
+            mpsc::channel::<fuyao_api::message::input::InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             id.clone(),
-            rx,
+            rx_queue,
+            rx_interrupt,
             session,
             Arc::clone(&self.store),
             Arc::clone(&self.provider),
+            Arc::clone(&self.tools),
+            self.params.agent_paths.clone(),
             self.tx_event.clone(),
         ));
 
         // 登记进调度表
-        self.sessions
-            .lock()
-            .await
-            .insert(id.clone(), SessionHandle { tx, task });
+        self.sessions.lock().await.insert(
+            id.clone(),
+            SessionHandle {
+                tx_queue,
+                tx_interrupt,
+                task,
+            },
+        );
 
         tracing::info!(session_id = %id, "恢复对话");
         Ok(())
@@ -180,20 +210,32 @@ impl Engine {
             .get(id)
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        // MessageParams 只对 User 有意义，其他变体入队时 params 置 None
-        let params_for_queue = match &event {
-            InputEvent::User(_) => Some(params),
-            _ => None,
-        };
-
-        handle
-            .tx
-            .send(QueuedMessage {
-                event,
-                params: params_for_queue,
-            })
-            .await
-            .map_err(|_| EngineError::Shutdown)?;
+        // 数据通道与中断通道分离：Interrupt 走独立通道（select! 中断点监听），
+        // User / Plugin 走数据队列（主循环消费）
+        match event {
+            InputEvent::Interrupt(interrupt_msg) => {
+                handle
+                    .tx_interrupt
+                    .send(interrupt_msg)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
+            }
+            InputEvent::User(_) | InputEvent::Plugin(_) => {
+                // MessageParams 只对 User 有意义，Plugin 入队时 params 置 None
+                let params_for_queue = match &event {
+                    InputEvent::User(_) => Some(params),
+                    _ => None,
+                };
+                handle
+                    .tx_queue
+                    .send(QueuedMessage {
+                        event,
+                        params: params_for_queue,
+                    })
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
+            }
+        }
 
         Ok(())
     }

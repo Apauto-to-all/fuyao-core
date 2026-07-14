@@ -2,6 +2,7 @@
 //!
 //! 集中放引擎模块间共享的类型别名、状态类型。
 
+use fuyao_api::message::input::InterruptMessage;
 use fuyao_api::{InputEvent, MessageParams};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
@@ -27,12 +28,18 @@ pub(crate) struct QueuedMessage {
 /// 活跃 session 的句柄
 ///
 /// Engine 的调度表（session_id → SessionHandle）持有它。
-/// `tx` 用于往这个 session 的消息队列塞事件（send 入口用），
-/// `task` 是这个 session 独立执行流的 tokio 任务句柄。
+/// 数据通道与中断通道分离：
+/// - `tx_queue`：User / Plugin 事件，task 主循环消费
+/// - `tx_interrupt`：Interrupt 事件，task 的 select! 中断点监听
+///
+/// 分离的原因：select! 监听中断时若和数据共用一个通道，会误取 User/Plugin
+/// （它们不是中断信号），处理逻辑变复杂。独立通道保证中断分支只收到 Interrupt。
 #[allow(dead_code)]
 pub(crate) struct SessionHandle {
-    /// session 专属消息队列的发送端（send 时往这塞 QueuedMessage）
-    pub tx: Sender<QueuedMessage>,
+    /// 数据通道发送端（User / Plugin）
+    pub tx_queue: Sender<QueuedMessage>,
+    /// 中断通道发送端（Interrupt）
+    pub tx_interrupt: Sender<InterruptMessage>,
     /// session 独立执行流的任务句柄（shutdown 时用于优雅 abort）
     pub task: JoinHandle<()>,
 }

@@ -20,3 +20,4 @@ dirs.workspace = true
 [dev-dependencies]
 async-trait = { workspace = true }
 async-stream = { workspace = true }
+uuid = { workspace = true }
