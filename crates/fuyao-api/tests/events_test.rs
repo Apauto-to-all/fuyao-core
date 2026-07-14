@@ -6,8 +6,8 @@
 
 use fuyao_api::message::input::{
     InputEvent, InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource,
-    PluginMessage, PluginPayload, PluginSource, ShutdownMessage, SystemSource, UserMessage,
-    UserMessageMode, UserMessageSource, UserPayload,
+    PluginMessage, PluginPayload, PluginSource, SystemSource, UserMessage, UserMessageMode,
+    UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, ErrorMessage, ErrorPayload,
@@ -76,9 +76,6 @@ fn input_event_samples() -> Vec<InputEvent> {
                 source: InterruptSource::User,
             },
         }),
-        InputEvent::Shutdown(ShutdownMessage {
-            base: EventBase::default(),
-        }),
         InputEvent::Plugin(PluginMessage {
             base: EventBase::default(),
             payload: PluginPayload {
@@ -104,19 +101,9 @@ fn input_event_serde_preserves_variant(#[values(0, 1, 2, 3)] idx: usize) {
     match (&original, &restored) {
         (InputEvent::User(_), InputEvent::User(_)) => {}
         (InputEvent::Interrupt(_), InputEvent::Interrupt(_)) => {}
-        (InputEvent::Shutdown(_), InputEvent::Shutdown(_)) => {}
         (InputEvent::Plugin(_), InputEvent::Plugin(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
-}
-
-#[test]
-fn input_shutdown_has_no_payload() {
-    // Shutdown 只有 base，无 payload —— 构造时不需 payload 字段
-    let event = InputEvent::Shutdown(ShutdownMessage {
-        base: EventBase::default(),
-    });
-    assert!(matches!(event, InputEvent::Shutdown(_)));
 }
 
 // ---------------------------------------------------------------------------
