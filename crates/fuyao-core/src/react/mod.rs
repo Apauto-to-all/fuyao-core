@@ -26,17 +26,19 @@ pub(crate) mod queue;
 mod tests;
 pub(crate) mod turn;
 
+use crate::dispatch;
 use crate::emit::Emitter;
-use crate::engine::types::SharedQueue;
+use crate::engine::types::{InboundUser, QueuedUserMessage, SharedQueue};
 use crate::interrupt::emit_interrupt_event;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::Session;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;
+use fuyao_api::message::output::{UserMessage as OutputUserMessage, UserPayload};
+use fuyao_api::{UserMessageMode, UserMessageSource};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::Provider;
 use std::sync::Arc;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
@@ -61,8 +63,12 @@ pub(crate) struct SessionCtx {
 
 /// session 的独立执行流
 ///
-/// 消费 guide 队列驱动 ReAct 循环；guide 空时 select! 等待 notify（新消息入队）
-/// 或 rx_interrupt（idle 中断）。pending 入队也会 notify（覆盖 AI 空闲只发 Pending）。
+/// 消费 guide 队列驱动 ReAct 循环；guide 空时 select! 等待入站消息（过管道入队）
+/// 或 rx_interrupt（idle 中断）。
+///
+/// User 消息统一经管道处理：Engine::send 把消息送入站通道 → select! 收到 →
+/// 过完整管道（拦截 → 处理[入 guide/pending 队列] → 发送[回显 User] → 观察）。
+/// 入队是 session 层管道的 process 职责，不在引擎层直接操作队列。
 ///
 /// 关于 SessionParams 的简化（有意决策）：`SessionParams` 在 `Engine::create_session`
 /// 里被消费——只取出 `agent_config` 构建 system_prompt 存进 `Session.system_prompt`，
@@ -76,7 +82,7 @@ pub(crate) async fn run_session(
     session_id: String,
     guide: SharedQueue,
     pending: SharedQueue,
-    notify: Arc<Notify>,
+    mut rx_inbound: Receiver<InboundUser>,
     mut rx_interrupt: Receiver<InterruptMessage>,
     mut session: Session,
     store: Arc<fuyao_session::SessionStore>,
@@ -99,7 +105,7 @@ pub(crate) async fn run_session(
         pending,
     };
 
-    // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待
+    // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断
     loop {
         // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
         // → 此时 pending 与 guide 语义等价，立即解禁进 guide 触发新 turn
@@ -114,14 +120,18 @@ pub(crate) async fn run_session(
             // ReAct 多轮复用同一份 model（一个 turn 一个模型）
             // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
             let first_params = msgs.first().map(|m| m.params.clone()).unwrap_or_default();
-            // 一次性全部注入：每条变一条 user message
-            queue::inject_messages(&ctx.emitter, &ctx.hooks, &mut session, msgs).await;
+            // 一次性全部注入：每条变一条 user message（入队时已过管道发回显，此处只推进历史）
+            queue::inject_messages(&mut session, msgs);
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
         } else {
-            // guide 空：等 notify（新消息入队）或中断
+            // guide 空：等入站消息（过管道入队）或中断
             tokio::select! {
-                // notify 唤醒：回循环顶部重新 consume（guide 或 pending 可能有新消息）
-                () = notify.notified() => { continue; }
+                Some(inbound) = rx_inbound.recv() => {
+                    // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察
+                    handle_inbound_user(&ctx, inbound).await;
+                    // 回循环顶部重新 consume（刚入队的消息会驱动新 turn）
+                    continue;
+                }
                 Some(interrupt_msg) = rx_interrupt.recv() => {
                     // idle 中断：无活跃 turn，只发通知事件
                     emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
@@ -130,4 +140,54 @@ pub(crate) async fn run_session(
             }
         }
     }
+}
+
+/// 处理入站 User 消息：过完整管道（拦截 → 处理[入队] → 发送[回显] → 观察）
+///
+/// process 段按 mode 入 guide / pending 队列；deliver 段发 OutputEvent::User 回显给 UI。
+fn handle_inbound_user(
+    ctx: &SessionCtx,
+    inbound: InboundUser,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    let guide = Arc::clone(&ctx.guide);
+    let pending = Arc::clone(&ctx.pending);
+    let mode = inbound.mode;
+    let queued = QueuedUserMessage {
+        content: inbound.content.clone(),
+        params: inbound.params,
+    };
+    // process 回调：按 mode 入队（瞬间、不阻塞）
+    let process: dispatch::ProcessFn = Box::new(move |_| {
+        let guide = guide.clone();
+        let pending = pending.clone();
+        Box::pin(async move {
+            match mode {
+                UserMessageMode::Guide => guide
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(queued),
+                UserMessageMode::Pending => pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push_back(queued),
+            }
+        })
+    });
+
+    Box::pin(async move {
+        dispatch::dispatch(
+            &ctx.emitter,
+            &ctx.hooks,
+            OutputEvent::User(OutputUserMessage {
+                base: fuyao_api::message::EventBase::default(),
+                payload: UserPayload {
+                    content: inbound.content,
+                    mode,
+                    source: UserMessageSource::User,
+                },
+            }),
+            Some(process),
+        )
+        .await;
+    })
 }

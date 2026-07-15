@@ -139,7 +139,7 @@ async fn handle_final_reply(
         persist(ctx.emitter.session_id(), session, &ctx.store).await;
     } else {
         // 有消息：全部注入，回 run_turn 顶部再调一轮 LLM
-        queue::inject_messages(&ctx.emitter, &ctx.hooks, session, msgs).await;
+        queue::inject_messages(session, msgs);
     }
 }
 
@@ -203,7 +203,7 @@ async fn handle_tool_calls(
     if effective_result.tool_calls.is_empty() {
         let msgs = queue::consume_all_guide(&ctx.guide);
         if !msgs.is_empty() {
-            queue::inject_messages(&ctx.emitter, &ctx.hooks, session, msgs).await;
+            queue::inject_messages(session, msgs);
         }
         return;
     }
@@ -260,7 +260,7 @@ async fn handle_tool_calls(
     // 步骤4：消费时机①——一批工具全部完成后、发回 AI 前，只看 guide（pending 不动）
     let msgs = queue::consume_all_guide(&ctx.guide);
     if !msgs.is_empty() {
-        queue::inject_messages(&ctx.emitter, &ctx.hooks, session, msgs).await;
+        queue::inject_messages(session, msgs);
     }
     // 回 run_turn 顶部：带 guide 消息（若有）+ 工具结果再调 LLM
 }

@@ -8,7 +8,7 @@
 
 pub(crate) mod types;
 
-use crate::engine::types::{QueuedUserMessage, SessionHandle, SharedQueue};
+use crate::engine::types::{SessionHandle, SharedQueue};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
@@ -16,14 +16,12 @@ use fuyao_api::message::input::InterruptMessage;
 use fuyao_api::message::output::{
     PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
 };
-use fuyao_api::{
-    EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams, UserMessageMode,
-};
+use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
 use fuyao_hooks::SharedHooks;
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
 use std::sync::{Arc, Mutex as StdMutex};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, mpsc};
 pub use types::SessionId;
 
 /// 引擎
@@ -126,16 +124,16 @@ impl Engine {
         let session_id = session.id.clone();
         let messages = std::mem::take(&mut session.messages);
 
-        // 建 session 专属双队列 + notify + 中断通道 + spawn 执行流 task
+        // 建 session 专属双队列 + 入站通道 + 中断通道 + spawn 执行流 task
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let notify = Arc::new(Notify::new());
+        let (tx_inbound, rx_inbound) = mpsc::channel::<crate::engine::types::InboundUser>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             session_id.clone(),
             Arc::clone(&guide),
             Arc::clone(&pending),
-            Arc::clone(&notify),
+            rx_inbound,
             rx_interrupt,
             // task 接管 session（含 system_prompt + messages）
             Session {
@@ -156,7 +154,7 @@ impl Engine {
             SessionHandle {
                 guide,
                 pending,
-                notify,
+                tx_inbound,
                 tx_interrupt,
                 task,
             },
@@ -180,16 +178,16 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        // 建 session 专属双队列 + notify + 中断通道 + spawn 执行流 task
+        // 建 session 专属双队列 + 入站通道 + 中断通道 + spawn 执行流 task
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let notify = Arc::new(Notify::new());
+        let (tx_inbound, rx_inbound) = mpsc::channel::<crate::engine::types::InboundUser>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             id.clone(),
             Arc::clone(&guide),
             Arc::clone(&pending),
-            Arc::clone(&notify),
+            rx_inbound,
             rx_interrupt,
             session,
             Arc::clone(&self.store),
@@ -206,7 +204,7 @@ impl Engine {
             SessionHandle {
                 guide,
                 pending,
-                notify,
+                tx_inbound,
                 tx_interrupt,
                 task,
             },
@@ -243,25 +241,19 @@ impl Engine {
 
         match event {
             InputEvent::User(user_msg) => {
-                // User 按 mode 分流入 guide / pending 队列
-                let queued = QueuedUserMessage {
+                // User 消息经入站通道送进 session task，由管道处理：
+                // 拦截 → 处理(入 guide/pending 队列) → 发送(回显 User 给 UI) → 观察。
+                // 不在引擎层直接操作队列——入队是 session 层管道的 process 职责。
+                let inbound = crate::engine::types::InboundUser {
                     content: user_msg.payload.content,
+                    mode: user_msg.payload.mode,
                     params,
                 };
-                match user_msg.payload.mode {
-                    UserMessageMode::Guide => handle
-                        .guide
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back(queued),
-                    UserMessageMode::Pending => handle
-                        .pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push_back(queued),
-                }
-                // 两种 mode 都 notify：guide 入队唤醒消费，pending 入队唤醒 drain（覆盖 AI 空闲只发 Pending）
-                handle.notify.notify_one();
+                handle
+                    .tx_inbound
+                    .send(inbound)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
             }
             InputEvent::Interrupt(interrupt_msg) => {
                 // 中断走独立通道（select! 中断点监听）

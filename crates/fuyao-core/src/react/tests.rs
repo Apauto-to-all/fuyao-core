@@ -515,7 +515,7 @@ async fn both_empty_turn_ends() {
 /// 回归：task 空闲时只发 pending 也能触发新 turn（pending 不应死信）
 ///
 /// 覆盖 main 循环的 drain_pending 补丁：task 空闲 = 无活跃 ReAct 链，
-/// pending 的"等链结束"解禁条件已满足，应立即解禁进 guide 触发 turn。
+/// pending 的"等链结束"解禁条件已满足，应立即解禁进 guide 触发新 turn。
 /// 修复前：main 循环只 consume guide，task 空闲时 pending 永远进不了 turn（死信）。
 #[tokio::test]
 async fn pending_consumed_when_task_idle() {
@@ -529,7 +529,8 @@ async fn pending_consumed_when_task_idle() {
 
     let guide = empty_queue();
     let pending = empty_queue();
-    let notify = Arc::new(Notify::new());
+    // 入站通道（User 消息经此送进 session task 过管道入队）
+    let (tx_inbound, rx_inbound) = mpsc::channel::<crate::engine::types::InboundUser>(16);
     // tx 必须随测试存活以保持中断通道打开（rx_interrupt.recv() 不提前返回 None）
     let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
@@ -541,7 +542,7 @@ async fn pending_consumed_when_task_idle() {
         "test_session".to_string(),
         Arc::clone(&guide),
         Arc::clone(&pending),
-        Arc::clone(&notify),
+        rx_inbound,
         rx_interrupt,
         session,
         Arc::clone(&store),
@@ -552,12 +553,16 @@ async fn pending_consumed_when_task_idle() {
         tx_event,
     ));
 
-    // 模拟 send：只往 pending 推一条 + notify 唤醒（task 空闲，无活跃 ReAct 链）
-    pending.lock().unwrap().push_back(QueuedUserMessage {
-        content: "排队消息".into(),
-        params: MessageParams::default(),
-    });
-    notify.notify_one();
+    // 模拟 send：经入站通道发一条 Pending 消息（过管道入 pending 队列）
+    // task 空闲（无活跃 ReAct 链），pending 的解禁条件已满足
+    tx_inbound
+        .send(crate::engine::types::InboundUser {
+            content: "排队消息".into(),
+            mode: fuyao_api::UserMessageMode::Pending,
+            params: MessageParams::default(),
+        })
+        .await
+        .unwrap();
 
     // 期待 pending 被解禁 → turn 跑完 → AssistantMessage（2 秒超时防止 bug 时挂死）
     let mut got_assistant = false;
