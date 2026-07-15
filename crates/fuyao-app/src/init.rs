@@ -1,52 +1,42 @@
-//! 引擎初始化 —— 应用层装配入口
+//! 引擎初始化 —— 应用层装配入口（配置 / 日志 / Provider 准备）
 //!
-//! 封装从 [`AgentContext`] 到可用 `((Engine, EngineHandle, LogGuard))` 的完整初始化流程：
+//! 负责从 [`AgentPaths`] 出发完成引擎装配前的所有准备：
 //! 1. 加载 `.env` 环境变量（三层目录）
 //! 2. 加载三层 TOML 配置
 //! 3. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
 //! 4. 注册 Provider/Model 到注册表（带缓存，重复调用幂等）
-//! 5. 确定 `model_id`（显式指定 > 配置文件 `[models.default]` > 第一个已注册模型）
+//! 5. 确定 `model_id`（配置文件 `[models.default]` > 第一个已注册模型）
 //! 6. 创建 [`OpenAIProvider`] 实例（按 `provider_id`）
 //! 7. 验证模型存在于注册表
-//! 8. 创建 [`Engine`]，返回 `((Engine, EngineHandle, LogGuard))`
 //!
-//! 典型用法（推荐用 [`crate::start`] 一行启动，自动串联 `init_engine` + `setup`）：
+//! 返回 `(provider, 默认 model_id, 日志 guard)`，由 [`crate::start`] 组装进 `Engine::new`。
+//! 工具注册表（[`crate::build_tool_registry`]）独立准备，与本模块解耦。
+//!
+//! 典型用法（推荐用 [`crate::start`] 一行启动）：
 //! ```ignore
-//! use fuyao_api::{AgentContext, ModelConfig, ThinkingType};
+//! use fuyao_api::AgentPaths;
 //!
-//! let agent_ctx = AgentContext {
-//!     model_config: ModelConfig {
-//!         model_id: Some("deepseek/deepseek-v4-flash".to_string()),
-//!         thinking_type: Some(ThinkingType::Enabled),      // 可选：开思考
-//!         reasoning_effort: Some("high".to_string()),       // 可选：思考强度
-//!         ..Default::default()
-//!     },
-//!     ..Default::default()
-//! };
-//! let (engine, handle, _log_guard) = fuyao_app::init_engine(agent_ctx)?;
+//! let agent_paths = AgentPaths::default();
+//! let (provider, model_id, _log_guard) = fuyao_app::init_engine(agent_paths).await?;
 //! ```
 
 use crate::logging::LogGuard;
-use fuyao_api::{AgentContext, AgentPaths};
-use fuyao_api::{FuyaoConfig, load_config, load_env, set_config};
-use fuyao_core::{Engine, EngineHandle};
+use fuyao_api::{AgentPaths, FuyaoConfig, load_config, load_env, set_config};
 use fuyao_provider::OpenAIProvider;
 use fuyao_provider::{
-    agent_paths_cache_key, get_model, list_models, register_model, register_provider,
+    Provider, agent_paths_cache_key, get_model, list_models, register_model, register_provider,
 };
 use std::sync::Arc;
 
 /// 初始化错误
 ///
-/// 每个变体携带可用于排错的上下文（已指定的 model_id、可用模型/Provider 列表等），
+/// 每个变体携带可用于排错的上下文（可用模型/Provider 列表等），
 /// 错误信息直接面向最终用户，包含明确的修正建议（如检查 API Key 配置）。
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
-    /// 未配置 `model_id`，且注册表中没有任何可用默认模型
-    #[error("未配置 model_id 且无可用默认模型 (指定: {model_id:?}, 可用: {available:?})")]
+    /// 注册表中没有任何可用模型（无法确定 provider_id）
+    #[error("无可用模型 (可用: {available:?})。请检查配置文件 [providers] 段")]
     NoModelWithDetail {
-        /// 调用方显式指定的 model_id（可能为 None）
-        model_id: Option<String>,
         /// 当前注册表中所有可用模型的 full_id 列表
         available: Vec<String>,
     },
@@ -71,27 +61,35 @@ pub enum InitError {
     ConfigError(String),
 }
 
-/// 初始化引擎 —— 应用层装配入口
+/// 引擎装配准备产物
+pub struct InitResult {
+    /// 已构造的 LLM Provider（引擎级共享，注入 `Engine::new`）
+    pub provider: Arc<dyn Provider>,
+    /// 推断出的默认 model_id（消息级缺省时兜底用，调用方发消息时可用此填充 MessageParams）
+    pub default_model_id: String,
+    /// 日志 guard：drop 时 flush 文件缓冲，须存活到引擎结束
+    pub log_guard: LogGuard,
+}
+
+/// 引擎装配准备 —— 应用层装配入口
 ///
-/// 从 [`AgentContext`] 出发，一气呵成完成：环境变量加载 → 配置注册 →
-/// 日志初始化 → model_id 确定 → Provider 创建 → 模型校验 → Engine 装配，
-/// 返回可直接使用的 `((Engine, EngineHandle, LogGuard))`。
+/// 从 [`AgentPaths`] 出发，一气呵成完成：环境变量加载 → 配置注册 →
+/// 日志初始化 → 默认 model_id 确定 → Provider 创建 → 模型校验，
+/// 返回可直接喂给 `Engine::new` 的 `(provider, 默认 model_id, 日志 guard)`。
 ///
-/// 返回的 `LogGuard` 须存活到引擎结束（drop 时 flush 文件日志缓冲）；
-/// 经 [`crate::start`] 一键启动时自动注入 `AppContext` 持有。
+/// 注意：model_id 现在是消息级属性（跟每条消息走），但 Provider 是引擎级共享。
+/// 本函数确定一个默认 model_id 仅用于挑 provider_id 创建 Provider 实例；
+/// 调用方发消息时仍可在 [`fuyao_api::MessageParams`] 里自由指定每轮模型。
 ///
 /// # 参数
-/// - `agent_ctx`：Agent 运行时上下文，至少应填充 `agent_paths`（决定三层目录）；
-///   若填充 `model_id` 则优先使用，否则按配置文件 `[models.default]` / 第一个已注册模型回退。
+/// - `agent_paths`：Agent 三层目录身份证明，决定配置与数据路径。
 ///
 /// # 错误
-/// - [`InitError::NoModelWithDetail`]：未指定 `model_id` 且注册表为空
+/// - [`InitError::NoModelWithDetail`]：注册表为空，无法确定 provider_id
 /// - [`InitError::ProviderNotFoundWithDetail`]：Provider 创建失败（API Key 缺失等）
-/// - [`InitError::ModelInfoFailed`]：model_id 在注册表中不存在
+/// - [`InitError::ModelInfoFailed`]：推断的 model_id 在注册表中不存在
 /// - [`InitError::ConfigError`]：配置文件加载失败
-pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle, LogGuard), InitError> {
-    let agent_paths = agent_ctx.agent_paths.clone();
-
+pub async fn init_engine(agent_paths: AgentPaths) -> Result<InitResult, InitError> {
     // 1. 加载 .env 环境变量
     load_env(&agent_paths);
 
@@ -113,23 +111,13 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle, Log
     // 4. 注册 Provider/Model（带缓存，重复调用幂等）
     ensure_registered(&agent_paths, config.as_ref())?;
 
-    // 5. 确定 model_id：显式指定 > 配置文件默认 > 第一个已注册模型
-    let model_id = agent_ctx
-        .model_config
-        .model_id
-        .clone()
-        .or_else(|| get_default_model_id(&agent_paths, config.as_ref()))
-        .ok_or_else(|| {
-            let loaded = list_models(&agent_paths);
-            InitError::NoModelWithDetail {
-                model_id: agent_ctx.model_config.model_id.clone(),
-                available: loaded.keys().cloned().collect(),
-            }
-        })?;
-
-    // 更新 agent_ctx 中的 model_id（确保已设置，供 Engine 内部读取）
-    let mut agent_ctx = agent_ctx;
-    agent_ctx.model_config.model_id = Some(model_id.clone());
+    // 5. 确定 model_id：配置文件默认 > 第一个已注册模型
+    let model_id = get_default_model_id(&agent_paths, config.as_ref()).ok_or_else(|| {
+        let loaded = list_models(&agent_paths);
+        InitError::NoModelWithDetail {
+            available: loaded.keys().cloned().collect(),
+        }
+    })?;
 
     // 6. 创建 Provider 实例（按 model_id 中 `/` 之前的 provider_id）
     let provider_id = model_id.split('/').next().unwrap_or("");
@@ -146,14 +134,18 @@ pub fn init_engine(agent_ctx: AgentContext) -> Result<(Engine, EngineHandle, Log
         return Err(InitError::ModelInfoFailed(model_id));
     }
 
-    // 8. 创建 Engine，返回 (Engine, EngineHandle, LogGuard)
-    let (engine, handle) = Engine::new(Box::new(provider), agent_ctx);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+
     tracing::info!(
         model_id = %model_id,
         console = logging_config.console,
-        "引擎初始化完成"
+        "引擎装配准备完成"
     );
-    Ok((engine, handle, log_guard))
+    Ok(InitResult {
+        provider,
+        default_model_id: model_id,
+        log_guard,
+    })
 }
 
 /// 确保指定 `agent_paths` 的 Provider/Model 已注册
@@ -221,11 +213,10 @@ mod tests {
     #[test]
     fn init_error_display_carries_context() {
         let no_model = InitError::NoModelWithDetail {
-            model_id: None,
             available: vec!["deepseek/deepseek-v4-flash".to_string()],
         };
         let msg = no_model.to_string();
-        assert!(msg.contains("未配置 model_id"), "{msg}");
+        assert!(msg.contains("无可用模型"), "{msg}");
         assert!(msg.contains("deepseek/deepseek-v4-flash"), "{msg}");
 
         let provider_err = InitError::ProviderNotFoundWithDetail {

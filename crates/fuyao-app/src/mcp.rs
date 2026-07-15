@@ -1,18 +1,29 @@
-//! MCP 工具注册
+//! MCP 工具收集
+//!
+//! 从 `[mcp_servers]` 配置启动 MCP server，把发现的工具转换成引擎可注入的
+//! `fuyao_core::ToolEntry`。返回 MCPManager（调用方持有保活，否则连接断开）+ 工具列表。
+//!
+//! 工具收集发生在 `Engine::new` 之前——MCP 工具与内置工具一起注入 `ToolRegistry`。
 
 use std::sync::Arc;
 
-use fuyao_core::EngineHandle;
+use fuyao_api::get_config;
+use fuyao_core::ToolEntry;
 use fuyao_mcp::MCPManager;
 
-/// 注册 MCP 工具到 EngineHandle
+/// 收集 MCP 工具
 ///
 /// 从 `[mcp_servers]` 配置创建 MCPManager，启动所有 server 连接，
-/// 将发现的工具注册到 EngineHandle。
+/// 把发现的工具（name / schema / handler 三元组）反序列化 schema 成 `ToolDefinition`
+/// 后包成 `ToolEntry` 收集。
 ///
-/// 无配置 server 时返回 None。
-pub async fn register_mcp_tools(handle: &EngineHandle) -> Option<Arc<MCPManager>> {
-    if fuyao_api::get_config().mcp_servers.is_empty() {
+/// - 无配置 server → 返回 `None`（不启动子进程）。
+/// - 部分启动失败 → 仅记录 WARN，继续收集已成功的工具。
+///
+/// 返回 `(MCPManager, 工具列表)`：调用方须持有 MCPManager 保活，
+/// 否则底层 server 连接断开，工具 handler 会失效。
+pub async fn collect_mcp_tools() -> Option<(Arc<MCPManager>, Vec<ToolEntry>)> {
+    if get_config().mcp_servers.is_empty() {
         return None;
     }
 
@@ -28,9 +39,23 @@ pub async fn register_mcp_tools(handle: &EngineHandle) -> Option<Arc<MCPManager>
         );
     }
 
-    for (name, schema, handler) in manager.get_tool_entries().await {
-        handle.register_tool(&name, schema, handler);
+    // MCPManager 已用强类型 ToolDefinition 持有 schema，get_tool_entries 序列化为 Value 返回；
+    // 此处反序列化回 ToolDefinition 再包成引擎 ToolEntry（handler 直接复用 MCP 生成的 ToolFn）
+    let mut entries = Vec::new();
+    for (name, schema_value, handler) in manager.get_tool_entries().await {
+        let definition = match serde_json::from_value::<fuyao_api::ToolDefinition>(schema_value) {
+            Ok(def) => def,
+            Err(e) => {
+                tracing::warn!(tool_name = %name, cause = %e, "MCP 工具 schema 反序列化失败，跳过");
+                continue;
+            }
+        };
+        entries.push(ToolEntry {
+            definition,
+            handler,
+        });
     }
 
-    Some(manager)
+    tracing::info!(tools = entries.len(), "MCP 工具收集完成");
+    Some((manager, entries))
 }

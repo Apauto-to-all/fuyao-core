@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// 工具条目：schema + handler
+#[derive(Clone)]
 pub struct ToolEntry {
     pub definition: ToolDefinition,
     pub handler: ToolFn,

@@ -487,9 +487,13 @@ mod tests {
         let emitter = PluginEmitter::new(PluginEventSource { name: "p".into() }, tx);
         assert_eq!(emitter.identity().name, "p");
         // sender 可用（编译期验证 + 发送 Interrupt 消息复用通道）
-        let _ = emitter.sender().try_send(InputEvent::Shutdown(
-            fuyao_api::message::input::ShutdownMessage {
+        let _ = emitter.sender().try_send(InputEvent::Interrupt(
+            fuyao_api::message::input::InterruptMessage {
                 base: EventBase::default(),
+                payload: fuyao_api::message::input::InterruptPayload {
+                    reason: "test".to_string(),
+                    source: fuyao_api::message::input::InterruptSource::System,
+                },
             },
         ));
     }

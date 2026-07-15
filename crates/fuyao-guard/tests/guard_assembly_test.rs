@@ -175,7 +175,6 @@ async fn tool_repeat_interrupt_sends_input_event() {
                 InputEvent::Interrupt(_) | InputEvent::User(_) | InputEvent::Plugin(_) => {
                     got_interrupt = true;
                 }
-                _ => {}
             }
         }
         if got_interrupt {

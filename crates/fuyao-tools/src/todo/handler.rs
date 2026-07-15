@@ -6,10 +6,10 @@
 //! 不传 todos 参数 = 读取当前列表，传了 = 整体覆盖写入。
 //! session_id 由 runner 通过 ToolCallContext 注入，不由 LLM 传递。
 
+use super::store::TodoStore;
 use super::types::{TodoSummary, TodoWriteResult};
 use crate::common;
 use fuyao_api::{TodoItem, ToolCallContext};
-use fuyao_session::get_session_manager;
 use serde_json::Value;
 
 /// 合法的 status 值
@@ -61,11 +61,10 @@ pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
     };
 
     let db_path = agent_paths.sessions_db_path();
-    let manager = match get_session_manager(db_path).await {
-        Ok(m) => m,
-        Err(e) => return common::tool_error(&format!("获取 SessionManager 失败: {e}")),
+    let store = match TodoStore::new(db_path).await {
+        Ok(s) => s,
+        Err(e) => return common::tool_error(&format!("打开 TodoStore 失败: {e}")),
     };
-    let store = manager.get_todo_store();
 
     let todos_data = args.get("todos");
 

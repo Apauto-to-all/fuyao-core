@@ -8,7 +8,7 @@ use std::collections::HashMap;
 /// 工具参数属性定义
 ///
 /// 定义单个参数的类型和描述信息。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolParameterProperty {
     /// 参数类型：string, integer, number, boolean, array, object
     #[serde(rename = "type")]
@@ -45,7 +45,7 @@ impl Default for ToolParameterProperty {
 /// 工具参数定义
 ///
 /// 定义工具的所有参数，包括类型、必需参数等。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolParameters {
     /// 参数类型，固定为 object
     #[serde(rename = "type")]
@@ -71,7 +71,7 @@ impl Default for ToolParameters {
 /// 工具 Schema 定义
 ///
 /// 遵循 OpenAI Function Calling 规范的工具定义。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolSchema {
     /// 工具名称，唯一标识
     pub name: String,
@@ -86,7 +86,7 @@ pub struct ToolSchema {
 /// 工具完整定义
 ///
 /// OpenAI API 调用时使用的工具定义格式。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolDefinition {
     /// 工具类型，固定为 function
     #[serde(rename = "type")]
@@ -135,5 +135,43 @@ mod tests {
         let prop = ToolParameterProperty::default();
         assert_eq!(prop.kind, "string");
         assert!(prop.description.is_empty());
+    }
+
+    /// ToolDefinition 序列化后能反序列化回等价结构（MCP 工具注入需要 Deserialize）
+    #[test]
+    fn tool_definition_roundtrip_serialize_deserialize() {
+        let mut def = ToolDefinition::new("read", "读取文件");
+        // 填入一个参数，验证嵌套结构（properties / required / enum）往返保真
+        def.function.parameters.properties.insert(
+            "path".to_string(),
+            ToolParameterProperty {
+                kind: "string".to_string(),
+                description: "文件路径".to_string(),
+                default: None,
+                enum_values: Some(vec!["a".to_string(), "b".to_string()]),
+                items: None,
+            },
+        );
+        def.function.parameters.required.push("path".to_string());
+
+        let json = serde_json::to_value(&def).expect("序列化失败");
+        let back: ToolDefinition =
+            serde_json::from_value(json).expect("反序列化失败（缺少 Deserialize）");
+
+        assert_eq!(back.kind, "function");
+        assert_eq!(back.function.name, "read");
+        assert_eq!(back.function.description, "读取文件");
+        assert_eq!(back.function.parameters.required, vec!["path".to_string()]);
+        let prop = back
+            .function
+            .parameters
+            .properties
+            .get("path")
+            .expect("参数 path 应保留");
+        assert_eq!(prop.kind, "string");
+        assert_eq!(
+            prop.enum_values.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
     }
 }
