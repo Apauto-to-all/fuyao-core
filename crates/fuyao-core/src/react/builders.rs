@@ -174,11 +174,11 @@ pub(crate) fn assistant_msg_to_payload(result: &StreamResult) -> AssistantPayloa
         },
         tool_calls: None,
         finish_reason: Some("stop".to_string()),
-        completion_tokens: 0,
-        prompt_tokens: 0,
-        total_tokens: 0,
-        reasoning_tokens: 0,
-        cached_tokens: 0,
+        completion_tokens: result.usage.completion_tokens as i64,
+        prompt_tokens: result.usage.prompt_tokens as i64,
+        total_tokens: result.usage.total_tokens as i64,
+        reasoning_tokens: result.usage.completion_reasoning_tokens.unwrap_or(0) as i64,
+        cached_tokens: result.usage.prompt_cached_tokens.unwrap_or(0) as i64,
     }
 }
 
@@ -207,11 +207,11 @@ pub(crate) fn assistant_with_tool_calls_to_payload(result: &StreamResult) -> Ass
         },
         tool_calls: Some(tool_call_payloads),
         finish_reason: Some("tool_calls".to_string()),
-        completion_tokens: 0,
-        prompt_tokens: 0,
-        total_tokens: 0,
-        reasoning_tokens: 0,
-        cached_tokens: 0,
+        completion_tokens: result.usage.completion_tokens as i64,
+        prompt_tokens: result.usage.prompt_tokens as i64,
+        total_tokens: result.usage.total_tokens as i64,
+        reasoning_tokens: result.usage.completion_reasoning_tokens.unwrap_or(0) as i64,
+        cached_tokens: result.usage.prompt_cached_tokens.unwrap_or(0) as i64,
     }
 }
 

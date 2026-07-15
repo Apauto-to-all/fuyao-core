@@ -25,18 +25,20 @@ use fuyao_api::message::output::{
 };
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::{StreamUsage, ToolCallData};
+use fuyao_provider::ToolCallData;
 use std::sync::{Arc, Mutex};
 
 /// 单轮共享状态
 ///
-/// stream 每收到一个事件就更新这里（累积 text/reasoning/tool_calls/usage）；
+/// stream 每收到一个事件就更新这里（累积 text/reasoning/tool_calls）；
 /// 中断分支读这里拿部分结果。用 `Arc<Mutex<...>>` 共享，block scope 锁不跨 await。
+///
+/// 用量统计（usage）不属于这里：它只由模型在流正常完成时给出，
+/// 随最终助手消息发出，不进共享状态。
 pub(crate) struct TurnState {
     pub text: String,
     pub reasoning: String,
     pub tool_calls: Vec<ToolCallData>,
-    pub usage: StreamUsage,
 }
 
 impl TurnState {
@@ -45,7 +47,6 @@ impl TurnState {
             text: String::new(),
             reasoning: String::new(),
             tool_calls: Vec::new(),
-            usage: StreamUsage::default(),
         }
     }
 }
@@ -100,14 +101,9 @@ pub(crate) async fn handle_interrupt(
     hooks: &SharedHooks,
 ) {
     // 先 clone 出所需数据再释放锁（不跨 await 持锁）
-    let (text, reasoning, tool_calls, usage) = {
+    let (text, reasoning, tool_calls) = {
         let s = lock(state);
-        (
-            s.text.clone(),
-            s.reasoning.clone(),
-            s.tool_calls.clone(),
-            s.usage.clone(),
-        )
+        (s.text.clone(), s.reasoning.clone(), s.tool_calls.clone())
     };
 
     match kind {
@@ -142,11 +138,12 @@ pub(crate) async fn handle_interrupt(
                         },
                         tool_calls: Some(tool_call_payloads.clone()),
                         finish_reason: Some("interrupted".to_string()),
-                        completion_tokens: usage.completion_tokens as i64,
-                        prompt_tokens: usage.prompt_tokens as i64,
-                        total_tokens: usage.total_tokens as i64,
-                        reasoning_tokens: usage.completion_reasoning_tokens.unwrap_or(0) as i64,
-                        cached_tokens: usage.prompt_cached_tokens.unwrap_or(0) as i64,
+                        // 中断时模型未给出用量，token 统一记 0
+                        completion_tokens: 0,
+                        prompt_tokens: 0,
+                        total_tokens: 0,
+                        reasoning_tokens: 0,
+                        cached_tokens: 0,
                     },
                 }),
                 None,
@@ -185,11 +182,12 @@ pub(crate) async fn handle_interrupt(
                             },
                             tool_calls: None,
                             finish_reason: Some("interrupted".to_string()),
-                            completion_tokens: usage.completion_tokens as i64,
-                            prompt_tokens: usage.prompt_tokens as i64,
-                            total_tokens: usage.total_tokens as i64,
-                            reasoning_tokens: usage.completion_reasoning_tokens.unwrap_or(0) as i64,
-                            cached_tokens: usage.prompt_cached_tokens.unwrap_or(0) as i64,
+                            // 中断时模型未给出用量，token 统一记 0
+                            completion_tokens: 0,
+                            prompt_tokens: 0,
+                            total_tokens: 0,
+                            reasoning_tokens: 0,
+                            cached_tokens: 0,
                         },
                     }),
                     None,

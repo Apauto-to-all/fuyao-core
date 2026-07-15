@@ -178,10 +178,12 @@ async fn handle_tool_calls(
 
     // 步骤2：用 effective_tool_calls 构造存储 Message + 发送 AssistantMessage
     // 拦截后的结果作为唯一数据源：存储 / 发送 / 执行三者一致。
+    // usage 由模型给出，拦截不改变它，沿用原始结果即可。
     let effective_result = StreamResult {
         text: result.text.clone(),
         reasoning: result.reasoning.clone(),
         tool_calls: effective_tool_calls,
+        usage: result.usage.clone(),
     };
     let assistant_msg = build_assistant_message_with_tool_calls(
         &effective_result,

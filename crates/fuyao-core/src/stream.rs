@@ -14,7 +14,7 @@ use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{
     BoxStream, ChatRequest, Provider, StreamDecoder, StreamError, StreamEvent, StreamOptions,
-    ToolCallData,
+    StreamUsage, ToolCallData,
 };
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ pub(crate) struct StreamResult {
     pub reasoning: String,
     /// 累积的工具调用（从 decoder.take_tool_calls 取出）
     pub tool_calls: Vec<ToolCallData>,
+    /// 本轮用量统计（由模型在流结束时给出）
+    pub usage: StreamUsage,
 }
 
 /// 运行一次流式 LLM 调用
@@ -95,14 +97,16 @@ pub(crate) async fn run_stream_session(
         }
     }
 
-    // 流正常结束：取累积的 tool_calls，同步最终状态，返回
+    // 流正常结束：取累积的 tool_calls 与用量统计，同步最终状态，返回
     let tool_calls = decoder.take_tool_calls();
+    let usage = decoder.usage().clone();
     sync_state_with_tools(state, &text, &reasoning, &tool_calls);
 
     Ok(StreamResult {
         text,
         reasoning,
         tool_calls,
+        usage,
     })
 }
 

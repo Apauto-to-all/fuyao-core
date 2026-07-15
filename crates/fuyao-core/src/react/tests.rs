@@ -120,6 +120,22 @@ impl MockProvider {
         ]
     }
 
+    /// 构造带用量统计的文本回复流（验证 usage 流到最终 AssistantMessage）
+    fn text_response_with_usage(
+        text: &str,
+        usage: StreamUsage,
+    ) -> Vec<Result<StreamEvent, StreamError>> {
+        vec![
+            Ok(StreamEvent::TextDelta {
+                content: text.to_string(),
+            }),
+            Ok(StreamEvent::Done {
+                usage,
+                finish_reason: FinishReason::Stop,
+            }),
+        ]
+    }
+
     /// 构造工具调用流
     fn tool_call_response(
         id: &str,
@@ -825,5 +841,60 @@ async fn messages_persisted_to_db() {
         tool_msg.tool_call_id.as_deref(),
         Some("tc_99"),
         "tool 消息应回填正确的 tool_call_id"
+    );
+}
+
+/// 用量统计流通：模型在 Done 事件给出的 usage，应原样出现在最终 AssistantMessage 的 token 字段
+///
+/// 验证修复重构漏搬：usage 不再被硬编码为 0，而是从 decoder.usage() 流经 StreamResult
+/// 到最终 AssistantMessage 的 5 个 token 字段（completion/prompt/total/reasoning/cached）。
+#[tokio::test]
+async fn usage_flows_to_final_assistant_message() {
+    let usage = StreamUsage {
+        prompt_tokens: 120,
+        completion_tokens: 80,
+        total_tokens: 200,
+        completion_reasoning_tokens: Some(30),
+        prompt_cached_tokens: Some(40),
+    };
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::text_response_with_usage("回复内容", usage),
+    ]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&mut h, "提问");
+
+    turn::run_turn(
+        &h.ctx,
+        &mut h.session,
+        &mut h.rx_interrupt,
+        MessageParams::default(),
+    )
+    .await;
+
+    let events = collect_events(&mut h.rx_event).await;
+    let assistant = events
+        .iter()
+        .find_map(|e| match e {
+            OutputEvent::Assistant(m) if m.payload.finish_reason.as_deref() == Some("stop") => {
+                Some(m)
+            }
+            _ => None,
+        })
+        .expect("应有 finish_reason=stop 的最终 AssistantMessage");
+
+    let p = &assistant.payload;
+    assert_eq!(
+        p.completion_tokens, 80,
+        "completion_tokens 应来自模型 usage"
+    );
+    assert_eq!(p.prompt_tokens, 120, "prompt_tokens 应来自模型 usage");
+    assert_eq!(p.total_tokens, 200, "total_tokens 应来自模型 usage");
+    assert_eq!(
+        p.reasoning_tokens, 30,
+        "reasoning_tokens 应来自 completion_reasoning_tokens"
+    );
+    assert_eq!(
+        p.cached_tokens, 40,
+        "cached_tokens 应来自 prompt_cached_tokens"
     );
 }
