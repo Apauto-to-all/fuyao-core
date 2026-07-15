@@ -386,7 +386,11 @@ impl MCPConnection {
         self.lifecycle_notify.notify_one();
     }
 
-    /// 断开连接
+    /// 断开连接（优雅关闭）
+    ///
+    /// 先通知后台 Task 退出，再显式调用 rmcp 的 `close_with_timeout` 做有界优雅关闭：
+    /// rmcp 会先关 transport（给 server 自行退出的机会），等后台清理完成，并确保
+    /// 子进程被回收；总超时 10 秒。单个 server 关闭失败仅记 WARN，不阻断其他 server。
     pub async fn disconnect(&mut self) {
         // 接收端可能已 drop（Task 已结束），忽略发送失败
         let _ = self.shutdown_tx.send(true);
@@ -400,10 +404,16 @@ impl MCPConnection {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.tools.clear();
 
-        // drop RunningService 关闭连接
+        // 显式优雅关闭 RunningService：rmcp 先关 transport、等 server 退出、超时 kill 子进程
+        let svc = { self.client.lock().await.take() };
+        if let Some(mut svc) = svc
+            && let Err(e) = svc.close_with_timeout(Duration::from_secs(10)).await
         {
-            let mut c = self.client.lock().await;
-            *c = None;
+            tracing::warn!(
+                server = %self.server_name,
+                cause = %e,
+                "MCP 连接关闭时后台任务 join 失败（已尽力清理）"
+            );
         }
     }
 }

@@ -144,3 +144,33 @@ async fn assembled_engine_runs_react_loop() {
     assert!(got_chunk, "装配后应产出 Chunk 事件");
     assert!(got_assistant, "装配后应产出 Assistant 事件");
 }
+
+// ============================================================================
+// shutdown：优雅停机串联（engine + MCP）
+// ============================================================================
+
+/// shutdown 对空 AppContext（无 MCP manager）不 panic，且消费 ctx drop log_guard
+#[tokio::test]
+async fn shutdown_with_no_mcp_manager_does_not_panic() {
+    let (_, _home) = temp_agent_paths();
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: fuyao_api::AgentPaths::default(),
+        },
+        std::sync::Arc::new(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        std::sync::Arc::new(tokio::sync::Mutex::new(HooksRegistry::default())) as SharedHooks,
+    )
+    .await;
+
+    let ctx = fuyao_app::AppContext {
+        mcp_manager: None,
+        log_guard: fuyao_app::LogGuard::default(),
+        default_model_id: "test".to_string(),
+    };
+
+    // 不应 panic：engine.shutdown() + mcp_manager=None（跳过 stop_all）+ ctx drop
+    fuyao_app::shutdown(engine, ctx).await;
+}

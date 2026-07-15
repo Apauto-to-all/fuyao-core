@@ -82,6 +82,24 @@ pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), Setu
     ))
 }
 
+/// 优雅关闭：先停引擎，再关 MCP（有序停机）
+///
+/// 应用退出时调用，实现「先关 MCP 再退出」的有序清理：
+/// 1. `engine.shutdown()`：清空 session 调度表，停止接收新对话。
+/// 2. `mcp_manager.stop_all()`：对每个 MCP 连接执行 rmcp 的 `close_with_timeout`
+///    优雅关闭（先关 transport 让 server 退出、超时 kill 子进程）。
+///
+/// 消费 `ctx` 使 `log_guard` 随之 drop，flush 文件日志缓冲。
+/// 单个 MCP server 关闭失败不影响其他（错误隔离在 `stop_all` 内部）。
+pub async fn shutdown(engine: Engine, ctx: AppContext) {
+    engine.shutdown().await;
+    if let Some(mcp_manager) = ctx.mcp_manager {
+        mcp_manager.stop_all().await;
+    }
+    tracing::info!("应用已优雅关闭（引擎 + MCP 已停）");
+    // ctx 在此 drop，log_guard flush 日志
+}
+
 /// 收集工具（内置 + MCP），汇总成引擎可注入的 `ToolRegistry`
 ///
 /// - 内置工具：`fuyao-tools` 静态表，按 `[tools.enabled]` 过滤。
