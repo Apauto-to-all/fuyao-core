@@ -14,6 +14,13 @@ fn test_paths() -> AgentPaths {
     AgentPaths::default()
 }
 
+/// 构造空 SharedHooks（无拦截/观察钩子，管道纯透传）
+fn empty_hooks() -> fuyao_hooks::SharedHooks {
+    Arc::new(tokio::sync::Mutex::new(
+        fuyao_hooks::HooksRegistry::default(),
+    ))
+}
+
 /// 构造一个 handler 恒返回固定串的工具条目
 fn fixed_result_tool(name: &str, result: &str) -> ToolEntry {
     let result = result.to_string();
@@ -93,7 +100,7 @@ async fn single_call_goes_sequential() {
     let (emitter, mut rx) = test_emitter(8);
     let calls = vec![make_tool_call("1", "read", r#"{"name":"a"}"#)];
 
-    let results = execute_tools(&calls, &tools, &test_paths(), &emitter).await;
+    let results = execute_tools(&calls, &tools, &test_paths(), &emitter, &empty_hooks()).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].content, "result_a");
 
@@ -119,7 +126,7 @@ async fn never_parallel_tool_goes_sequential() {
         make_tool_call("2", "bash", r#"{"name":"b"}"#),
     ];
 
-    let results = execute_tools(&calls, &tools, &test_paths(), &emitter).await;
+    let results = execute_tools(&calls, &tools, &test_paths(), &emitter, &empty_hooks()).await;
     // 串行：结果按提交序
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].content, "result_a");
@@ -144,7 +151,7 @@ async fn parallel_executes_all_and_preserves_submit_order() {
         make_tool_call("3", "glob", r#"{"name":"c"}"#),
     ];
 
-    let results = execute_tools(&calls, &tools, &test_paths(), &emitter).await;
+    let results = execute_tools(&calls, &tools, &test_paths(), &emitter, &empty_hooks()).await;
     assert_eq!(results.len(), 3);
     // 返回顺序 = 提交顺序（即便并行执行完成顺序可能不同）
     assert_eq!(results[0].content, "result_a");
@@ -170,7 +177,15 @@ async fn parallel_respects_max_concurrent() {
         max_concurrent: 1,
         ..Default::default()
     };
-    let results = execute_parallel(&calls, &tools, &test_paths(), &emitter, &config).await;
+    let results = execute_parallel(
+        &calls,
+        &tools,
+        &test_paths(),
+        &emitter,
+        &empty_hooks(),
+        &config,
+    )
+    .await;
     assert_eq!(results.len(), 10);
     // 提交序保持
     for (i, r) in results.iter().enumerate() {
@@ -196,7 +211,7 @@ async fn parallel_emit_count_matches_calls() {
     let expected = calls.len();
 
     let (emitter, mut rx) = test_emitter(expected);
-    let _ = execute_tools(&calls, &tools, &test_paths(), &emitter).await;
+    let _ = execute_tools(&calls, &tools, &test_paths(), &emitter, &empty_hooks()).await;
 
     let mut count = 0;
     while count < expected {

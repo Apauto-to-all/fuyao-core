@@ -863,6 +863,7 @@ dependencies = [
  "futures-util",
  "fuyao-api",
  "fuyao-core",
+ "fuyao-hooks",
  "fuyao-mcp",
  "fuyao-provider",
  "fuyao-tools",

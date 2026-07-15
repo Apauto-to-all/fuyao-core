@@ -19,6 +19,7 @@ use fuyao_api::message::output::{
 use fuyao_api::{
     EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams, UserMessageMode,
 };
+use fuyao_hooks::SharedHooks;
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -47,6 +48,12 @@ pub struct Engine {
     /// 工具注册表（引擎级共享，所有 session task 共用同一份）
     tools: Arc<ToolRegistry>,
 
+    /// 钩子注册表（引擎级共享，所有 session task 共用同一份）
+    ///
+    /// 装配方在 `Engine::new` 前构造好（可先 `PluginHost::install` 注册插件），
+    /// 引擎持有后透传给每个 session 的 dispatch 管道。拦截/观察在 session task 内执行。
+    hooks: SharedHooks,
+
     /// 活跃 session 调度表（session_id → SessionHandle）
     sessions: Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
 
@@ -68,10 +75,15 @@ impl Engine {
     ///
     /// `tools` 由装配方注入（如从 `fuyao_tools::all_tools()` 转换），引擎持有后
     /// 所有 session task 共享同一份工具表。
+    ///
+    /// `hooks` 同样由装配方注入（构造前可先 `PluginHost::install` 注册插件），
+    /// 引擎持有后透传给每个 session 的 dispatch 管道。拦截/观察在 session task 内执行，
+    /// 引擎层只负责装配与共享。
     pub async fn new(
         params: EngineParams,
         provider: Arc<dyn fuyao_provider::Provider>,
         tools: ToolRegistry,
+        hooks: SharedHooks,
     ) -> Self {
         // 用 agent_paths 解析 db_path，打开数据库
         let db_path = params.agent_paths.sessions_db_path();
@@ -87,6 +99,7 @@ impl Engine {
             store: Arc::new(store),
             provider,
             tools: Arc::new(tools),
+            hooks,
             sessions: Mutex::new(std::collections::HashMap::new()),
             tx_event,
             rx_event: Mutex::new(rx_event),
@@ -132,6 +145,7 @@ impl Engine {
             Arc::clone(&self.store),
             Arc::clone(&self.provider),
             Arc::clone(&self.tools),
+            Arc::clone(&self.hooks),
             self.params.agent_paths.clone(),
             self.tx_event.clone(),
         ));
@@ -181,6 +195,7 @@ impl Engine {
             Arc::clone(&self.store),
             Arc::clone(&self.provider),
             Arc::clone(&self.tools),
+            Arc::clone(&self.hooks),
             self.params.agent_paths.clone(),
             self.tx_event.clone(),
         ));

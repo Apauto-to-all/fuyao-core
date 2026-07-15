@@ -197,6 +197,13 @@ fn empty_queue() -> SharedQueue {
     Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
+/// 构造空 SharedHooks（无拦截/观察钩子，管道纯透传）
+fn empty_hooks() -> fuyao_hooks::SharedHooks {
+    Arc::new(tokio::sync::Mutex::new(
+        fuyao_hooks::HooksRegistry::default(),
+    ))
+}
+
 /// 构造测试用 SessionCtx + session + rx_interrupt + 收事件的 rx
 ///
 /// `tx_interrupt` 不发中断，但必须随 harness 存活以保持中断通道打开：
@@ -224,6 +231,7 @@ async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> 
         store,
         provider,
         tools,
+        hooks: empty_hooks(),
         agent_paths: fuyao_api::AgentPaths::default(),
         emitter: Emitter::new(tx_event, "test_session".to_string()),
         guide: empty_queue(),
@@ -539,6 +547,7 @@ async fn pending_consumed_when_task_idle() {
         Arc::clone(&store),
         provider,
         Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
         fuyao_api::AgentPaths::default(),
         tx_event,
     ));

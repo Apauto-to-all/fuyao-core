@@ -16,6 +16,7 @@
 //! 中断事件 vs 增量结果分离：`OutputEvent::Interrupt`（用户可见通知）由调用方
 //! 在 select! 命中时就发；本模块只补增量结果（部分内容、中断式工具结果）。
 
+use crate::dispatch;
 use crate::emit::Emitter;
 use fuyao_api::message::input::{InterruptPayload, InterruptSource};
 use fuyao_api::message::output::{
@@ -23,6 +24,7 @@ use fuyao_api::message::output::{
     InterruptPayload as OutputInterruptPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::{EventBase, OutputEvent};
+use fuyao_hooks::SharedHooks;
 use fuyao_provider::{StreamUsage, ToolCallData};
 use std::sync::{Arc, Mutex};
 
@@ -95,6 +97,7 @@ pub(crate) async fn handle_interrupt(
     kind: InterruptKind,
     interrupt: &InterruptPayload,
     emitter: &Emitter,
+    hooks: &SharedHooks,
 ) {
     // 先 clone 出所需数据再释放锁（不跨 await 持锁）
     let (text, reasoning, tool_calls, usage) = {
@@ -121,8 +124,10 @@ pub(crate) async fn handle_interrupt(
                 })
                 .collect();
 
-            emitter
-                .emit(OutputEvent::Assistant(AssistantMessage {
+            dispatch::dispatch(
+                emitter,
+                hooks,
+                OutputEvent::Assistant(AssistantMessage {
                     base: EventBase::default(),
                     payload: AssistantPayload {
                         content: if text.is_empty() {
@@ -143,8 +148,10 @@ pub(crate) async fn handle_interrupt(
                         reasoning_tokens: usage.completion_reasoning_tokens.unwrap_or(0) as i64,
                         cached_tokens: usage.prompt_cached_tokens.unwrap_or(0) as i64,
                     },
-                }))
-                .await;
+                }),
+                None,
+            )
+            .await;
 
             // 为每个有效 tool_call 发中断式 ToolResult
             for payload in &tool_call_payloads {
@@ -154,14 +161,16 @@ pub(crate) async fn handle_interrupt(
                     &interrupt.source,
                     &interrupt.reason,
                 );
-                emitter.emit(result).await;
+                dispatch::dispatch(emitter, hooks, result, None).await;
             }
         }
         InterruptKind::Streaming => {
             // 纯文本/推理中断：发部分 AssistantMessage
             if !text.is_empty() || !reasoning.is_empty() {
-                emitter
-                    .emit(OutputEvent::Assistant(AssistantMessage {
+                dispatch::dispatch(
+                    emitter,
+                    hooks,
+                    OutputEvent::Assistant(AssistantMessage {
                         base: EventBase::default(),
                         payload: AssistantPayload {
                             content: if text.is_empty() {
@@ -182,8 +191,10 @@ pub(crate) async fn handle_interrupt(
                             reasoning_tokens: usage.completion_reasoning_tokens.unwrap_or(0) as i64,
                             cached_tokens: usage.prompt_cached_tokens.unwrap_or(0) as i64,
                         },
-                    }))
-                    .await;
+                    }),
+                    None,
+                )
+                .await;
             }
         }
     }
@@ -212,16 +223,24 @@ fn make_interrupt_tool_result(
 /// 发送中断通知事件（用户可见的停止信号）
 ///
 /// 由 react 在 select! 命中中断命令时调用，转 input Interrupt 为 output Interrupt 事件。
-pub(crate) async fn emit_interrupt_event(interrupt: &InterruptPayload, emitter: &Emitter) {
-    emitter
-        .emit(OutputEvent::Interrupt(OutputInterruptMessage {
+pub(crate) async fn emit_interrupt_event(
+    interrupt: &InterruptPayload,
+    emitter: &Emitter,
+    hooks: &SharedHooks,
+) {
+    dispatch::dispatch(
+        emitter,
+        hooks,
+        OutputEvent::Interrupt(OutputInterruptMessage {
             base: EventBase::default(),
             payload: OutputInterruptPayload {
                 reason: interrupt.reason.clone(),
                 source: interrupt.source.clone(),
             },
-        }))
-        .await;
+        }),
+        None,
+    )
+    .await;
 }
 
 #[cfg(test)]
@@ -254,11 +273,21 @@ mod tests {
         }
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let emitter = Emitter::new(tx, "sess1".to_string());
+        let hooks: SharedHooks = Arc::new(tokio::sync::Mutex::new(
+            fuyao_hooks::HooksRegistry::default(),
+        ));
         let interrupt = InterruptPayload {
             reason: "用户取消".into(),
             source: InterruptSource::User,
         };
-        handle_interrupt(&state, InterruptKind::Streaming, &interrupt, &emitter).await;
+        handle_interrupt(
+            &state,
+            InterruptKind::Streaming,
+            &interrupt,
+            &emitter,
+            &hooks,
+        )
+        .await;
         let ev = rx.recv().await.expect("应有事件");
         match ev {
             OutputEvent::Assistant(m) => {

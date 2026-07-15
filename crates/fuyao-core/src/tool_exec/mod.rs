@@ -26,11 +26,13 @@
 
 mod parallel;
 
+use crate::dispatch;
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::ToolCallContext;
 use fuyao_api::message::output::{ToolResultMessage, ToolResultPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
+use fuyao_hooks::SharedHooks;
 use fuyao_provider::ToolCallData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -57,6 +59,7 @@ pub(crate) async fn execute_tools(
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
+    hooks: &SharedHooks,
 ) -> Vec<ToolExecResult> {
     if tool_calls.is_empty() {
         return Vec::new();
@@ -81,29 +84,30 @@ pub(crate) async fn execute_tools(
             max_concurrent = config.max_concurrent,
             "工具批次并行执行"
         );
-        execute_parallel(tool_calls, tools, agent_paths, emitter, &config).await
+        execute_parallel(tool_calls, tools, agent_paths, emitter, hooks, &config).await
     } else {
-        execute_sequential(tool_calls, tools, agent_paths, emitter).await
+        execute_sequential(tool_calls, tools, agent_paths, emitter, hooks).await
     }
 }
 
 /// 串行执行一批工具调用
 ///
-/// 逐个查注册表 → 调 handler → 立即 emit ToolResult 事件 → 收集结果。
-/// 完成一个 emit 一个，不等全部跑完。返回结果按提交顺序供调用方 push 进 messages。
+/// 逐个查注册表 → 调 handler → 立即经管道发 ToolResult 事件 → 收集结果。
+/// 完成一个发出一个，不等全部跑完。返回结果按提交顺序供调用方 push 进 messages。
 async fn execute_sequential(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
+    hooks: &SharedHooks,
 ) -> Vec<ToolExecResult> {
     let session_id = emitter.session_id().to_string();
     let mut results = Vec::with_capacity(tool_calls.len());
 
     for tc in tool_calls {
         let result = execute_single(tc, tools, agent_paths, &session_id).await;
-        // 完成一个 emit 一个：立即发 ToolResult 事件
-        emitter.emit(tool_result_event(&result)).await;
+        // 完成一个发出一个：立即经管道发 ToolResult 事件
+        dispatch::dispatch(emitter, hooks, tool_result_event(&result), None).await;
         results.push(result);
     }
 
@@ -113,7 +117,7 @@ async fn execute_sequential(
 /// 并行执行一批工具调用
 ///
 /// 使用 JoinSet + Semaphore 控制并发数。
-/// - **emit 顺序 = 完成顺序**：`join_next` 逐个收，完成即 emit（UX 友好，先完成先看到）。
+/// - **emit 顺序 = 完成顺序**：`join_next` 逐个收，完成即经管道发出（UX 友好，先完成先看到）。
 /// - **返回顺序 = 提交顺序**：spawn 时记录 idx，结果写入预分配 `Vec<Option>` 对应槽位，
 ///   最后 flatten 恢复提交序（喂 LLM 时 tool_result 与 tool_call 对齐，确定性）。
 /// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误结果，不连坐兄弟任务。
@@ -123,6 +127,7 @@ async fn execute_parallel(
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
+    hooks: &SharedHooks,
     config: &fuyao_api::ToolRunnerConfig,
 ) -> Vec<ToolExecResult> {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
@@ -147,11 +152,11 @@ async fn execute_parallel(
     // 预分配：按提交序存放，spawn 用 idx 回填；完成序 emit、提交序返回
     let mut slots: Vec<Option<ToolExecResult>> = (0..tool_calls.len()).map(|_| None).collect();
 
-    // join_next 逐个收：完成一个 emit 一个
+    // join_next 逐个收：完成一个经管道发出一个
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok((idx, result)) => {
-                emitter.emit(tool_result_event(&result)).await;
+                dispatch::dispatch(emitter, hooks, tool_result_event(&result), None).await;
                 slots[idx] = Some(result);
             }
             Err(join_err) => {

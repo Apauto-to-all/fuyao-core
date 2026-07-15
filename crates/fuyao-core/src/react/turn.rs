@@ -16,6 +16,7 @@ use super::SessionCtx;
 use super::builders::{
     assistant_msg_to_payload, assistant_with_tool_calls_to_payload, build_assistant_message,
     build_assistant_message_with_tool_calls, build_chat_request, build_model_and_options,
+    tool_call_data_to_event, tool_call_event_to_data,
 };
 use crate::interrupt::{
     SharedTurnState, TurnState, classify, emit_interrupt_event, handle_interrupt,
@@ -57,6 +58,7 @@ pub(crate) async fn run_turn(
                 options.clone(),
                 &ctx.provider,
                 &ctx.emitter,
+                &ctx.hooks,
                 &mut decoder,
                 &state,
             );
@@ -66,12 +68,12 @@ pub(crate) async fn run_turn(
                 // 中断通道独立：此处只会收到 Interrupt
                 interrupt_msg = rx_interrupt.recv() => {
                     if let Some(interrupt_msg) = interrupt_msg {
-                        emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter).await;
+                        emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
                         let kind = {
                             let s = state.lock().unwrap_or_else(|e| e.into_inner());
                             classify(&s)
                         };
-                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter).await;
+                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
                         persist(ctx.emitter.session_id(), session, &ctx.store).await;
                         return;
                     }
@@ -115,15 +117,19 @@ async fn handle_final_reply(
     result: &StreamResult,
     params: &MessageParams,
 ) {
-    // 发最终 AssistantMessage
+    // 发最终 AssistantMessage（经管道：拦截 → 发送 → 观察）
     let assistant_msg = build_assistant_message(result, params.model_config.model_id.as_deref());
     session.messages.push(assistant_msg);
-    ctx.emitter
-        .emit(OutputEvent::Assistant(AssistantMessage {
+    crate::dispatch::dispatch(
+        &ctx.emitter,
+        &ctx.hooks,
+        OutputEvent::Assistant(AssistantMessage {
             base: EventBase::default(),
             payload: assistant_msg_to_payload(result),
-        }))
-        .await;
+        }),
+        None,
+    )
+    .await;
 
     // 消费时机②：① pending 全倒 guide ② guide 全取注入
     queue::drain_pending_to_guide(&ctx.guide, &ctx.pending);
@@ -133,14 +139,18 @@ async fn handle_final_reply(
         persist(ctx.emitter.session_id(), session, &ctx.store).await;
     } else {
         // 有消息：全部注入，回 run_turn 顶部再调一轮 LLM
-        queue::inject_messages(&ctx.emitter, session, msgs).await;
+        queue::inject_messages(&ctx.emitter, &ctx.hooks, session, msgs).await;
     }
 }
 
-/// 处理工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①（只看 guide）
+/// 处理工具调用：逐个拦截工具调用 → 发 AssistantMessage → 执行整批工具 → 消费时机①
+///
+/// 工具调用逐个经 dispatch_intercept 拦截（照搬归档做法）：
+/// - 每个工具调用作为一条 `OutputEvent::ToolCall` 事件单独拦截
+/// - 插件可修改其参数/名称，或返回 Block 跳过该工具
+/// - 未被 Block 的累积成 `effective_tool_calls`，作为后续「存储 / 发送 / 执行」的唯一数据源
 ///
 /// 一批工具全部执行完成后才消费 guide（不是每个工具完成都消费）。
-/// execute_tools 是串行执行完所有 tool_calls 才返回的——消费点就在它返回后。
 async fn handle_tool_calls(
     ctx: &SessionCtx,
     session: &mut Session,
@@ -148,45 +158,89 @@ async fn handle_tool_calls(
     result: &StreamResult,
     params: &MessageParams,
 ) {
-    // 发 AssistantMessage（含 tool_calls，finish_reason=tool_calls）
-    let assistant_msg =
-        build_assistant_message_with_tool_calls(result, params.model_config.model_id.as_deref());
-    session.messages.push(assistant_msg);
-    ctx.emitter
-        .emit(OutputEvent::Assistant(AssistantMessage {
-            base: EventBase::default(),
-            payload: assistant_with_tool_calls_to_payload(result),
-        }))
-        .await;
+    // 步骤1：逐个拦截工具调用，构造 effective_tool_calls
+    // 整批 tool_calls 拆成单个 ToolCall 事件，各自经管道拦截；Block 的跳过。
+    let mut effective_tool_calls: Vec<fuyao_provider::ToolCallData> =
+        Vec::with_capacity(result.tool_calls.len());
+    for tc in &result.tool_calls {
+        let event = tool_call_data_to_event(tc);
+        if let Some(intercepted) =
+            crate::dispatch::dispatch_intercept(&ctx.emitter, &ctx.hooks, event).await
+        {
+            // 拦截 Pass：发送（含观察），并从拦截后的 payload 提取工具调用数据回灌
+            crate::dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted.clone()).await;
+            if let Some(data) = tool_call_event_to_data(&intercepted) {
+                effective_tool_calls.push(data);
+            }
+        }
+        // Block：跳过该工具（不发送、不执行、不存储）
+    }
 
-    // 中断点②：工具执行期间
+    // 步骤2：用 effective_tool_calls 构造存储 Message + 发送 AssistantMessage
+    // 拦截后的结果作为唯一数据源：存储 / 发送 / 执行三者一致。
+    let effective_result = StreamResult {
+        text: result.text.clone(),
+        reasoning: result.reasoning.clone(),
+        tool_calls: effective_tool_calls,
+    };
+    let assistant_msg = build_assistant_message_with_tool_calls(
+        &effective_result,
+        params.model_config.model_id.as_deref(),
+    );
+    session.messages.push(assistant_msg);
+    crate::dispatch::dispatch(
+        &ctx.emitter,
+        &ctx.hooks,
+        OutputEvent::Assistant(AssistantMessage {
+            base: EventBase::default(),
+            payload: assistant_with_tool_calls_to_payload(&effective_result),
+        }),
+        None,
+    )
+    .await;
+
+    // 若全部工具调用被拦截（effective 为空），无需执行，直接走消费时机①
+    if effective_result.tool_calls.is_empty() {
+        let msgs = queue::consume_all_guide(&ctx.guide);
+        if !msgs.is_empty() {
+            queue::inject_messages(&ctx.emitter, &ctx.hooks, session, msgs).await;
+        }
+        return;
+    }
+
+    // 步骤3：中断点②——工具执行期间
     // 中断（Interrupt）或通道关闭（None，session 结束）都取消工具执行、落库结束 turn。
-    // select! 命中 recv 分支时 exec_fut 被 drop，未完成的工具结果丢失（已完成的已 emit）。
+    // select! 命中 recv 分支时 exec_fut 被 drop，未完成的工具结果丢失（已完成的已发出）。
     let tool_results = {
         let exec_fut = tool_exec::execute_tools(
-            &result.tool_calls,
+            &effective_result.tool_calls,
             &ctx.tools,
             &ctx.agent_paths,
             &ctx.emitter,
+            &ctx.hooks,
         );
         tokio::select! {
             results = exec_fut => results,
             cmd = rx_interrupt.recv() => {
                 // 收到 Interrupt 或通道关闭（None）：发中断/补发 ToolResult，落库结束
                 if let Some(ref interrupt_msg) = cmd {
-                    emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter).await;
-                    // 为所有 tool_calls 发中断式 ToolResult
-                    // （execute_tools 完成一个 emit 一个，已完成的已发；
+                    emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
+                    // 为所有 effective tool_calls 发中断式 ToolResult
+                    // （execute_tools 完成一个发出一个，已完成的已发；
                     //  select! drop exec_fut 时未完成的丢失，这里统一补发）
-                    for tc in &result.tool_calls {
-                        ctx.emitter
-                            .emit(make_interrupt_tool_result_event(
+                    for tc in &effective_result.tool_calls {
+                        crate::dispatch::dispatch(
+                            &ctx.emitter,
+                            &ctx.hooks,
+                            make_interrupt_tool_result_event(
                                 tc.id.clone(),
                                 tc.name.clone(),
                                 &interrupt_msg.payload.source,
                                 &interrupt_msg.payload.reason,
-                            ))
-                            .await;
+                            ),
+                            None,
+                        )
+                        .await;
                     }
                 }
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
@@ -203,10 +257,10 @@ async fn handle_tool_calls(
         ));
     }
 
-    // 消费时机①：一批工具全部完成后、发回 AI 前——只看 guide（pending 不动）
+    // 步骤4：消费时机①——一批工具全部完成后、发回 AI 前，只看 guide（pending 不动）
     let msgs = queue::consume_all_guide(&ctx.guide);
     if !msgs.is_empty() {
-        queue::inject_messages(&ctx.emitter, session, msgs).await;
+        queue::inject_messages(&ctx.emitter, &ctx.hooks, session, msgs).await;
     }
     // 回 run_turn 顶部：带 guide 消息（若有）+ 工具结果再调 LLM
 }

@@ -18,7 +18,7 @@ use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{EngineParams, MessageParams, ModelConfig, SessionParams};
 use fuyao_app::build_tool_registry;
-use fuyao_core::Engine;
+use fuyao_core::{Engine, HooksRegistry, SharedHooks};
 
 /// 构造 Guide 模式的用户消息
 fn guide_user_message(content: &str, model_id: &str) -> (InputEvent, MessageParams) {
@@ -88,12 +88,14 @@ async fn assembled_engine_runs_react_loop() {
         events: text_events("装配后回复"),
     }) as std::sync::Arc<dyn fuyao_provider::Provider>;
 
+    let hooks: SharedHooks = std::sync::Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
         provider,
         registry,
+        hooks,
     )
     .await;
 

@@ -11,6 +11,7 @@
 //! - 出事件（[`Engine::recv`]，单一出口，出所有 OutputEvent）
 //! - 关闭引擎（[`Engine::shutdown`]，独立方法，不走消息流）
 
+mod dispatch;
 mod emit;
 mod engine;
 mod error;
@@ -23,3 +24,9 @@ mod tool_registry;
 pub use engine::{Engine, SessionId};
 pub use error::EngineError;
 pub use tool_registry::{ToolEntry, ToolRegistry, ToolRegistryBuilder};
+
+/// 共享钩子注册表的便捷重导出
+///
+/// 装配方构造好 `HooksRegistry` 后，包成 `SharedHooks` 传给 [`Engine::new`]。
+/// 重导出在这里，让调用方从 `fuyao_core` 一处拿（无需直接依赖 `fuyao-hooks`）。
+pub use fuyao_hooks::{HooksRegistry, SharedHooks};

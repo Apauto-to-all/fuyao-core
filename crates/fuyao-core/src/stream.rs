@@ -6,10 +6,12 @@
 //! 失败直接报错：provider 报任何错误都发不可恢复 Error 事件并返回 Err，
 //! 不做重试退避（重试后续再加，当前不影响引擎重构）。
 
+use crate::dispatch;
 use crate::emit::Emitter;
 use crate::interrupt::SharedTurnState;
 use fuyao_api::message::output::{ErrorMessage, ErrorPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
+use fuyao_hooks::SharedHooks;
 use fuyao_provider::{
     BoxStream, ChatRequest, Provider, StreamDecoder, StreamError, StreamEvent, StreamOptions,
     ToolCallData,
@@ -35,12 +37,14 @@ pub(crate) struct StreamResult {
 ///
 /// 中断靠外层 select! drop 本函数的 future——本函数自身不知道被中断，
 /// `state` 保留中断时刻的部分结果供中断分支读取。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_stream_session(
     request: ChatRequest,
     model: &str,
     options: StreamOptions,
     provider: &Arc<dyn Provider>,
     emitter: &Emitter,
+    hooks: &SharedHooks,
     decoder: &mut StreamDecoder,
     state: &SharedTurnState,
 ) -> Result<StreamResult, StreamError> {
@@ -61,26 +65,30 @@ pub(crate) async fn run_stream_session(
                     _ => {}
                 }
 
-                // 解码成 OutputEvent 并发出（emitter 已含 session_id 标签）
+                // 解码成 OutputEvent 并经管道发出（拦截 → 发送 → 观察）
                 let output_events = decoder.process(event);
                 for ev in output_events {
-                    emitter.emit(ev).await;
+                    dispatch::dispatch(emitter, hooks, ev, None).await;
                 }
 
                 // 同步共享状态（block scope 锁，不跨 await）
                 sync_state(state, &text, &reasoning);
             }
             Err(e) => {
-                // 不重试：发不可恢复 Error 事件，直接返回
-                emitter
-                    .emit(OutputEvent::Error(ErrorMessage {
+                // 不重试：经管道发不可恢复 Error 事件，直接返回
+                dispatch::dispatch(
+                    emitter,
+                    hooks,
+                    OutputEvent::Error(ErrorMessage {
                         base: EventBase::default(),
                         payload: ErrorPayload {
                             message: format!("LLM 调用失败: {e}"),
                             recoverable: false,
                         },
-                    }))
-                    .await;
+                    }),
+                    None,
+                )
+                .await;
                 tracing::warn!(session_id = emitter.session_id(), cause = %e, "LLM 流式调用失败");
                 return Err(e);
             }

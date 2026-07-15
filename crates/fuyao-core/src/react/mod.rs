@@ -33,6 +33,7 @@ use crate::tool_registry::ToolRegistry;
 use fuyao_api::Session;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;
+use fuyao_hooks::SharedHooks;
 use fuyao_provider::Provider;
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -40,7 +41,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
 ///
-/// 聚合 store / provider / tools / agent_paths / emitter / guide / pending
+/// 聚合 store / provider / tools / hooks / agent_paths / emitter / guide / pending
 /// 这些所有 turn 都需要的共享只读依赖 + 双队列，避免 run_turn 参数列表过长。
 /// 不含可变状态（session / rx_interrupt）——那些作为独立 &mut 参数传入。
 /// 由 run_session 构造一次，整个 task 期间以 `&SessionCtx` 不可变借用复用。
@@ -48,6 +49,8 @@ pub(crate) struct SessionCtx {
     pub store: Arc<fuyao_session::SessionStore>,
     pub provider: Arc<dyn Provider>,
     pub tools: Arc<ToolRegistry>,
+    /// 钩子注册表（引擎级共享，透传给本 session 的 dispatch 管道）
+    pub hooks: SharedHooks,
     pub agent_paths: fuyao_api::AgentPaths,
     pub emitter: Emitter,
     /// 引导队列（直接消费）
@@ -79,6 +82,7 @@ pub(crate) async fn run_session(
     store: Arc<fuyao_session::SessionStore>,
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
+    hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
     tx_event: Sender<OutputEvent>,
 ) {
@@ -88,6 +92,7 @@ pub(crate) async fn run_session(
         store,
         provider,
         tools,
+        hooks,
         agent_paths,
         emitter: Emitter::new(tx_event, session_id.clone()),
         guide,
@@ -110,7 +115,7 @@ pub(crate) async fn run_session(
             // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
             let first_params = msgs.first().map(|m| m.params.clone()).unwrap_or_default();
             // 一次性全部注入：每条变一条 user message
-            queue::inject_messages(&ctx.emitter, &mut session, msgs).await;
+            queue::inject_messages(&ctx.emitter, &ctx.hooks, &mut session, msgs).await;
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
         } else {
             // guide 空：等 notify（新消息入队）或中断
@@ -119,7 +124,7 @@ pub(crate) async fn run_session(
                 () = notify.notified() => { continue; }
                 Some(interrupt_msg) = rx_interrupt.recv() => {
                     // idle 中断：无活跃 turn，只发通知事件
-                    emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter).await;
+                    emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
                     tracing::debug!(session_id = %ctx.emitter.session_id(), "idle 时收到中断信号");
                 }
             }
