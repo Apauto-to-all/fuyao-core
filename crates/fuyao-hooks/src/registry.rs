@@ -19,14 +19,10 @@ struct Prioritized<T> {
 
 /// Hooks 注册表
 pub struct HooksRegistry {
-    /// before_llm 钩子列表
-    before_llm: Vec<Prioritized<BeforeLlmFn>>,
     /// 输出拦截钩子列表
     output_intercept: Vec<Prioritized<OutputInterceptFn>>,
     /// 输出观察钩子列表
     output_observe: Vec<Prioritized<OutputObserveFn>>,
-    /// LLM 错误决策钩子列表
-    on_llm_error: Vec<Prioritized<OnLlmErrorFn>>,
     /// 发送输入事件钩子列表（插件发送任意 InputEvent，引擎统一入队）
     send_input: Vec<Prioritized<SendInputFn>>,
     /// 标记是否需要排序
@@ -45,19 +41,12 @@ impl HooksRegistry {
     pub fn new() -> Self {
         let timeout_secs = fuyao_api::get_config().hooks.timeout_secs;
         Self {
-            before_llm: Vec::new(),
             output_intercept: Vec::new(),
             output_observe: Vec::new(),
-            on_llm_error: Vec::new(),
             send_input: Vec::new(),
             dirty: false,
             hook_timeout: Duration::from_secs(timeout_secs),
         }
-    }
-
-    pub fn register_before_llm(&mut self, priority: i32, handler: BeforeLlmFn) {
-        self.before_llm.push(Prioritized { priority, handler });
-        self.dirty = true;
     }
 
     pub fn register_output_intercept(&mut self, priority: i32, handler: OutputInterceptFn) {
@@ -71,12 +60,6 @@ impl HooksRegistry {
             priority: 0,
             handler,
         });
-    }
-
-    /// 注册 LLM 错误决策钩子
-    pub fn register_on_llm_error(&mut self, priority: i32, handler: OnLlmErrorFn) {
-        self.on_llm_error.push(Prioritized { priority, handler });
-        self.dirty = true;
     }
 
     /// 注册发送输入事件钩子
@@ -93,9 +76,7 @@ impl HooksRegistry {
         fn sort_by_priority<T>(v: &mut [Prioritized<T>]) {
             v.sort_by_key(|b| std::cmp::Reverse(b.priority));
         }
-        sort_by_priority(&mut self.before_llm);
         sort_by_priority(&mut self.output_intercept);
-        sort_by_priority(&mut self.on_llm_error);
         sort_by_priority(&mut self.send_input);
         self.dirty = false;
     }
@@ -112,42 +93,6 @@ impl HooksRegistry {
         } else {
             tokio::time::timeout(self.hook_timeout, fut).await.ok()
         }
-    }
-
-    /// 执行 before_llm 钩子：异步串行，返回最后一个非空消息 + skip_tools OR 语义
-    pub async fn hook_before_llm(&mut self) -> BeforeLlmOutput {
-        self.ensure_sorted();
-        let mut result = BeforeLlmOutput::default();
-        for entry in &self.before_llm {
-            let handler_fut = AssertUnwindSafe((entry.handler)()).catch_unwind();
-            match self.run_hook_with_timeout(handler_fut).await {
-                Some(Ok(output)) => {
-                    if !output.messages.is_empty() {
-                        result.messages = output.messages;
-                    }
-                    // 任一 hook 请求 skip_tools 则生效（OR 语义）
-                    if output.skip_tools {
-                        result.skip_tools = true;
-                    }
-                }
-                Some(Err(payload)) => {
-                    tracing::warn!(
-                        hook = "before_llm",
-                        recovered = true,
-                        cause = %panic_payload_to_string(&*payload),
-                        "钩子执行 panic 已恢复"
-                    );
-                }
-                None => {
-                    tracing::warn!(
-                        hook = "before_llm",
-                        timeout_secs = self.hook_timeout.as_secs(),
-                        "钩子执行超时已跳过"
-                    );
-                }
-            }
-        }
-        result
     }
 
     /// 执行输出拦截钩子：串行，panic 防护，任一返回 Block 则立即返回
@@ -193,29 +138,6 @@ impl HooksRegistry {
         }
     }
 
-    /// 执行 LLM 错误决策钩子：串行，panic 防护，首个非 Retry 结果即返回
-    ///
-    /// 默认行为：无钩子或所有钩子返回 Retry 时，返回 Retry（无限重试）
-    pub fn hook_on_llm_error(&self, error: &str, retry_count: u32) -> LlmErrorAction {
-        for entry in &self.on_llm_error {
-            match std::panic::catch_unwind(AssertUnwindSafe(|| (entry.handler)(error, retry_count)))
-            {
-                Ok(LlmErrorAction::Retry) => continue,
-                Ok(action) => return action,
-                Err(payload) => {
-                    tracing::warn!(
-                        hook = "on_llm_error",
-                        recovered = true,
-                        cause = %panic_payload_to_string(&*payload),
-                        "钩子执行 panic 已恢复"
-                    );
-                    continue;
-                }
-            }
-        }
-        LlmErrorAction::Retry
-    }
-
     /// 初始化发送输入事件钩子：引擎启动时调用一次，传入 Sender
     ///
     /// 每个钩子收到 Sender 后自行保存，后续可随时 try_send。
@@ -248,136 +170,7 @@ impl HooksRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::Message;
     use std::sync::Arc;
-
-    #[test]
-    fn hooks_registry_new_is_empty() {
-        let reg = HooksRegistry::new();
-        assert!(reg.before_llm.is_empty());
-    }
-
-    #[tokio::test]
-    async fn hook_before_llm_returns_last_non_empty() {
-        let mut reg = HooksRegistry::new();
-        reg.register_before_llm(
-            0,
-            Arc::new(|| {
-                Box::pin(async {
-                    BeforeLlmOutput {
-                        messages: vec![Message::user("first".to_string())],
-                        skip_tools: false,
-                    }
-                })
-            }),
-        );
-        reg.register_before_llm(
-            0,
-            Arc::new(|| {
-                Box::pin(async {
-                    BeforeLlmOutput {
-                        messages: vec![Message::user("second".to_string())],
-                        skip_tools: false,
-                    }
-                })
-            }),
-        );
-
-        let result = reg.hook_before_llm().await;
-        assert_eq!(result.messages.len(), 1);
-        assert_eq!(result.messages[0].content, Some("second".to_string()));
-        assert!(!result.skip_tools);
-    }
-
-    #[tokio::test]
-    async fn hook_before_llm_priority_order() {
-        let mut reg = HooksRegistry::new();
-        reg.register_before_llm(
-            1,
-            Arc::new(|| {
-                Box::pin(async {
-                    BeforeLlmOutput {
-                        messages: vec![Message::user("high".to_string())],
-                        skip_tools: false,
-                    }
-                })
-            }),
-        );
-        reg.register_before_llm(
-            -1,
-            Arc::new(|| {
-                Box::pin(async {
-                    BeforeLlmOutput {
-                        messages: vec![Message::user("low".to_string())],
-                        skip_tools: false,
-                    }
-                })
-            }),
-        );
-
-        let result = reg.hook_before_llm().await;
-        assert_eq!(result.messages.len(), 1);
-        assert_eq!(result.messages[0].content, Some("low".to_string()));
-    }
-
-    #[tokio::test]
-    async fn hook_before_llm_skip_tools_or_semantics() {
-        let mut reg = HooksRegistry::new();
-        // hook A: skip_tools = false
-        reg.register_before_llm(
-            1,
-            Arc::new(|| {
-                Box::pin(async {
-                    BeforeLlmOutput {
-                        messages: vec![Message::user("a".to_string())],
-                        skip_tools: false,
-                    }
-                })
-            }),
-        );
-        // hook B: skip_tools = true
-        reg.register_before_llm(
-            0,
-            Arc::new(|| {
-                Box::pin(async {
-                    BeforeLlmOutput {
-                        messages: vec![Message::user("b".to_string())],
-                        skip_tools: true,
-                    }
-                })
-            }),
-        );
-
-        let result = reg.hook_before_llm().await;
-        // OR 语义：任一 hook 设 true 即生效
-        assert!(result.skip_tools);
-        // 消息仍是最后一个非空
-        assert_eq!(result.messages[0].content, Some("b".to_string()));
-    }
-
-    #[test]
-    fn hook_on_llm_error_default_returns_retry() {
-        let reg = HooksRegistry::new();
-        let action = reg.hook_on_llm_error("timeout", 1);
-        assert!(matches!(action, LlmErrorAction::Retry));
-    }
-
-    #[test]
-    fn hook_on_llm_error_abort_action() {
-        let mut reg = HooksRegistry::new();
-        reg.register_on_llm_error(0, Arc::new(|_, _| LlmErrorAction::Abort));
-        let action = reg.hook_on_llm_error("error", 1);
-        assert!(matches!(action, LlmErrorAction::Abort));
-    }
-
-    #[test]
-    fn hook_on_llm_error_panic_protection() {
-        let mut reg = HooksRegistry::new();
-        reg.register_on_llm_error(0, Arc::new(|_, _| panic!("钩子崩溃")));
-        reg.register_on_llm_error(0, Arc::new(|_, _| LlmErrorAction::Abort));
-        let action = reg.hook_on_llm_error("error", 1);
-        assert!(matches!(action, LlmErrorAction::Abort));
-    }
 
     #[tokio::test]
     async fn init_send_inputs_calls_handler_with_sender() {

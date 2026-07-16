@@ -34,9 +34,8 @@ pub trait Plugin: Send + Sync {
         }
     }
 
-    /// 注册阶段：拿到 SharedHooks，自行调用 register_before_llm /
-    /// register_output_intercept / register_output_observe /
-    /// register_on_llm_error / register_send_input 中的任意组合。
+    /// 注册阶段：拿到 SharedHooks，自行调用 register_output_intercept /
+    /// register_output_observe / register_send_input 中的任意组合。
     ///
     /// 默认空实现（观察型插件可不注册任何 hook）。
     async fn register(&self, _hooks: &SharedHooks) {}

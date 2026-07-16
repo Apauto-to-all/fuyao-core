@@ -6,7 +6,7 @@
 //! - panic 防护贯穿（单个插件崩溃不阻塞其他插件）
 //! - dispose 逆序（LIFO）
 //! - 重名硬失败
-//! - 拦截短路、before_llm OR 语义
+//! - 拦截短路
 //!
 //! 超时行为依赖私有字段 hook_timeout，集成测试不可注入，由单元测试覆盖。
 
@@ -15,7 +15,6 @@ mod common;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use fuyao_api::Message;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{ChunkMessage, ChunkPayload};
@@ -118,36 +117,6 @@ async fn plugin_registered_intercept_hook_blocks_output() {
         matches!(result, InterceptResult::Block(ref reason) if reason == "插件拦截"),
         "拦截型插件应使 hook_output_intercept 返回 Block"
     );
-}
-
-#[tokio::test]
-async fn plugin_registered_before_llm_hook_injects_messages() {
-    let injected = vec![Message::user("注入消息".to_string())];
-    let plugin = common::BeforeLlmPlugin::new("injector", injected.clone(), false);
-    let mut host = PluginHost::new();
-    host.add(Box::new(plugin));
-    let hooks = common::empty_hooks();
-    host.install(&hooks).await.unwrap();
-
-    let output = hooks.lock().await.hook_before_llm().await;
-    assert_eq!(output.messages.len(), 1, "before_llm 应注入插件提供的消息");
-    assert!(!output.skip_tools, "未请求 skip_tools");
-}
-
-#[tokio::test]
-async fn before_llm_skip_tools_or_semantics_across_plugins() {
-    // 两个 before_llm 插件，一个不 skip，一个 skip → OR 语义最终 skip
-    let plugin_a = common::BeforeLlmPlugin::new("a", vec![], false);
-    let plugin_b = common::BeforeLlmPlugin::new("b", vec![Message::user("msg".to_string())], true);
-    let mut host = PluginHost::new();
-    host.add(Box::new(plugin_a));
-    host.add(Box::new(plugin_b));
-    let hooks = common::empty_hooks();
-    host.install(&hooks).await.unwrap();
-
-    let output = hooks.lock().await.hook_before_llm().await;
-    assert!(output.skip_tools, "任一插件 skip 则最终生效（OR）");
-    assert_eq!(output.messages.len(), 1, "末非空 messages 生效");
 }
 
 // ---------------------------------------------------------------------------
@@ -273,15 +242,6 @@ async fn multiple_observe_plugins_all_fire() {
 // ---------------------------------------------------------------------------
 // 无钩子时的默认行为
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn hook_before_llm_returns_default_when_no_hooks() {
-    let registry = HooksRegistry::new();
-    let hooks: SharedHooks = Arc::new(tokio::sync::Mutex::new(registry));
-    let output = hooks.lock().await.hook_before_llm().await;
-    assert!(output.messages.is_empty());
-    assert!(!output.skip_tools);
-}
 
 #[tokio::test]
 async fn hook_output_intercept_passes_when_no_hooks() {

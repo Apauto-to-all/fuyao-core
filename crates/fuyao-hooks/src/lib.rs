@@ -15,10 +15,7 @@ mod types;
 
 pub use plugin::{Plugin, PluginEmitter, PluginHost, PluginInstallError};
 pub use registry::HooksRegistry;
-pub use types::{
-    BeforeLlmFn, BeforeLlmOutput, InterceptResult, LlmErrorAction, OnLlmErrorFn, OutputInterceptFn,
-    OutputObserveFn, SendInputFn,
-};
+pub use types::{InterceptResult, OutputInterceptFn, OutputObserveFn, SendInputFn};
 
 /// 共享钩子注册表
 ///

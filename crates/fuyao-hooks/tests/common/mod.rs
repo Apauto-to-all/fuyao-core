@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use fuyao_hooks::{BeforeLlmOutput, Plugin, SharedHooks};
+use fuyao_hooks::{Plugin, SharedHooks};
 
 // ---------------------------------------------------------------------------
 // 计数型 fake plugin：记录 register / dispose 调用次数
@@ -171,52 +171,6 @@ impl Plugin for InterceptPlugin {
             }
         });
         hooks.lock().await.register_output_intercept(0, handler);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 注册 before_llm 钩子的 fake plugin：验证 OR 语义
-// ---------------------------------------------------------------------------
-
-use fuyao_api::Message;
-use fuyao_hooks::BeforeLlmFn;
-
-/// 注册 before_llm 钩子，可控制返回的 messages 与 skip_tools。
-pub struct BeforeLlmPlugin {
-    name: &'static str,
-    inject_messages: Vec<Message>,
-    skip_tools: bool,
-}
-
-impl BeforeLlmPlugin {
-    pub fn new(name: &'static str, inject_messages: Vec<Message>, skip_tools: bool) -> Self {
-        Self {
-            name,
-            inject_messages,
-            skip_tools,
-        }
-    }
-}
-
-#[async_trait]
-impl Plugin for BeforeLlmPlugin {
-    fn name(&self) -> &str {
-        self.name
-    }
-    async fn register(&self, hooks: &SharedHooks) {
-        // BeforeLlmOutput 未派生 Clone，闭包内每次构造新实例
-        let messages = self.inject_messages.clone();
-        let skip = self.skip_tools;
-        let handler: BeforeLlmFn = Arc::new(move || {
-            let msgs = messages.clone();
-            Box::pin(async move {
-                BeforeLlmOutput {
-                    messages: msgs,
-                    skip_tools: skip,
-                }
-            })
-        });
-        hooks.lock().await.register_before_llm(0, handler);
     }
 }
 
