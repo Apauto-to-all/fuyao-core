@@ -15,6 +15,6 @@ pub use input::{
 };
 // 事件 enum 导出
 pub use input::InputEvent;
-pub use output::{OutputEvent, QueueUpdateKind};
+pub use output::OutputEvent;
 // 注：envelope / payload 不在此导出，外部通过 input::UserMessage / output::UserMessage 等路径访问
 // （输入输出 envelope/payload 同名，靠模块路径区分，避免根导出撞名）

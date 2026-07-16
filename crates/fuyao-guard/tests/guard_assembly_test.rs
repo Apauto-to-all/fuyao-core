@@ -286,7 +286,7 @@ async fn plugin_injected_message_only_clears_pending() {
 
 #[tokio::test]
 async fn intercept_passes_through_non_tool_result() {
-    // 非 ToolResult 事件（如 Assistant、TurnStart）应直接 Pass 不修改
+    // 非 ToolResult 事件（如 Assistant）应直接 Pass 不修改
     let (hooks, _rx) = assembled_guard().await;
 
     let event = OutputEvent::Assistant(fuyao_api::message::output::AssistantMessage {

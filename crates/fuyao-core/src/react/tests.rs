@@ -274,7 +274,6 @@ async fn collect_events(rx: &mut mpsc::Receiver<OutputEvent>) -> Vec<OutputEvent
 /// 提取事件的 session_id
 fn event_session_id(event: &OutputEvent) -> Option<&str> {
     match event {
-        OutputEvent::TurnStart(m) => m.base.session_id.as_deref(),
         OutputEvent::Chunk(m) => m.base.session_id.as_deref(),
         OutputEvent::User(m) => m.base.session_id.as_deref(),
         OutputEvent::ToolCall(m) => m.base.session_id.as_deref(),
@@ -283,7 +282,6 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Interrupt(m) => m.base.session_id.as_deref(),
         OutputEvent::Error(m) => m.base.session_id.as_deref(),
         OutputEvent::Plugin(m) => m.base.session_id.as_deref(),
-        OutputEvent::QueueUpdate(m) => m.base.session_id.as_deref(),
     }
 }
 

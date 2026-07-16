@@ -44,7 +44,6 @@ impl Emitter {
 fn stamp_session_id(event: &mut OutputEvent, session_id: &str) {
     let id = Some(session_id.to_string());
     match event {
-        OutputEvent::TurnStart(m) => m.base.session_id = id,
         OutputEvent::Chunk(m) => m.base.session_id = id,
         OutputEvent::User(m) => m.base.session_id = id,
         OutputEvent::ToolCall(m) => m.base.session_id = id,
@@ -53,6 +52,5 @@ fn stamp_session_id(event: &mut OutputEvent, session_id: &str) {
         OutputEvent::Interrupt(m) => m.base.session_id = id,
         OutputEvent::Error(m) => m.base.session_id = id,
         OutputEvent::Plugin(m) => m.base.session_id = id,
-        OutputEvent::QueueUpdate(m) => m.base.session_id = id,
     }
 }

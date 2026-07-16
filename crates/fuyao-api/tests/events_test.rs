@@ -11,8 +11,7 @@ use fuyao_api::message::input::{
 };
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, ErrorMessage, ErrorPayload,
-    OutputEvent, QueueUpdateKind, QueueUpdateMessage, QueueUpdatePayload, ToolCallMessage,
-    ToolCallPayload, ToolResultMessage, ToolResultPayload, TurnStartMessage,
+    OutputEvent, ToolCallMessage, ToolCallPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, InterruptPayload as OutputInterruptPayload,
@@ -107,14 +106,11 @@ fn input_event_serde_preserves_variant(#[values(0, 1, 2, 3)] idx: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// OutputEvent：10 变体穷尽性与 serde 往返
+// OutputEvent：8 变体穷尽性与 serde 往返
 // ---------------------------------------------------------------------------
 
 fn output_event_samples() -> Vec<OutputEvent> {
     vec![
-        OutputEvent::TurnStart(TurnStartMessage {
-            base: EventBase::default(),
-        }),
         OutputEvent::Chunk(ChunkMessage {
             base: EventBase::default(),
             payload: ChunkPayload {
@@ -190,26 +186,17 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 message: None,
             },
         }),
-        OutputEvent::QueueUpdate(QueueUpdateMessage {
-            base: EventBase::default(),
-            payload: QueueUpdatePayload {
-                guide_count: 2,
-                pending_count: 1,
-                kind: QueueUpdateKind::Enqueued,
-            },
-        }),
     ]
 }
 
 #[rstest]
-fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)] idx: usize) {
+fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7)] idx: usize) {
     let original = output_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: OutputEvent = serde_json::from_str(&json).expect("反序列化失败");
 
-    // 10 变体穷尽匹配，保证 serde 不丢标签
+    // 8 变体穷尽匹配，保证 serde 不丢标签
     match (&original, &restored) {
-        (OutputEvent::TurnStart(_), OutputEvent::TurnStart(_)) => {}
         (OutputEvent::Chunk(_), OutputEvent::Chunk(_)) => {}
         (OutputEvent::User(_), OutputEvent::User(_)) => {}
         (OutputEvent::ToolCall(_), OutputEvent::ToolCall(_)) => {}
@@ -218,17 +205,8 @@ fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)] 
         (OutputEvent::Interrupt(_), OutputEvent::Interrupt(_)) => {}
         (OutputEvent::Error(_), OutputEvent::Error(_)) => {}
         (OutputEvent::Plugin(_), OutputEvent::Plugin(_)) => {}
-        (OutputEvent::QueueUpdate(_), OutputEvent::QueueUpdate(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
-}
-
-#[test]
-fn output_turn_start_has_no_payload() {
-    let event = OutputEvent::TurnStart(TurnStartMessage {
-        base: EventBase::default(),
-    });
-    assert!(matches!(event, OutputEvent::TurnStart(_)));
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +308,7 @@ fn input_and_output_user_message_are_independent_types() {
 }
 
 // ---------------------------------------------------------------------------
-// InterruptSource / QueueUpdateKind：枚举相等性
+// InterruptSource：枚举相等性
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -339,13 +317,6 @@ fn interrupt_source_enum_equality() {
     assert_eq!(InterruptSource::User, InterruptSource::User);
     assert_ne!(InterruptSource::User, InterruptSource::Hook);
     assert_ne!(InterruptSource::User, InterruptSource::System);
-}
-
-#[test]
-fn queue_update_kind_enum_equality() {
-    assert_eq!(QueueUpdateKind::Enqueued, QueueUpdateKind::Enqueued);
-    assert_ne!(QueueUpdateKind::Enqueued, QueueUpdateKind::Consumed);
-    assert_ne!(QueueUpdateKind::Enqueued, QueueUpdateKind::Transferred);
 }
 
 // ---------------------------------------------------------------------------

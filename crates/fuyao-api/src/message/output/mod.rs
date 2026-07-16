@@ -3,7 +3,6 @@
 //! Engine → UI 的事件类型。
 //! 每个事件对应一个枚举变体，envelope + payload 放在独立文件中管理。
 //!
-//! - `turn_start`: 轮次开始（envelope {base}，无 payload）
 //! - `chunk`: 流式输出块（文本/推理片段）
 //! - `user`: 用户消息（引擎处理用户输入后发出）
 //! - `tool_call`: 工具调用
@@ -12,17 +11,14 @@
 //! - `interrupt`: 中断（引擎中断轮次后发出）
 //! - `error`: 错误
 //! - `plugin`: 插件事件
-//! - `queue_update`: 队列状态更新（双队列深度通知）
 
 mod assistant;
 mod chunk;
 mod error;
 mod interrupt;
 mod plugin;
-mod queue_update;
 mod tool_call;
 mod tool_result;
-mod turn_start;
 mod user_message;
 
 // envelope / payload 在 output 层导出（外部通过 output::UserMessage 等路径访问）
@@ -31,10 +27,8 @@ pub use chunk::{ChunkMessage, ChunkPayload};
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use plugin::{PluginMessage, PluginPayload};
-pub use queue_update::{QueueUpdateKind, QueueUpdateMessage, QueueUpdatePayload};
 pub use tool_call::{ToolCallMessage, ToolCallPayload};
 pub use tool_result::{ToolResultMessage, ToolResultPayload};
-pub use turn_start::TurnStartMessage;
 pub use user_message::{UserMessage, UserPayload};
 
 /// 输出事件（Engine → UI）
@@ -43,8 +37,6 @@ pub use user_message::{UserMessage, UserPayload};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
 pub enum OutputEvent {
-    /// 轮次开始（引擎每次 ReAct 轮次开始时发出）
-    TurnStart(TurnStartMessage),
     /// 流式输出块（文本/推理片段）
     Chunk(ChunkMessage),
     /// 用户消息（引擎处理用户输入后发出，CLI 据此渲染）
@@ -61,8 +53,6 @@ pub enum OutputEvent {
     Error(ErrorMessage),
     /// 插件事件
     Plugin(PluginMessage),
-    /// 队列状态更新（双队列深度变化时发出）
-    QueueUpdate(QueueUpdateMessage),
 }
 
 #[cfg(test)]
@@ -70,14 +60,6 @@ mod tests {
     use super::*;
     use crate::message::EventBase;
     use crate::message::input::{InterruptSource, PluginEventSource};
-
-    #[test]
-    fn turn_start_variant() {
-        let event = OutputEvent::TurnStart(TurnStartMessage {
-            base: EventBase::default(),
-        });
-        assert!(matches!(event, OutputEvent::TurnStart(_)));
-    }
 
     #[test]
     fn chunk_variant() {
@@ -175,19 +157,6 @@ mod tests {
             },
         });
         assert!(matches!(event, OutputEvent::Plugin(_)));
-    }
-
-    #[test]
-    fn queue_update_variant() {
-        let event = OutputEvent::QueueUpdate(QueueUpdateMessage {
-            base: EventBase::default(),
-            payload: QueueUpdatePayload {
-                guide_count: 2,
-                pending_count: 1,
-                kind: QueueUpdateKind::Enqueued,
-            },
-        });
-        assert!(matches!(event, OutputEvent::QueueUpdate(_)));
     }
 
     #[test]
