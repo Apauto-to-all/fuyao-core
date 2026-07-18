@@ -1,0 +1,87 @@
+//! SQLite 存储层
+//!
+//! 使用 sqlx（async）+ SqlitePool 连接池，原生 async，无需 spawn_blocking 包装。
+//! SessionStore 是 session 持久化的唯一入口，持有连接池供外部（如引擎层）共享。
+//!
+//! 模块组织：
+//! - [`row`]：sessions / messages 表的行映射（DB 行 ↔ 领域类型）
+//! - [`session`]：Session CRUD（创建 / 读取 / 更新 / 删除 / 列表 / 计数）
+//! - [`message`]：消息持久化助手（增量保存 / 加载，仅供本模块内部使用）
+//! - [`lineage`]：会话分裂与血统链解析（上下文压缩专用）
+
+mod lineage;
+mod message;
+mod row;
+mod session;
+
+#[cfg(test)]
+mod tests;
+
+use crate::error::SessionError;
+use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
+use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use std::path::PathBuf;
+use std::time::Duration;
+
+/// 会话存储层
+///
+/// 持有 SqlitePool 连接池，提供 Session + Message 的 CRUD。
+/// 连接池可经 [`pool`](Self::pool) 对外共享，供引擎层或兄弟模块复用同一连接池。
+pub struct SessionStore {
+    db_path: PathBuf,
+    pool: SqlitePool,
+}
+
+impl SessionStore {
+    /// 创建并初始化存储
+    ///
+    /// 连接参数（busy_timeout / max_connections）从全局配置 `get_config().session.storage` 读取。
+    pub async fn new(db_path: PathBuf) -> Result<Self, SessionError> {
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let storage = fuyao_api::get_config().session.storage.clone();
+
+        // 连接选项：启用 WAL、外键、忙等待
+        let options = SqliteConnectOptions::new()
+            .filename(&db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_secs(storage.busy_timeout_secs));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(storage.max_connections)
+            .connect_with(options)
+            .await?;
+
+        // 初始化 schema
+        sqlx::raw_sql(SCHEMA_SQL).execute(&pool).await?;
+
+        // 写入 schema 版本（仅首次）
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_version")
+            .fetch_one(&pool)
+            .await?;
+        if count == 0 {
+            sqlx::query("INSERT INTO schema_version (version) VALUES (?1)")
+                .bind(SCHEMA_VERSION)
+                .execute(&pool)
+                .await?;
+        }
+
+        tracing::info!(db_path = %db_path.display(), "会话存储初始化完成");
+        Ok(Self { db_path, pool })
+    }
+
+    /// 数据库文件路径
+    pub fn db_path(&self) -> &PathBuf {
+        &self.db_path
+    }
+
+    /// 获取连接池引用（供引擎层或兄弟模块共享同一连接池）
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}
