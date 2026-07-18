@@ -28,9 +28,10 @@ pub(crate) mod turn;
 
 use crate::dispatch;
 use crate::emit::Emitter;
-use crate::engine::types::{InboundUser, QueuedUserMessage, SharedQueue};
+use crate::engine::types::{QueuedUserMessage, SharedQueue};
 use crate::interrupt::emit_interrupt_event;
 use crate::tool_registry::ToolRegistry;
+use fuyao_api::InboundUser;
 use fuyao_api::Session;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;

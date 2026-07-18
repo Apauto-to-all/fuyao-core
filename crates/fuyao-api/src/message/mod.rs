@@ -13,6 +13,8 @@ pub use input::{
     InterruptSource, PluginEventSource, PluginSource, SystemSource, UserMessageMode,
     UserMessageSource,
 };
+// InboundUser 是引擎内部载荷（InputEvent::User 解包后），供 hooks SessionSender 引用
+pub use input::InboundUser;
 // 事件 enum 导出
 pub use input::InputEvent;
 pub use output::OutputEvent;

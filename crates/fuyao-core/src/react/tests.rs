@@ -544,7 +544,7 @@ async fn pending_consumed_when_task_idle() {
     let guide = empty_queue();
     let pending = empty_queue();
     // 入站通道（User 消息经此送进 session task 过管道入队）
-    let (tx_inbound, rx_inbound) = mpsc::channel::<crate::engine::types::InboundUser>(16);
+    let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
     // tx 必须随测试存活以保持中断通道打开（rx_interrupt.recv() 不提前返回 None）
     let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
@@ -570,7 +570,7 @@ async fn pending_consumed_when_task_idle() {
     // 模拟 send：经入站通道发一条 Pending 消息（过管道入 pending 队列）
     // task 空闲（无活跃 ReAct 链），pending 的解禁条件已满足
     tx_inbound
-        .send(crate::engine::types::InboundUser {
+        .send(fuyao_api::InboundUser {
             content: "排队消息".into(),
             mode: fuyao_api::UserMessageMode::Pending,
             params: MessageParams::default(),

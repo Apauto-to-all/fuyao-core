@@ -127,7 +127,7 @@ impl Engine {
         // 建 session 专属双队列 + 入站通道 + 中断通道 + spawn 执行流 task
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let (tx_inbound, rx_inbound) = mpsc::channel::<crate::engine::types::InboundUser>(16);
+        let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             session_id.clone(),
@@ -181,7 +181,7 @@ impl Engine {
         // 建 session 专属双队列 + 入站通道 + 中断通道 + spawn 执行流 task
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let (tx_inbound, rx_inbound) = mpsc::channel::<crate::engine::types::InboundUser>(16);
+        let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let task = tokio::spawn(react::run_session(
             id.clone(),
@@ -244,7 +244,7 @@ impl Engine {
                 // User 消息经入站通道送进 session task，由管道处理：
                 // 拦截 → 处理(入 guide/pending 队列) → 发送(回显 User 给 UI) → 观察。
                 // 不在引擎层直接操作队列——入队是 session 层管道的 process 职责。
-                let inbound = crate::engine::types::InboundUser {
+                let inbound = fuyao_api::InboundUser {
                     content: user_msg.payload.content,
                     mode: user_msg.payload.mode,
                     params,

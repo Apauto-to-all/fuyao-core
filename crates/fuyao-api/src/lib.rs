@@ -34,8 +34,8 @@ pub use config::{
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
-    EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginSource,
-    SystemSource, UserMessageMode, UserMessageSource,
+    EventBase, InboundUser, InputEvent, InterruptSource, OutputEvent, PluginEventSource,
+    PluginSource, SystemSource, UserMessageMode, UserMessageSource,
 };
 pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,

@@ -9,6 +9,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
+// InboundUser 已提升到 fuyao-api，供 fuyao-hooks 的 SessionSender 引用（避免 hooks 反向依赖 core）
+pub(crate) use fuyao_api::InboundUser;
+
 /// 会话 ID
 ///
 /// 当前直接用 `String`，与 session crate 的 `Session.id` 类型一致。
@@ -29,20 +32,6 @@ pub(crate) struct QueuedUserMessage {
 
 /// 共享队列（guide / pending 对等，同类型，可互倒）
 pub(crate) type SharedQueue = Arc<Mutex<VecDeque<QueuedUserMessage>>>;
-
-/// 入站用户消息（引擎层送进 session task 的载荷）
-///
-/// Engine::send 收到 InputEvent::User 后，转成此结构发到 session 的入站通道。
-/// session task 在 select! 里收到后，过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察。
-/// `mode` 决定入 guide 还是 pending（在 process 段入队时分流）。
-pub(crate) struct InboundUser {
-    /// 消息文本
-    pub content: String,
-    /// 消息模式（Guide / Pending）
-    pub mode: fuyao_api::UserMessageMode,
-    /// 消息参数（model id 等，跟着每条消息走）
-    pub params: MessageParams,
-}
 
 /// 活跃 session 的句柄
 ///
