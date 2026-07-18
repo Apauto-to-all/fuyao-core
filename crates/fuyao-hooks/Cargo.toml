@@ -9,7 +9,6 @@ fuyao-api = { path = "../fuyao-api" }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

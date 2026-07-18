@@ -3,6 +3,7 @@
 //! 拦截钩子（异步串行，可取消带原因，panic 防护）+ 观察钩子（异步串行）。
 //! 按优先级排序执行。
 
+use crate::plugin::SessionSender;
 use crate::plugin::panic_payload_to_string;
 use crate::types::*;
 use futures_util::future::FutureExt;
@@ -138,17 +139,17 @@ impl HooksRegistry {
         }
     }
 
-    /// 初始化发送输入事件钩子：引擎启动时调用一次，传入 Sender
+    /// 初始化发送输入事件钩子：每个 session 装配时调用一次，传入该 session 的 sender
     ///
-    /// 每个钩子收到 Sender 后自行保存，后续可随时 try_send。
-    /// 这是真·主动模式，不依赖 emit 调用频率。
-    pub async fn init_send_inputs(
-        &mut self,
-        tx: tokio::sync::mpsc::Sender<fuyao_api::message::InputEvent>,
-    ) {
+    /// 每个钩子收到 [`SessionSender`] 后自行保存，后续可随时调用其方法发送消息。
+    /// 这是真·主动模式：插件自主决定何时发送，引擎只负责消费。
+    ///
+    /// SessionSender 绑定的是该 session 的三条通道（不是全局 tx），
+    /// 多 session 并发时各 session 的 sender 完全隔离。
+    pub async fn init_send_inputs(&mut self, sender: SessionSender) {
         self.ensure_sorted();
         for entry in &self.send_input {
-            let handler_fut = AssertUnwindSafe((entry.handler)(tx.clone())).catch_unwind();
+            let handler_fut = AssertUnwindSafe((entry.handler)(sender.clone())).catch_unwind();
             match self.run_hook_with_timeout(handler_fut).await {
                 Some(Ok(())) => {}
                 Some(Err(payload)) => tracing::warn!(
@@ -170,13 +171,36 @@ impl HooksRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugin::SessionSender;
+    use fuyao_api::InboundUser;
+    use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
     use std::sync::Arc;
 
+    /// 构造测试用 SessionSender + 三条接收端（identity="test_plugin"）
+    fn make_sender() -> (
+        SessionSender,
+        tokio::sync::mpsc::Receiver<InboundUser>,
+        tokio::sync::mpsc::Receiver<InterruptMessage>,
+        tokio::sync::mpsc::Receiver<PluginMessage>,
+    ) {
+        let (tx_user, rx_user) = tokio::sync::mpsc::channel(16);
+        let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);
+        let (tx_plugin, rx_plugin) = tokio::sync::mpsc::channel(16);
+        let sender = SessionSender::new(
+            PluginEventSource {
+                name: "test_plugin".into(),
+            },
+            tx_user,
+            tx_interrupt,
+            tx_plugin,
+        );
+        (sender, rx_user, rx_interrupt, rx_plugin)
+    }
+
+    /// init_send_inputs 调用所有 send_input hook，传入 SessionSender
     #[tokio::test]
     async fn init_send_inputs_calls_handler_with_sender() {
-        use fuyao_api::message::input::{UserMessage, UserPayload};
-        use fuyao_api::message::{EventBase, InputEvent, UserMessageMode, UserMessageSource};
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(10);
+        let (sender, mut rx_user, _rx_interrupt, _rx_plugin) = make_sender();
         let mut reg = HooksRegistry::new();
         let called = Arc::new(std::sync::Mutex::new(false));
         let called_clone = called.clone();
@@ -186,41 +210,28 @@ mod tests {
                 let called = called_clone.clone();
                 Box::pin(async move {
                     *called.lock().unwrap() = true;
-                    sender
-                        .try_send(InputEvent::User(UserMessage {
-                            base: EventBase::default(),
-                            payload: UserPayload {
-                                content: "引导消息".to_string(),
-                                mode: UserMessageMode::Guide,
-                                source: UserMessageSource::Plugin(
-                                    fuyao_api::message::PluginSource {
-                                        name: "hook".to_string(),
-                                    },
-                                ),
-                            },
-                        }))
-                        .ok();
+                    sender.send_user("引导消息");
                 })
             }),
         );
-        reg.init_send_inputs(tx).await;
-        assert!(*called.lock().unwrap());
-        let received = rx.try_recv().unwrap();
-        assert!(matches!(received, InputEvent::User(_)));
+        reg.init_send_inputs(sender).await;
+        assert!(*called.lock().unwrap(), "hook 应被调用");
+        let received = rx_user.recv().await.expect("应收到 User 消息");
+        assert_eq!(received.content, "引导消息");
     }
 
+    /// 空 send_input 列表时 init_send_inputs 不 panic
     #[tokio::test]
     async fn init_send_input_noop_when_empty() {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<fuyao_api::message::InputEvent>(10);
+        let (sender, _rx_user, _rx_interrupt, _rx_plugin) = make_sender();
         let mut reg = HooksRegistry::new();
-        reg.init_send_inputs(tx).await;
+        reg.init_send_inputs(sender).await;
     }
 
+    /// 单个 hook panic 不阻塞后续 hook
     #[tokio::test]
     async fn init_send_input_panic_protection() {
-        use fuyao_api::message::input::{UserMessage, UserPayload};
-        use fuyao_api::message::{EventBase, InputEvent, UserMessageMode, UserMessageSource};
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<InputEvent>(10);
+        let (sender, mut rx_user, _rx_interrupt, _rx_plugin) = make_sender();
         let mut reg = HooksRegistry::new();
         reg.register_send_input(
             0,
@@ -230,26 +241,13 @@ mod tests {
             0,
             Arc::new(|sender| {
                 Box::pin(async move {
-                    sender
-                        .try_send(InputEvent::User(UserMessage {
-                            base: EventBase::default(),
-                            payload: UserPayload {
-                                content: "降级消息".to_string(),
-                                mode: UserMessageMode::Guide,
-                                source: UserMessageSource::Plugin(
-                                    fuyao_api::message::PluginSource {
-                                        name: "hook".to_string(),
-                                    },
-                                ),
-                            },
-                        }))
-                        .ok();
+                    sender.send_user("降级消息");
                 })
             }),
         );
-        reg.init_send_inputs(tx).await;
-        let received = rx.try_recv().unwrap();
-        assert!(matches!(received, InputEvent::User(_)));
+        reg.init_send_inputs(sender).await;
+        let received = rx_user.recv().await.expect("panic 后正常 hook 仍应执行");
+        assert_eq!(received.content, "降级消息");
     }
 
     /// 观察钩子按注册顺序串行执行

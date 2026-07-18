@@ -44,7 +44,10 @@ mod tests {
         };
         assert_eq!(inbound.content, "你好");
         assert_eq!(inbound.mode, UserMessageMode::Guide);
-        assert_eq!(inbound.params.model_config.model_id, params.model_config.model_id);
+        assert_eq!(
+            inbound.params.model_config.model_id,
+            params.model_config.model_id
+        );
     }
 
     #[test]
