@@ -3,7 +3,7 @@
 //! 集中放引擎模块间共享的类型别名、状态类型。
 
 use fuyao_api::MessageParams;
-use fuyao_api::message::input::InterruptMessage;
+use fuyao_api::message::input::{InterruptMessage, PluginMessage};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
@@ -36,11 +36,12 @@ pub(crate) type SharedQueue = Arc<Mutex<VecDeque<QueuedUserMessage>>>;
 /// 活跃 session 的句柄
 ///
 /// Engine 的调度表（session_id → SessionHandle）持有它。
-/// 双队列 + 入站通道 + 中断通道分离：
+/// 双队列 + 入站通道 + 中断通道 + Plugin 通道分离：
 /// - `guide`：引导队列，直接消费，驱动 ReAct 循环
 /// - `pending`：排队队列，AI 不再调工具（最终回复）后才解禁转入 guide
 /// - `tx_inbound`：入站通道（User 消息送进 session task 过管道）
 /// - `tx_interrupt`：中断通道，select! 中断点监听（与队列正交）
+/// - `tx_plugin`：Plugin 通道，插件通知送进 session task 过 dispatch 管道（不参与 ReAct）
 #[allow(dead_code)]
 pub(crate) struct SessionHandle {
     /// 引导队列（直接消费）
@@ -51,6 +52,8 @@ pub(crate) struct SessionHandle {
     pub tx_inbound: Sender<InboundUser>,
     /// 中断通道发送端（Interrupt）
     pub tx_interrupt: Sender<InterruptMessage>,
+    /// Plugin 通道发送端（Plugin 通知，过 dispatch 管道发外部）
+    pub tx_plugin: Sender<PluginMessage>,
     /// session 独立执行流的任务句柄（shutdown 时用于优雅 abort）
     pub task: JoinHandle<()>,
 }

@@ -549,6 +549,8 @@ async fn pending_consumed_when_task_idle() {
     let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
+    // Plugin 通道（保持打开，避免 rx_plugin.recv() 提前返回 None）
+    let (_tx_plugin, rx_plugin) = mpsc::channel::<fuyao_api::message::input::PluginMessage>(16);
     let (tx_event, mut rx_event) = mpsc::channel(128);
 
     // 启动 session 执行流（两队列都空，task 进入 select! 等待）
@@ -558,6 +560,7 @@ async fn pending_consumed_when_task_idle() {
         Arc::clone(&pending),
         rx_inbound,
         rx_interrupt,
+        rx_plugin,
         session,
         Arc::clone(&store),
         provider,
@@ -601,6 +604,98 @@ async fn pending_consumed_when_task_idle() {
     assert!(got_assistant, "应收到含「已收到」的 AssistantMessage");
     assert!(pending.lock().unwrap().is_empty(), "pending 应被消费空");
     assert!(guide.lock().unwrap().is_empty(), "guide 应保持空");
+}
+
+/// Plugin 消息路由：经 tx_plugin 通道发 InputEvent::Plugin 携带的 PluginMessage →
+/// 从 rx_event 流出 OutputEvent::Plugin（session_id 标签正确）。
+///
+/// 验证阶段 2 新链路：
+/// - InputEvent::Plugin 不再在 Engine 层直发 OutputEvent::Plugin
+/// - 改为送进 session 的 tx_plugin 通道，由 session task 过 dispatch 管道
+/// - 经 Emitter 自动盖 session_id 标签
+#[tokio::test]
+async fn plugin_message_routes_through_dispatch() {
+    use fuyao_api::message::input::{PluginEventSource, PluginMessage, PluginPayload};
+
+    // 不会被调用（Plugin 消息不触发 ReAct），随便给个空响应占位
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
+
+    let store = temp_store().await;
+    let session = Session::new(None, Some("系统提示词".to_string()));
+    store.create(&session).await.unwrap();
+
+    let guide = empty_queue();
+    let pending = empty_queue();
+    let (_tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
+    let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
+    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
+    std::mem::forget(rx_interrupt_tx);
+    // tx_plugin 需要保留以发送消息
+    let (tx_plugin, rx_plugin) = mpsc::channel::<fuyao_api::message::input::PluginMessage>(16);
+    let (tx_event, mut rx_event) = mpsc::channel(128);
+
+    let task = tokio::spawn(run_session(
+        "plugin_session".to_string(),
+        Arc::clone(&guide),
+        Arc::clone(&pending),
+        rx_inbound,
+        rx_interrupt,
+        rx_plugin,
+        session,
+        Arc::clone(&store),
+        provider,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        tx_event,
+    ));
+
+    // 模拟 Engine::send 的 Plugin 分支：发一条 Plugin 消息到 tx_plugin 通道
+    tx_plugin
+        .send(PluginMessage {
+            base: fuyao_api::message::EventBase::default(),
+            payload: PluginPayload {
+                source: PluginEventSource {
+                    name: "loop_guard".into(),
+                },
+                event_type: "loop_warn".into(),
+                data: None,
+                error: None,
+                message: Some("检测到循环".into()),
+            },
+        })
+        .await
+        .unwrap();
+
+    // 期待从 rx_event 收到 OutputEvent::Plugin（带 session_id 标签）
+    let mut got_plugin = false;
+    let timed_out = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = rx_event.recv().await {
+            if let OutputEvent::Plugin(m) = ev {
+                assert_eq!(m.payload.source.name, "loop_guard");
+                assert_eq!(m.payload.event_type, "loop_warn");
+                assert_eq!(m.payload.message.as_deref(), Some("检测到循环"));
+                // 经 Emitter 自动盖 session_id 标签
+                assert_eq!(
+                    m.base.session_id.as_deref(),
+                    Some("plugin_session"),
+                    "Plugin 事件应盖 session_id 标签"
+                );
+                got_plugin = true;
+                break;
+            }
+        }
+    })
+    .await
+    .is_err();
+
+    task.abort();
+
+    assert!(
+        !timed_out,
+        "2 秒内未收到 Plugin 事件，tx_plugin → dispatch 管道路由未通"
+    );
+    assert!(got_plugin, "应收到 OutputEvent::Plugin");
 }
 
 /// 中断-流式期间：流式中途发 Interrupt → 产出 Interrupt 事件 + 部分 AssistantMessage（finish_reason=interrupted）

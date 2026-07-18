@@ -21,8 +21,6 @@ mod sender;
 mod tests;
 
 pub use factory::Plugin;
-pub use host::{PluginHost, PluginInstallError};
+pub use host::{PluginHost, PluginInstallError, panic_payload_to_string};
 pub use instance::PluginInstance;
 pub use sender::SessionSender;
-
-pub(crate) use host::panic_payload_to_string;

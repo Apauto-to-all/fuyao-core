@@ -25,7 +25,10 @@ pub enum PluginInstallError {
 }
 
 /// 把 panic payload（`Box<dyn Any + Send>`）转为可读 String
-pub(crate) fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+///
+/// 暴露为 `pub` 是为了让 fuyao-core 在 register 阶段做同步 panic 防护时复用同一份逻辑
+/// （engine 在 assemble_session_hooks 里 catch_unwind instance.register，需要把 payload 转可读字符串）。
+pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {

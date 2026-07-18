@@ -34,8 +34,11 @@ use crate::tool_registry::ToolRegistry;
 use fuyao_api::InboundUser;
 use fuyao_api::Session;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::input::InterruptMessage;
-use fuyao_api::message::output::{UserMessage as OutputUserMessage, UserPayload};
+use fuyao_api::message::input::{InterruptMessage, PluginMessage};
+use fuyao_api::message::output::{
+    PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
+    UserMessage as OutputUserMessage, UserPayload,
+};
 use fuyao_api::{UserMessageMode, UserMessageSource};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::Provider;
@@ -85,6 +88,7 @@ pub(crate) async fn run_session(
     pending: SharedQueue,
     mut rx_inbound: Receiver<InboundUser>,
     mut rx_interrupt: Receiver<InterruptMessage>,
+    mut rx_plugin: Receiver<PluginMessage>,
     mut session: Session,
     store: Arc<fuyao_session::SessionStore>,
     provider: Arc<dyn Provider>,
@@ -125,7 +129,7 @@ pub(crate) async fn run_session(
             queue::inject_messages(&mut session, msgs);
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
         } else {
-            // guide 空：等入站消息（过管道入队）或中断
+            // guide 空：等入站消息（过管道入队）/ 中断 / Plugin 通知
             tokio::select! {
                 Some(inbound) = rx_inbound.recv() => {
                     // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察
@@ -137,6 +141,11 @@ pub(crate) async fn run_session(
                     // idle 中断：无活跃 turn，只发通知事件
                     emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
                     tracing::debug!(session_id = %ctx.emitter.session_id(), "idle 时收到中断信号");
+                }
+                Some(plugin_msg) = rx_plugin.recv() => {
+                    // 入站 Plugin 消息过 dispatch 管道发外部（带 session_id 标签）
+                    // Plugin 消息不参与 ReAct（不触发 turn）
+                    handle_inbound_plugin(&ctx, plugin_msg).await;
                 }
             }
         }
@@ -190,5 +199,29 @@ fn handle_inbound_user(
             Some(process),
         )
         .await;
+    })
+}
+
+/// 处理入站 Plugin 消息：把 input 侧 PluginMessage 转 output 侧 OutputEvent::Plugin，
+/// 过完整 dispatch 管道（拦截 → 发送 → 观察）。
+///
+/// process 段传 None——Plugin 消息无需特殊处理（不像 User 要入队），纯通知透传。
+/// 发送时 Emitter 自动盖 session_id 标签。
+fn handle_inbound_plugin(
+    ctx: &SessionCtx,
+    plugin_msg: PluginMessage,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    Box::pin(async move {
+        let output_event = OutputEvent::Plugin(OutputPluginMessage {
+            base: plugin_msg.base,
+            payload: OutputPluginPayload {
+                source: plugin_msg.payload.source,
+                event_type: plugin_msg.payload.event_type,
+                data: plugin_msg.payload.data,
+                error: plugin_msg.payload.error,
+                message: plugin_msg.payload.message,
+            },
+        });
+        dispatch::dispatch(&ctx.emitter, &ctx.hooks, output_event, None).await;
     })
 }

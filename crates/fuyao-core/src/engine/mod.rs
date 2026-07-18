@@ -12,12 +12,9 @@ use crate::engine::types::{SessionHandle, SharedQueue};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::message::input::InterruptMessage;
-use fuyao_api::message::output::{
-    PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
-};
+use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
 use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
-use fuyao_hooks::SharedHooks;
+use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -46,11 +43,13 @@ pub struct Engine {
     /// 工具注册表（引擎级共享，所有 session task 共用同一份）
     tools: Arc<ToolRegistry>,
 
-    /// 钩子注册表（引擎级共享，所有 session task 共用同一份）
+    /// 插件工厂集合（引擎级共享，每 session 装配时调 create_instances）
     ///
-    /// 装配方在 `Engine::new` 前构造好（可先 `PluginHost::install` 注册插件），
-    /// 引擎持有后透传给每个 session 的 dispatch 管道。拦截/观察在 session task 内执行。
-    hooks: SharedHooks,
+    /// 引擎级只持有工厂模板（无 per-session 状态）；每个 session 启动时
+    /// 调用 [`PluginHost::create_instances`] 生成该 session 的独立实例集合，
+    /// 各实例的 register 注册到该 session 私有的 HooksRegistry。
+    /// 多 session 并发时互不串台（每个 session 都有独立的 hook 状态）。
+    plugin_host: Arc<PluginHost>,
 
     /// 活跃 session 调度表（session_id → SessionHandle）
     sessions: Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
@@ -74,14 +73,14 @@ impl Engine {
     /// `tools` 由装配方注入（如从 `fuyao_tools::all_tools()` 转换），引擎持有后
     /// 所有 session task 共享同一份工具表。
     ///
-    /// `hooks` 同样由装配方注入（构造前可先 `PluginHost::install` 注册插件），
-    /// 引擎持有后透传给每个 session 的 dispatch 管道。拦截/观察在 session task 内执行，
-    /// 引擎层只负责装配与共享。
+    /// `plugin_host` 是插件工厂集合，引擎级共享。每个 session 启动时调用
+    /// [`PluginHost::create_instances`] 生成该 session 的独立实例，
+    /// 各实例 register 到该 session 私有的 HooksRegistry。拦截/观察在 session task 内执行。
     pub async fn new(
         params: EngineParams,
         provider: Arc<dyn fuyao_provider::Provider>,
         tools: ToolRegistry,
-        hooks: SharedHooks,
+        plugin_host: PluginHost,
     ) -> Self {
         // 用 agent_paths 解析 db_path，打开数据库
         let db_path = params.agent_paths.sessions_db_path();
@@ -97,7 +96,7 @@ impl Engine {
             store: Arc::new(store),
             provider,
             tools: Arc::new(tools),
-            hooks,
+            plugin_host: Arc::new(plugin_host),
             sessions: Mutex::new(std::collections::HashMap::new()),
             tx_event,
             rx_event: Mutex::new(rx_event),
@@ -123,42 +122,18 @@ impl Engine {
 
         let session_id = session.id.clone();
         let messages = std::mem::take(&mut session.messages);
+        // task 接管 session（含 system_prompt + messages）
+        let session = Session {
+            messages,
+            ..session
+        };
 
-        // 建 session 专属双队列 + 入站通道 + 中断通道 + spawn 执行流 task
-        let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
-        let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
-        let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
-        let task = tokio::spawn(react::run_session(
-            session_id.clone(),
-            Arc::clone(&guide),
-            Arc::clone(&pending),
-            rx_inbound,
-            rx_interrupt,
-            // task 接管 session（含 system_prompt + messages）
-            Session {
-                messages,
-                ..session
-            },
-            Arc::clone(&self.store),
-            Arc::clone(&self.provider),
-            Arc::clone(&self.tools),
-            Arc::clone(&self.hooks),
-            self.params.agent_paths.clone(),
-            self.tx_event.clone(),
-        ));
-
-        // 登记进调度表
-        self.sessions.lock().await.insert(
-            session_id.clone(),
-            SessionHandle {
-                guide,
-                pending,
-                tx_inbound,
-                tx_interrupt,
-                task,
-            },
-        );
+        // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
+        let handle = self.assemble_session(session_id.clone(), session).await;
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), handle);
 
         tracing::info!(session_id = %session_id, "创建对话");
         Ok(session_id)
@@ -178,40 +153,137 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        // 建 session 专属双队列 + 入站通道 + 中断通道 + spawn 执行流 task
+        // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
+        let handle = self.assemble_session(id.clone(), session).await;
+        self.sessions.lock().await.insert(id.clone(), handle);
+
+        tracing::info!(session_id = %id, "恢复对话");
+        Ok(())
+    }
+
+    /// 装配 session（create_session / resume_session 公共方法）
+    ///
+    /// 建该 session 专属的双队列 + 四条通道（inbound/interrupt/plugin + 事件出口），
+    /// 装配该 session 的 hooks（per-session 独立实例），spawn 执行流 task，
+    /// 返回 SessionHandle 由调用方登记进调度表。
+    ///
+    /// 关键：`assemble_session_hooks` 必须 async（`init_send_inputs` 是 async），
+    /// 故本方法也是 async。
+    async fn assemble_session(&self, session_id: SessionId, session: Session) -> SessionHandle {
+        // 双队列
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
+
+        // 三条 session 级通道
         let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
+        let (tx_plugin, rx_plugin) = mpsc::channel::<PluginMessage>(16);
+
+        // 装配该 session 的 hooks（per-session：create_instances + register + SessionSender）
+        let hooks = self
+            .assemble_session_hooks(
+                &session_id,
+                tx_inbound.clone(),
+                tx_interrupt.clone(),
+                tx_plugin.clone(),
+            )
+            .await;
+
+        // spawn 执行流 task（多传 rx_plugin 参数）
         let task = tokio::spawn(react::run_session(
-            id.clone(),
+            session_id.clone(),
             Arc::clone(&guide),
             Arc::clone(&pending),
             rx_inbound,
             rx_interrupt,
+            rx_plugin,
             session,
             Arc::clone(&self.store),
             Arc::clone(&self.provider),
             Arc::clone(&self.tools),
-            Arc::clone(&self.hooks),
+            hooks,
             self.params.agent_paths.clone(),
             self.tx_event.clone(),
         ));
 
-        // 登记进调度表
-        self.sessions.lock().await.insert(
-            id.clone(),
-            SessionHandle {
-                guide,
-                pending,
-                tx_inbound,
-                tx_interrupt,
-                task,
+        SessionHandle {
+            guide,
+            pending,
+            tx_inbound,
+            tx_interrupt,
+            tx_plugin,
+            task,
+        }
+    }
+
+    /// 装配某 session 的 hooks（per-session，每 session 调用一次）
+    ///
+    /// 流程：
+    /// 1. `plugin_host.create_instances()` 生成该 session 的所有插件实例（含重名检查 + create_instance panic 防护）
+    /// 2. 每个 `instance.register(&mut registry)` 注册到该 session 私有的 registry（register panic 单独防护）
+    /// 3. 构造 `SessionSender`（绑定该 session 的三条通道）
+    /// 4. `registry.init_send_inputs(sender).await` 把 sender 传给 send_input hook
+    /// 5. 包成 `SharedHooks` 返回
+    ///
+    /// 失败容错：插件实例化失败（重名等）该 session 以**空 hooks** 运行（不硬 panic，让 session 还能用）。
+    async fn assemble_session_hooks(
+        &self,
+        session_id: &SessionId,
+        tx_inbound: mpsc::Sender<fuyao_api::InboundUser>,
+        tx_interrupt: mpsc::Sender<InterruptMessage>,
+        tx_plugin: mpsc::Sender<PluginMessage>,
+    ) -> SharedHooks {
+        let mut registry = HooksRegistry::new();
+
+        // 1. 工厂生产实例（同步，host 内部已含 create_instance panic 防护）
+        let instances = match self.plugin_host.create_instances() {
+            Ok(insts) => insts,
+            Err(e) => {
+                tracing::error!(
+                    session_id = %session_id,
+                    cause = %e,
+                    "插件实例化失败（重名或装配错误），该 session 将以空 hooks 运行"
+                );
+                return Arc::new(Mutex::new(registry));
+            }
+        };
+
+        // 2. 每个 instance 注册 hook（register 是同步调用，单独 panic 防护）
+        //    单个 instance.register panic 不阻塞其他实例注册
+        for (idx, instance) in instances.iter().enumerate() {
+            let hint = format!("instance-{idx}");
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                instance.register(&mut registry)
+            }));
+            if let Err(payload) = result {
+                tracing::warn!(
+                    session_id = %session_id,
+                    hint = %hint,
+                    phase = "register",
+                    recovered = true,
+                    cause = %fuyao_hooks::panic_payload_to_string(&*payload),
+                    "插件实例 register panic 已恢复"
+                );
+            }
+        }
+
+        // 3. 构造 SessionSender（identity 用 session_id 占位）
+        //    注：各插件发 Plugin 消息的精确身份由插件通过 send_plugin_full 等方法控制，
+        //    或后续给 SessionSender 加 with_identity 方法优化
+        let sender = SessionSender::new(
+            PluginEventSource {
+                name: format!("session:{session_id}"),
             },
+            tx_inbound,
+            tx_interrupt,
+            tx_plugin,
         );
 
-        tracing::info!(session_id = %id, "恢复对话");
-        Ok(())
+        // 4. 把 sender 传给所有 send_input hook
+        registry.init_send_inputs(sender).await;
+
+        // 5. 包成 SharedHooks
+        Arc::new(Mutex::new(registry))
     }
 
     /// 入事件（单一入口）
@@ -264,22 +336,14 @@ impl Engine {
                     .map_err(|_| EngineError::Shutdown)?;
             }
             InputEvent::Plugin(plugin_msg) => {
-                // 插件通知不进队列，直接转发为 OutputEvent::Plugin（不参与 ReAct）
-                let mut base = plugin_msg.base;
-                base.session_id = Some(id.clone());
-                let _ = self
-                    .tx_event
-                    .send(OutputEvent::Plugin(OutputPluginMessage {
-                        base,
-                        payload: OutputPluginPayload {
-                            source: plugin_msg.payload.source,
-                            event_type: plugin_msg.payload.event_type,
-                            data: plugin_msg.payload.data,
-                            error: plugin_msg.payload.error,
-                            message: plugin_msg.payload.message,
-                        },
-                    }))
-                    .await;
+                // 插件通知送进 session 的 Plugin 通道，由 session task 过 dispatch 管道：
+                // 拦截 → 发送（盖 session_id 标签发外部） → 观察
+                // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道
+                handle
+                    .tx_plugin
+                    .send(plugin_msg)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
             }
         }
 

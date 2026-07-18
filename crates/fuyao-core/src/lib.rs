@@ -25,8 +25,13 @@ pub use engine::{Engine, SessionId};
 pub use error::EngineError;
 pub use tool_registry::{ToolEntry, ToolRegistry, ToolRegistryBuilder};
 
-/// 共享钩子注册表的便捷重导出
+/// 插件相关类型的便捷重导出
 ///
-/// 装配方构造好 `HooksRegistry` 后，包成 `SharedHooks` 传给 [`Engine::new`]。
-/// 重导出在这里，让调用方从 `fuyao_core` 一处拿（无需直接依赖 `fuyao-hooks`）。
-pub use fuyao_hooks::{HooksRegistry, SharedHooks};
+/// 装配方从 `fuyao_core` 一处拿插件相关类型（无需直接依赖 `fuyao-hooks`）：
+/// - [`PluginHost`]：构造空 host → `add` 注册插件工厂 → 传入 [`Engine::new`]
+/// - [`Plugin`] / [`PluginInstance`]：实现自定义插件
+/// - [`SessionSender`]：插件通过 send_input hook 拿到，用于发消息
+///
+/// 引擎内部 per-session 装配时调 [`PluginHost::create_instances`] 生成实例，
+/// 各实例 register 到该 session 私有的 HooksRegistry。
+pub use fuyao_hooks::{Plugin, PluginHost, PluginInstance, SessionSender, SharedHooks};

@@ -20,7 +20,9 @@ mod plugin;
 mod registry;
 mod types;
 
-pub use plugin::{Plugin, PluginHost, PluginInstallError, PluginInstance, SessionSender};
+pub use plugin::{
+    Plugin, PluginHost, PluginInstallError, PluginInstance, SessionSender, panic_payload_to_string,
+};
 pub use registry::HooksRegistry;
 pub use types::{InterceptResult, OutputInterceptFn, OutputObserveFn, SendInputFn};
 
