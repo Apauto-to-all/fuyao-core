@@ -17,8 +17,7 @@ mod tools;
 use std::sync::Arc;
 
 use fuyao_api::{AgentPaths, EngineParams};
-use fuyao_core::{Engine, SharedHooks, ToolRegistry, ToolRegistryBuilder};
-use fuyao_hooks::HooksRegistry;
+use fuyao_core::{Engine, PluginHost, ToolRegistry, ToolRegistryBuilder};
 use fuyao_mcp::MCPManager;
 
 pub use init::{InitError, InitResult, init_engine};
@@ -63,12 +62,14 @@ pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), Setu
     // 2. 收集工具 + 启动 MCP（内置 + MCP 汇总进 ToolRegistry）
     let (tools, mcp_manager) = build_tool_registry().await;
 
-    // 3. 构造钩子注册表（本轮不装配插件，传空注册表；机制已接通）
-    //    后续在此处 PluginHost::install 注册插件后再传入。
-    let hooks: SharedHooks = std::sync::Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
+    // 3. 装配插件工厂（per-session 实例化的引擎级入口）
+    //    每个 session 启动时由 Engine 调 create_instances 生成独立实例，
+    //    多 session 并发时各插件状态互不串台。
+    let mut plugin_host = PluginHost::new();
+    plugin_host.add(Box::new(fuyao_guard::LoopGuardPlugin::new()));
 
-    // 4. 启动引擎（工具 + 钩子构造时注入）
-    let engine = Engine::new(EngineParams { agent_paths }, provider, tools, hooks).await;
+    // 4. 启动引擎（工具 + 插件工厂构造时注入）
+    let engine = Engine::new(EngineParams { agent_paths }, provider, tools, plugin_host).await;
 
     tracing::info!(model_id = %default_model_id, "引擎启动完成");
 

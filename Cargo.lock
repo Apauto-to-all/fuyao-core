@@ -863,6 +863,7 @@ dependencies = [
  "futures-util",
  "fuyao-api",
  "fuyao-core",
+ "fuyao-guard",
  "fuyao-hooks",
  "fuyao-mcp",
  "fuyao-provider",
@@ -900,7 +901,6 @@ dependencies = [
 name = "fuyao-guard"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "fuyao-api",
  "fuyao-hooks",
  "serde_json",

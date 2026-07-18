@@ -5,7 +5,6 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-async-trait.workspace = true
 fuyao-api = { path = "../fuyao-api" }
 fuyao-hooks = { path = "../fuyao-hooks" }
 tokio = { workspace = true }
