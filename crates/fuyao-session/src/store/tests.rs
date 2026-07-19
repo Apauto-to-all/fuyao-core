@@ -203,6 +203,37 @@ async fn mark_compaction_returns_not_found_for_missing_session() {
     assert!(matches!(result, Err(SessionError::NotFound(_))));
 }
 
+// ===== update_system_prompt 测试组 =====
+
+#[tokio::test]
+async fn update_system_prompt_updates_db_row() {
+    let store = temp_store().await;
+    let mut session = Session::new(None, Some("旧提示词".to_string()));
+    store.create(&mut session).await.unwrap();
+
+    store
+        .update_system_prompt(&session.id, "新提示词（压缩后重建）")
+        .await
+        .unwrap();
+
+    // 通过 get 验证字段已更新，且其他字段未被破坏
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        loaded.system_prompt.as_deref(),
+        Some("新提示词（压缩后重建）")
+    );
+    // 其他字段保持原值（create 时初始化的默认值）
+    assert_eq!(loaded.compression_count, 0);
+    assert!(loaded.last_compacted_seq.is_none());
+}
+
+#[tokio::test]
+async fn update_system_prompt_errors_on_missing_session() {
+    let store = temp_store().await;
+    let result = store.update_system_prompt("nonexistent", "新提示词").await;
+    assert!(matches!(result, Err(SessionError::NotFound(_))));
+}
+
 // ===== load_visible_messages 测试组 =====
 
 #[tokio::test]

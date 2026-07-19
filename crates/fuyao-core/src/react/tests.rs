@@ -249,6 +249,7 @@ async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> 
         tools,
         hooks: empty_hooks(),
         agent_paths: fuyao_api::AgentPaths::default(),
+        agent_config: fuyao_api::AgentConfig::default(),
         emitter: Emitter::new(tx_event, "test_session".to_string()),
         guide: empty_queue(),
         pending: empty_queue(),
@@ -572,6 +573,7 @@ async fn pending_consumed_when_task_idle() {
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
+        fuyao_api::AgentConfig::default(),
         tx_event,
     ));
 
@@ -652,6 +654,7 @@ async fn plugin_message_routes_through_dispatch() {
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
+        fuyao_api::AgentConfig::default(),
         tx_event,
     ));
 

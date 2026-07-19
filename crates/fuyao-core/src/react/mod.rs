@@ -59,6 +59,8 @@ pub(crate) struct SessionCtx {
     /// 钩子注册表（引擎级共享，透传给本 session 的 dispatch 管道）
     pub hooks: SharedHooks,
     pub agent_paths: fuyao_api::AgentPaths,
+    /// Agent 配置（创建时定死的会话级配置，压缩后重建 system_prompt 用）
+    pub agent_config: fuyao_api::AgentConfig,
     pub emitter: Emitter,
     /// 引导队列（直接消费）
     pub guide: SharedQueue,
@@ -104,6 +106,7 @@ pub(crate) async fn run_session(
     tools: Arc<ToolRegistry>,
     hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
+    agent_config: fuyao_api::AgentConfig,
     tx_event: Sender<OutputEvent>,
 ) {
     tracing::info!(session_id = %session_id, "session 执行流启动");
@@ -114,6 +117,7 @@ pub(crate) async fn run_session(
         tools,
         hooks,
         agent_paths,
+        agent_config,
         emitter: Emitter::new(tx_event, session_id.clone()),
         guide,
         pending,
@@ -264,12 +268,35 @@ async fn run_pre_turn_compression(
     .await
     {
         Ok(new_messages) => {
+            // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
+            // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
+            // X 已被压进摘要后不再误导模型
+            let new_prompt = fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.agent_config);
+
+            // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
+            // messages 已重建（压缩核心成果保住），system_prompt 内存更新照常进行——
+            // 下轮请求已经会用新 prompt，DB 字段下次 update session 时会自然同步
+            if let Err(e) = ctx
+                .store
+                .update_system_prompt(ctx.emitter.session_id(), &new_prompt)
+                .await
+            {
+                tracing::warn!(
+                    session_id = ctx.emitter.session_id(),
+                    cause = %e,
+                    "system_prompt 落库失败，仅更新内存"
+                );
+            }
+
             // 更新反抖动统计
             let mut state = ctx
                 .compression_state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             state.record_compaction(summary.tokens_before as u32, summary.tokens_after as u32);
+
+            // 写回内存 session（messages + system_prompt）
+            session.system_prompt = Some(new_prompt);
             session.messages = new_messages;
         }
         Err(e) => {

@@ -119,6 +119,47 @@ impl super::SessionStore {
         Ok(next_seq)
     }
 
+    /// 更新 session 的 system_prompt（压缩后重建系统提示词用）
+    ///
+    /// 单字段 UPDATE，不动其他字段、不动 messages 表。压缩触发后由 react 层调用，
+    /// 把 `build_system_prompt` 重新构建的提示词落库，避免旧 system_prompt 中残留的
+    /// 动态内容（如"基于刚才的 X 错误继续排查"）在 X 已被压进摘要后误导模型。
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]：session_id 在数据库中不存在
+    pub async fn update_system_prompt(
+        &self,
+        session_id: &str,
+        new_system_prompt: &str,
+    ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        // 校验 session 存在（与 mark_compaction 一致的防护，避免给不存在的 session 写脏数据）
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(SessionError::NotFound(session_id.to_string()));
+        }
+
+        sqlx::query("UPDATE sessions SET system_prompt = ?2 WHERE id = ?1")
+            .bind(session_id)
+            .bind(new_system_prompt)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            session_id = session_id,
+            prompt_len = new_system_prompt.len(),
+            "system_prompt 已更新（压缩后重建）"
+        );
+        Ok(())
+    }
+
     /// 加载模型可见窗口消息
     ///
     /// 返回「最近一条 compaction 消息（若有）及之后的所有消息」。

@@ -13,7 +13,9 @@ use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
-use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
+use fuyao_api::{
+    AgentConfig, EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams,
+};
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
@@ -129,7 +131,9 @@ impl Engine {
         };
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
-        let handle = self.assemble_session(session_id.clone(), session).await;
+        let handle = self
+            .assemble_session(session_id.clone(), session, params.agent_config)
+            .await;
         self.sessions
             .lock()
             .await
@@ -154,7 +158,13 @@ impl Engine {
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
-        let handle = self.assemble_session(id.clone(), session).await;
+        // TODO: resume 场景没有原始 agent_config（未持久化），用 default 兜底——
+        // 压缩重建 system_prompt 时会回退到 agents/default.md。
+        // 若需保留原 session 的非 default Agent 人格，需扩展 sessions 表
+        // 持久化 agent_definition 列（单独立项）
+        let handle = self
+            .assemble_session(id.clone(), session, AgentConfig::default())
+            .await;
         self.sessions.lock().await.insert(id.clone(), handle);
 
         tracing::info!(session_id = %id, "恢复对话");
@@ -169,7 +179,12 @@ impl Engine {
     ///
     /// 关键：`assemble_session_hooks` 必须 async（`init_send_inputs` 是 async），
     /// 故本方法也是 async。
-    async fn assemble_session(&self, session_id: SessionId, session: Session) -> SessionHandle {
+    async fn assemble_session(
+        &self,
+        session_id: SessionId,
+        session: Session,
+        agent_config: AgentConfig,
+    ) -> SessionHandle {
         // 双队列
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
@@ -203,6 +218,7 @@ impl Engine {
             Arc::clone(&self.tools),
             hooks,
             self.params.agent_paths.clone(),
+            agent_config,
             self.tx_event.clone(),
         ));
 
