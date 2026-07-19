@@ -11,9 +11,11 @@
 //! - `interrupt`: 中断（引擎中断轮次后发出）
 //! - `error`: 错误
 //! - `plugin`: 插件事件
+//! - `compression`: 上下文压缩事件（Started/Delta/Ended 三阶段）
 
 mod assistant;
 mod chunk;
+mod compression;
 mod error;
 mod interrupt;
 mod plugin;
@@ -24,6 +26,10 @@ mod user_message;
 // envelope / payload 在 output 层导出（外部通过 output::UserMessage 等路径访问）
 pub use assistant::{AssistantMessage, AssistantPayload};
 pub use chunk::{ChunkMessage, ChunkPayload};
+pub use compression::{
+    CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
+    CompressionReason, CompressionStartedPayload,
+};
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use plugin::{PluginMessage, PluginPayload};
@@ -53,6 +59,8 @@ pub enum OutputEvent {
     Error(ErrorMessage),
     /// 插件事件
     Plugin(PluginMessage),
+    /// 上下文压缩事件（含 Started/Delta/Ended 三阶段，前端据此追踪压缩生命周期）
+    Compression(CompressionMessage),
 }
 
 #[cfg(test)]
@@ -157,6 +165,19 @@ mod tests {
             },
         });
         assert!(matches!(event, OutputEvent::Plugin(_)));
+    }
+
+    #[test]
+    fn compression_variant() {
+        let event = OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Started(CompressionStartedPayload {
+                reason: CompressionReason::Auto,
+                prompt_tokens: 10_000,
+                context_length: 128_000,
+            }),
+        });
+        assert!(matches!(event, OutputEvent::Compression(_)));
     }
 
     #[test]

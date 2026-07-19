@@ -10,8 +10,10 @@ use fuyao_api::message::input::{
     UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::{
-    AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, ErrorMessage, ErrorPayload,
-    OutputEvent, ToolCallMessage, ToolCallPayload, ToolResultMessage, ToolResultPayload,
+    AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, CompressionDeltaPayload,
+    CompressionEndedPayload, CompressionMessage, CompressionPayload, CompressionReason,
+    CompressionStartedPayload, ErrorMessage, ErrorPayload, OutputEvent, ToolCallMessage,
+    ToolCallPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, InterruptPayload as OutputInterruptPayload,
@@ -91,7 +93,7 @@ fn input_event_samples() -> Vec<InputEvent> {
 }
 
 #[rstest]
-fn input_event_serde_preserves_variant(#[values(0, 1, 2, 3)] idx: usize) {
+fn input_event_serde_preserves_variant(#[values(0, 1, 2)] idx: usize) {
     let original = input_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: InputEvent = serde_json::from_str(&json).expect("反序列化失败");
@@ -186,16 +188,42 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 message: None,
             },
         }),
+        // 压缩事件三阶段（Started / Delta / Ended）样本
+        OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Started(CompressionStartedPayload {
+                reason: CompressionReason::Auto,
+                prompt_tokens: 10_000,
+                context_length: 128_000,
+            }),
+        }),
+        OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Delta(CompressionDeltaPayload {
+                content: Some("摘要片段".into()),
+                reasoning: None,
+            }),
+        }),
+        OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Ended(CompressionEndedPayload {
+                reason: CompressionReason::Auto,
+                content: "完整摘要".into(),
+                tokens_before: 12_000,
+                tokens_after: 3_000,
+                new_seq: 42,
+            }),
+        }),
     ]
 }
 
 #[rstest]
-fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7)] idx: usize) {
+fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] idx: usize) {
     let original = output_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: OutputEvent = serde_json::from_str(&json).expect("反序列化失败");
 
-    // 8 变体穷尽匹配，保证 serde 不丢标签
+    // 11 样本穷尽匹配（8 基础变体 + 3 压缩 mode），保证 serde 不丢标签
     match (&original, &restored) {
         (OutputEvent::Chunk(_), OutputEvent::Chunk(_)) => {}
         (OutputEvent::User(_), OutputEvent::User(_)) => {}
@@ -205,6 +233,7 @@ fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7)] idx: u
         (OutputEvent::Interrupt(_), OutputEvent::Interrupt(_)) => {}
         (OutputEvent::Error(_), OutputEvent::Error(_)) => {}
         (OutputEvent::Plugin(_), OutputEvent::Plugin(_)) => {}
+        (OutputEvent::Compression(_), OutputEvent::Compression(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
 }

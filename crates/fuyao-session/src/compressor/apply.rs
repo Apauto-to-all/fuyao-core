@@ -15,8 +15,10 @@ use fuyao_api::{CompressionConfig, Message};
 
 /// 落地压缩结果：写 compaction 边界 + 重建内存可见窗口
 ///
-/// 返回的新 messages 数组**显著短于**输入：[compaction 边界] + [tail 保留窗口]。
-/// 主循环拿到后直接 `session.messages = result`。
+/// 返回 `(新 messages, 新 compaction 边界的 seq)`：
+/// - 新 messages 数组**显著短于**输入：[compaction 边界] + [tail 保留窗口]。
+///   主循环拿到后直接 `session.messages = result`。
+/// - new_seq 用于上层发布 CompressionEnded 事件时携带（前端定位压缩在对话流中的位置）。
 ///
 /// `context_length` 用于按比例计算保留窗口预算，必须与 `generate_summary` 传入的值一致，
 /// 保证 summary 层与 apply 层切的是同一个窗口。
@@ -27,10 +29,10 @@ pub async fn apply(
     cfg: &CompressionConfig,
     context_length: u32,
     store: &SessionStore,
-) -> Result<Vec<Message>, SessionError> {
+) -> Result<(Vec<Message>, i64), SessionError> {
     // 1. 写 compaction 边界（事务内 INSERT + UPDATE sessions）
     let new_seq = store
-        .mark_compaction(session_id, summary.text.clone(), CompressionReason::Auto)
+        .mark_compaction(session_id, summary.content.clone(), CompressionReason::Auto)
         .await?;
 
     // 2. 重新切窗口（与 summary 层切的一致——基于原 messages）
@@ -40,7 +42,7 @@ pub async fn apply(
 
     // 3. 构造内存新窗口：[compaction 边界] + [keep_recent（保留原 seq）]
     let mut new_messages = Vec::with_capacity(1 + window.keep_recent.len());
-    let mut boundary = Message::compaction(summary.text.clone());
+    let mut boundary = Message::compaction(summary.content.clone());
     boundary.seq = new_seq;
     new_messages.push(boundary);
     new_messages.extend(window.keep_recent.iter().cloned());
@@ -55,7 +57,7 @@ pub async fn apply(
         "上下文压缩已应用"
     );
 
-    Ok(new_messages)
+    Ok((new_messages, new_seq))
 }
 
 #[cfg(test)]
@@ -84,7 +86,7 @@ mod tests {
         store.create(&mut session).await.unwrap();
 
         let summary = SummaryResult {
-            text: "## 目标\n- 测试".to_string(),
+            content: "## 目标\n- 测试".to_string(),
             tokens_before: 100,
             tokens_after: 50,
         };
@@ -94,7 +96,7 @@ mod tests {
             keep_tokens_max: 50, // 极小预算，强制压缩多数消息
             ..CompressionConfig::default()
         };
-        let new_messages = apply(
+        let (new_messages, new_seq) = apply(
             &session.messages,
             &summary,
             &session.id,
@@ -105,10 +107,13 @@ mod tests {
         .await
         .unwrap();
 
+        // apply 返回的 new_seq 与边界消息的 seq 一致
+        assert!(new_seq > 0);
+
         // 第一条是 compaction 边界
         assert_eq!(new_messages[0].kind, MessageKind::Compaction);
         assert_eq!(new_messages[0].content.as_deref(), Some("## 目标\n- 测试"));
-        assert!(new_messages[0].seq > 0);
+        assert_eq!(new_messages[0].seq, new_seq);
 
         // 总长度显著小于原始
         assert!(new_messages.len() < session.messages.len());

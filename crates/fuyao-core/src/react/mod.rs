@@ -34,10 +34,11 @@ use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{InterruptMessage, PluginMessage};
 use fuyao_api::message::output::{
-    PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
-    UserMessage as OutputUserMessage, UserPayload,
+    CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
+    CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
+    PluginPayload as OutputPluginPayload, UserMessage as OutputUserMessage, UserPayload,
 };
-use fuyao_api::{CompressionConfig, InboundUser, Session};
+use fuyao_api::{CompressionConfig, EventBase, InboundUser, Session};
 use fuyao_api::{UserMessageMode, UserMessageSource};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{Provider, StreamUsage};
@@ -234,29 +235,88 @@ async fn run_pre_turn_compression(
         "触发上下文压缩"
     );
 
-    // 执行层：生成摘要（原消息原样发，前缀缓存完整命中）
-    let summary = match fuyao_session::generate_summary(
-        session.system_prompt.as_deref(),
-        &session.messages,
-        &ctx.provider,
-        model_id,
-        context_length,
-        &ctx.compression_config,
+    // 发 Compression Started 事件：调摘要 LLM 之前，让前端显示"压缩中..."状态
+    dispatch::dispatch(
+        &ctx.emitter,
+        &ctx.hooks,
+        OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Started(CompressionStartedPayload {
+                reason: CompressionReason::Auto,
+                prompt_tokens: usage.prompt_tokens,
+                context_length,
+            }),
+        }),
+        None,
     )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                session_id = ctx.emitter.session_id(),
-                cause = %e,
-                "摘要生成失败，跳过本次压缩"
-            );
-            return;
-        }
+    .await;
+
+    // 执行层：生成摘要（原消息原样发，前缀缓存完整命中）
+    //
+    // 流式增量通过 channel 转发到并发的 Delta 事件发送任务：
+    // - callback 是同步 FnMut，无法 await dispatch，所以用 try_send 推到 channel
+    // - select! 并发：generate_summary 与 Delta 消费者同时跑，每收到一条就发 Compression Delta
+    // - channel 满了 try_send 失败就丢（Delta 本就是 live-only 增量，丢得起）
+    let (delta_tx, mut delta_rx) =
+        tokio::sync::mpsc::channel::<(Option<String>, Option<String>)>(32);
+
+    // callback 用 let 绑定避免临时值生命周期问题（future 会借用它）
+    let mut on_delta = |content: Option<&str>, reasoning: Option<&str>| {
+        let _ = delta_tx.try_send((content.map(String::from), reasoning.map(String::from)));
     };
 
-    // 落地层：mark_compaction + 重建 messages
+    // Delta 消费者：循环从 channel 取 delta 发事件，delta_tx drop 后 recv 返回 None 退出
+    let mut delta_consumer = Box::pin(async {
+        while let Some((content, reasoning)) = delta_rx.recv().await {
+            dispatch::dispatch(
+                &ctx.emitter,
+                &ctx.hooks,
+                OutputEvent::Compression(CompressionMessage {
+                    base: EventBase::default(),
+                    payload: CompressionPayload::Delta(CompressionDeltaPayload {
+                        content,
+                        reasoning,
+                    }),
+                }),
+                None,
+            )
+            .await;
+        }
+    });
+
+    // summary 与 Delta 消费者并发跑；summary 完成后 on_delta（含 delta_tx）drop，
+    // Delta 消费者 recv 返回 None 自然退出
+    let summary = tokio::select! {
+        biased;
+        s = fuyao_session::generate_summary(
+            session.system_prompt.as_deref(),
+            &session.messages,
+            &ctx.provider,
+            model_id,
+            context_length,
+            &ctx.compression_config,
+            &mut on_delta,
+        ) => {
+            match s {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = ctx.emitter.session_id(),
+                        cause = %e,
+                        "摘要生成失败，跳过本次压缩"
+                    );
+                    return;
+                }
+            }
+        }
+        _ = &mut delta_consumer => {
+            unreachable!("Delta 消费者先于 summary 结束")
+        }
+    };
+    // 等 Delta 消费者把剩余积压推完（summary 完成后 on_delta/delta_tx drop，recv 返回 None 退出）
+    let _ = (&mut delta_consumer).await;
+
+    // 落地层：mark_compaction + 重建 messages（返回 new_seq 供 Ended 事件）
     match fuyao_session::apply(
         &session.messages,
         &summary,
@@ -267,7 +327,7 @@ async fn run_pre_turn_compression(
     )
     .await
     {
-        Ok(new_messages) => {
+        Ok((new_messages, new_seq)) => {
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
             // X 已被压进摘要后不再误导模型
@@ -288,16 +348,36 @@ async fn run_pre_turn_compression(
                 );
             }
 
-            // 更新反抖动统计
-            let mut state = ctx
-                .compression_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            state.record_compaction(summary.tokens_before as u32, summary.tokens_after as u32);
+            // 更新反抖动统计（用块 scope 限定 MutexGuard 生命周期，避免跨 await 持锁）
+            {
+                let mut state = ctx
+                    .compression_state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                state.record_compaction(summary.tokens_before as u32, summary.tokens_after as u32);
+            }
 
             // 写回内存 session（messages + system_prompt）
             session.system_prompt = Some(new_prompt);
             session.messages = new_messages;
+
+            // 发 Compression Ended 事件：apply 落库成功后，让前端移除"压缩中"状态、展示统计
+            dispatch::dispatch(
+                &ctx.emitter,
+                &ctx.hooks,
+                OutputEvent::Compression(CompressionMessage {
+                    base: EventBase::default(),
+                    payload: CompressionPayload::Ended(CompressionEndedPayload {
+                        reason: CompressionReason::Auto,
+                        content: summary.content.clone(),
+                        tokens_before: summary.tokens_before as u32,
+                        tokens_after: summary.tokens_after as u32,
+                        new_seq,
+                    }),
+                }),
+                None,
+            )
+            .await;
         }
         Err(e) => {
             tracing::warn!(

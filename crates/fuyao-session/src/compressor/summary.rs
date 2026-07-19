@@ -1,17 +1,22 @@
-//! 执行层：调 provider 生成摘要 + 失败处理
+//! 执行层：调 provider 流式生成摘要 + 失败处理
 //!
 //! 关键约束（保留前缀缓存）：
 //! - **消息原样发**：所有 user/assistant/tool 消息保持原 role/content/tool_calls 不变
 //! - **system 不变**：用 session 原本的 system_prompt（前缀缓存完整命中）
 //! - **末尾追加一条 user 消息**：内容是 COMPRESSION_SYSTEM_PROMPT，作为摘要指令
 //! - 强制 `tools=[]`，独立于主 ReAct 流，不进对话流
+//! - 用流式 `stream_chat()` 接口，每个 TextDelta/ReasoningDelta 经 callback 上报，
+//!   调用方（react 层）据此发 Compression Delta 事件供前端实时渲染
 //! - 多次压缩时旧 compaction 消息原样在序列里（role=system，content=旧摘要），
 //!   LLM 自然能看到，不需要单独提取 previous_summary 注入
 
 use crate::compressor::prompt::COMPRESSION_SYSTEM_PROMPT;
 use crate::compressor::window::{estimate_tokens, select_recent};
+use futures_util::StreamExt;
 use fuyao_api::{CompressionConfig, Message};
-use fuyao_provider::{ChatMessage, ChatRequest, Provider, StreamError};
+use fuyao_provider::{
+    BoxStream, ChatMessage, ChatRequest, Provider, StreamError, StreamEvent, StreamOptions,
+};
 
 /// 压缩执行错误
 #[derive(Debug, thiserror::Error)]
@@ -30,8 +35,8 @@ pub enum CompressionError {
 /// 摘要生成结果
 #[derive(Debug, Clone)]
 pub struct SummaryResult {
-    /// 摘要正文（Markdown）
-    pub text: String,
+    /// 摘要正文（content 全文，不含 reasoning——reasoning 不进落库边界）
+    pub content: String,
     /// 压缩前的 token 估算（反抖动统计用）
     pub tokens_before: usize,
     /// 压缩后的 token 估算（保留 tail + 摘要）
@@ -53,15 +58,18 @@ fn to_chat_message(m: &Message) -> ChatMessage {
     }
 }
 
-/// 生成摘要：消息原样发 + 末尾追加摘要指令
+/// 生成摘要：消息原样发 + 末尾追加摘要指令 + 流式收集
 ///
 /// # 参数
 /// - `system_prompt`：session 原本的 system_prompt（保持不变，前缀缓存命中）
 /// - `messages`：当前 session 的可见消息（原样发，不构造、不序列化）
-/// - `provider`：LLM provider（用 `chat()` 非流式接口）
+/// - `provider`：LLM provider（用 `stream_chat()` 流式接口）
 /// - `model_id`：摘要用哪个模型（一般与主对话一致）
 /// - `context_length`：模型上下文长度（用于按比例计算保留窗口预算）
 /// - `cfg`：压缩配置
+/// - `on_delta`：流式增量回调。每个 TextDelta 调一次 `(Some(content), None)`，
+///   每个 ReasoningDelta 调一次 `(None, Some(reasoning))`。调用方据此发 Compression Delta 事件。
+///   回调是同步的（fnMut 不能 await），调用方若需异步处理应通过 channel 转发。
 pub async fn generate_summary(
     system_prompt: Option<&str>,
     messages: &[Message],
@@ -69,6 +77,7 @@ pub async fn generate_summary(
     model_id: &str,
     context_length: u32,
     cfg: &CompressionConfig,
+    on_delta: &mut impl FnMut(Option<&str>, Option<&str>),
 ) -> Result<SummaryResult, CompressionError> {
     if messages.len() < 2 {
         return Err(CompressionError::NothingToCompress);
@@ -96,22 +105,38 @@ pub async fn generate_summary(
         system: system_prompt.map(String::from),
     };
 
-    // 调 provider（非流式 chat，不带 tools）
-    let response = provider.chat(request, model_id).await?;
+    // 调 provider（流式 stream_chat，不带 tools）
+    let mut stream: BoxStream<Result<StreamEvent, StreamError>> =
+        provider.stream_chat(request, model_id, StreamOptions::default());
 
-    let text = response.content.unwrap_or_default();
-    let text = text.trim();
-    if text.is_empty() {
+    let mut content = String::new();
+    while let Some(result) = stream.next().await {
+        match result? {
+            StreamEvent::TextDelta { content: delta } => {
+                content.push_str(&delta);
+                on_delta(Some(&delta), None);
+            }
+            StreamEvent::ReasoningDelta { content: delta } => {
+                on_delta(None, Some(&delta));
+            }
+            StreamEvent::Done { .. } => break,
+            // ToolCallChunk 不会出现（tools=[]）；其他变体忽略
+            _ => {}
+        }
+    }
+
+    let content = content.trim();
+    if content.is_empty() {
         return Err(CompressionError::EmptySummary);
     }
 
     // 估算压缩效果（反抖动统计用）
     let tokens_before = estimate_tokens(messages);
-    let summary_tokens = text.len().div_ceil(4);
+    let summary_tokens = content.len().div_ceil(4);
     let tokens_after = estimate_tokens(window.keep_recent) + summary_tokens;
 
     Ok(SummaryResult {
-        text: text.to_string(),
+        content: content.to_string(),
         tokens_before,
         tokens_after,
     })
@@ -121,23 +146,34 @@ pub async fn generate_summary(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use fuyao_provider::{BoxStream, ChatResponse, FinishReason, StreamUsage};
+    use fuyao_provider::{ChatResponse, FinishReason, StreamUsage};
     use std::sync::Arc;
 
-    /// 返回固定文本的 mock provider
-    struct FixedProvider {
-        content: String,
+    /// 流式 mock provider：把构造时给的字符串切片，逐个作为 TextDelta 推送
+    struct StreamingProvider {
+        /// 文本片段序列（每个元素变一条 TextDelta 事件）
+        chunks: Vec<String>,
     }
 
     #[async_trait]
-    impl Provider for FixedProvider {
+    impl Provider for StreamingProvider {
         fn stream_chat(
             &self,
             _request: ChatRequest,
             _model: &str,
-            _options: fuyao_provider::StreamOptions,
-        ) -> BoxStream<Result<fuyao_provider::StreamEvent, StreamError>> {
-            unimplemented!("压缩用 chat()")
+            _options: StreamOptions,
+        ) -> BoxStream<Result<StreamEvent, StreamError>> {
+            let chunks = self.chunks.clone();
+            let stream = async_stream::stream! {
+                for chunk in chunks {
+                    yield Ok(StreamEvent::TextDelta { content: chunk });
+                }
+                yield Ok(StreamEvent::Done {
+                    usage: StreamUsage::default(),
+                    finish_reason: FinishReason::Stop,
+                });
+            };
+            Box::pin(stream)
         }
 
         async fn chat(
@@ -145,8 +181,10 @@ mod tests {
             _request: ChatRequest,
             _model: &str,
         ) -> Result<ChatResponse, StreamError> {
+            // 压缩现在用 stream_chat，chat() 保留实现只为满足 trait
+            let full = self.chunks.join("");
             Ok(ChatResponse {
-                content: Some(self.content.clone()),
+                content: Some(full),
                 reasoning: None,
                 tool_calls: None,
                 usage: StreamUsage::default(),
@@ -169,13 +207,19 @@ mod tests {
             .collect()
     }
 
+    /// no-op callback（不关心增量的测试用）
+    fn noop_delta() -> impl FnMut(Option<&str>, Option<&str>) {
+        |_, _| {}
+    }
+
     #[tokio::test]
     async fn generate_summary_returns_text() {
-        let provider: Arc<dyn Provider> = Arc::new(FixedProvider {
-            content: "## 目标\n- 测试".to_string(),
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
+            chunks: vec!["## 目标".into(), "\n- 测试".into()],
         });
         let msgs = make_messages(10);
 
+        let mut cb = noop_delta();
         let result = generate_summary(
             Some("你是助手"),
             &msgs,
@@ -183,20 +227,22 @@ mod tests {
             "model",
             128_000,
             &cfg_small_keep(),
+            &mut cb,
         )
         .await
         .unwrap();
-        assert_eq!(result.text, "## 目标\n- 测试");
+        assert_eq!(result.content, "## 目标\n- 测试");
         assert!(result.tokens_before > 0);
     }
 
     #[tokio::test]
     async fn generate_summary_errors_on_empty() {
-        let provider: Arc<dyn Provider> = Arc::new(FixedProvider {
-            content: "   ".to_string(),
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
+            chunks: vec!["   ".into()],
         });
         let msgs = make_messages(10);
 
+        let mut cb = noop_delta();
         let result = generate_summary(
             Some("你是助手"),
             &msgs,
@@ -204,6 +250,7 @@ mod tests {
             "model",
             128_000,
             &cfg_small_keep(),
+            &mut cb,
         )
         .await;
         assert!(matches!(result, Err(CompressionError::EmptySummary)));
@@ -211,10 +258,12 @@ mod tests {
 
     #[tokio::test]
     async fn generate_summary_errors_when_nothing_to_compress() {
-        let provider: Arc<dyn Provider> = Arc::new(FixedProvider {
-            content: "x".to_string(),
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
+            chunks: vec!["x".into()],
         });
         let msgs = make_messages(1);
+
+        let mut cb = noop_delta();
         let result = generate_summary(
             Some("你是助手"),
             &msgs,
@@ -222,9 +271,43 @@ mod tests {
             "model",
             128_000,
             &cfg_small_keep(),
+            &mut cb,
         )
         .await;
         assert!(matches!(result, Err(CompressionError::NothingToCompress)));
+    }
+
+    /// 验证流式增量经 callback 上报，且最终 content 拼接正确
+    #[tokio::test]
+    async fn generate_summary_streams_text_delta_via_callback() {
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
+            chunks: vec!["片段1".into(), "片段2".into(), "片段3".into()],
+        });
+        let msgs = make_messages(10);
+
+        let mut received: Vec<String> = Vec::new();
+        let mut cb = |content: Option<&str>, _reasoning: Option<&str>| {
+            if let Some(c) = content {
+                received.push(c.to_string());
+            }
+        };
+
+        let result = generate_summary(
+            Some("你是助手"),
+            &msgs,
+            &provider,
+            "model",
+            128_000,
+            &cfg_small_keep(),
+            &mut cb,
+        )
+        .await
+        .unwrap();
+
+        // callback 被调三次，每次收到一个片段
+        assert_eq!(received, vec!["片段1", "片段2", "片段3"]);
+        // 最终 content 是拼接后的完整字符串
+        assert_eq!(result.content, "片段1片段2片段3");
     }
 
     #[test]

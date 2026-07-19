@@ -52,5 +52,6 @@ fn stamp_session_id(event: &mut OutputEvent, session_id: &str) {
         OutputEvent::Interrupt(m) => m.base.session_id = id,
         OutputEvent::Error(m) => m.base.session_id = id,
         OutputEvent::Plugin(m) => m.base.session_id = id,
+        OutputEvent::Compression(m) => m.base.session_id = id,
     }
 }

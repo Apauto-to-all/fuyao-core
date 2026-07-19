@@ -288,6 +288,7 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Interrupt(m) => m.base.session_id.as_deref(),
         OutputEvent::Error(m) => m.base.session_id.as_deref(),
         OutputEvent::Plugin(m) => m.base.session_id.as_deref(),
+        OutputEvent::Compression(m) => m.base.session_id.as_deref(),
     }
 }
 

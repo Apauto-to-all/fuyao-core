@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 fuyao-api = { path = "../fuyao-api" }
 fuyao-provider = { path = "../fuyao-provider" }
+futures-util.workspace = true
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -14,6 +15,6 @@ uuid = { workspace = true }
 tracing.workspace = true
 
 [dev-dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
-futures-util.workspace = true
 tempfile = { workspace = true }
