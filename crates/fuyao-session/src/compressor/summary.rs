@@ -60,12 +60,14 @@ fn to_chat_message(m: &Message) -> ChatMessage {
 /// - `messages`：当前 session 的可见消息（原样发，不构造、不序列化）
 /// - `provider`：LLM provider（用 `chat()` 非流式接口）
 /// - `model_id`：摘要用哪个模型（一般与主对话一致）
+/// - `context_length`：模型上下文长度（用于按比例计算保留窗口预算）
 /// - `cfg`：压缩配置
 pub async fn generate_summary(
     system_prompt: Option<&str>,
     messages: &[Message],
     provider: &std::sync::Arc<dyn Provider>,
     model_id: &str,
+    context_length: u32,
     cfg: &CompressionConfig,
 ) -> Result<SummaryResult, CompressionError> {
     if messages.len() < 2 {
@@ -73,7 +75,9 @@ pub async fn generate_summary(
     }
 
     // 窗口切分（仅用于估算 tokens_after / 决定 apply 时保留多少近账）
-    let window = select_recent(messages, cfg.keep_tokens);
+    // 保留预算按模型上下文比例动态计算
+    let keep_tokens = cfg.effective_keep_tokens(context_length);
+    let window = select_recent(messages, keep_tokens);
     if window.to_compress.is_empty() {
         return Err(CompressionError::NothingToCompress);
     }
@@ -153,7 +157,8 @@ mod tests {
 
     fn cfg_small_keep() -> CompressionConfig {
         CompressionConfig {
-            keep_tokens: 50, // 极小预算，强制压缩多数消息
+            keep_ratio: 1.0,     // 比例拉满，让 effective_keep_tokens 永远等于 keep_tokens_max
+            keep_tokens_max: 50, // 极小预算，强制压缩多数消息
             ..CompressionConfig::default()
         }
     }
@@ -176,6 +181,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            128_000,
             &cfg_small_keep(),
         )
         .await
@@ -196,6 +202,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            128_000,
             &cfg_small_keep(),
         )
         .await;
@@ -213,6 +220,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            128_000,
             &cfg_small_keep(),
         )
         .await;

@@ -15,6 +15,13 @@ use serde::Deserialize;
 /// - `context_length` 从 ModelConfig 解析；解析不到时回退 `fallback_context`
 /// - `summary_max_tokens` 作为输出预留扣除
 ///
+/// 保留窗口按模型上下文比例动态计算（替代固定 `keep_tokens`）：
+/// ```text
+/// 实际保留 = min(context_length × keep_ratio, keep_tokens_max)
+/// ```
+/// - 小上下文模型（如 32K）按比例保留较少，避免撑爆
+/// - 大上下文模型（如 200K+）受 `keep_tokens_max` 上限保护，避免保留过多
+///
 /// 反抖动：连续两次压缩的 token 节省比例低于 `min_savings_pct` 时停压缩，
 /// 避免无效循环（对齐 hermes + zeroclaw 共识）。
 #[derive(Debug, Clone, Deserialize)]
@@ -24,8 +31,10 @@ pub struct CompressionConfig {
     pub enabled: bool,
     /// 触发阈值（0.0~1.0），prompt_tokens / (context_length - summary_max_tokens) 超过此值时触发
     pub threshold: f64,
-    /// 保留窗口的 token 预算（tail 段，从末尾倒序累加）
-    pub keep_tokens: usize,
+    /// 保留窗口的相对比例（0.0~1.0），实际保留 = min(context_length × keep_ratio, keep_tokens_max)
+    pub keep_ratio: f64,
+    /// 保留窗口的 token 上限（tail 段，防止超长上下文模型保留过多）
+    pub keep_tokens_max: usize,
     /// 摘要 LLM 输出上限（token）
     pub summary_max_tokens: usize,
     /// 无法解析模型上下文长度时的回退值
@@ -39,11 +48,28 @@ impl Default for CompressionConfig {
         Self {
             enabled: true,
             threshold: 0.85,
-            keep_tokens: 8000,
+            keep_ratio: 0.05,
+            keep_tokens_max: 8000,
             summary_max_tokens: 4096,
             fallback_context: 128_000,
             min_savings_pct: 10,
         }
+    }
+}
+
+impl CompressionConfig {
+    /// 按模型上下文比例计算实际保留 token 数
+    ///
+    /// 公式：`min(context_length × keep_ratio, keep_tokens_max)`
+    ///
+    /// - 小上下文模型（如 32K × 0.05 = 1600）：保留较少
+    /// - 大上下文模型（如 200K × 0.05 = 10000）：被 `keep_tokens_max`（默认 8000）截断
+    ///
+    /// 当 `context_length` 或 `keep_ratio` 为 0 时返回 0；下游 `select_recent` 内部
+    /// 保证至少保留最后一条消息，不会因此丢失活跃任务。
+    pub fn effective_keep_tokens(&self, context_length: u32) -> usize {
+        let ratio_amount = (context_length as f64 * self.keep_ratio) as usize;
+        ratio_amount.min(self.keep_tokens_max)
     }
 }
 
@@ -109,10 +135,56 @@ mod tests {
         let c = CompressionConfig::default();
         assert!(c.enabled);
         assert!((c.threshold - 0.85).abs() < f64::EPSILON);
-        assert_eq!(c.keep_tokens, 8000);
+        assert!((c.keep_ratio - 0.05).abs() < f64::EPSILON);
+        assert_eq!(c.keep_tokens_max, 8000);
         assert_eq!(c.summary_max_tokens, 4096);
         assert_eq!(c.fallback_context, 128_000);
         assert_eq!(c.min_savings_pct, 10);
+    }
+
+    #[test]
+    fn effective_keep_tokens_uses_ratio_for_small_context() {
+        // 小上下文：32K × 0.05 = 1600，未被 max 截断
+        let cfg = CompressionConfig::default();
+        assert_eq!(cfg.effective_keep_tokens(32_000), 1600);
+    }
+
+    #[test]
+    fn effective_keep_tokens_capped_by_max_for_large_context() {
+        // 大上下文：200K × 0.05 = 10000，被 max=8000 截断
+        let cfg = CompressionConfig::default();
+        assert_eq!(cfg.effective_keep_tokens(200_000), 8000);
+    }
+
+    #[test]
+    fn effective_keep_tokens_returns_zero_for_zero_context() {
+        // context_length=0 → 返回 0；select_recent 内部保证至少保留最后一条
+        let cfg = CompressionConfig::default();
+        assert_eq!(cfg.effective_keep_tokens(0), 0);
+    }
+
+    #[test]
+    fn effective_keep_tokens_returns_zero_for_zero_ratio() {
+        // 用户极端配置：keep_ratio=0 → 永远返回 0
+        let cfg = CompressionConfig {
+            keep_ratio: 0.0,
+            ..CompressionConfig::default()
+        };
+        assert_eq!(cfg.effective_keep_tokens(128_000), 0);
+    }
+
+    #[test]
+    fn effective_keep_tokens_uses_custom_ratio_and_max() {
+        // 用户调高比例到 0.1，max 调到 12000
+        let cfg = CompressionConfig {
+            keep_ratio: 0.1,
+            keep_tokens_max: 12_000,
+            ..CompressionConfig::default()
+        };
+        // 64K × 0.1 = 6400（未被 max 截断）
+        assert_eq!(cfg.effective_keep_tokens(64_000), 6400);
+        // 200K × 0.1 = 20000，被 max=12000 截断
+        assert_eq!(cfg.effective_keep_tokens(200_000), 12_000);
     }
 
     #[test]
@@ -147,6 +219,7 @@ threshold = 0.9
         // 缺省字段
         assert_eq!(w.session.storage.busy_timeout_secs, 5);
         assert!((w.session.compression.threshold - 0.9).abs() < f64::EPSILON);
-        assert_eq!(w.session.compression.keep_tokens, 8000);
+        assert!((w.session.compression.keep_ratio - 0.05).abs() < f64::EPSILON);
+        assert_eq!(w.session.compression.keep_tokens_max, 8000);
     }
 }

@@ -17,11 +17,15 @@ use fuyao_api::{CompressionConfig, Message};
 ///
 /// 返回的新 messages 数组**显著短于**输入：[compaction 边界] + [tail 保留窗口]。
 /// 主循环拿到后直接 `session.messages = result`。
+///
+/// `context_length` 用于按比例计算保留窗口预算，必须与 `generate_summary` 传入的值一致，
+/// 保证 summary 层与 apply 层切的是同一个窗口。
 pub async fn apply(
     messages: &[Message],
     summary: &SummaryResult,
     session_id: &str,
     cfg: &CompressionConfig,
+    context_length: u32,
     store: &SessionStore,
 ) -> Result<Vec<Message>, SessionError> {
     // 1. 写 compaction 边界（事务内 INSERT + UPDATE sessions）
@@ -30,7 +34,9 @@ pub async fn apply(
         .await?;
 
     // 2. 重新切窗口（与 summary 层切的一致——基于原 messages）
-    let window = select_recent(messages, cfg.keep_tokens);
+    // 保留预算按模型上下文比例动态计算，与 generate_summary 用同一公式
+    let keep_tokens = cfg.effective_keep_tokens(context_length);
+    let window = select_recent(messages, keep_tokens);
 
     // 3. 构造内存新窗口：[compaction 边界] + [keep_recent（保留原 seq）]
     let mut new_messages = Vec::with_capacity(1 + window.keep_recent.len());
@@ -84,12 +90,20 @@ mod tests {
         };
 
         let cfg = CompressionConfig {
-            keep_tokens: 50,
+            keep_ratio: 1.0,     // 比例拉满，让 effective_keep_tokens 永远等于 keep_tokens_max
+            keep_tokens_max: 50, // 极小预算，强制压缩多数消息
             ..CompressionConfig::default()
         };
-        let new_messages = apply(&session.messages, &summary, &session.id, &cfg, &store)
-            .await
-            .unwrap();
+        let new_messages = apply(
+            &session.messages,
+            &summary,
+            &session.id,
+            &cfg,
+            128_000,
+            &store,
+        )
+        .await
+        .unwrap();
 
         // 第一条是 compaction 边界
         assert_eq!(new_messages[0].kind, MessageKind::Compaction);

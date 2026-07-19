@@ -80,7 +80,8 @@ mod tests {
         CompressionConfig {
             enabled: true,
             threshold: 0.85,
-            keep_tokens: 8000,
+            keep_ratio: 0.05,
+            keep_tokens_max: 8000,
             summary_max_tokens: 4096,
             fallback_context: 128_000,
             min_savings_pct: 10,

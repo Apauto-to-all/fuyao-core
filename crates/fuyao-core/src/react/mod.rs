@@ -236,6 +236,7 @@ async fn run_pre_turn_compression(
         &session.messages,
         &ctx.provider,
         model_id,
+        context_length,
         &ctx.compression_config,
     )
     .await
@@ -257,6 +258,7 @@ async fn run_pre_turn_compression(
         &summary,
         ctx.emitter.session_id(),
         &ctx.compression_config,
+        context_length,
         &ctx.store,
     )
     .await
