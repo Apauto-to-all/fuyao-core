@@ -241,6 +241,10 @@ impl OpenAIProvider {
     fn classify_http_error(status_code: u16, body: &str) -> StreamError {
         match status_code {
             401 | 403 => StreamError::AuthError(body.to_string()),
+            // 413 Payload Too Large：请求体超过供应商上限，按上下文溢出处理
+            // 引擎不对该错误自动兜底（如自动压缩），交由上层应用识别后自行决策
+            // （提示用户、切换模型、或允许用户主动压缩）
+            413 => StreamError::ContextOverflow,
             429 => {
                 let retry_after_ms = extract_retry_after_ms(body);
                 let retry_after_secs = extract_retry_after_secs(body);
@@ -250,7 +254,7 @@ impl OpenAIProvider {
                 }
             }
             _ => {
-                // 检测上下文溢出
+                // 检测上下文溢出（覆盖 400 + body 含 OpenAI 风格关键词的场景）
                 if body.contains("context_length_exceeded")
                     || body.contains("maximum context length")
                 {
@@ -1173,6 +1177,21 @@ mod tests {
     fn classify_http_error_context_overflow() {
         let err =
             OpenAIProvider::classify_http_error(400, "context_length_exceeded: too many tokens");
+        assert!(matches!(err, StreamError::ContextOverflow));
+    }
+
+    #[test]
+    fn classify_http_error_413_payload_too_large() {
+        // 413 Payload Too Large：HTTP 状态码已明确表示请求体过大，
+        // 不依赖 body 关键词匹配，直接归类为 ContextOverflow
+        let err = OpenAIProvider::classify_http_error(413, "payload too large");
+        assert!(matches!(err, StreamError::ContextOverflow));
+    }
+
+    #[test]
+    fn classify_http_error_413_with_unexpected_body_still_overflow() {
+        // 413 即便 body 是空字符串或非典型格式，仍是上下文溢出
+        let err = OpenAIProvider::classify_http_error(413, "");
         assert!(matches!(err, StreamError::ContextOverflow));
     }
 
