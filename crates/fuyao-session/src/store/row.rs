@@ -96,7 +96,7 @@ impl From<MessageRow> for Message {
             cached_tokens: r.cached_tokens,
             cost: r.cost,
             seq: r.seq,
-            kind: MessageKind::from_str(&r.kind),
+            kind: MessageKind::parse(&r.kind),
         }
     }
 }

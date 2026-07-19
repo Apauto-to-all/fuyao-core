@@ -15,7 +15,7 @@ mod schema;
 mod store;
 
 pub use compressor::{
-    apply, generate_summary, should_compress, CompressionState as CompressionRuntimeState,
+    CompressionState as CompressionRuntimeState, apply, generate_summary, should_compress,
 };
 pub use error::SessionError;
 pub use store::SessionStore;

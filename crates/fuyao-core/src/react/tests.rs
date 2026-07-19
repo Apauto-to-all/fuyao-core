@@ -239,8 +239,8 @@ struct TestHarness {
 
 async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> TestHarness {
     let store = temp_store().await;
-    let session = Session::new(None, Some("系统提示词".to_string()));
-    store.create(&session).await.unwrap();
+    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    store.create(&mut session).await.unwrap();
     let (tx_event, rx_event) = mpsc::channel(128);
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
     let ctx = SessionCtx {
@@ -252,6 +252,11 @@ async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> 
         emitter: Emitter::new(tx_event, "test_session".to_string()),
         guide: empty_queue(),
         pending: empty_queue(),
+        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
+        compression_state: Arc::new(std::sync::Mutex::new(
+            fuyao_session::CompressionRuntimeState::default(),
+        )),
+        compression_config: fuyao_api::CompressionConfig::default(),
     };
     TestHarness {
         ctx,
@@ -538,8 +543,8 @@ async fn pending_consumed_when_task_idle() {
     )]));
 
     let store = temp_store().await;
-    let session = Session::new(None, Some("系统提示词".to_string()));
-    store.create(&session).await.unwrap();
+    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    store.create(&mut session).await.unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -621,8 +626,8 @@ async fn plugin_message_routes_through_dispatch() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
 
     let store = temp_store().await;
-    let session = Session::new(None, Some("系统提示词".to_string()));
-    store.create(&session).await.unwrap();
+    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    store.create(&mut session).await.unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();

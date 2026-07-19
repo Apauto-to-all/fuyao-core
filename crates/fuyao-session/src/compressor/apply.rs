@@ -6,11 +6,11 @@
 //! 2. 构造内存新窗口 = [compaction 消息(seq=new_seq)] + [原 keep_recent 消息（保留原 seq）]
 //! 3. 返回新窗口给主循环，主循环 `session.messages = new_messages` 直接替换
 
+use crate::SessionStore;
 use crate::compressor::summary::SummaryResult;
 use crate::compressor::window::select_recent;
 use crate::error::SessionError;
 use crate::store::compaction::CompressionReason;
-use crate::SessionStore;
 use fuyao_api::{CompressionConfig, Message, MessageKind};
 
 /// 落地压缩结果：写 compaction 边界 + 重建内存可见窗口
@@ -81,10 +81,9 @@ mod tests {
         let mut session = fuyao_api::Session::new(None, None);
         // 10 条消息，每条 ~16 token（用极小 keep_tokens 强制压缩）
         for i in 0..10 {
-            session.messages.push(Message::user(format!(
-                "消息_{i}_{}",
-                "x".repeat(40)
-            )));
+            session
+                .messages
+                .push(Message::user(format!("消息_{i}_{}", "x".repeat(40))));
         }
         store.create(&mut session).await.unwrap();
 

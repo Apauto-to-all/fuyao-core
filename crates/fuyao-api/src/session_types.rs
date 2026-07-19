@@ -101,7 +101,7 @@ impl MessageKind {
     }
 
     /// 从数据库字符串反序列化
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s {
             "compaction" => Self::Compaction,
             _ => Self::Message,
@@ -382,10 +382,10 @@ mod tests {
     fn message_kind_roundtrip() {
         assert_eq!(MessageKind::Message.as_str(), "message");
         assert_eq!(MessageKind::Compaction.as_str(), "compaction");
-        assert_eq!(MessageKind::from_str("message"), MessageKind::Message);
-        assert_eq!(MessageKind::from_str("compaction"), MessageKind::Compaction);
+        assert_eq!(MessageKind::parse("message"), MessageKind::Message);
+        assert_eq!(MessageKind::parse("compaction"), MessageKind::Compaction);
         // 未知字符串兜底为 Message
-        assert_eq!(MessageKind::from_str("unknown"), MessageKind::Message);
+        assert_eq!(MessageKind::parse("unknown"), MessageKind::Message);
     }
 
     #[test]

@@ -21,10 +21,14 @@ pub struct Window<'a> {
 
 /// 估算单条消息的 token 数
 fn estimate_message_tokens(msg: &Message) -> usize {
-    let text_len = msg.content.as_deref().unwrap_or("").len()
-        + msg.reasoning.as_deref().unwrap_or("").len();
+    let text_len =
+        msg.content.as_deref().unwrap_or("").len() + msg.reasoning.as_deref().unwrap_or("").len();
     // ponytail: 不解析 tool_calls JSON 深度估算——保留粗估，压缩触发偏保守没问题
-    let tool_len = msg.tool_calls.as_ref().map(|v| v.to_string().len()).unwrap_or(0);
+    let tool_len = msg
+        .tool_calls
+        .as_ref()
+        .map(|v| v.to_string().len())
+        .unwrap_or(0);
     text_len.div_ceil(CHARS_PER_TOKEN) + tool_len.div_ceil(CHARS_PER_TOKEN) + 4
 }
 
@@ -112,16 +116,17 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
             if let Some(ref tool_calls) = msg.tool_calls {
                 // 检查这个 assistant 的所有 tool_call_id 是否在后续消息中都有 result
                 // ponytail: 解析出 owned id 列表避免借用冲突（call_ids 跨整个 if 块使用）
-                let call_ids: Vec<String> = serde_json::from_value::<Vec<serde_json::Value>>(
-                    tool_calls.clone(),
-                )
-                .map(|calls| {
-                    calls
-                        .iter()
-                        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()).map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+                let call_ids: Vec<String> =
+                    serde_json::from_value::<Vec<serde_json::Value>>(tool_calls.clone())
+                        .map(|calls| {
+                            calls
+                                .iter()
+                                .filter_map(|tc| {
+                                    tc.get("id").and_then(|v| v.as_str()).map(String::from)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
                 let call_id_refs: std::collections::HashSet<&str> =
                     call_ids.iter().map(String::as_str).collect();
@@ -195,10 +200,10 @@ pub fn serialize_for_summary(messages: &[Message]) -> String {
                 format!("{role_label}: {content}{tool_info}")
             }
         };
-        if let Some(reasoning) = msg.reasoning.as_deref() {
-            if !reasoning.is_empty() {
-                line.push_str(&format!("\n  [推理]: {reasoning}"));
-            }
+        if let Some(reasoning) = msg.reasoning.as_deref()
+            && !reasoning.is_empty()
+        {
+            line.push_str(&format!("\n  [推理]: {reasoning}"));
         }
         parts.push(line);
     }
@@ -260,7 +265,7 @@ mod tests {
         assistant_with_tc.tool_calls = Some(serde_json::json!([{"id": "call_1"}]));
         let msgs = vec![
             Message::user("u1".to_string()),
-            assistant_with_tc,                      // assistant + tool_call
+            assistant_with_tc, // assistant + tool_call
             Message::tool_result("call_1".into(), "结果".into()), // tool result
             Message::user("u2".to_string()),
         ];

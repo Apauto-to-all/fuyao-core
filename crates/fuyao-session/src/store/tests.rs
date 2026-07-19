@@ -145,11 +145,17 @@ async fn mark_compaction_inserts_boundary_message() {
     let store = temp_store().await;
     let mut session = Session::new(None, None);
     session.messages.push(Message::user("hello".to_string()));
-    session.messages.push(Message::assistant(Some("hi".to_string())));
+    session
+        .messages
+        .push(Message::assistant(Some("hi".to_string())));
     store.create(&mut session).await.unwrap();
 
     let new_seq = store
-        .mark_compaction(&session.id, "## 目标\n- 测试".to_string(), CompressionReason::Auto)
+        .mark_compaction(
+            &session.id,
+            "## 目标\n- 测试".to_string(),
+            CompressionReason::Auto,
+        )
         .await
         .unwrap();
 
@@ -279,7 +285,9 @@ async fn load_full_history_includes_compacted_messages() {
     let store = temp_store().await;
     let mut session = Session::new(None, None);
     session.messages.push(Message::user("old".to_string()));
-    session.messages.push(Message::assistant(Some("reply".to_string())));
+    session
+        .messages
+        .push(Message::assistant(Some("reply".to_string())));
     store.create(&mut session).await.unwrap();
 
     store

@@ -61,20 +61,22 @@ impl super::SessionStore {
         let mut tx = self.pool.begin().await?;
 
         // 验证 session 存在（避免给不存在的 session 插孤儿消息）
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
-            .bind(session_id)
-            .fetch_one(&mut *tx)
-            .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
         if !exists {
             return Err(SessionError::NotFound(session_id.to_string()));
         }
 
         // 生成新 seq（事务内 COALESCE 保证并发安全）
-        let next_seq: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1")
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
+        let next_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -156,10 +158,7 @@ impl super::SessionStore {
     /// 加载全量历史（含被压缩掉的旧消息）
     ///
     /// 用途：审计、调试、导出。不参与 ReAct 循环。
-    pub async fn load_full_history(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<Message>, SessionError> {
+    pub async fn load_full_history(&self, session_id: &str) -> Result<Vec<Message>, SessionError> {
         let rows = sqlx::query_as::<_, MessageRow>(
             "SELECT id, session_id, model_id, role, content, tool_call_id,
                     tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,

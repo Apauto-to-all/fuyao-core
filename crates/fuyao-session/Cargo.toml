@@ -5,13 +5,13 @@ edition.workspace = true
 
 [dependencies]
 fuyao-api = { path = "../fuyao-api" }
+fuyao-provider = { path = "../fuyao-provider" }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 tracing.workspace = true
-fuyao-provider = { version = "0.1.0", path = "../fuyao-provider" }
 
 [dev-dependencies]
 async-trait.workspace = true

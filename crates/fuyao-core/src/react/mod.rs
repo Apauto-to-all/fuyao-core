@@ -31,18 +31,19 @@ use crate::emit::Emitter;
 use crate::engine::types::{QueuedUserMessage, SharedQueue};
 use crate::interrupt::emit_interrupt_event;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::InboundUser;
-use fuyao_api::Session;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{InterruptMessage, PluginMessage};
 use fuyao_api::message::output::{
     PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
     UserMessage as OutputUserMessage, UserPayload,
 };
+use fuyao_api::{CompressionConfig, InboundUser, Session};
 use fuyao_api::{UserMessageMode, UserMessageSource};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::Provider;
+use fuyao_provider::{Provider, StreamUsage};
+use fuyao_session::CompressionRuntimeState;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
@@ -63,6 +64,14 @@ pub(crate) struct SessionCtx {
     pub guide: SharedQueue,
     /// 排队队列（最终回复后转入 guide）
     pub pending: SharedQueue,
+    /// 上一轮 LLM 返回的真实 usage（pre-turn 压缩触发判定用）
+    ///
+    /// 由 [`turn::handle_final_reply`] 写入，主循环 pre-turn 读。None 表示首轮尚未跑过。
+    pub last_usage: Arc<Mutex<Option<StreamUsage>>>,
+    /// 压缩运行时状态（反抖动统计，per-session）
+    pub compression_state: Arc<std::sync::Mutex<CompressionRuntimeState>>,
+    /// 压缩配置（从全局 config 读取，启动时定死）
+    pub compression_config: CompressionConfig,
 }
 
 /// session 的独立执行流
@@ -108,6 +117,9 @@ pub(crate) async fn run_session(
         emitter: Emitter::new(tx_event, session_id.clone()),
         guide,
         pending,
+        last_usage: Arc::new(Mutex::new(None)),
+        compression_state: Arc::new(std::sync::Mutex::new(CompressionRuntimeState::default())),
+        compression_config: fuyao_api::get_config().session.compression.clone(),
     };
 
     // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断
@@ -121,6 +133,11 @@ pub(crate) async fn run_session(
             msgs = queue::consume_all_guide(&ctx.guide);
         }
         if !msgs.is_empty() {
+            // === 上下文压缩检查（pre-turn）===
+            // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库 → 重建 messages
+            // 失败 log warn 跳过本次压缩，主流程继续
+            run_pre_turn_compression(&ctx, &mut session, &msgs).await;
+
             // 取第一条消息的 params（决定本轮 model/options）
             // ReAct 多轮复用同一份 model（一个 turn 一个模型）
             // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
@@ -148,6 +165,116 @@ pub(crate) async fn run_session(
                     handle_inbound_plugin(&ctx, plugin_msg).await;
                 }
             }
+        }
+    }
+}
+
+/// Pre-turn 上下文压缩检查
+///
+/// 在主循环注入新消息前、调 LLM 前，根据上一轮真实 usage 判定要不要压缩。
+/// 触发条件满足时：调一次独立 LLM（`tools=[]`）拿摘要 → `mark_compaction` 落库 →
+/// 重建 `session.messages` 为 `[compaction 边界] + [tail 保留窗口]`。
+///
+/// 失败处理（对齐 opencode "失败保持边界" + hermes 分级）：
+/// - 摘要为空 / 无可压缩内容：log warn 跳过
+/// - LLM 调用失败：log warn 跳过（不进 cooldown，下次还会触发判定）
+/// - 落库失败：log warn 跳过
+///
+/// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
+async fn run_pre_turn_compression(
+    ctx: &SessionCtx,
+    session: &mut Session,
+    incoming: &[QueuedUserMessage],
+) {
+    // 读取上一轮真实 usage（首轮无 usage 跳过——还没跑过没法判定）
+    let usage = {
+        let guard = ctx.last_usage.lock().await;
+        match guard.clone() {
+            Some(u) => u,
+            None => return,
+        }
+    };
+
+    // 解析当前模型上下文长度（用 incoming 第一条消息的 model_id）
+    // ponytail: 多 guide 消息 model 不一致用第一条（与 run_turn 内 "取第一条 params" 一致）
+    let model_id = incoming
+        .first()
+        .and_then(|m| m.params.model_config.model_id.as_deref())
+        .unwrap_or("");
+    let context_length = fuyao_provider::get_model(model_id, &ctx.agent_paths)
+        .map(|m| m.limit.context)
+        .unwrap_or(ctx.compression_config.fallback_context);
+
+    // 阈值检测（含反抖动判定）
+    let trigger = {
+        let state = ctx
+            .compression_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fuyao_session::should_compress(
+            usage.prompt_tokens,
+            context_length,
+            &ctx.compression_config,
+            &state,
+        )
+    };
+    if !trigger {
+        return;
+    }
+
+    tracing::info!(
+        session_id = ctx.emitter.session_id(),
+        prompt_tokens = usage.prompt_tokens,
+        context_length = context_length,
+        model_id = model_id,
+        "触发上下文压缩"
+    );
+
+    // 执行层：生成摘要
+    let summary = match fuyao_session::generate_summary(
+        &session.messages,
+        &ctx.provider,
+        model_id,
+        &ctx.compression_config,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "摘要生成失败，跳过本次压缩"
+            );
+            return;
+        }
+    };
+
+    // 落地层：mark_compaction + 重建 messages
+    match fuyao_session::apply(
+        &session.messages,
+        &summary,
+        ctx.emitter.session_id(),
+        &ctx.compression_config,
+        &ctx.store,
+    )
+    .await
+    {
+        Ok(new_messages) => {
+            // 更新反抖动统计
+            let mut state = ctx
+                .compression_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.record_compaction(summary.tokens_before as u32, summary.tokens_after as u32);
+            session.messages = new_messages;
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "压缩落地失败，跳过本次压缩"
+            );
         }
     }
 }

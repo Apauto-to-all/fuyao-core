@@ -99,7 +99,7 @@ pub async fn generate_summary(
 
     Ok(SummaryResult {
         text: text.to_string(),
-        tokens_before: tokens_before as usize,
+        tokens_before,
         tokens_after,
         previous_summary,
     })
@@ -141,10 +141,6 @@ mod tests {
                 finish_reason: FinishReason::Stop,
             })
         }
-    }
-
-    fn cfg() -> CompressionConfig {
-        CompressionConfig::default()
     }
 
     fn cfg_small_keep() -> CompressionConfig {

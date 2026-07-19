@@ -54,10 +54,7 @@ pub const COMPRESSION_SYSTEM_PROMPT: &str = r#"你是一个摘要代理，负责
 ///
 /// 多次压缩时把上一次的摘要作为 `<previous-summary>` 喂回，要求 LLM 「保留旧信息 +
 /// 增量新信息」（对齐 opencode + hermes 共识，防多轮压缩信息流失）。
-pub fn build_prompt(
-    serialized_conversation: &str,
-    previous_summary: Option<&str>,
-) -> String {
+pub fn build_prompt(serialized_conversation: &str, previous_summary: Option<&str>) -> String {
     let prev_block = match previous_summary {
         Some(s) if !s.is_empty() => {
             format!(
@@ -86,10 +83,7 @@ mod tests {
 
     #[test]
     fn build_prompt_with_previous_summary() {
-        let p = build_prompt(
-            "user: 继续\nassistant: 完成",
-            Some("## 目标\n- 老任务"),
-        );
+        let p = build_prompt("user: 继续\nassistant: 完成", Some("## 目标\n- 老任务"));
         assert!(p.contains("<previous-summary>"));
         assert!(p.contains("老任务"));
         assert!(p.contains("<conversation-to-summarize>"));

@@ -117,6 +117,9 @@ async fn handle_final_reply(
     result: &StreamResult,
     params: &MessageParams,
 ) {
+    // 回传本轮真实 usage 给主循环（pre-turn 压缩触发判定用）
+    *ctx.last_usage.lock().await = Some(result.usage.clone());
+
     // 发最终 AssistantMessage（经管道：拦截 → 发送 → 观察）
     let assistant_msg = build_assistant_message(result, params.model_config.model_id.as_deref());
     session.messages.push(assistant_msg);
