@@ -4,14 +4,14 @@
 //! 1. 调 [`SessionStore::mark_compaction`]（事务内 INSERT compaction 边界消息 +
 //!    UPDATE sessions 元数据），返回新 seq
 //! 2. 构造内存新窗口 = [compaction 消息(seq=new_seq)] + [原 keep_recent 消息（保留原 seq）]
-//! 3. 返回新窗口给主循环，主循环 `session.messages = new_messages` 直接替换
+//! 3. 返回新窗口给主循环，主循环 `session.messages = result` 直接替换
 
 use crate::SessionStore;
 use crate::compressor::summary::SummaryResult;
 use crate::compressor::window::select_recent;
 use crate::error::SessionError;
 use crate::store::compaction::CompressionReason;
-use fuyao_api::{CompressionConfig, Message, MessageKind};
+use fuyao_api::{CompressionConfig, Message};
 
 /// 落地压缩结果：写 compaction 边界 + 重建内存可见窗口
 ///
@@ -52,20 +52,10 @@ pub async fn apply(
     Ok(new_messages)
 }
 
-/// 从可见窗口消息中提取上一次的摘要（多次压缩增量更新用）
-///
-/// 找最近一条 `kind=Compaction` 的消息，返回其 content。
-pub fn find_previous_summary(messages: &[Message]) -> Option<&str> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.kind == MessageKind::Compaction)
-        .and_then(|m| m.content.as_deref())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuyao_api::MessageKind;
     use tempfile::tempdir;
 
     async fn temp_store() -> SessionStore {
@@ -91,7 +81,6 @@ mod tests {
             text: "## 目标\n- 测试".to_string(),
             tokens_before: 100,
             tokens_after: 50,
-            previous_summary: None,
         };
 
         let cfg = CompressionConfig {
@@ -107,37 +96,12 @@ mod tests {
         assert_eq!(new_messages[0].content.as_deref(), Some("## 目标\n- 测试"));
         assert!(new_messages[0].seq > 0);
 
-        // 总长度显著小于原始（至少剪掉一半）
+        // 总长度显著小于原始
         assert!(new_messages.len() < session.messages.len());
 
         // 后续消息是 tail 保留窗口（原 seq 保留）
         for m in &new_messages[1..] {
             assert_eq!(m.kind, MessageKind::Message);
         }
-    }
-
-    #[test]
-    fn find_previous_summary_returns_latest_compaction_content() {
-        let mut msgs = vec![
-            Message::user("u1".to_string()),
-            Message::compaction("旧摘要".to_string()),
-            Message::user("u2".to_string()),
-            Message::compaction("新摘要".to_string()),
-            Message::user("u3".to_string()),
-        ];
-        // 模拟 seq 已填充
-        for (i, m) in msgs.iter_mut().enumerate() {
-            m.seq = (i + 1) as i64;
-        }
-        assert_eq!(find_previous_summary(&msgs), Some("新摘要"));
-    }
-
-    #[test]
-    fn find_previous_summary_returns_none_when_no_compaction() {
-        let msgs = vec![
-            Message::user("u1".to_string()),
-            Message::assistant(Some("a1".to_string())),
-        ];
-        assert_eq!(find_previous_summary(&msgs), None);
     }
 }

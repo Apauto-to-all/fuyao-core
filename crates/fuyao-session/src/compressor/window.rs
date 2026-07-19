@@ -1,9 +1,7 @@
 //! 窗口算法：保留最近窗口的 token 预算切分 + 整 turn 完整性
 //!
-//! 算法（融合 opencode 简单做法 + 归档 `expand_for_integrity`）：
-//! 1. 反向遍历 messages 累加 token 估算，直到达到 keep_tokens 预算 → 切分点
-//! 2. 切分点处的 assistant+tool 块若不完整，向前扩大至完整块边界
-//! 3. 强制保留最后一条 user + assistant（防活跃任务丢失、防 UI 看不见上一条回复）
+//! 仅用于决定 apply 时「保留多少近账」（keep_recent），不再参与摘要请求构造——
+//! 摘要请求把全部消息原样发给 LLM，不切窗口、不序列化，前缀缓存完整命中。
 
 use fuyao_api::{Message, MessageKind};
 
@@ -13,9 +11,9 @@ const CHARS_PER_TOKEN: usize = 4;
 /// 窗口切分结果
 #[derive(Debug)]
 pub struct Window<'a> {
-    /// 被压缩的旧部分（喂摘要 LLM）
+    /// 被压缩的旧部分（apply 时从内存剔除，由 LLM 摘要覆盖）
     pub to_compress: &'a [Message],
-    /// 保留的近端窗口（原样留在可见消息流里）
+    /// 保留的近端窗口（apply 时原样留在可见消息流里）
     pub keep_recent: &'a [Message],
 }
 
@@ -42,7 +40,6 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
 /// 步骤：
 /// 1. 反向累加 token 到 keep_tokens → 找切分点
 /// 2. 扩大至 turn 完整边界（不切断 assistant+tool_result 块）
-/// 3. 强制最后一条 user/assistant 留 tail
 pub fn select_recent<'a>(messages: &'a [Message], keep_tokens: usize) -> Window<'a> {
     if messages.is_empty() {
         return Window {
@@ -66,9 +63,6 @@ pub fn select_recent<'a>(messages: &'a [Message], keep_tokens: usize) -> Window<
 
     // 扩大至整 turn 完整边界
     let cut = expand_for_integrity(messages, cut);
-
-    // ponytail: 不再单独强制最后一条 user/assistant——
-    // 反向累加必然包含 messages[len-1]，且 expand_for_integrity 保证 tool 块完整
 
     Window {
         to_compress: &messages[..cut],
@@ -115,7 +109,7 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
         if msg.role == "assistant" {
             if let Some(ref tool_calls) = msg.tool_calls {
                 // 检查这个 assistant 的所有 tool_call_id 是否在后续消息中都有 result
-                // ponytail: 解析出 owned id 列表避免借用冲突（call_ids 跨整个 if 块使用）
+                // ponytail: 解析出 owned id 列表避免借用冲突
                 let call_ids: Vec<String> =
                     serde_json::from_value::<Vec<serde_json::Value>>(tool_calls.clone())
                         .map(|calls| {
@@ -131,7 +125,7 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
                 let call_id_refs: std::collections::HashSet<&str> =
                     call_ids.iter().map(String::as_str).collect();
 
-                // 收集 cut 之后的 tool result id（注：这里看 messages[scan+1..total]）
+                // 收集 cut 之后的 tool result id
                 let result_ids: std::collections::HashSet<&str> = messages[scan + 1..total]
                     .iter()
                     .filter(|m| m.role == "tool")
@@ -157,59 +151,6 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
     0
 }
 
-/// 把一批消息序列化为喂摘要 LLM 的纯文本
-///
-/// 格式：`[role]: content`，对齐 opencode `serialize()`。
-/// tool_calls 用 JSON 字符串简短表示。tool 输出超过 2000 字符截断（防止巨大结果污染摘要）。
-const TOOL_OUTPUT_MAX_CHARS: usize = 2000;
-
-pub fn serialize_for_summary(messages: &[Message]) -> String {
-    let mut parts = Vec::with_capacity(messages.len());
-    for msg in messages {
-        if msg.kind == MessageKind::Compaction {
-            // 历史压缩边界：摘要正文直接呈现
-            let content = msg.content.as_deref().unwrap_or("");
-            parts.push(format!("[历史摘要]:\n{}", content));
-            continue;
-        }
-        let role_label = match msg.role.as_str() {
-            "user" => "[User]",
-            "assistant" => "[Assistant]",
-            "tool" => "[Tool result]",
-            "system" => "[System]",
-            _ => "[Other]",
-        };
-        let mut line = match msg.role.as_str() {
-            "tool" => {
-                // tool 输出过长截断
-                let content = msg.content.as_deref().unwrap_or("");
-                let truncated = if content.len() > TOOL_OUTPUT_MAX_CHARS {
-                    format!("{}...(已截断)", &content[..TOOL_OUTPUT_MAX_CHARS])
-                } else {
-                    content.to_string()
-                };
-                format!("{role_label}: {truncated}")
-            }
-            _ => {
-                let content = msg.content.as_deref().unwrap_or("");
-                let tool_info = msg
-                    .tool_calls
-                    .as_ref()
-                    .map(|tc| format!(" [tool_calls: {tc}]"))
-                    .unwrap_or_default();
-                format!("{role_label}: {content}{tool_info}")
-            }
-        };
-        if let Some(reasoning) = msg.reasoning.as_deref()
-            && !reasoning.is_empty()
-        {
-            line.push_str(&format!("\n  [推理]: {reasoning}"));
-        }
-        parts.push(line);
-    }
-    parts.join("\n\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,14 +163,11 @@ mod tests {
 
     #[test]
     fn select_recent_keeps_tail_within_budget() {
-        // 4 条消息，每条 ~10 token；预算 25 token（够装 ~2 条）
         let msgs: Vec<Message> = (0..4)
             .map(|i| Message::user(format!("消息_{i}_{}", "x".repeat(20))))
             .collect();
         let w = select_recent(&msgs, 25);
-        // tail 至少保留最后 1-2 条
         assert!(!w.keep_recent.is_empty());
-        // head + tail = 全集
         assert_eq!(w.to_compress.len() + w.keep_recent.len(), msgs.len());
     }
 
@@ -253,9 +191,8 @@ mod tests {
         let msgs = vec![
             Message::user("u1".to_string()),
             Message::assistant(Some("a1".to_string())),
-            Message::user("u2".to_string()), // 切分点在这之后安全
+            Message::user("u2".to_string()),
         ];
-        // cut=2 指向 "u2"，是安全边界
         assert_eq!(expand_for_integrity(&msgs, 2), 2);
     }
 
@@ -265,32 +202,10 @@ mod tests {
         assistant_with_tc.tool_calls = Some(serde_json::json!([{"id": "call_1"}]));
         let msgs = vec![
             Message::user("u1".to_string()),
-            assistant_with_tc, // assistant + tool_call
-            Message::tool_result("call_1".into(), "结果".into()), // tool result
+            assistant_with_tc,
+            Message::tool_result("call_1".into(), "结果".into()),
             Message::user("u2".to_string()),
         ];
-        // cut=2 指向 "tool result"，需要向前扩大到 assistant 之前的 user
-        // assistant 的 tool_call 在 messages[1+1..] = messages[2..] 里有结果（call_1）
-        // 所以 messages[1] (assistant) 的块完整 → 切分点 = 1
         assert_eq!(expand_for_integrity(&msgs, 2), 1);
-    }
-
-    #[test]
-    fn serialize_includes_role_labels() {
-        let msgs = vec![
-            Message::user("你好".to_string()),
-            Message::assistant(Some("回复".to_string())),
-        ];
-        let s = serialize_for_summary(&msgs);
-        assert!(s.contains("[User]: 你好"));
-        assert!(s.contains("[Assistant]: 回复"));
-    }
-
-    #[test]
-    fn serialize_truncates_long_tool_output() {
-        let long = "y".repeat(3000);
-        let msgs = vec![Message::tool_result("c1".into(), long)];
-        let s = serialize_for_summary(&msgs);
-        assert!(s.contains("已截断"));
     }
 }

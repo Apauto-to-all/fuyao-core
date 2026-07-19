@@ -230,8 +230,9 @@ async fn run_pre_turn_compression(
         "触发上下文压缩"
     );
 
-    // 执行层：生成摘要
+    // 执行层：生成摘要（原消息原样发，前缀缓存完整命中）
     let summary = match fuyao_session::generate_summary(
+        session.system_prompt.as_deref(),
         &session.messages,
         &ctx.provider,
         model_id,

@@ -1,9 +1,12 @@
-//! 摘要 prompt 模板
+//! 摘要提示词
 //!
-//! 搬自归档 `compressor/mod.rs:COMPRESSION_SYSTEM_PROMPT`，补充 previous-summary
-//! 增量更新块（对齐 opencode + hermes 共识：多次压缩时把上次摘要喂回 LLM）。
+//! 作为**末尾追加的 user 消息**触发摘要，原对话消息和 system_prompt 都不动——
+//! 这是前缀缓存的生命线（system + 原消息序列都不变，缓存完整命中，只末尾加一条指令）。
+//!
+//! 多次压缩场景：上一次的 compaction 消息（role=system, content=旧摘要）原样在
+//! 消息序列里，LLM 自然能看到，不需要单独提取 previous_summary 注入。
 
-/// 摘要系统提示词
+/// 摘要指令（作为末尾追加的 user 消息内容）
 ///
 /// 强约束：① 不回答对话中的问题，只输出摘要 ② 用对话语言 ③ 不泄密钥 ④ 输出固定
 /// 8 段 Markdown 结构。LLM 不需要被赋予主动性——这是结构化抽取任务，不是对话。
@@ -49,49 +52,3 @@ pub const COMPRESSION_SYSTEM_PROMPT: &str = r#"你是一个摘要代理，负责
 - 保留精确文件路径、命令、错误字符串和标识符。
 - 不要提及摘要过程或上下文被压缩。
 - 不要调用任何工具，只输出摘要文本。"#;
-
-/// 构造单条 user 消息内容：把待压缩的对话序列化喂给 LLM。
-///
-/// 多次压缩时把上一次的摘要作为 `<previous-summary>` 喂回，要求 LLM 「保留旧信息 +
-/// 增量新信息」（对齐 opencode + hermes 共识，防多轮压缩信息流失）。
-pub fn build_prompt(serialized_conversation: &str, previous_summary: Option<&str>) -> String {
-    let prev_block = match previous_summary {
-        Some(s) if !s.is_empty() => {
-            format!(
-                "<previous-summary>\n以下是上一轮压缩产出的摘要，请保留其中仍相关的信息，并增量纳入本次对话的新进展：\n\n{s}\n</previous-summary>\n\n"
-            )
-        }
-        _ => String::new(),
-    };
-
-    format!(
-        "{prev_block}<conversation-to-summarize>\n{serialized_conversation}\n</conversation-to-summarize>"
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_prompt_without_previous_summary() {
-        let p = build_prompt("user: 你好\nassistant: 你好！", None);
-        assert!(p.contains("<conversation-to-summarize>"));
-        assert!(p.contains("你好"));
-        assert!(!p.contains("<previous-summary>"));
-    }
-
-    #[test]
-    fn build_prompt_with_previous_summary() {
-        let p = build_prompt("user: 继续\nassistant: 完成", Some("## 目标\n- 老任务"));
-        assert!(p.contains("<previous-summary>"));
-        assert!(p.contains("老任务"));
-        assert!(p.contains("<conversation-to-summarize>"));
-    }
-
-    #[test]
-    fn build_prompt_with_empty_previous_summary_omits_block() {
-        let p = build_prompt("对话", Some(""));
-        assert!(!p.contains("<previous-summary>"));
-    }
-}
