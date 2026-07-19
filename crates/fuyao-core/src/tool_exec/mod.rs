@@ -4,16 +4,16 @@
 //! 工具执行是 session 级——各 task 在自己的 ReAct 循环里查 handler 执行，互不等。
 //!
 //! 工具结果不走队列：它是 ReAct 循环的内部中间产物，产生时 task 正握着控制权，
-//! 直接 push 进 task 本地的 `session.messages`，然后 continue 回循环顶部。
+//! 通过 `result_tx` 通知调用方，调用方立即走 `emit_to_history`（拦截 → push messages → 发事件）。
 //!
 //! 关键设计：
-//! - **完成一个 emit 一个**：每执行完一个工具就立即发 ToolResult 事件 + 返回结果，
+//! - **完成一个通知一个**：每执行完一个工具就立即通过 `result_tx` 发送结果，
 //!   不等所有工具都跑完才批量发出（避开归档「收齐再 emit、中断丢已完成结果」的结构债）。
-//!   并行版用 `JoinSet::join_next` 逐个收，完成即 emit；串行版在循环里逐个 emit。
+//!   并行版用 `JoinSet::join_next` 逐个收，完成即通知；串行版在循环里逐个通知。
+//! - **本模块不再 emit 事件**：emit/拦截/push session.messages 是调用方（turn.rs）的职责，
+//!   经 `emit_to_history` 统一入口完成。本模块只负责"执行 + 通知"。
 //! - **智能调度**：`should_parallelize` 判定批次能否并行（never_parallel / 路径重叠 /
 //!   parallel_safe），能并行走 `execute_parallel`（JoinSet + Semaphore），否则走 `execute_sequential`。
-//! - **emit 顺序 = 完成顺序；返回顺序 = 提交顺序**：并行时 UI 先看到先完成的工具结果，
-//!   喂给 LLM 的 tool_result 仍按 tool_call 提交序对齐（确定性）。
 //! - **容错降级**：未知工具不报错（返回提示字符串），参数解析失败用 `Value::Null`。
 //! - **工具的并发安全是工具自己的责任**：引擎只负责「让多个 session 能同时调同一个工具」，
 //!   不介入排序/加锁。Semaphore/JoinSet 是每次调用的局部对象，session 间互不可见、互不协调。
@@ -26,16 +26,13 @@
 
 mod parallel;
 
-use crate::dispatch;
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::ToolCallContext;
-use fuyao_api::message::output::{ToolResultMessage, ToolResultPayload};
-use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_hooks::SharedHooks;
 use fuyao_provider::ToolCallData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::Sender;
 use tokio::task::JoinSet;
 
 /// 单个工具执行的结果
@@ -51,18 +48,20 @@ pub(crate) struct ToolExecResult {
 /// 执行一批工具调用（智能调度：能并行则并行，否则串行）
 ///
 /// 空批次直接返回。否则读 `[tools.runner]` 配置，`should_parallelize` 判定走并行还是串行。
-/// 两种路径都遵循「完成一个 emit 一个」。
+/// 两种路径都遵循「完成一个通知一个」——通过 `result_tx` 发送结果，调用方据此立即
+/// 走 `emit_to_history`（拦截 → push session.messages → 发送事件 → 观察）。
 ///
-/// 工具结果最终全部返回（提交顺序），供调用方 push 进 task 本地的 `session.messages`。
+/// 工具事件（ToolResult OutputEvent）的 emit 与拦截不在本模块做——归调用方统一处理，
+/// 保证「拦截 → 存储 → 消费」三者数据一致。
 pub(crate) async fn execute_tools(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
-    hooks: &SharedHooks,
-) -> Vec<ToolExecResult> {
+    result_tx: &Sender<ToolExecResult>,
+) {
     if tool_calls.is_empty() {
-        return Vec::new();
+        return;
     }
 
     // 工具并发策略从全局配置读取（`[tools.runner]`），运行期只读
@@ -84,57 +83,58 @@ pub(crate) async fn execute_tools(
             max_concurrent = config.max_concurrent,
             "工具批次并行执行"
         );
-        execute_parallel(tool_calls, tools, agent_paths, emitter, hooks, &config).await
+        execute_parallel(tool_calls, tools, agent_paths, emitter, result_tx, &config).await
     } else {
-        execute_sequential(tool_calls, tools, agent_paths, emitter, hooks).await
+        execute_sequential(tool_calls, tools, agent_paths, emitter, result_tx).await
     }
 }
 
 /// 串行执行一批工具调用
 ///
-/// 逐个查注册表 → 调 handler → 立即经管道发 ToolResult 事件 → 收集结果。
-/// 完成一个发出一个，不等全部跑完。返回结果按提交顺序供调用方 push 进 messages。
+/// 逐个查注册表 → 调 handler → 立即通过 `result_tx` 通知调用方。
+/// 完成一个通知一个，不等全部跑完。
 async fn execute_sequential(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
-    hooks: &SharedHooks,
-) -> Vec<ToolExecResult> {
+    result_tx: &Sender<ToolExecResult>,
+) {
     let session_id = emitter.session_id().to_string();
-    let mut results = Vec::with_capacity(tool_calls.len());
 
     for tc in tool_calls {
         let result = execute_single(tc, tools, agent_paths, &session_id).await;
-        // 完成一个发出一个：立即经管道发 ToolResult 事件
-        dispatch::dispatch(emitter, hooks, tool_result_event(&result), None).await;
-        results.push(result);
+        // 完成一个通知一个：调用方据此立即走 emit_to_history
+        if result_tx.send(result).await.is_err() {
+            tracing::warn!(
+                session_id = emitter.session_id(),
+                "result_tx 已关闭，工具结果丢弃"
+            );
+            return;
+        }
     }
-
-    results
 }
 
 /// 并行执行一批工具调用
 ///
 /// 使用 JoinSet + Semaphore 控制并发数。
-/// - **emit 顺序 = 完成顺序**：`join_next` 逐个收，完成即经管道发出（UX 友好，先完成先看到）。
-/// - **返回顺序 = 提交顺序**：spawn 时记录 idx，结果写入预分配 `Vec<Option>` 对应槽位，
-///   最后 flatten 恢复提交序（喂 LLM 时 tool_result 与 tool_call 对齐，确定性）。
-/// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误结果，不连坐兄弟任务。
+/// - **通知顺序 = 完成顺序**：`join_next` 逐个收，完成即通过 `result_tx` 通知调用方
+///   （UX 上调用方立即走 emit_to_history，UI 先看到先完成的工具结果）。
+/// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误日志，不连坐兄弟任务。
 ///   JoinSet drop 时自动 abort 所有未完成任务（中断取消语义由调用方的 select! drop 触发）。
 async fn execute_parallel(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
-    hooks: &SharedHooks,
+    result_tx: &Sender<ToolExecResult>,
     config: &fuyao_api::ToolRunnerConfig,
-) -> Vec<ToolExecResult> {
+) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
     let session_id = emitter.session_id().to_string();
-    let mut join_set: JoinSet<(usize, ToolExecResult)> = JoinSet::new();
+    let mut join_set: JoinSet<ToolExecResult> = JoinSet::new();
 
-    for (idx, tc) in tool_calls.iter().enumerate() {
+    for tc in tool_calls {
         let tc = tc.clone();
         let tools = tools.clone(); // Arc clone，廉价，多并行 task 共享同一注册表
         let agent_paths = agent_paths.clone(); // AgentPaths 已 Clone
@@ -144,20 +144,21 @@ async fn execute_parallel(
         join_set.spawn(async move {
             // 获取许可：限制同一批次内同时运行的工具数（session 局部，不影响其他 session）
             let _permit = semaphore.acquire().await;
-            let result = execute_single(&tc, &tools, &agent_paths, &session_id).await;
-            (idx, result)
+            execute_single(&tc, &tools, &agent_paths, &session_id).await
         });
     }
 
-    // 预分配：按提交序存放，spawn 用 idx 回填；完成序 emit、提交序返回
-    let mut slots: Vec<Option<ToolExecResult>> = (0..tool_calls.len()).map(|_| None).collect();
-
-    // join_next 逐个收：完成一个经管道发出一个
+    // join_next 逐个收：完成一个通知一个（调用方据此 emit_to_history）
     while let Some(joined) = join_set.join_next().await {
         match joined {
-            Ok((idx, result)) => {
-                dispatch::dispatch(emitter, hooks, tool_result_event(&result), None).await;
-                slots[idx] = Some(result);
+            Ok(result) => {
+                if result_tx.send(result).await.is_err() {
+                    tracing::warn!(
+                        session_id = emitter.session_id(),
+                        "result_tx 已关闭，剩余工具结果丢弃"
+                    );
+                    return;
+                }
             }
             Err(join_err) => {
                 // task panic / 被取消：不连坐兄弟任务，降级为错误日志
@@ -169,9 +170,6 @@ async fn execute_parallel(
             }
         }
     }
-
-    // 恢复提交顺序：flatten 丢弃 panic 留下的空槽位
-    slots.into_iter().flatten().collect()
 }
 
 /// 执行单个工具调用
@@ -222,18 +220,6 @@ async fn execute_single(
         tool_name,
         content,
     }
-}
-
-/// 由结果构造 ToolResult 事件（base.session_id 由 Emitter 盖标签）
-fn tool_result_event(result: &ToolExecResult) -> OutputEvent {
-    OutputEvent::ToolResult(ToolResultMessage {
-        base: EventBase::default(),
-        payload: ToolResultPayload {
-            tool_call_id: result.tool_call_id.clone(),
-            tool_name: result.tool_name.clone(),
-            content: result.content.clone(),
-        },
-    })
 }
 
 #[cfg(test)]

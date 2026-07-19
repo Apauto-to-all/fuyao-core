@@ -259,6 +259,15 @@ struct TestHarness {
 }
 
 async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> TestHarness {
+    make_harness_with_hooks(provider, tools, empty_hooks()).await
+}
+
+/// 同 make_harness，但允许传入自定义 hooks（用于拦截同步测试）
+async fn make_harness_with_hooks(
+    provider: Arc<dyn Provider>,
+    tools: Arc<ToolRegistry>,
+    hooks: fuyao_hooks::SharedHooks,
+) -> TestHarness {
     let store = temp_store().await;
     let mut session = Session::new(None, Some("系统提示词".to_string()));
     store.create(&mut session).await.unwrap();
@@ -268,7 +277,7 @@ async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> 
         store,
         provider,
         tools,
-        hooks: empty_hooks(),
+        hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
         agent_config: fuyao_api::AgentConfig::default(),
         emitter: Emitter::new(tx_event, "test_session".to_string()),
@@ -1163,4 +1172,122 @@ async fn cost_accumulated_per_assistant_message() {
         "两条 Message.cost({sum_costs}) 之和应等于 session.total_cost({})",
         h.session.total_cost
     );
+}
+
+// ===== emit_to_history 端到端拦截同步测试 =====
+
+use fuyao_hooks::{HooksRegistry, InterceptResult};
+
+/// 拦截修改最终 Assistant content 后：
+/// - session.messages 里的 Message 携带修改后内容
+/// - 下轮 build_chat_request 用的是修改后内容（拦截→存储→消费三者一致）
+#[tokio::test]
+async fn intercept_modifies_final_assistant_in_history_and_next_request() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "原始内容",
+    )]));
+    let tools = Arc::new(ToolRegistry::builder().build());
+
+    // 注册拦截器：给 Assistant content 加前缀 "[脱敏]"
+    let hooks: fuyao_hooks::SharedHooks =
+        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
+    {
+        let mut reg = hooks.lock().await;
+        reg.register_output_intercept(
+            0,
+            Arc::new(|ev| {
+                if let OutputEvent::Assistant(m) = ev {
+                    let mut modified = m.clone();
+                    if let Some(c) = &mut modified.payload.content {
+                        *c = format!("[脱敏]{c}");
+                    }
+                    InterceptResult::Pass(OutputEvent::Assistant(modified))
+                } else {
+                    InterceptResult::Pass(ev.clone())
+                }
+            }),
+        );
+    }
+
+    let mut h = make_harness_with_hooks(provider, tools, hooks).await;
+    preload_user(&mut h, "用户问题");
+
+    turn::run_turn(
+        &h.ctx,
+        &mut h.session,
+        &mut h.rx_interrupt,
+        MessageParams::default(),
+    )
+    .await;
+
+    // 1. session.messages 最后一条是修改后的内容
+    let last_msg = h
+        .session
+        .messages
+        .last()
+        .expect("应有 assistant 消息进历史");
+    assert_eq!(last_msg.role, "assistant");
+    assert_eq!(
+        last_msg.content.as_deref(),
+        Some("[脱敏]原始内容"),
+        "session.messages 应携带拦截后的内容"
+    );
+
+    // 2. 下轮 build_chat_request 用的是修改后内容（端到端一致性）
+    let request = super::builders::build_chat_request(&h.session);
+    let assistant_in_request = request
+        .messages
+        .iter()
+        .rfind(|m| m.role == "assistant")
+        .expect("ChatRequest 应包含 assistant 消息");
+    assert_eq!(
+        assistant_in_request.content.as_deref(),
+        Some("[脱敏]原始内容"),
+        "下轮 LLM 请求应使用拦截后的内容（拦截→存储→消费一致）"
+    );
+}
+
+/// 拦截 Block 最终 Assistant 后：session.messages 不含 assistant 消息（不计费、不进历史）
+#[tokio::test]
+async fn intercept_block_skips_final_assistant_in_history() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "被拦截",
+    )]));
+    let tools = Arc::new(ToolRegistry::builder().build());
+
+    let hooks: fuyao_hooks::SharedHooks =
+        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
+    {
+        let mut reg = hooks.lock().await;
+        reg.register_output_intercept(
+            0,
+            Arc::new(|ev| {
+                if matches!(ev, OutputEvent::Assistant(_)) {
+                    InterceptResult::Block("拦截 assistant".to_string())
+                } else {
+                    InterceptResult::Pass(ev.clone())
+                }
+            }),
+        );
+    }
+
+    let mut h = make_harness_with_hooks(provider, tools, hooks).await;
+    preload_user(&mut h, "用户问题");
+
+    turn::run_turn(
+        &h.ctx,
+        &mut h.session,
+        &mut h.rx_interrupt,
+        MessageParams::default(),
+    )
+    .await;
+
+    // Block：不应有任何 assistant 消息进 session.messages（只有 preload 的 user）
+    let has_assistant = h.session.messages.iter().any(|m| m.role == "assistant");
+    assert!(
+        !has_assistant,
+        "Block 时 assistant 消息不应进 session.messages"
+    );
+    // total_cost 也应为 0（拦截 Block 的消息不计费）
+    assert_eq!(h.session.total_cost, 0.0, "Block 时不应累积任何费用");
 }

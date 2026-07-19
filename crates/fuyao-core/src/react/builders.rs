@@ -3,14 +3,18 @@
 //! 从 ReAct 循环抽出的纯构造逻辑：
 //! - [`build_chat_request`]：从 session.messages 凑 ChatRequest
 //! - [`build_model_and_options`]：从 MessageParams 解析 model + StreamOptions
-//! - 各类 Assistant Message / Payload 构造器
+//! - 各类 Assistant Payload 构造器（事件用）
 //! - 工具调用拦截回灌用的双向转换函数
+//! - [`fill_assistant_message_usage_and_cost`]：填 assistant Message 的 token + cost 字段
+//!
+//! 注：Message 主体构造由 turn.rs 的 emit_to_history 闭包内联完成（因每种事件的字段映射不同，
+//! 集中成 trait 反而过度抽象）。本模块只留 payload 构造、请求构造与 token/cost 填充。
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{Message, MessageParams, Session};
+use fuyao_api::{MessageParams, Session};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 
 /// 从 session 的内存历史凑 ChatRequest
@@ -108,72 +112,6 @@ pub(crate) fn build_model_and_options(
     (model, options)
 }
 
-/// 从流式结果构建 Assistant Message（无工具调用，最终回复）
-pub(crate) fn build_assistant_message(result: &StreamResult, model_id: Option<&str>) -> Message {
-    let mut msg = Message::assistant(if result.text.is_empty() {
-        None
-    } else {
-        Some(result.text.clone())
-    });
-    if !result.reasoning.is_empty() {
-        msg.reasoning = Some(result.reasoning.clone());
-    }
-    msg.model_id = model_id.map(|s| s.to_string());
-    msg.finish_reason = Some("stop".to_string());
-    // 填本轮 usage 到持久化字段（DB 落库需要，cost 计算的数据源）
-    fill_message_usage(&mut msg, &result.usage);
-    msg
-}
-
-/// 从流式结果构建含 tool_calls 的 Assistant Message（用于进内存历史）
-///
-/// tool_calls 转成 OpenAI 格式 JSON：[{id, type:"function", function:{name, arguments}}]
-pub(crate) fn build_assistant_message_with_tool_calls(
-    result: &StreamResult,
-    model_id: Option<&str>,
-) -> Message {
-    let tool_calls_json: Vec<serde_json::Value> = result
-        .tool_calls
-        .iter()
-        .map(|tc| {
-            serde_json::json!({
-                "id": tc.id,
-                "type": "function",
-                "function": {
-                    "name": tc.name,
-                    "arguments": tc.arguments,
-                }
-            })
-        })
-        .collect();
-
-    let mut msg = Message::assistant(if result.text.is_empty() {
-        None
-    } else {
-        Some(result.text.clone())
-    });
-    if !result.reasoning.is_empty() {
-        msg.reasoning = Some(result.reasoning.clone());
-    }
-    msg.tool_calls = Some(serde_json::Value::Array(tool_calls_json));
-    msg.model_id = model_id.map(|s| s.to_string());
-    msg.finish_reason = Some("tool_calls".to_string());
-    // 填本轮 usage 到持久化字段（DB 落库需要，cost 计算的数据源）
-    fill_message_usage(&mut msg, &result.usage);
-    msg
-}
-
-/// 把本轮 usage 写入 Message 的持久化 token 字段
-///
-/// 单独抽出避免两个 build 函数重复同一段 4 行赋值。cost 字段不在本函数填——
-/// 它由 turn 层计算后填入（依赖 agent_paths，不在纯构造器里做）。
-fn fill_message_usage(msg: &mut Message, usage: &fuyao_provider::StreamUsage) {
-    msg.prompt_tokens = usage.prompt_tokens as i64;
-    msg.completion_tokens = usage.completion_tokens as i64;
-    msg.reasoning_tokens = usage.completion_reasoning_tokens.unwrap_or(0) as i64;
-    msg.cached_tokens = usage.prompt_cached_tokens.unwrap_or(0) as i64;
-}
-
 /// 从流式结果构建 AssistantPayload（无工具调用，最终回复事件）
 pub(crate) fn assistant_msg_to_payload(result: &StreamResult) -> AssistantPayload {
     AssistantPayload {
@@ -235,6 +173,9 @@ pub(crate) fn assistant_with_tool_calls_to_payload(result: &StreamResult) -> Ass
 // 工具调用逐个经 dispatch_intercept 拦截后，需要从拦截后的 OutputEvent::ToolCall
 // 提取出执行用的 ToolCallData（参数可能被插件修改），保证「执行 / 存储 / 发送」
 // 三者数据一致（都以拦截后的 payload 为准）。
+//
+// 注：assistant Message 的 token + cost 字段填充归 fuyao-session 的 `fill_message_cost`
+// 统一实现（所有费用计算集中在 session 模块，避免散落）。
 
 /// 把单个工具调用数据构造成 ToolCall 输出事件（供逐个拦截用）
 pub(crate) fn tool_call_data_to_event(tc: &ToolCallData) -> OutputEvent {
@@ -267,7 +208,7 @@ pub(crate) fn tool_call_event_to_data(event: &OutputEvent) -> Option<ToolCallDat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::Session;
+    use fuyao_api::{Message, Session};
 
     /// 构造带工具调用的 assistant Message
     fn assistant_with_calls(ids: &[&str]) -> Message {

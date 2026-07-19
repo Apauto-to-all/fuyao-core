@@ -13,9 +13,10 @@
 //! 4. **观察（observe）**：插件只读副作用（持久化/日志/统计）
 //!
 //! 调用方式：
-//! - 大多数消息（Chunk/Error/ToolResult/Assistant 等）用 [`dispatch`]，process 传 None
-//! - 需要处理动作的消息（User 入队/ToolCall 收集/Interrupt 投递）用 [`dispatch`]，
-//!   process 传对应回调
+//! - **进历史的消息**（User 回显后的入队、Assistant、ToolResult 等）用
+//!   [`emit_to_history`]：拦截 → 用拦截后事件构造 Message 并 push 进 session.messages
+//!   → 发送事件 → 观察。**所有要落到 DB 的消息必经此入口**，保证拦截→存储→消费三者一致
+//! - 不进历史的纯事件（Chunk/Error/Compression/Interrupt 通知等）用 [`dispatch`]，process 传 None
 //! - 工具调用需要拿拦截结果回灌时，用 [`dispatch_intercept`] 单独拦截
 
 mod deliver;
@@ -23,6 +24,7 @@ mod intercept;
 
 use crate::emit::Emitter;
 use fuyao_api::message::OutputEvent;
+use fuyao_api::{Message, Session};
 use fuyao_hooks::SharedHooks;
 use std::future::Future;
 use std::pin::Pin;
@@ -43,6 +45,9 @@ pub(crate) type ProcessFn =
 /// 处理回调必须是轻量、不阻塞的（入队、收集、投递）；耗时动作（工具执行）在管道外。
 ///
 /// Block 时整条丢弃（不执行处理、不发送、不观察）。
+///
+/// 注意：本函数**不 push session.messages**——只走管道。如需把拦截后的消息落到
+/// 历史（进 DB + 下轮 LLM 输入），用 [`emit_to_history`]。
 pub(crate) async fn dispatch(
     emitter: &Emitter,
     hooks: &SharedHooks,
@@ -63,10 +68,62 @@ pub(crate) async fn dispatch(
     deliver(emitter, hooks, intercepted).await;
 }
 
+/// 进历史消息的统一出口：拦截 → 构造 Message push → 发送事件 → 观察
+///
+/// 所有要进 `session.messages`（影响下轮 LLM 输入 + 落库）的消息必经此入口。
+/// 保证「拦截 → 存储 → 消费」三者数据一致——拦截后的事件既用来构造 Message push，
+/// 又用来发送给 UI，同源不分裂。
+///
+/// `msg_from_event` 闭包从拦截后的 OutputEvent 提取字段构造 Message。
+/// 返回 `None` 表示该事件不应进历史（如转换失败或不匹配的事件类型）。
+///
+/// **token + cost 自动累积**：闭包返回的 Message 应已填好 token + cost 字段
+/// （由调用方在闭包内用 `fill_assistant_message_usage_and_cost` 填充）。
+/// 本函数识别 assistant 角色自动累积 `session.total_*`——push 和计费强绑定，
+/// 未来新增 assistant 产出点不会漏算 cost。
+///
+/// Block 时：不 push、不发，返回 None（调用方据此跳过后续动作，如入队）。
+/// 与现有 ToolCall Block 语义一致——消息不进历史、UI 看不到，是插件的责任。
+///
+/// 返回拦截后事件供调用方做后续动作（如入队、计费）。
+pub(crate) async fn emit_to_history(
+    emitter: &Emitter,
+    hooks: &SharedHooks,
+    session: &mut Session,
+    event: OutputEvent,
+    msg_from_event: impl FnOnce(&OutputEvent) -> Option<Message>,
+) -> Option<OutputEvent> {
+    // 1. 拦截
+    let intercepted = intercept(emitter, hooks, event).await?;
+
+    // 2. 用拦截后事件构造 Message，识别 assistant 累积 session 总计后 push
+    if let Some(msg) = msg_from_event(&intercepted) {
+        // 自动累积 session.total_*（仅 assistant 角色；cost 用 Decimal 精确累加，
+        // 避免 f64 加法误差——累积逻辑统一在 fuyao_session::accumulate_session_total）
+        let is_assistant = msg.role == "assistant";
+        let msg_cost = msg.cost;
+        fuyao_session::accumulate_session_total(session, &msg);
+        if is_assistant {
+            tracing::debug!(
+                session_id = emitter.session_id(),
+                cost = msg_cost,
+                total_cost = session.total_cost,
+                "本轮费用已累积"
+            );
+        }
+        session.messages.push(msg);
+    }
+
+    // 3. 发送事件给 UI + 4. 观察钩子
+    deliver(emitter, hooks, intercepted.clone()).await;
+
+    Some(intercepted)
+}
+
 /// 仅拦截（不含处理/发送/观察），返回拦截后事件
 ///
-/// 用于工具调用等需要拿拦截结果回灌的场景：拦截后从事件提取数据，
-/// 攒成执行批次，再在管道外批量执行。
+/// 用于 User 入站等需要拿拦截后 payload 做后续动作（入队用拦截后 content）
+/// 但不直接 push session.messages 的场景（push 时机由队列消费决定）。
 pub(crate) async fn dispatch_intercept(
     emitter: &Emitter,
     hooks: &SharedHooks,
@@ -278,5 +335,112 @@ mod tests {
             }
             _ => panic!("应为 Assistant 事件"),
         }
+    }
+
+    // ===== emit_to_history 测试 =====
+
+    /// 从 Assistant 事件构造 Message（模拟业务闭包）
+    fn assistant_msg_from_event(ev: &OutputEvent) -> Option<Message> {
+        match ev {
+            OutputEvent::Assistant(m) => {
+                let mut msg = Message::assistant(m.payload.content.clone());
+                msg.reasoning = m.payload.reasoning.clone();
+                Some(msg)
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_to_history_pushes_message_when_pass() {
+        // 拦截 Pass：用拦截后 payload 构造 Message push 进 session.messages，事件也发出
+        let (emitter, hooks, mut rx) = make_emitter_hooks();
+        let mut session = Session::default();
+
+        emit_to_history(
+            &emitter,
+            &hooks,
+            &mut session,
+            make_assistant_event("hello"),
+            assistant_msg_from_event,
+        )
+        .await;
+
+        // session.messages 应有一条 Message，content 为 "hello"
+        assert_eq!(session.messages.len(), 1, "Pass 时应 push 一条 Message");
+        assert_eq!(session.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(session.messages[0].role, "assistant");
+
+        // 事件也应发出
+        assert!(rx.try_recv().is_ok(), "Pass 时应发出事件");
+    }
+
+    #[tokio::test]
+    async fn emit_to_history_pushes_modified_content() {
+        // 拦截修改 content 后，session.messages 里的 Message 携带修改后内容
+        // （拦截→存储→消费三者一致的核心验证）
+        let (emitter, hooks, _rx) = make_emitter_hooks();
+        {
+            let mut reg = hooks.lock().await;
+            reg.register_output_intercept(
+                0,
+                std::sync::Arc::new(|ev| {
+                    if let OutputEvent::Assistant(m) = ev {
+                        let mut modified = m.clone();
+                        if let Some(c) = &mut modified.payload.content {
+                            *c = format!("[已脱敏]{c}");
+                        }
+                        InterceptResult::Pass(OutputEvent::Assistant(modified))
+                    } else {
+                        InterceptResult::Pass(ev.clone())
+                    }
+                }),
+            );
+        }
+        let mut session = Session::default();
+
+        emit_to_history(
+            &emitter,
+            &hooks,
+            &mut session,
+            make_assistant_event("secret"),
+            assistant_msg_from_event,
+        )
+        .await;
+
+        // 关键断言：session.messages 里的是修改后内容（与 UI 看到的一致）
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(
+            session.messages[0].content.as_deref(),
+            Some("[已脱敏]secret"),
+            "session.messages 应携带拦截后的内容"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_to_history_skips_on_block() {
+        // 拦截 Block：不 push、不发，返回 None
+        let (emitter, hooks, mut rx) = make_emitter_hooks();
+        {
+            let mut reg = hooks.lock().await;
+            reg.register_output_intercept(
+                0,
+                std::sync::Arc::new(|_| InterceptResult::Block("插件拦截".to_string())),
+            );
+        }
+        let mut session = Session::default();
+
+        let result = emit_to_history(
+            &emitter,
+            &hooks,
+            &mut session,
+            make_assistant_event("blocked"),
+            assistant_msg_from_event,
+        )
+        .await;
+
+        assert!(result.is_none(), "Block 应返回 None");
+        assert!(session.messages.is_empty(), "Block 时不应 push Message");
+        assert!(rx.try_recv().is_err(), "Block 时不应发出事件");
     }
 }

@@ -389,54 +389,55 @@ async fn run_pre_turn_compression(
     }
 }
 
-/// 处理入站 User 消息：过完整管道（拦截 → 处理[入队] → 发送[回显] → 观察）
+/// 处理入站 User 消息：过完整管道（拦截 → 入队[用拦截后 content] → 发送[回显] → 观察）
 ///
-/// process 段按 mode 入 guide / pending 队列；deliver 段发 OutputEvent::User 回显给 UI。
-fn handle_inbound_user(
-    ctx: &SessionCtx,
-    inbound: InboundUser,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-    let guide = Arc::clone(&ctx.guide);
-    let pending = Arc::clone(&ctx.pending);
+/// 拦截后的 payload 用于入队，保证「队列里的内容 = UI 看到的内容 = 后续 push 进
+/// session.messages 的内容」三者一致。
+///
+/// Block 时：不入队、不回显（消息不参与对话）。
+///
+/// 注意：**不直接 push session.messages**——push 时机由队列消费（inject_messages）
+/// 决定，避免 pending 早 push 破坏消息顺序（pending 要等链结束才解禁）。
+async fn handle_inbound_user(ctx: &SessionCtx, inbound: InboundUser) {
     let mode = inbound.mode;
-    let queued = QueuedUserMessage {
-        content: inbound.content.clone(),
-        params: inbound.params,
-    };
-    // process 回调：按 mode 入队（瞬间、不阻塞）
-    let process: dispatch::ProcessFn = Box::new(move |_| {
-        let guide = guide.clone();
-        let pending = pending.clone();
-        Box::pin(async move {
-            match mode {
-                UserMessageMode::Guide => guide
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back(queued),
-                UserMessageMode::Pending => pending
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push_back(queued),
-            }
-        })
+    let event = OutputEvent::User(OutputUserMessage {
+        base: fuyao_api::message::EventBase::default(),
+        payload: UserPayload {
+            content: inbound.content,
+            mode,
+            source: UserMessageSource::User,
+        },
     });
 
-    Box::pin(async move {
-        dispatch::dispatch(
-            &ctx.emitter,
-            &ctx.hooks,
-            OutputEvent::User(OutputUserMessage {
-                base: fuyao_api::message::EventBase::default(),
-                payload: UserPayload {
-                    content: inbound.content,
-                    mode,
-                    source: UserMessageSource::User,
-                },
-            }),
-            Some(process),
-        )
-        .await;
-    })
+    // 拦截：返回拦截后事件，用于入队 + 发送
+    let Some(intercepted) = dispatch::dispatch_intercept(&ctx.emitter, &ctx.hooks, event).await
+    else {
+        return; // Block：不入队、不回显
+    };
+
+    // 从拦截后事件提取 content 入队（携带拦截后内容）
+    let queued = match &intercepted {
+        OutputEvent::User(m) => QueuedUserMessage {
+            content: m.payload.content.clone(),
+            params: inbound.params,
+        },
+        _ => return,
+    };
+    match mode {
+        UserMessageMode::Guide => ctx
+            .guide
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(queued),
+        UserMessageMode::Pending => ctx
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(queued),
+    }
+
+    // 发送拦截后事件给 UI（deliver：盖 session_id + 推到出口通道 + 观察钩子）
+    dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted).await;
 }
 
 /// 处理入站 Plugin 消息：把 input 侧 PluginMessage 转 output 侧 OutputEvent::Plugin，
