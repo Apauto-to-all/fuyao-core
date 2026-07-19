@@ -11,6 +11,9 @@ tokio = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 tracing.workspace = true
+fuyao-provider = { version = "0.1.0", path = "../fuyao-provider" }
 
 [dev-dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
 tempfile = { workspace = true }

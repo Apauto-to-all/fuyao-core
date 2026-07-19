@@ -16,8 +16,6 @@ fn current_timestamp() -> f64 {
 pub struct Session {
     /// 会话唯一标识
     pub id: String,
-    /// 父会话 ID（压缩分裂时指向原会话）
-    pub parent_session_id: Option<String>,
     /// 会话标题
     pub title: Option<String>,
     /// 系统提示词
@@ -42,6 +40,10 @@ pub struct Session {
     pub ended_at: Option<f64>,
     /// 结束原因
     pub end_reason: Option<String>,
+    /// 被压缩过的次数（每次 mark_compaction +1，用于精度降级提示）
+    pub compression_count: i32,
+    /// 最近一次压缩边界消息的 seq（NULL = 从未压缩）
+    pub last_compacted_seq: Option<i64>,
     /// 消息列表
     pub messages: Vec<Message>,
 }
@@ -57,7 +59,6 @@ impl Session {
             .to_string();
         Self {
             id,
-            parent_session_id: None,
             title: title.or_else(|| Some("新会话".to_string())),
             system_prompt,
             message_count: 0,
@@ -70,7 +71,40 @@ impl Session {
             started_at: current_timestamp(),
             ended_at: None,
             end_reason: None,
+            compression_count: 0,
+            last_compacted_seq: None,
             messages: Vec::new(),
+        }
+    }
+}
+
+/// 消息类型（区分普通消息与压缩边界消息）
+///
+/// `kind='compaction'` 的消息是上下文压缩产生的边界点，其 `content` 字段
+/// 存摘要正文，模型可见窗口以此为下界过滤。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageKind {
+    /// 普通消息（user / assistant / system / tool）
+    #[default]
+    Message,
+    /// 压缩边界消息（content = 摘要正文）
+    Compaction,
+}
+
+impl MessageKind {
+    /// 序列化为数据库存储的字符串
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::Compaction => "compaction",
+        }
+    }
+
+    /// 从数据库字符串反序列化
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "compaction" => Self::Compaction,
+            _ => Self::Message,
         }
     }
 }
@@ -110,6 +144,10 @@ pub struct Message {
     pub cached_tokens: i64,
     /// 单条消息费用
     pub cost: f64,
+    /// 会话内单调递增的投影序号（由 store 层填充，业务层只读）
+    pub seq: i64,
+    /// 消息类型（普通消息 / 压缩边界）
+    pub kind: MessageKind,
 }
 
 impl Message {
@@ -150,6 +188,20 @@ impl Message {
             role: "system".to_string(),
             content: Some(content),
             timestamp: current_timestamp(),
+            ..Self::default()
+        }
+    }
+
+    /// 创建压缩边界消息（上下文压缩专用）
+    ///
+    /// `content` = 摘要正文（Markdown）；`role='system'` 避免与 user/assistant
+    /// 流混淆，`kind=Compaction` 是真正的类型标记（DB 列 + 业务识别都靠它）。
+    pub fn compaction(summary: String) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: Some(summary),
+            timestamp: current_timestamp(),
+            kind: MessageKind::Compaction,
             ..Self::default()
         }
     }
@@ -324,5 +376,30 @@ mod tests {
     fn todo_item_default_status_is_pending() {
         let item = TodoItem::default();
         assert_eq!(item.status, "pending");
+    }
+
+    #[test]
+    fn message_kind_roundtrip() {
+        assert_eq!(MessageKind::Message.as_str(), "message");
+        assert_eq!(MessageKind::Compaction.as_str(), "compaction");
+        assert_eq!(MessageKind::from_str("message"), MessageKind::Message);
+        assert_eq!(MessageKind::from_str("compaction"), MessageKind::Compaction);
+        // 未知字符串兜底为 Message
+        assert_eq!(MessageKind::from_str("unknown"), MessageKind::Message);
+    }
+
+    #[test]
+    fn message_default_kind_is_message() {
+        let msg = Message::default();
+        assert_eq!(msg.kind, MessageKind::Message);
+        assert_eq!(msg.seq, 0);
+    }
+
+    #[test]
+    fn message_compaction_marks_kind() {
+        let msg = Message::compaction("## 目标\n- 测试".to_string());
+        assert_eq!(msg.kind, MessageKind::Compaction);
+        assert_eq!(msg.role, "system");
+        assert_eq!(msg.content.as_deref(), Some("## 目标\n- 测试"));
     }
 }

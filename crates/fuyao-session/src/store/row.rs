@@ -1,13 +1,12 @@
 //! 数据库行映射：sessions / messages 表 ↔ 领域类型（Session / Message）
 
-use fuyao_api::{Message, Session};
+use fuyao_api::{Message, MessageKind, Session};
 use sqlx::FromRow;
 
 /// 会话行（数据库列映射，字段顺序与 sessions 表一致）
 #[derive(FromRow)]
 pub(super) struct SessionRow {
     pub(super) id: String,
-    pub(super) parent_session_id: Option<String>,
     pub(super) started_at: f64,
     pub(super) ended_at: Option<f64>,
     pub(super) end_reason: Option<String>,
@@ -20,13 +19,14 @@ pub(super) struct SessionRow {
     pub(super) total_cost: f64,
     pub(super) title: Option<String>,
     pub(super) system_prompt: Option<String>,
+    pub(super) compression_count: i32,
+    pub(super) last_compacted_seq: Option<i64>,
 }
 
 impl From<SessionRow> for Session {
     fn from(r: SessionRow) -> Self {
         Session {
             id: r.id,
-            parent_session_id: r.parent_session_id,
             title: r.title,
             system_prompt: r.system_prompt,
             message_count: r.message_count,
@@ -39,6 +39,8 @@ impl From<SessionRow> for Session {
             started_at: r.started_at,
             ended_at: r.ended_at,
             end_reason: r.end_reason,
+            compression_count: r.compression_count,
+            last_compacted_seq: r.last_compacted_seq,
             messages: Vec::new(),
         }
     }
@@ -63,6 +65,8 @@ pub(super) struct MessageRow {
     pub(super) cost: f64,
     pub(super) finish_reason: Option<String>,
     pub(super) reasoning: Option<String>,
+    pub(super) seq: i64,
+    pub(super) kind: String,
 }
 
 impl From<MessageRow> for Message {
@@ -91,6 +95,8 @@ impl From<MessageRow> for Message {
             reasoning_tokens: r.reasoning_tokens,
             cached_tokens: r.cached_tokens,
             cost: r.cost,
+            seq: r.seq,
+            kind: MessageKind::from_str(&r.kind),
         }
     }
 }

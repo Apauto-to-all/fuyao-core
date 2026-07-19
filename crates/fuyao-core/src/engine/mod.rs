@@ -118,7 +118,7 @@ impl Engine {
         let mut session = Session::new(None, Some(system_prompt));
 
         // 落库
-        self.store.create(&session).await?;
+        self.store.create(&mut session).await?;
 
         let session_id = session.id.clone();
         let messages = std::mem::take(&mut session.messages);

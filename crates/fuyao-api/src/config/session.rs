@@ -5,24 +5,44 @@
 
 use serde::Deserialize;
 
-/// 上下文压缩配置（迁移自 `fuyao-session/src/compressor`）
+/// 上下文压缩配置（`[session.compression]`）
+///
+/// 触发公式（对齐 opencode V2 + hermes 共识）：
+/// ```text
+/// prompt_tokens >= threshold × (context_length - summary_max_tokens)
+/// ```
+/// - `prompt_tokens` 来自上一轮 LLM 返回的真实 usage（pre-turn 触发时只能用上一轮值）
+/// - `context_length` 从 ModelConfig 解析；解析不到时回退 `fallback_context`
+/// - `summary_max_tokens` 作为输出预留扣除
+///
+/// 反抖动：连续两次压缩的 token 节省比例低于 `min_savings_pct` 时停压缩，
+/// 避免无效循环（对齐 hermes + zeroclaw 共识）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CompressionConfig {
-    /// 触发压缩的上下文占用阈值（0.0~1.0），原 `tracker.rs:12` = 0.85
+    /// 是否启用上下文压缩
+    pub enabled: bool,
+    /// 触发阈值（0.0~1.0），prompt_tokens / (context_length - summary_max_tokens) 超过此值时触发
     pub threshold: f64,
-    /// 最近消息保留窗口大小，原 `compressor/mod.rs:15` MAX_RECENT_WINDOW = 6
-    pub recent_window: usize,
-    /// 无法解析模型上下文长度时的回退值，原 `tracker.rs:51` = 128000
+    /// 保留窗口的 token 预算（tail 段，从末尾倒序累加）
+    pub keep_tokens: usize,
+    /// 摘要 LLM 输出上限（token）
+    pub summary_max_tokens: usize,
+    /// 无法解析模型上下文长度时的回退值
     pub fallback_context: u32,
+    /// 反抖动：连续两次压缩节省比例低于此值（%）时停压缩
+    pub min_savings_pct: u8,
 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             threshold: 0.85,
-            recent_window: 6,
+            keep_tokens: 8000,
+            summary_max_tokens: 4096,
             fallback_context: 128_000,
+            min_savings_pct: 10,
         }
     }
 }
@@ -87,9 +107,12 @@ mod tests {
     #[test]
     fn compression_config_defaults_match_hardcoded() {
         let c = CompressionConfig::default();
+        assert!(c.enabled);
         assert!((c.threshold - 0.85).abs() < f64::EPSILON);
-        assert_eq!(c.recent_window, 6);
+        assert_eq!(c.keep_tokens, 8000);
+        assert_eq!(c.summary_max_tokens, 4096);
         assert_eq!(c.fallback_context, 128_000);
+        assert_eq!(c.min_savings_pct, 10);
     }
 
     #[test]
@@ -124,6 +147,6 @@ threshold = 0.9
         // 缺省字段
         assert_eq!(w.session.storage.busy_timeout_secs, 5);
         assert!((w.session.compression.threshold - 0.9).abs() < f64::EPSILON);
-        assert_eq!(w.session.compression.recent_window, 6);
+        assert_eq!(w.session.compression.keep_tokens, 8000);
     }
 }

@@ -7,9 +7,9 @@
 //! - [`row`]：sessions / messages 表的行映射（DB 行 ↔ 领域类型）
 //! - [`session`]：Session CRUD（创建 / 读取 / 更新 / 删除 / 列表 / 计数）
 //! - [`message`]：消息持久化助手（增量保存 / 加载，仅供本模块内部使用）
-//! - [`lineage`]：会话分裂与血统链解析（上下文压缩专用）
+//! - [`compaction`]：上下文压缩边界写入 + 可见窗口加载（compressor 模块消费）
 
-mod lineage;
+pub(crate) mod compaction;
 mod message;
 mod row;
 mod session;
