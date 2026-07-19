@@ -120,6 +120,8 @@ pub(crate) fn build_assistant_message(result: &StreamResult, model_id: Option<&s
     }
     msg.model_id = model_id.map(|s| s.to_string());
     msg.finish_reason = Some("stop".to_string());
+    // 填本轮 usage 到持久化字段（DB 落库需要，cost 计算的数据源）
+    fill_message_usage(&mut msg, &result.usage);
     msg
 }
 
@@ -156,7 +158,20 @@ pub(crate) fn build_assistant_message_with_tool_calls(
     msg.tool_calls = Some(serde_json::Value::Array(tool_calls_json));
     msg.model_id = model_id.map(|s| s.to_string());
     msg.finish_reason = Some("tool_calls".to_string());
+    // 填本轮 usage 到持久化字段（DB 落库需要，cost 计算的数据源）
+    fill_message_usage(&mut msg, &result.usage);
     msg
+}
+
+/// 把本轮 usage 写入 Message 的持久化 token 字段
+///
+/// 单独抽出避免两个 build 函数重复同一段 4 行赋值。cost 字段不在本函数填——
+/// 它由 turn 层计算后填入（依赖 agent_paths，不在纯构造器里做）。
+fn fill_message_usage(msg: &mut Message, usage: &fuyao_provider::StreamUsage) {
+    msg.prompt_tokens = usage.prompt_tokens as i64;
+    msg.completion_tokens = usage.completion_tokens as i64;
+    msg.reasoning_tokens = usage.completion_reasoning_tokens.unwrap_or(0) as i64;
+    msg.cached_tokens = usage.prompt_cached_tokens.unwrap_or(0) as i64;
 }
 
 /// 从流式结果构建 AssistantPayload（无工具调用，最终回复事件）

@@ -15,6 +15,7 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 tracing.workspace = true
 dirs.workspace = true
+rust_decimal.workspace = true
 
 # 仅测试用：MockProvider 的 async trait 实现 + stream! 宏
 [dev-dependencies]

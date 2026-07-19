@@ -29,7 +29,8 @@ use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;
 use fuyao_api::message::output::AssistantMessage;
 use fuyao_api::{Message, MessageParams, Session};
-use fuyao_provider::StreamDecoder;
+use fuyao_provider::{StreamDecoder, StreamUsage};
+use rust_decimal::prelude::ToPrimitive;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
@@ -121,7 +122,16 @@ async fn handle_final_reply(
     *ctx.last_usage.lock().await = Some(result.usage.clone());
 
     // 发最终 AssistantMessage（经管道：拦截 → 发送 → 观察）
-    let assistant_msg = build_assistant_message(result, params.model_config.model_id.as_deref());
+    let mut assistant_msg =
+        build_assistant_message(result, params.model_config.model_id.as_deref());
+    // 累积本轮费用（最终回复轮：一次独立付费调用，照常计费）
+    accumulate_usage_and_cost(
+        ctx,
+        session,
+        &mut assistant_msg,
+        &result.usage,
+        params.model_config.model_id.as_deref(),
+    );
     session.messages.push(assistant_msg);
     crate::dispatch::dispatch(
         &ctx.emitter,
@@ -188,8 +198,16 @@ async fn handle_tool_calls(
         tool_calls: effective_tool_calls,
         usage: result.usage.clone(),
     };
-    let assistant_msg = build_assistant_message_with_tool_calls(
+    let mut assistant_msg = build_assistant_message_with_tool_calls(
         &effective_result,
+        params.model_config.model_id.as_deref(),
+    );
+    // 累积本轮费用（工具调用轮也是一次独立付费调用，必须计费）
+    accumulate_usage_and_cost(
+        ctx,
+        session,
+        &mut assistant_msg,
+        &effective_result.usage,
         params.model_config.model_id.as_deref(),
     );
     session.messages.push(assistant_msg);
@@ -280,6 +298,67 @@ async fn persist(
     if let Err(e) = store.update(session).await {
         tracing::warn!(session_id = session_id, cause = %e, "session 落库失败");
     }
+}
+
+/// 累积本轮 usage 进 session.total_*，计算 cost 填进 Message + session.total_cost
+///
+/// 每条 assistant 消息都是一次独立的付费 LLM 调用（无论是否含工具调用），
+/// 都必须累积 token 与费用。落库走 [`persist`]，由 `SessionStore::update` 全量
+/// UPDATE 把 `session.total_*` 和 `messages.cost` / `messages.*_tokens` 写入 DB。
+///
+/// 计算依赖：
+/// - token 字段已由 [`fill_message_usage`](super::builders::fill_message_usage) 填进 msg
+/// - cost 用 [`fuyao_session::calculate_cost`] 按当前模型价格表算（无价格返回 0）
+/// - `agent_paths` 决定从哪个 agent 的模型注册表取价格
+///
+/// model_id 缺失（理论不应发生，但防御）时跳过 cost 计算与 session 累积，
+/// 仅保留 msg 的 token 字段填充——不会污染 session 总计。
+fn accumulate_usage_and_cost(
+    ctx: &SessionCtx,
+    session: &mut Session,
+    msg: &mut Message,
+    usage: &StreamUsage,
+    model_id: Option<&str>,
+) {
+    // 1. 填 msg 的 token 字段（builders 已填一次，这里再填是防御 + 让本函数自洽）
+    msg.prompt_tokens = usage.prompt_tokens as i64;
+    msg.completion_tokens = usage.completion_tokens as i64;
+    msg.reasoning_tokens = usage.completion_reasoning_tokens.unwrap_or(0) as i64;
+    msg.cached_tokens = usage.prompt_cached_tokens.unwrap_or(0) as i64;
+
+    // 2. 无 model_id 时无法算 cost，也不累积 session（避免污染总计）
+    let Some(mid) = model_id else {
+        return;
+    };
+
+    // 3. 计算 cost（无价格配置返回 0，不影响流程）
+    let cost = fuyao_session::calculate_cost(
+        mid,
+        msg.prompt_tokens,
+        msg.completion_tokens,
+        msg.reasoning_tokens,
+        msg.cached_tokens,
+        &ctx.agent_paths,
+    );
+    let cost_f64 = cost.to_f64().unwrap_or(0.0);
+    msg.cost = cost_f64;
+
+    // 4. 累积进 session 总计（落库由 persist → SessionStore::update 处理）
+    session.total_prompt_tokens += msg.prompt_tokens;
+    session.total_completion_tokens += msg.completion_tokens;
+    session.total_reasoning_tokens += msg.reasoning_tokens;
+    session.total_cached_tokens += msg.cached_tokens;
+    session.total_cost += cost_f64;
+
+    tracing::debug!(
+        session_id = ctx.emitter.session_id(),
+        model_id = mid,
+        prompt_tokens = msg.prompt_tokens,
+        completion_tokens = msg.completion_tokens,
+        cost = cost_f64,
+        total_cost = session.total_cost,
+        "本轮费用已累积"
+    );
 }
 
 /// 构建中断式 ToolResult 事件

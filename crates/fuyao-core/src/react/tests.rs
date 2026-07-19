@@ -155,6 +155,27 @@ impl MockProvider {
             }),
         ]
     }
+
+    /// 构造带用量统计的工具调用流（验证工具调用轮的 usage 也累积进 session 总计）
+    fn tool_call_response_with_usage(
+        id: &str,
+        name: &str,
+        args: &str,
+        usage: StreamUsage,
+    ) -> Vec<Result<StreamEvent, StreamError>> {
+        vec![
+            Ok(StreamEvent::ToolCallChunk {
+                index: 0,
+                id: Some(id.to_string()),
+                name: Some(name.to_string()),
+                args_delta: Some(args.to_string()),
+            }),
+            Ok(StreamEvent::Done {
+                usage,
+                finish_reason: FinishReason::ToolCalls,
+            }),
+        ]
+    }
 }
 
 #[async_trait]
@@ -998,5 +1019,148 @@ async fn usage_flows_to_final_assistant_message() {
     assert_eq!(
         p.cached_tokens, 40,
         "cached_tokens 应来自 prompt_cached_tokens"
+    );
+}
+
+/// 费用统计：每条 assistant 消息（无论是否含工具调用）都应累积进 session 总计，
+/// 持久化的 Message 字段也应携带 token（修复重构漏搬：之前落库 token 全为 0）。
+///
+/// 两轮 ReAct（工具调用轮 + 最终回复轮），每轮 mock 不同 usage：
+/// - 工具调用轮：prompt=100, completion=50, reasoning=10, cached=20
+/// - 最终回复轮：prompt=200, completion=80, reasoning=20, cached=40
+/// 预期累积：prompt=300, completion=130, reasoning=30, cached=60
+///
+/// 同时验证 cost 字段被赋值——测试前向全局模型注册表注入带价格的测试模型，
+/// cost 应为非零（按价格表算），结束后清理缓存避免污染其他测试。
+#[tokio::test]
+async fn cost_accumulated_per_assistant_message() {
+    use fuyao_api::{Model, ModelCost, ModelLimit, ModelModalities};
+
+    // 构造带价格的测试模型并注册到全局缓存
+    // 输入 2/M、输出 12/M、推理 6/M、缓存 0.4/M（与 cost.rs 单测一致）
+    let test_model = Model {
+        name: "cost-test".to_string(),
+        cost: ModelCost {
+            input: Some(2.0),
+            output: Some(12.0),
+            reasoning: Some(6.0),
+            cache: Some(0.4),
+            tiers: vec![],
+        },
+        limit: ModelLimit::default(),
+        reasoning_efforts: vec![],
+        modalities: ModelModalities::default(),
+    };
+    let agent_paths = fuyao_api::AgentPaths::default();
+    let cache_key = fuyao_provider::agent_paths_cache_key(&agent_paths);
+    fuyao_provider::register_model("test/cost-model", test_model, &cache_key);
+
+    // 用带 usage 的两轮响应（工具调用 + 最终回复）
+    let tool_usage = StreamUsage {
+        prompt_tokens: 100,
+        completion_tokens: 50,
+        total_tokens: 150,
+        completion_reasoning_tokens: Some(10),
+        prompt_cached_tokens: Some(20),
+    };
+    let final_usage = StreamUsage {
+        prompt_tokens: 200,
+        completion_tokens: 80,
+        total_tokens: 280,
+        completion_reasoning_tokens: Some(20),
+        prompt_cached_tokens: Some(40),
+    };
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response_with_usage("c_cost", "echo", r#"{}"#, tool_usage),
+        MockProvider::text_response_with_usage("done", final_usage),
+    ]));
+
+    let mut h = make_harness(provider, echo_registry()).await;
+    preload_user(&mut h, "测费用累积");
+
+    // 用带 model_id 的 params，让累积逻辑能查到价格表
+    let mut params = MessageParams::default();
+    params.model_config.model_id = Some("test/cost-model".to_string());
+
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, params).await;
+
+    // 清理全局缓存（避免污染后续测试）
+    fuyao_provider::clear_cache(&agent_paths);
+
+    // === 验证 1：session 总计正确累积（两轮相加） ===
+    assert_eq!(
+        h.session.total_prompt_tokens, 300,
+        "工具调用轮(100) + 最终回复轮(200) = 300"
+    );
+    assert_eq!(
+        h.session.total_completion_tokens, 130,
+        "工具调用轮(50) + 最终回复轮(80) = 130"
+    );
+    assert_eq!(
+        h.session.total_reasoning_tokens, 30,
+        "工具调用轮(10) + 最终回复轮(20) = 30"
+    );
+    assert_eq!(
+        h.session.total_cached_tokens, 60,
+        "工具调用轮(20) + 最终回复轮(40) = 60"
+    );
+
+    // === 验证 2：cost 为非零（价格表已注入，按 /M 算） ===
+    assert!(
+        h.session.total_cost > 0.0,
+        "注入价格表后 session.total_cost 应非零，实际 = {}",
+        h.session.total_cost
+    );
+
+    // === 验证 3：持久化的 Message 字段携带 token（usage 持久化洞修复） ===
+    let assistant_msgs: Vec<_> = h
+        .session
+        .messages
+        .iter()
+        .filter(|m| m.role == "assistant")
+        .collect();
+    assert_eq!(
+        assistant_msgs.len(),
+        2,
+        "应有两条 assistant 消息（工具调用轮 + 最终回复轮）"
+    );
+
+    // 第一条：工具调用轮
+    let tool_turn = assistant_msgs
+        .iter()
+        .find(|m| m.finish_reason.as_deref() == Some("tool_calls"))
+        .expect("应有 finish_reason=tool_calls 的消息");
+    assert_eq!(tool_turn.prompt_tokens, 100);
+    assert_eq!(tool_turn.completion_tokens, 50);
+    assert_eq!(tool_turn.reasoning_tokens, 10);
+    assert_eq!(tool_turn.cached_tokens, 20);
+    assert!(
+        tool_turn.cost > 0.0,
+        "工具调用轮 Message.cost 应非零，实际 = {}",
+        tool_turn.cost
+    );
+
+    // 第二条：最终回复轮
+    let final_turn = assistant_msgs
+        .iter()
+        .find(|m| m.finish_reason.as_deref() == Some("stop"))
+        .expect("应有 finish_reason=stop 的消息");
+    assert_eq!(final_turn.prompt_tokens, 200);
+    assert_eq!(final_turn.completion_tokens, 80);
+    assert_eq!(final_turn.reasoning_tokens, 20);
+    assert_eq!(final_turn.cached_tokens, 40);
+    assert!(
+        final_turn.cost > 0.0,
+        "最终回复轮 Message.cost 应非零，实际 = {}",
+        final_turn.cost
+    );
+
+    // === 验证 4：两条 Message.cost 之和 = session.total_cost（无丢失） ===
+    let sum_costs = tool_turn.cost + final_turn.cost;
+    let diff = (sum_costs - h.session.total_cost).abs();
+    assert!(
+        diff < 1e-9,
+        "两条 Message.cost({sum_costs}) 之和应等于 session.total_cost({})",
+        h.session.total_cost
     );
 }
