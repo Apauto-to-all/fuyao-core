@@ -28,18 +28,18 @@ pub(crate) mod turn;
 
 use crate::dispatch;
 use crate::emit::Emitter;
-use crate::engine::types::{QueuedUserMessage, SharedQueue};
+use crate::engine::types::SharedQueue;
 use crate::interrupt::emit_interrupt_event;
 use crate::tool_registry::ToolRegistry;
+use fuyao_api::UserMessageMode;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{InterruptMessage, PluginMessage};
 use fuyao_api::message::output::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
-    PluginPayload as OutputPluginPayload, UserMessage as OutputUserMessage, UserPayload,
+    PluginPayload as OutputPluginPayload,
 };
 use fuyao_api::{CompressionConfig, EventBase, InboundUser, Session};
-use fuyao_api::{UserMessageMode, UserMessageSource};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{Provider, StreamUsage};
 use fuyao_session::CompressionRuntimeState;
@@ -147,8 +147,8 @@ pub(crate) async fn run_session(
             // ReAct 多轮复用同一份 model（一个 turn 一个模型）
             // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
             let first_params = msgs.first().map(|m| m.params.clone()).unwrap_or_default();
-            // 一次性全部注入：每条变一条 user message（入队时已过管道发回显，此处只推进历史）
-            queue::inject_messages(&mut session, msgs);
+            // 一次性全部注入：每条经 emit_to_history（拦截 → push Message::user → 发送 → 观察）
+            queue::inject_messages(&ctx, &mut session, msgs).await;
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
         } else {
             // guide 空：等入站消息（过管道入队）/ 中断 / Plugin 通知
@@ -189,7 +189,7 @@ pub(crate) async fn run_session(
 async fn run_pre_turn_compression(
     ctx: &SessionCtx,
     session: &mut Session,
-    incoming: &[QueuedUserMessage],
+    incoming: &[InboundUser],
 ) {
     // 读取上一轮真实 usage（首轮无 usage 跳过——还没跑过没法判定）
     let usage = {
@@ -389,55 +389,28 @@ async fn run_pre_turn_compression(
     }
 }
 
-/// 处理入站 User 消息：过完整管道（拦截 → 入队[用拦截后 content] → 发送[回显] → 观察）
+/// 处理入站 User 消息：**纯入队**（无任何 side effect）
 ///
-/// 拦截后的 payload 用于入队，保证「队列里的内容 = UI 看到的内容 = 后续 push 进
-/// session.messages 的内容」三者一致。
+/// 入队只负责按 mode 分流到 guide / pending 队列，**不做**拦截、不发事件、不触发钩子。
+/// 所有处理（拦截 / push / 发送 / 观察）推迟到 `inject_messages` 消费时统一过
+/// `emit_to_history` 管道——与 assistant / tool_result 走完全相同的路径。
 ///
-/// Block 时：不入队、不回显（消息不参与对话）。
-///
-/// 注意：**不直接 push session.messages**——push 时机由队列消费（inject_messages）
-/// 决定，避免 pending 早 push 破坏消息顺序（pending 要等链结束才解禁）。
+/// 这样保证 user 消息的拦截/push/发送三个时机**对齐**（都在消费时刻），
+/// 修复"以输入消息为核心组织"导致的三时机错位（拦截提前、发送提前、push 延迟）。
 async fn handle_inbound_user(ctx: &SessionCtx, inbound: InboundUser) {
-    let mode = inbound.mode;
-    let event = OutputEvent::User(OutputUserMessage {
-        base: fuyao_api::message::EventBase::default(),
-        payload: UserPayload {
-            content: inbound.content,
-            mode,
-            source: UserMessageSource::User,
-        },
-    });
-
-    // 拦截：返回拦截后事件，用于入队 + 发送
-    let Some(intercepted) = dispatch::dispatch_intercept(&ctx.emitter, &ctx.hooks, event).await
-    else {
-        return; // Block：不入队、不回显
-    };
-
-    // 从拦截后事件提取 content 入队（携带拦截后内容）
-    let queued = match &intercepted {
-        OutputEvent::User(m) => QueuedUserMessage {
-            content: m.payload.content.clone(),
-            params: inbound.params,
-        },
-        _ => return,
-    };
+    let mode = inbound.message.payload.mode;
     match mode {
         UserMessageMode::Guide => ctx
             .guide
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(queued),
+            .push_back(inbound),
         UserMessageMode::Pending => ctx
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(queued),
+            .push_back(inbound),
     }
-
-    // 发送拦截后事件给 UI（deliver：盖 session_id + 推到出口通道 + 观察钩子）
-    dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted).await;
 }
 
 /// 处理入站 Plugin 消息：把 input 侧 PluginMessage 转 output 侧 OutputEvent::Plugin，

@@ -2,7 +2,7 @@
 //!
 //! 集中放引擎模块间共享的类型别名、状态类型。
 
-use fuyao_api::MessageParams;
+use fuyao_api::InboundUser;
 use fuyao_api::message::input::{InterruptMessage, PluginMessage};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,9 @@ use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
 
 // InboundUser 已提升到 fuyao-api，供 fuyao-hooks 的 SessionSender 引用（避免 hooks 反向依赖 core）
-pub(crate) use fuyao_api::InboundUser;
+//
+// 队列载荷直接复用 InboundUser（output 侧 UserMessage + params，字段完整含 source）。
+// 入队时不需要拆解/重组——送进通道什么样，入队就什么样，消费时原样过 emit_to_history。
 
 /// 会话 ID
 ///
@@ -19,19 +21,12 @@ pub(crate) use fuyao_api::InboundUser;
 /// 后续若类型安全需求增强，可提升为 newtype。
 pub type SessionId = String;
 
-/// 队列消息（内容 + 消息参数，mode 已在入队时分流）
-///
-/// guide / pending 两个队列装同一种消息。mode 在入站消息过管道的 process 段
-/// 入队时已按 Guide/Pending 分流到对应对列，队列内不再区分。
-pub(crate) struct QueuedUserMessage {
-    /// 消息文本
-    pub content: String,
-    /// 消息参数（model id 等，跟着每条消息走）
-    pub params: MessageParams,
-}
-
 /// 共享队列（guide / pending 对等，同类型，可互倒）
-pub(crate) type SharedQueue = Arc<Mutex<VecDeque<QueuedUserMessage>>>;
+///
+/// 队列载荷直接复用 `InboundUser`（output 侧 `UserMessage` + `MessageParams`），
+/// 不再单独定义队列类型——入站载荷与队列载荷字段完全一致，
+/// 复用同一类型避免无意义的拆解/重组（也消除字段丢失风险）。
+pub(crate) type SharedQueue = Arc<Mutex<VecDeque<InboundUser>>>;
 
 /// 活跃 session 的句柄
 ///

@@ -329,12 +329,19 @@ impl Engine {
 
         match event {
             InputEvent::User(user_msg) => {
-                // User 消息经入站通道送进 session task，由管道处理：
-                // 拦截 → 处理(入 guide/pending 队列) → 发送(回显 User 给 UI) → 观察。
-                // 不在引擎层直接操作队列——入队是 session 层管道的 process 职责。
+                // 立即把 input 侧 UserMessage 字段照搬转化为 output 侧 UserMessage
+                // （base + payload 完整保留，含 source），与 params 一起送进 session task。
+                // 后续 handle_inbound_user 纯入队，inject_messages 消费时统一过管道。
+                let outbound = fuyao_api::message::output::UserMessage {
+                    base: user_msg.base,
+                    payload: fuyao_api::message::output::UserPayload {
+                        content: user_msg.payload.content,
+                        mode: user_msg.payload.mode,
+                        source: user_msg.payload.source,
+                    },
+                };
                 let inbound = fuyao_api::InboundUser {
-                    content: user_msg.payload.content,
-                    mode: user_msg.payload.mode,
+                    message: outbound,
                     params,
                 };
                 handle

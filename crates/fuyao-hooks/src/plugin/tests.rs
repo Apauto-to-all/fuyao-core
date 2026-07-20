@@ -397,8 +397,8 @@ async fn sender_send_user_uses_guide_mode_by_default() {
     let (sender, mut rx_user, _rx_int, _rx_plug) = make_sender();
     sender.send_user("hello");
     let received = rx_user.recv().await.expect("应收到 User 消息");
-    assert_eq!(received.content, "hello");
-    assert_eq!(received.mode, UserMessageMode::Guide);
+    assert_eq!(received.message.payload.content, "hello");
+    assert_eq!(received.message.payload.mode, UserMessageMode::Guide);
 }
 
 /// send_user_with_mode 指定 Pending 模式
@@ -407,8 +407,8 @@ async fn sender_send_user_with_mode_pending() {
     let (sender, mut rx_user, _rx_int, _rx_plug) = make_sender();
     sender.send_user_with_mode("排队", UserMessageMode::Pending);
     let received = rx_user.recv().await.expect("应收到 User 消息");
-    assert_eq!(received.content, "排队");
-    assert_eq!(received.mode, UserMessageMode::Pending);
+    assert_eq!(received.message.payload.content, "排队");
+    assert_eq!(received.message.payload.mode, UserMessageMode::Pending);
 }
 
 /// send_interrupt 投递到 Interrupt 通道，source = Hook
@@ -473,7 +473,7 @@ async fn sender_three_channels_are_independent() {
     assert!(rx_plug.try_recv().is_err(), "Plugin 通道不应有消息");
     // User 通道有消息
     let received = rx_user.recv().await.expect("User 通道应有消息");
-    assert_eq!(received.content, "只发 User");
+    assert_eq!(received.message.payload.content, "只发 User");
 }
 
 /// identity() 只读访问

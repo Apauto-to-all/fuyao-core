@@ -4,10 +4,14 @@
 //! 覆盖 run_turn（7 个）与 run_session（1 个，pending 空闲解禁回归）。
 
 use super::*;
-use crate::engine::types::QueuedUserMessage;
 use async_trait::async_trait;
 use futures_util::stream;
 use fuyao_api::MessageParams;
+use fuyao_api::message::EventBase;
+use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
+use fuyao_api::message::output::{
+    UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
+};
 use fuyao_provider::{
     BoxStream, ChatResponse, FinishReason, StreamError, StreamEvent, StreamUsage,
 };
@@ -227,6 +231,36 @@ fn echo_registry() -> Arc<ToolRegistry> {
         handler,
     };
     Arc::new(ToolRegistry::builder().register(entry).build())
+}
+
+/// 构造测试用 InboundUser（默认 Guide 模式 + User 来源）
+fn make_inbound(content: &str) -> fuyao_api::InboundUser {
+    fuyao_api::InboundUser {
+        message: OutputUserMessage {
+            base: EventBase::default(),
+            payload: OutputUserPayload {
+                content: content.to_string(),
+                mode: UserMessageMode::Guide,
+                source: UserMessageSource::User,
+            },
+        },
+        params: MessageParams::default(),
+    }
+}
+
+/// 构造测试用 InboundUser（指定 mode）
+fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> fuyao_api::InboundUser {
+    fuyao_api::InboundUser {
+        message: OutputUserMessage {
+            base: EventBase::default(),
+            payload: OutputUserPayload {
+                content: content.to_string(),
+                mode,
+                source: UserMessageSource::User,
+            },
+        },
+        params: MessageParams::default(),
+    }
 }
 
 /// 构造空 SharedQueue
@@ -456,14 +490,8 @@ async fn guide_all_consumed_on_tool_complete() {
     let mut h = make_harness(provider, echo_registry()).await;
     preload_user(&mut h, "原始问题");
     // 工具执行期间用户补充 2 条 guide 消息（模拟入队）
-    h.ctx.guide.lock().unwrap().push_back(QueuedUserMessage {
-        content: "补充1".into(),
-        params: MessageParams::default(),
-    });
-    h.ctx.guide.lock().unwrap().push_back(QueuedUserMessage {
-        content: "补充2".into(),
-        params: MessageParams::default(),
-    });
+    h.ctx.guide.lock().unwrap().push_back(make_inbound("补充1"));
+    h.ctx.guide.lock().unwrap().push_back(make_inbound("补充2"));
 
     turn::run_turn(
         &h.ctx,
@@ -506,14 +534,16 @@ async fn pending_before_guide_on_final_reply() {
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     preload_user(&mut h, "第一条");
     // 预置 pending 1 条 + guide 1 条（最终回复后应都被消费）
-    h.ctx.pending.lock().unwrap().push_back(QueuedUserMessage {
-        content: "排队消息".into(),
-        params: MessageParams::default(),
-    });
-    h.ctx.guide.lock().unwrap().push_back(QueuedUserMessage {
-        content: "引导消息".into(),
-        params: MessageParams::default(),
-    });
+    h.ctx
+        .pending
+        .lock()
+        .unwrap()
+        .push_back(make_inbound_with_mode("排队消息", UserMessageMode::Pending));
+    h.ctx
+        .guide
+        .lock()
+        .unwrap()
+        .push_back(make_inbound_with_mode("引导消息", UserMessageMode::Guide));
 
     turn::run_turn(
         &h.ctx,
@@ -611,11 +641,10 @@ async fn pending_consumed_when_task_idle() {
     // 模拟 send：经入站通道发一条 Pending 消息（过管道入 pending 队列）
     // task 空闲（无活跃 ReAct 链），pending 的解禁条件已满足
     tx_inbound
-        .send(fuyao_api::InboundUser {
-            content: "排队消息".into(),
-            mode: fuyao_api::UserMessageMode::Pending,
-            params: MessageParams::default(),
-        })
+        .send(make_inbound_with_mode(
+            "排队消息",
+            fuyao_api::UserMessageMode::Pending,
+        ))
         .await
         .unwrap();
 
@@ -1290,4 +1319,123 @@ async fn intercept_block_skips_final_assistant_in_history() {
     );
     // total_cost 也应为 0（拦截 Block 的消息不计费）
     assert_eq!(h.session.total_cost, 0.0, "Block 时不应累积任何费用");
+}
+
+/// 用户消息经 inject_messages 时走 emit_to_history：插件可在**消费时刻**拦截改写。
+///
+/// 这是任务 4（01.3 文档）的核心修复验证：拦截/push/发送三时机对齐在消费时刻，
+/// 与 assistant / tool_result 完全对称。修复前 inject_messages 是裸 push，插件
+/// 无法在 user 消息进历史时介入（拦截裂缝）。
+#[tokio::test]
+async fn inject_messages_intercepts_user_at_consume_time() {
+    let (tx_event, _rx_event) = mpsc::channel::<OutputEvent>(128);
+    let emitter = Emitter::new(tx_event, "test_session".to_string());
+    let hooks: fuyao_hooks::SharedHooks =
+        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
+    {
+        let mut reg = hooks.lock().await;
+        reg.register_output_intercept(
+            0,
+            Arc::new(|ev| {
+                if let OutputEvent::User(m) = ev {
+                    let mut modified = m.clone();
+                    modified.payload.content = format!("[脱敏]{}", modified.payload.content);
+                    InterceptResult::Pass(OutputEvent::User(modified))
+                } else {
+                    InterceptResult::Pass(ev.clone())
+                }
+            }),
+        );
+    }
+    let store = temp_store().await;
+    let ctx = SessionCtx {
+        store,
+        provider: Arc::new(MockProvider::new(vec![])) as Arc<dyn Provider>,
+        tools: Arc::new(ToolRegistry::builder().build()),
+        hooks,
+        agent_paths: fuyao_api::AgentPaths::default(),
+        agent_config: fuyao_api::AgentConfig::default(),
+        emitter,
+        guide: empty_queue(),
+        pending: empty_queue(),
+        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
+        compression_state: Arc::new(std::sync::Mutex::new(
+            fuyao_session::CompressionRuntimeState::default(),
+        )),
+        compression_config: fuyao_api::CompressionConfig::default(),
+    };
+    let mut session = Session::default();
+
+    // 投两条消息进队列，注入后应都被拦截改写
+    let msgs = vec![make_inbound("秘密1"), make_inbound("秘密2")];
+    queue::inject_messages(&ctx, &mut session, msgs).await;
+
+    // 验证：session.messages 里的 content 是拦截后的（带 [脱敏] 前缀）
+    assert_eq!(session.messages.len(), 2, "两条 user 消息应都进历史");
+    assert_eq!(
+        session.messages[0].content.as_deref(),
+        Some("[脱敏]秘密1"),
+        "user 消息经拦截后内容应进 session.messages"
+    );
+    assert_eq!(
+        session.messages[1].content.as_deref(),
+        Some("[脱敏]秘密2"),
+        "第二条 user 消息也应被拦截改写"
+    );
+}
+
+/// 插件/系统来源的 source 字段完整流到 session.messages 的产出事件（消费时刻发 UI）
+///
+/// 验证修复错误①：source 字段不再丢失。检查 inject_messages 走 emit_to_history 后
+/// 发出的事件携带原始 source（含 Plugin 名称）。
+#[tokio::test]
+async fn inject_messages_preserves_plugin_source_in_event() {
+    let (tx_event, mut rx_event) = mpsc::channel::<OutputEvent>(128);
+    let emitter = Emitter::new(tx_event, "test_session".to_string());
+    let hooks: fuyao_hooks::SharedHooks =
+        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
+    let store = temp_store().await;
+    let ctx = SessionCtx {
+        store,
+        provider: Arc::new(MockProvider::new(vec![])) as Arc<dyn Provider>,
+        tools: Arc::new(ToolRegistry::builder().build()),
+        hooks,
+        agent_paths: fuyao_api::AgentPaths::default(),
+        agent_config: fuyao_api::AgentConfig::default(),
+        emitter,
+        guide: empty_queue(),
+        pending: empty_queue(),
+        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
+        compression_state: Arc::new(std::sync::Mutex::new(
+            fuyao_session::CompressionRuntimeState::default(),
+        )),
+        compression_config: fuyao_api::CompressionConfig::default(),
+    };
+    let mut session = Session::default();
+
+    // 构造一条 Plugin 来源消息（模拟 SessionSender.send_user 注入）
+    let inbound = fuyao_api::InboundUser {
+        message: OutputUserMessage {
+            base: EventBase::default(),
+            payload: OutputUserPayload {
+                content: "循环检测提醒".into(),
+                mode: UserMessageMode::Guide,
+                source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
+                    name: "loop_guard".into(),
+                }),
+            },
+        },
+        params: MessageParams::default(),
+    };
+    queue::inject_messages(&ctx, &mut session, vec![inbound]).await;
+
+    // 收到的事件应是 OutputEvent::User 且 source = Plugin(loop_guard)
+    let received = rx_event.try_recv().expect("应收到 User 事件");
+    match received {
+        OutputEvent::User(m) => match m.payload.source {
+            UserMessageSource::Plugin(p) => assert_eq!(p.name, "loop_guard"),
+            _ => panic!("source 应为 Plugin，实际：{:?}", m.payload.source),
+        },
+        _ => panic!("应为 User 事件"),
+    }
 }

@@ -17,8 +17,10 @@ use fuyao_api::MessageParams;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{
     InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource, PluginMessage,
-    PluginPayload, UserMessageMode,
+    PluginPayload, PluginSource, UserMessageMode, UserMessageSource,
 };
+use fuyao_api::message::output::UserMessage as OutputUserMessage;
+use fuyao_api::message::output::UserPayload as OutputUserPayload;
 use tokio::sync::mpsc::Sender;
 
 /// Session 级消息发送器
@@ -73,10 +75,20 @@ impl SessionSender {
     /// `mode` 决定消息入哪个队列：
     /// - `Guide`：进入引导队列，AI 完成一轮（如工具调用）后立即投递
     /// - `Pending`：进入排队队列，AI 不再调工具（最终回复）后才投递
+    ///
+    /// source 字段自动标记为 `Plugin`，携带本插件的 identity 名称——保证来源可追溯。
     pub fn send_user_with_mode(&self, content: impl Into<String>, mode: UserMessageMode) {
         let result = self.tx_user.try_send(InboundUser {
-            content: content.into(),
-            mode,
+            message: OutputUserMessage {
+                base: EventBase::default(),
+                payload: OutputUserPayload {
+                    content: content.into(),
+                    mode,
+                    source: UserMessageSource::Plugin(PluginSource {
+                        name: self.identity.name.clone(),
+                    }),
+                },
+            },
             params: MessageParams::default(),
         });
         if let Err(e) = result {
