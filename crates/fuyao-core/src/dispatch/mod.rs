@@ -78,7 +78,7 @@ pub(crate) async fn dispatch(
 /// 返回 `None` 表示该事件不应进历史（如转换失败或不匹配的事件类型）。
 ///
 /// **token + cost 自动累积**：闭包返回的 Message 应已填好 token + cost 字段
-/// （由调用方在闭包内用 `fill_assistant_message_usage_and_cost` 填充）。
+/// （由调用方在闭包内用 `fuyao_session::fill_message_cost` 填充）。
 /// 本函数识别 assistant 角色自动累积 `session.total_*`——push 和计费强绑定，
 /// 未来新增 assistant 产出点不会漏算 cost。
 ///
@@ -97,6 +97,7 @@ pub(crate) async fn emit_to_history(
     let intercepted = intercept(emitter, hooks, event).await?;
 
     // 2. 用拦截后事件构造 Message，识别 assistant 累积 session 总计后 push
+    //    闭包从 intercepted 借用所需字段（内部已 clone 出 Message 持有的 owned 数据）
     if let Some(msg) = msg_from_event(&intercepted) {
         // 自动累积 session.total_*（仅 assistant 角色；cost 用 Decimal 精确累加，
         // 避免 f64 加法误差——累积逻辑统一在 fuyao_session::accumulate_session_total）
@@ -115,9 +116,10 @@ pub(crate) async fn emit_to_history(
     }
 
     // 3. 发送事件给 UI + 4. 观察钩子
-    deliver(emitter, hooks, intercepted.clone()).await;
+    //    move intercepted 进 deliver（避免 clone）；deliver 返回同一份 event 供本函数返回
+    let delivered = deliver(emitter, hooks, intercepted).await;
 
-    Some(intercepted)
+    Some(delivered)
 }
 
 /// 仅拦截（不含处理/发送/观察），返回拦截后事件
