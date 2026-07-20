@@ -19,6 +19,9 @@ use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{EngineParams, MessageParams, ModelConfig, SessionParams};
 use fuyao_app::build_tool_registry;
 use fuyao_core::{Engine, PluginHost};
+use fuyao_provider::{
+    BoxStream, ChatRequest, ChatResponse, StreamError, StreamEvent, StreamOptions,
+};
 
 /// 构造 Guide 模式的用户消息
 fn guide_user_message(content: &str, model_id: &str) -> (InputEvent, MessageParams) {
@@ -173,4 +176,314 @@ async fn shutdown_with_no_mcp_manager_does_not_panic() {
 
     // 不应 panic：engine.shutdown() + mcp_manager=None（跳过 stop_all）+ ctx drop
     fuyao_app::shutdown(engine, ctx).await;
+}
+
+// ============================================================================
+// RetryRunner 端到端：OutputEvent::Retry 在 session 内被发出
+// ============================================================================
+
+/// 辅助：把任意 Provider 包成 Arc<dyn Provider>
+fn as_provider<P: fuyao_provider::Provider + 'static>(
+    p: P,
+) -> std::sync::Arc<dyn fuyao_provider::Provider> {
+    std::sync::Arc::new(p)
+}
+
+/// 可恢复错误：首次 RateLimit → 应发 OutputEvent::Retry → 重试成功产出 Assistant
+///
+/// 用 `retry_after_ms: Some(10)` 让退避只睡 10ms（backoff_duration 优先级最高），
+/// 避免真睡默认 2 秒初始退避。
+#[tokio::test]
+async fn retry_runner_emits_retry_event_then_succeeds() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    let provider = common::FlakyThenSuccessProvider::new(
+        vec![fuyao_provider::StreamError::RateLimit {
+            retry_after_ms: Some(10),
+            retry_after_secs: None,
+        }],
+        text_events("重试后成功"),
+    );
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(provider),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    let (event, params) = guide_user_message("测试重试", "test/model");
+    engine
+        .send(&session_id, event, params)
+        .await
+        .expect("发消息失败");
+
+    // 收事件：期望顺序 Retry(attempt=1) → Chunk → Assistant
+    let mut got_retry = false;
+    let mut got_assistant = false;
+    for _ in 0..50 {
+        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+            Ok(Some(OutputEvent::Retry(r))) => {
+                got_retry = true;
+                assert_eq!(r.payload.attempt, 1, "首次重试 attempt 应为 1");
+                assert_eq!(r.payload.max_retries, u32::MAX, "默认无限重试");
+                assert_eq!(
+                    r.payload.wait_ms, 10,
+                    "退避应等于 retry-after-ms 头（优先级最高）"
+                );
+                assert!(
+                    r.payload.cause.contains("速率限制"),
+                    "cause 应含错误描述，实际: {}",
+                    r.payload.cause
+                );
+            }
+            Ok(Some(OutputEvent::Assistant(a))) => {
+                got_assistant = true;
+                assert!(
+                    a.payload
+                        .content
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("重试后成功"),
+                    "Assistant 应含重试后成功内容"
+                );
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    engine.shutdown().await;
+    assert!(got_retry, "应发出 OutputEvent::Retry 事件");
+    assert!(got_assistant, "重试后应产出 Assistant 事件");
+}
+
+/// 严重错误（不可重试）：AuthError → 不应发 Retry 事件，Error 立即冒泡
+#[tokio::test]
+async fn retry_runner_no_retry_on_auth_error() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    let provider = common::FlakyThenSuccessProvider::new(
+        vec![fuyao_provider::StreamError::AuthError(
+            "invalid key".to_string(),
+        )],
+        text_events("永远不该被看到"),
+    );
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(provider),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    let (event, params) = guide_user_message("测试严重错误", "test/model");
+    engine
+        .send(&session_id, event, params)
+        .await
+        .expect("发消息失败");
+
+    // 收事件：应有 Error，不应有 Retry
+    let mut got_error = false;
+    let mut got_retry = false;
+    for _ in 0..50 {
+        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+            Ok(Some(OutputEvent::Error(_))) => {
+                got_error = true;
+                break;
+            }
+            Ok(Some(OutputEvent::Retry(_))) => {
+                got_retry = true;
+            }
+            _ => {}
+        }
+    }
+
+    engine.shutdown().await;
+    assert!(!got_retry, "严重错误不应触发 Retry 事件");
+    assert!(got_error, "严重错误应冒泡为 OutputEvent::Error");
+}
+
+/// 首 chunk 后错误：吐 TextDelta 后再吐 RateLimit → 不应发 Retry，Error 冒泡
+#[tokio::test]
+async fn retry_runner_no_retry_after_first_chunk() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    // 构造一个始终吐「TextDelta + RateLimit 错误」的 Provider
+    struct AlwaysFirstChunkThenError;
+    #[async_trait::async_trait]
+    impl fuyao_provider::Provider for AlwaysFirstChunkThenError {
+        fn stream_chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+            _options: StreamOptions,
+        ) -> BoxStream<Result<StreamEvent, StreamError>> {
+            let items: Vec<Result<StreamEvent, StreamError>> = vec![
+                Ok(StreamEvent::TextDelta {
+                    content: "hi".to_string(),
+                }),
+                Err(fuyao_provider::StreamError::RateLimit {
+                    retry_after_ms: Some(10),
+                    retry_after_secs: None,
+                }),
+            ];
+            Box::pin(futures_util::stream::iter(items))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+        ) -> Result<ChatResponse, StreamError> {
+            Err(StreamError::ApiError("mock: chat 不支持".to_string()))
+        }
+    }
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(AlwaysFirstChunkThenError),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    let (event, params) = guide_user_message("测试首 chunk", "test/model");
+    engine
+        .send(&session_id, event, params)
+        .await
+        .expect("发消息失败");
+
+    let mut got_error = false;
+    let mut got_retry = false;
+    for _ in 0..50 {
+        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+            Ok(Some(OutputEvent::Error(_))) => {
+                got_error = true;
+                break;
+            }
+            Ok(Some(OutputEvent::Retry(_))) => {
+                got_retry = true;
+            }
+            _ => {}
+        }
+    }
+
+    engine.shutdown().await;
+    assert!(
+        !got_retry,
+        "首 chunk 后错误不应触发 Retry（避免 UI 重复输出）"
+    );
+    assert!(got_error, "首 chunk 后错误应冒泡为 Error");
+}
+
+/// 重试循环持续发 Retry 事件：连返 RateLimit → 至少发 1 条 Retry 事件
+///
+/// 默认 `max_retries=u32::MAX`（无限重试），不会自然耗尽。测试用 deadline
+/// 打断循环，只验证「Retry 事件确实持续被发出」——max_retries=0 的耗尽场景
+/// 由 fuyao-core 单测覆盖（带可配置 max_retries 的精确断言）。
+#[tokio::test]
+async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    // 构造永远失败的 Provider（每次都返带 retry-after-ms=10 的 RateLimit）
+    struct AlwaysRateLimit;
+    #[async_trait::async_trait]
+    impl fuyao_provider::Provider for AlwaysRateLimit {
+        fn stream_chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+            _options: StreamOptions,
+        ) -> BoxStream<Result<StreamEvent, StreamError>> {
+            let e = fuyao_provider::StreamError::RateLimit {
+                retry_after_ms: Some(10),
+                retry_after_secs: None,
+            };
+            Box::pin(futures_util::stream::iter(std::iter::once(Err(e))))
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+        ) -> Result<ChatResponse, StreamError> {
+            Err(StreamError::ApiError("mock: chat 不支持".to_string()))
+        }
+    }
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(AlwaysRateLimit),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    let (event, params) = guide_user_message("测试持续重试", "test/model");
+    engine
+        .send(&session_id, event, params)
+        .await
+        .expect("发消息失败");
+
+    // 2 秒内应至少看到 2 条 Retry 事件（attempt 递增）
+    let mut retry_attempts = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(2000);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        if let Ok(Some(OutputEvent::Retry(r))) =
+            tokio::time::timeout(Duration::from_millis(200), engine.recv()).await
+        {
+            retry_attempts.push(r.payload.attempt);
+        }
+    }
+
+    engine.shutdown().await;
+    assert!(
+        retry_attempts.len() >= 2,
+        "持续错误应至少触发 2 次 Retry 事件（实际: {} 次）",
+        retry_attempts.len()
+    );
+    // attempt 应递增（1, 2, 3, ...）
+    assert_eq!(retry_attempts[0], 1, "首次 attempt 应为 1");
+    assert!(
+        retry_attempts.windows(2).all(|w| w[1] == w[0] + 1),
+        "attempt 应递增 1, 2, 3, ...，实际: {retry_attempts:?}"
+    );
 }

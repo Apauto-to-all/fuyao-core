@@ -69,6 +69,7 @@ pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), Setu
     plugin_host.add(Box::new(fuyao_guard::LoopGuardPlugin::new()));
 
     // 4. 启动引擎（工具 + 插件工厂构造时注入）
+    //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
     let engine = Engine::new(EngineParams { agent_paths }, provider, tools, plugin_host).await;
 
     tracing::info!(model_id = %default_model_id, "引擎启动完成");

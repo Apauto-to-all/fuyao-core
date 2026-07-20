@@ -21,14 +21,13 @@ use crate::interrupt::{
     SharedTurnState, TurnState, classify, emit_interrupt_event, handle_interrupt,
 };
 use crate::react::queue;
-use crate::stream::{self, StreamResult};
+use crate::stream::StreamResult;
 use crate::tool_exec;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;
 use fuyao_api::message::output::{AssistantMessage, TitleMessage, TitlePayload};
 use fuyao_api::{Message, MessageParams, Session};
-use fuyao_provider::StreamDecoder;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
@@ -45,25 +44,21 @@ pub(crate) async fn run_turn(
     let (model, options) = build_model_and_options(&params, &ctx.tools);
 
     loop {
-        let request = build_chat_request(session);
-        let mut decoder = StreamDecoder::new();
+        // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
+        // 每次 loop 顶部新建；retry.rs 在重试时清空复用，保证不携带上一次的部分结果。
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));
+        // 本轮的 ChatRequest（重试间复用同一份——一次 LLM 调用内 session.messages 不变）
+        let request = build_chat_request(session);
 
-        // 中断点①：流式期间
+        // 中断点①：流式期间（含重试 sleep 期间——select! drop future 即取消 sleep）
+        // run_stream_with_retry 内部按错误类型自动重试，发 OutputEvent::Retry 给 UI。
+        // 中断：外层 select! drop retry future → 退避 sleep 取消 → 中断分支胜出。
         let stream_result = {
-            let stream_fut = stream::run_stream_session(
-                request,
-                &model,
-                options.clone(),
-                &ctx.provider,
-                &ctx.emitter,
-                &ctx.hooks,
-                &mut decoder,
-                &state,
-            );
-            tokio::pin!(stream_fut);
+            let retry_fut =
+                super::retry::run_stream_with_retry(ctx, request, &model, &options, &state);
+            tokio::pin!(retry_fut);
             tokio::select! {
-                result = &mut stream_fut => result,
+                result = &mut retry_fut => result,
                 // 中断通道独立：此处只会收到 Interrupt
                 interrupt_msg = rx_interrupt.recv() => {
                     if let Some(interrupt_msg) = interrupt_msg {
@@ -94,11 +89,22 @@ pub(crate) async fn run_turn(
                     // execute_tools 内部若被中断会直接 return（见下方），此处 assume 已完成
                 }
             }
-            Err(_) => {
+            Err(e) => {
+                // 错误冒泡（retry 已判定不可重试或耗尽）：
+                // stream.rs 不再发 Error 事件（职责归位），由本层经 dispatch 发
                 tracing::warn!(
                     session_id = ctx.emitter.session_id(),
+                    cause = %e,
                     "LLM 调用失败，本轮未产出 Assistant 消息"
                 );
+                let error_event = OutputEvent::Error(fuyao_api::message::output::ErrorMessage {
+                    base: EventBase::default(),
+                    payload: fuyao_api::message::output::ErrorPayload {
+                        message: format!("LLM 调用失败: {e}"),
+                        recoverable: false,
+                    },
+                });
+                crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event, None).await;
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
                 return;
             }

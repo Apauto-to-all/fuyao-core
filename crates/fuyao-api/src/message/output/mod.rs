@@ -13,6 +13,7 @@
 //! - `plugin`: 插件事件
 //! - `compression`: 上下文压缩事件（Started/Delta/Ended 三阶段）
 //! - `title`: 会话标题更新（首轮对话后异步生成）
+//! - `retry`: LLM 重试事件（重试前发，前端据此渲染「N 秒后重试」提示）
 
 mod assistant;
 mod chunk;
@@ -20,6 +21,7 @@ mod compression;
 mod error;
 mod interrupt;
 mod plugin;
+mod retry;
 mod title;
 mod tool_call;
 mod tool_result;
@@ -35,6 +37,7 @@ pub use compression::{
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use plugin::{PluginMessage, PluginPayload};
+pub use retry::{RetryMessage, RetryPayload};
 pub use title::{TitleMessage, TitlePayload};
 pub use tool_call::{ToolCallMessage, ToolCallPayload};
 pub use tool_result::{ToolResultMessage, ToolResultPayload};
@@ -66,6 +69,8 @@ pub enum OutputEvent {
     Compression(CompressionMessage),
     /// 会话标题更新（首轮对话后异步生成，前端据此更新会话列表标题）
     Title(TitleMessage),
+    /// LLM 重试事件（重试前发，前端据此渲染「重试中…N 秒后重试，错误：xxx」提示）
+    Retry(RetryMessage),
 }
 
 #[cfg(test)]
@@ -207,5 +212,19 @@ mod tests {
             },
         });
         assert!(matches!(event, OutputEvent::Title(_)));
+    }
+
+    #[test]
+    fn retry_variant() {
+        let event = OutputEvent::Retry(RetryMessage {
+            base: EventBase::default(),
+            payload: RetryPayload {
+                attempt: 2,
+                max_retries: 5,
+                wait_ms: 4000,
+                cause: "速率限制".into(),
+            },
+        });
+        assert!(matches!(event, OutputEvent::Retry(_)));
     }
 }

@@ -22,6 +22,7 @@
 
 mod builders;
 pub(crate) mod queue;
+pub(crate) mod retry;
 #[cfg(test)]
 mod tests;
 pub(crate) mod turn;

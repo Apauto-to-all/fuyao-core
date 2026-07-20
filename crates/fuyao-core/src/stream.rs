@@ -3,14 +3,13 @@
 //! 消费 provider 的 StreamEvent 流，经 StreamDecoder 解码成 OutputEvent 发出。
 //! 流结束后返回累积结果（含 tool_calls）。
 //!
-//! 失败直接报错：provider 报任何错误都发不可恢复 Error 事件并返回 Err，
-//! 不做重试退避（重试后续再加，当前不影响引擎重构）。
+//! 失败处理：provider 报错时直接 `return Err(e)`——本模块只负责流式解码，
+//! **不发 Error 事件**。错误冒泡到调用方（RetryRunner / turn.rs），
+//! 由调用方决定是重试（发 OutputEvent::Retry）还是终止（发 OutputEvent::Error）。
 
 use crate::dispatch;
 use crate::emit::Emitter;
 use crate::interrupt::SharedTurnState;
-use fuyao_api::message::output::{ErrorMessage, ErrorPayload};
-use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{
     BoxStream, ChatRequest, Provider, StreamDecoder, StreamError, StreamEvent, StreamOptions,
@@ -77,20 +76,7 @@ pub(crate) async fn run_stream_session(
                 sync_state(state, &text, &reasoning);
             }
             Err(e) => {
-                // 不重试：经管道发不可恢复 Error 事件，直接返回
-                dispatch::dispatch(
-                    emitter,
-                    hooks,
-                    OutputEvent::Error(ErrorMessage {
-                        base: EventBase::default(),
-                        payload: ErrorPayload {
-                            message: format!("LLM 调用失败: {e}"),
-                            recoverable: false,
-                        },
-                    }),
-                    None,
-                )
-                .await;
+                // 错误冒泡到调用方（RetryRunner / turn.rs），由调用方决定重试还是发 Error
                 tracing::warn!(session_id = emitter.session_id(), cause = %e, "LLM 流式调用失败");
                 return Err(e);
             }
