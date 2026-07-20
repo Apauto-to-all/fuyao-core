@@ -44,8 +44,9 @@ pub struct Session {
     pub compression_count: i32,
     /// 最近一次压缩边界消息的 seq（NULL = 从未压缩）
     pub last_compacted_seq: Option<i64>,
-    /// 消息列表
-    pub messages: Vec<Message>,
+    // 注：消息列表（messages）已从内存移除——每条消息产生即落 DB，
+    // 需要时按 session_id 从数据库查询（见 SessionStore::load_visible_messages）。
+    // 这样单个 session 内存占用恒定（不随历史增长），多 session 并发无内存压力。
 }
 
 impl Session {
@@ -73,7 +74,6 @@ impl Session {
             end_reason: None,
             compression_count: 0,
             last_compacted_seq: None,
-            messages: Vec::new(),
         }
     }
 }

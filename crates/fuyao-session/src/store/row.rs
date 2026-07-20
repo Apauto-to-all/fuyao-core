@@ -41,7 +41,6 @@ impl From<SessionRow> for Session {
             end_reason: r.end_reason,
             compression_count: r.compression_count,
             last_compacted_seq: r.last_compacted_seq,
-            messages: Vec::new(),
         }
     }
 }

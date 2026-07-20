@@ -1,4 +1,4 @@
-//! SessionStore 单元测试（CRUD + 上下文压缩边界）
+//! SessionStore 单元测试（CRUD + 上下文压缩边界 + 事件级落库）
 
 use super::SessionStore;
 use super::compaction::CompressionReason;
@@ -17,26 +17,19 @@ async fn temp_store() -> SessionStore {
     SessionStore::new(db_path).await.expect("创建存储失败")
 }
 
-// ===== 基础 CRUD 测试（适配新字段：seq / kind） =====
+// ===== 基础 CRUD 测试（元数据 only——消息已脱离 session 内存） =====
 
 #[tokio::test]
 async fn store_create_and_get() {
     let store = temp_store().await;
-    let mut session = Session::new(Some("测试".to_string()), None);
-    session.messages.push(Message::user("你好".to_string()));
+    let session = Session::new(Some("测试".to_string()), None);
+    store.create(&session).await.unwrap();
 
-    store.create(&mut session).await.unwrap();
     let loaded = store.get(&session.id).await.unwrap().unwrap();
     assert_eq!(loaded.id, session.id);
     assert_eq!(loaded.title, Some("测试".to_string()));
-    assert_eq!(loaded.messages.len(), 1);
-    assert_eq!(loaded.messages[0].content, Some("你好".to_string()));
-    // 新会话从未压缩：compression_count=0, last_compacted_seq=None
     assert_eq!(loaded.compression_count, 0);
     assert!(loaded.last_compacted_seq.is_none());
-    // 首条消息 seq=1
-    assert_eq!(loaded.messages[0].seq, 1);
-    assert_eq!(loaded.messages[0].kind, MessageKind::Message);
 }
 
 #[tokio::test]
@@ -47,45 +40,23 @@ async fn store_get_returns_none_for_missing() {
 }
 
 #[tokio::test]
-async fn store_update_increments_messages() {
-    let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    session.messages.push(Message::user("第一条".to_string()));
-    store.create(&mut session).await.unwrap();
-
-    session
-        .messages
-        .push(Message::assistant(Some("回复".to_string())));
-    session.message_count = 2;
-    store.update(&mut session).await.unwrap();
-
-    let loaded = store.get(&session.id).await.unwrap().unwrap();
-    assert_eq!(loaded.messages.len(), 2);
-    assert_eq!(loaded.messages[1].role, "assistant");
-    // seq 连续递增
-    assert_eq!(loaded.messages[0].seq, 1);
-    assert_eq!(loaded.messages[1].seq, 2);
-}
-
-#[tokio::test]
 async fn store_delete_removes_session() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
 
     let deleted = store.delete(&session.id).await.unwrap();
     assert!(deleted);
-
     assert!(store.get(&session.id).await.unwrap().is_none());
 }
 
 #[tokio::test]
 async fn store_list_all_returns_sessions() {
     let store = temp_store().await;
-    let mut s1 = Session::new(Some("会话1".to_string()), None);
-    let mut s2 = Session::new(Some("会话2".to_string()), None);
-    store.create(&mut s1).await.unwrap();
-    store.create(&mut s2).await.unwrap();
+    let s1 = Session::new(Some("会话1".to_string()), None);
+    let s2 = Session::new(Some("会话2".to_string()), None);
+    store.create(&s1).await.unwrap();
+    store.create(&s2).await.unwrap();
 
     let list = store.list_all(10, 0).await.unwrap();
     assert_eq!(list.len(), 2);
@@ -96,45 +67,87 @@ async fn store_list_all_returns_sessions() {
 async fn store_count_returns_correct_count() {
     let store = temp_store().await;
     assert_eq!(store.count().await.unwrap(), 0);
-    store.create(&mut Session::new(None, None)).await.unwrap();
+    store.create(&Session::new(None, None)).await.unwrap();
     assert_eq!(store.count().await.unwrap(), 1);
 }
 
 #[tokio::test]
-async fn store_incremental_save_only_inserts_new() {
+async fn store_update_syncs_metadata() {
     let store = temp_store().await;
     let mut session = Session::new(None, None);
-    session.messages.push(Message::user("m1".to_string()));
-    session.messages.push(Message::user("m2".to_string()));
-    store.create(&mut session).await.unwrap();
+    store.create(&session).await.unwrap();
 
-    session.messages.push(Message::user("m3".to_string()));
-    store.update(&mut session).await.unwrap();
+    // 改一些元数据后 update
+    session.total_prompt_tokens = 12345;
+    session.compression_count = 2;
+    store.update(&session).await.unwrap();
 
     let loaded = store.get(&session.id).await.unwrap().unwrap();
-    assert_eq!(loaded.messages.len(), 3);
-    assert_eq!(loaded.messages[2].content, Some("m3".to_string()));
-    assert_eq!(loaded.messages[2].seq, 3);
+    assert_eq!(loaded.total_prompt_tokens, 12345);
+    assert_eq!(loaded.compression_count, 2);
+}
+
+// ===== insert_message / count_messages 测试（事件级落库） =====
+
+#[tokio::test]
+async fn insert_message_assigns_sequential_seq() {
+    let store = temp_store().await;
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut m1 = Message::user("第一条".to_string());
+    let seq1 = store.insert_message(&session.id, &mut m1).await.unwrap();
+    assert_eq!(seq1, 1);
+    assert_eq!(m1.seq, 1, "msg.seq 应被回填");
+
+    let mut m2 = Message::assistant(Some("回复".to_string()));
+    let seq2 = store.insert_message(&session.id, &mut m2).await.unwrap();
+    assert_eq!(seq2, 2);
+    assert_eq!(m2.seq, 2);
 }
 
 #[tokio::test]
-async fn store_tool_calls_serialized_as_json() {
+async fn insert_message_serializes_tool_calls() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
     let mut msg = Message::assistant(None);
     msg.tool_calls = Some(serde_json::json!([{
         "id": "call_1",
         "type": "function",
         "function": { "name": "bash", "arguments": "{}" }
     }]));
-    session.messages.push(msg);
-    store.create(&mut session).await.unwrap();
+    store.insert_message(&session.id, &mut msg).await.unwrap();
 
-    let loaded = store.get(&session.id).await.unwrap().unwrap();
-    assert!(loaded.messages[0].tool_calls.is_some());
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].tool_calls.is_some());
+    assert_eq!(visible[0].tool_calls.as_ref().unwrap()[0]["id"], "call_1");
+}
+
+#[tokio::test]
+async fn count_messages_excludes_compaction_boundary() {
+    let store = temp_store().await;
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut m1 = Message::user("a".to_string());
+    store.insert_message(&session.id, &mut m1).await.unwrap();
+    let mut m2 = Message::user("b".to_string());
+    store.insert_message(&session.id, &mut m2).await.unwrap();
+
+    assert_eq!(store.count_messages(&session.id).await.unwrap(), 2);
+
+    // 压缩边界消息（kind='compaction'）不计入
+    store
+        .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+        .await
+        .unwrap();
     assert_eq!(
-        loaded.messages[0].tool_calls.as_ref().unwrap()[0]["id"],
-        "call_1"
+        store.count_messages(&session.id).await.unwrap(),
+        2,
+        "count_messages 应排除 compaction 边界"
     );
 }
 
@@ -143,12 +156,13 @@ async fn store_tool_calls_serialized_as_json() {
 #[tokio::test]
 async fn mark_compaction_inserts_boundary_message() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    session.messages.push(Message::user("hello".to_string()));
-    session
-        .messages
-        .push(Message::assistant(Some("hi".to_string())));
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut m1 = Message::user("hello".to_string());
+    store.insert_message(&session.id, &mut m1).await.unwrap();
+    let mut m2 = Message::assistant(Some("hi".to_string()));
+    store.insert_message(&session.id, &mut m2).await.unwrap();
 
     let new_seq = store
         .mark_compaction(
@@ -175,21 +189,18 @@ async fn mark_compaction_inserts_boundary_message() {
 #[tokio::test]
 async fn mark_compaction_updates_session_metadata() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
 
     let new_seq = store
         .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
         .await
         .unwrap();
 
-    // 通过 get 验证 sessions 表更新
     let loaded = store.get(&session.id).await.unwrap().unwrap();
     assert_eq!(loaded.last_compacted_seq, Some(new_seq));
     assert_eq!(loaded.compression_count, 1);
-    // 统计字段不重置（保持原值）
     assert_eq!(loaded.total_prompt_tokens, 0);
-    // end_reason / ended_at 不被压缩改动
     assert!(loaded.ended_at.is_none());
     assert!(loaded.end_reason.is_none());
 }
@@ -208,21 +219,19 @@ async fn mark_compaction_returns_not_found_for_missing_session() {
 #[tokio::test]
 async fn update_system_prompt_updates_db_row() {
     let store = temp_store().await;
-    let mut session = Session::new(None, Some("旧提示词".to_string()));
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, Some("旧提示词".to_string()));
+    store.create(&session).await.unwrap();
 
     store
         .update_system_prompt(&session.id, "新提示词（压缩后重建）")
         .await
         .unwrap();
 
-    // 通过 get 验证字段已更新，且其他字段未被破坏
     let loaded = store.get(&session.id).await.unwrap().unwrap();
     assert_eq!(
         loaded.system_prompt.as_deref(),
         Some("新提示词（压缩后重建）")
     );
-    // 其他字段保持原值（create 时初始化的默认值）
     assert_eq!(loaded.compression_count, 0);
     assert!(loaded.last_compacted_seq.is_none());
 }
@@ -239,9 +248,8 @@ async fn update_system_prompt_errors_on_missing_session() {
 #[tokio::test]
 async fn update_title_updates_db_row() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    // create 时 title 默认 "新会话"
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
     assert_eq!(session.title.as_deref(), Some("新会话"));
 
     store
@@ -249,10 +257,8 @@ async fn update_title_updates_db_row() {
         .await
         .unwrap();
 
-    // 通过 get 验证 title 已更新，且其他字段未被破坏
     let loaded = store.get(&session.id).await.unwrap().unwrap();
     assert_eq!(loaded.title.as_deref(), Some("Rust 异步讨论"));
-    // 其他字段保持原值
     assert_eq!(loaded.compression_count, 0);
     assert!(loaded.last_compacted_seq.is_none());
 }
@@ -269,10 +275,13 @@ async fn update_title_errors_on_missing_session() {
 #[tokio::test]
 async fn load_visible_returns_all_when_never_compacted() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    session.messages.push(Message::user("m1".to_string()));
-    session.messages.push(Message::user("m2".to_string()));
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut m1 = Message::user("m1".to_string());
+    store.insert_message(&session.id, &mut m1).await.unwrap();
+    let mut m2 = Message::user("m2".to_string());
+    store.insert_message(&session.id, &mut m2).await.unwrap();
 
     let visible = store.load_visible_messages(&session.id).await.unwrap();
     assert_eq!(visible.len(), 2);
@@ -281,11 +290,13 @@ async fn load_visible_returns_all_when_never_compacted() {
 #[tokio::test]
 async fn load_visible_returns_only_after_boundary() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    session.messages.push(Message::user("old1".to_string()));
-    session.messages.push(Message::user("old2".to_string()));
-    session.messages.push(Message::user("old3".to_string()));
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    for content in ["old1", "old2", "old3"] {
+        let mut msg = Message::user(content.to_string());
+        store.insert_message(&session.id, &mut msg).await.unwrap();
+    }
 
     // 标记压缩：此时 seq=4 是 compaction 边界
     store
@@ -294,9 +305,8 @@ async fn load_visible_returns_only_after_boundary() {
         .unwrap();
 
     // 再加一条新消息
-    let mut session2 = store.get(&session.id).await.unwrap().unwrap();
-    session2.messages.push(Message::user("new1".to_string()));
-    store.update(&mut session2).await.unwrap();
+    let mut new_msg = Message::user("new1".to_string());
+    store.insert_message(&session.id, &mut new_msg).await.unwrap();
 
     let visible = store.load_visible_messages(&session.id).await.unwrap();
     // 只看到 compaction 边界（seq=4）+ 之后的消息（seq=5）
@@ -310,9 +320,11 @@ async fn load_visible_returns_only_after_boundary() {
 #[tokio::test]
 async fn load_visible_returns_latest_after_multiple_compactions() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    session.messages.push(Message::user("v1-1".to_string()));
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut m = Message::user("v1-1".to_string());
+    store.insert_message(&session.id, &mut m).await.unwrap();
 
     // 第一次压缩
     let seq1 = store
@@ -320,9 +332,8 @@ async fn load_visible_returns_latest_after_multiple_compactions() {
         .await
         .unwrap();
 
-    let mut s = store.get(&session.id).await.unwrap().unwrap();
-    s.messages.push(Message::user("v2-1".to_string()));
-    store.update(&mut s).await.unwrap();
+    let mut m = Message::user("v2-1".to_string());
+    store.insert_message(&session.id, &mut m).await.unwrap();
 
     // 第二次压缩
     let seq2 = store
@@ -344,12 +355,13 @@ async fn load_visible_returns_latest_after_multiple_compactions() {
 #[tokio::test]
 async fn load_full_history_includes_compacted_messages() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
-    session.messages.push(Message::user("old".to_string()));
-    session
-        .messages
-        .push(Message::assistant(Some("reply".to_string())));
-    store.create(&mut session).await.unwrap();
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut m1 = Message::user("old".to_string());
+    store.insert_message(&session.id, &mut m1).await.unwrap();
+    let mut m2 = Message::assistant(Some("reply".to_string()));
+    store.insert_message(&session.id, &mut m2).await.unwrap();
 
     store
         .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)

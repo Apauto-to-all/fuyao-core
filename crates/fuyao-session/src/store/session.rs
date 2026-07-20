@@ -1,14 +1,18 @@
 //! Session CRUD：创建 / 读取 / 更新 / 删除 / 列表 / 计数
+//!
+//! 注：消息（Message）已不在内存——产生即通过 [`super::SessionStore::insert_message`]
+//! 单条落 DB，需要时按 session_id 用 `load_visible_messages` 查询。
+//! 本模块的 `create` / `update` 只维护 sessions 表的元数据（统计字段、system_prompt 等）。
 
 use super::row::SessionRow;
 use crate::error::SessionError;
 use fuyao_api::Session;
 
 impl super::SessionStore {
-    /// 创建会话
-    pub async fn create(&self, session: &mut Session) -> Result<(), SessionError> {
-        let mut tx = self.pool.begin().await?;
-
+    /// 创建会话（只 INSERT sessions 元数据行）
+    ///
+    /// 消息产生时由调用方经 `insert_message` 单条落库，不在此处批量写。
+    pub async fn create(&self, session: &Session) -> Result<(), SessionError> {
         sqlx::query(
             "INSERT INTO sessions (id, started_at, ended_at, end_reason,
                 message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
@@ -31,19 +35,16 @@ impl super::SessionStore {
         .bind(session.system_prompt.as_deref())
         .bind(session.compression_count)
         .bind(session.last_compacted_seq)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
 
-        Self::save_messages_tx(&mut tx, session).await?;
-        tx.commit().await?;
         Ok(())
     }
 
-    /// 获取会话（含可见窗口消息）
+    /// 获取会话（纯元数据，不含消息）
     ///
-    /// 内部调 [`load_visible_messages`](super::SessionStore::load_visible_messages)：
-    /// 内存 Session 持有的就是模型可见窗口（最近一条 compaction 及之后），
-    /// 旧消息仍存 DB 但不进内存。
+    /// 消息请用 [`load_visible_messages`](super::SessionStore::load_visible_messages)
+    /// 或 [`load_full_history`](super::SessionStore::load_full_history) 单独查。
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>, SessionError> {
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT id, started_at, ended_at, end_reason,
@@ -56,20 +57,14 @@ impl super::SessionStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(r) => {
-                let mut session: Session = r.into();
-                session.messages = self.load_visible_messages(session_id).await?;
-                Ok(Some(session))
-            }
-            None => Ok(None),
-        }
+        Ok(row.map(Session::from))
     }
 
-    /// 更新会话（增量保存消息）
-    pub async fn update(&self, session: &mut Session) -> Result<(), SessionError> {
-        let mut tx = self.pool.begin().await?;
-
+    /// 更新会话元数据（只 UPDATE sessions 表，不碰 messages 表）
+    ///
+    /// 消息已在产生时经 `insert_message` 落库，本方法只同步元数据
+    /// （统计字段、system_prompt、ended_at/end_reason、压缩指针等）。
+    pub async fn update(&self, session: &Session) -> Result<(), SessionError> {
         sqlx::query(
             "UPDATE sessions SET
                 ended_at = ?2, end_reason = ?3,
@@ -94,11 +89,9 @@ impl super::SessionStore {
         .bind(session.system_prompt.as_deref())
         .bind(session.compression_count)
         .bind(session.last_compacted_seq)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?;
 
-        Self::save_messages_tx(&mut tx, session).await?;
-        tx.commit().await?;
         Ok(())
     }
 
