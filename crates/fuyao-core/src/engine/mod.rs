@@ -192,8 +192,16 @@ impl Engine {
     /// 把数据库里的老对话捞回内存：用 session id 从 store 加载历史，
     /// 装进内存，重新登记进调度表。
     ///
+    /// 与 `create_session` 对称，同样由调用方提供 `SessionParams`
+    /// （含 Agent 配置）——引擎核心不持久化 AgentConfig，恢复时由
+    /// 调用方把创建时的那份配置原样再传一次。
+    ///
     /// session id 不在数据库 → 同步返回 `Err(SessionNotFound)`。
-    pub async fn resume_session(&self, id: &SessionId) -> Result<(), EngineError> {
+    pub async fn resume_session(
+        &self,
+        id: &SessionId,
+        params: SessionParams,
+    ) -> Result<(), EngineError> {
         // 从数据库加载
         let session = self
             .store
@@ -202,12 +210,8 @@ impl Engine {
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
-        // TODO: resume 场景没有原始 agent_config（未持久化），用 default 兜底——
-        // 压缩重建 system_prompt 时会回退到 agents/default.md。
-        // 若需保留原 session 的非 default Agent 人格，需扩展 sessions 表
-        // 持久化 agent_definition 列（单独立项）
         let handle = self
-            .assemble_session(id.clone(), session, AgentConfig::default())
+            .assemble_session(id.clone(), session, params.agent_config)
             .await;
         self.sessions.lock().await.insert(id.clone(), handle);
 
