@@ -12,6 +12,7 @@
 //! - `error`: 错误
 //! - `plugin`: 插件事件
 //! - `compression`: 上下文压缩事件（Started/Delta/Ended 三阶段）
+//! - `title`: 会话标题更新（首轮对话后异步生成）
 
 mod assistant;
 mod chunk;
@@ -19,6 +20,7 @@ mod compression;
 mod error;
 mod interrupt;
 mod plugin;
+mod title;
 mod tool_call;
 mod tool_result;
 mod user_message;
@@ -33,6 +35,7 @@ pub use compression::{
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use plugin::{PluginMessage, PluginPayload};
+pub use title::{TitleMessage, TitlePayload};
 pub use tool_call::{ToolCallMessage, ToolCallPayload};
 pub use tool_result::{ToolResultMessage, ToolResultPayload};
 pub use user_message::{UserMessage, UserPayload};
@@ -61,6 +64,8 @@ pub enum OutputEvent {
     Plugin(PluginMessage),
     /// 上下文压缩事件（含 Started/Delta/Ended 三阶段，前端据此追踪压缩生命周期）
     Compression(CompressionMessage),
+    /// 会话标题更新（首轮对话后异步生成，前端据此更新会话列表标题）
+    Title(TitleMessage),
 }
 
 #[cfg(test)]
@@ -191,5 +196,16 @@ mod tests {
         });
         let cloned = event.clone();
         assert!(matches!(cloned, OutputEvent::Chunk(_)));
+    }
+
+    #[test]
+    fn title_variant() {
+        let event = OutputEvent::Title(TitleMessage {
+            base: EventBase::default(),
+            payload: TitlePayload {
+                title: "Rust 异步讨论".into(),
+            },
+        });
+        assert!(matches!(event, OutputEvent::Title(_)));
     }
 }

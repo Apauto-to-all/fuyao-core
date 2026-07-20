@@ -26,7 +26,7 @@ use crate::tool_exec;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;
-use fuyao_api::message::output::AssistantMessage;
+use fuyao_api::message::output::{AssistantMessage, TitleMessage, TitlePayload};
 use fuyao_api::{Message, MessageParams, Session};
 use fuyao_provider::StreamDecoder;
 use std::sync::Arc;
@@ -150,10 +150,97 @@ async fn handle_final_reply(
     if msgs.is_empty() {
         // guide 和 pending 都空：落库，turn 结束
         persist(ctx.emitter.session_id(), session, &ctx.store).await;
+        // 首轮最终回复后异步生成标题（fire-and-forget，不阻塞主循环）
+        maybe_spawn_title_generation(ctx, session, result);
     } else {
         // 有消息：全部注入（每条经 emit_to_history 拦截→push→发送→观察），回 run_turn 顶部再调一轮 LLM
         queue::inject_messages(ctx, session, msgs).await;
     }
+}
+
+/// 首轮对话后触发标题自动生成（fire-and-forget）
+///
+/// 触发条件（同时满足）：
+/// - `[session.title] enabled = true`
+/// - `session.messages` 中 `role=user` 的消息数严格等于 1（首轮判定：计数法比
+///   `title=="新会话"` 更稳——用户可能改过 title）
+/// - 能取到首条 user content 与本轮 assistant 文本
+///
+/// 执行模型：`tokio::spawn` 独立 task，不阻塞主 ReAct 循环。
+/// spawn 的 future 是 `'static` 的，**不借用 `&mut Session`**——标题直接走
+/// `SessionStore::update_title` 单字段 SQL 落库，内存态不更新（下次 resume 时
+/// 从 DB 自然读回）。
+///
+/// 多 session 并发天然安全：clone `Arc<store>` / `Arc<provider>` / `emitter` /
+/// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
+fn maybe_spawn_title_generation(ctx: &SessionCtx, session: &Session, result: &StreamResult) {
+    let title_cfg = &fuyao_api::get_config().session.title;
+    if !title_cfg.enabled {
+        return;
+    }
+
+    // 计数法判定首轮
+    let user_count = session.messages.iter().filter(|m| m.role == "user").count();
+    if user_count != 1 {
+        return;
+    }
+
+    // 取首条 user content + 本轮 assistant 文本（StreamResult.text 是本轮流式累积全文）
+    let user_content = session
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone())
+        .unwrap_or_default();
+    let assistant_content = result.text.clone();
+    // 标题生成回退用的主模型 ID：从 session 最后一条 assistant 消息读取
+    // （emit_to_history 闭包构造 Message 时已把 model_id 存进字段）。读不到则空串，
+    // maybe_generate_title 内部会因 model_id 无法解析返回 None。
+    let main_model_id = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .and_then(|m| m.model_id.clone())
+        .unwrap_or_default();
+
+    // clone 'static 依赖进 spawn（所有字段都是 Send + 'static）
+    let store = Arc::clone(&ctx.store);
+    let emitter = ctx.emitter.clone();
+    let hooks = ctx.hooks.clone();
+    let agent_paths = ctx.agent_paths.clone();
+    let session_id = ctx.emitter.session_id().to_string();
+
+    tokio::spawn(async move {
+        match fuyao_session::maybe_generate_title(
+            &user_content,
+            &assistant_content,
+            &main_model_id,
+            &agent_paths,
+        )
+        .await
+        {
+            Some(title) => {
+                // 单字段落库（失败仅 warn，不影响主流程）
+                if let Err(e) = store.update_title(&session_id, &title).await {
+                    tracing::warn!(session_id = %session_id, cause = %e, "标题落库失败");
+                    return;
+                }
+                // 发 Title 事件：经 dispatch 管道（拦截 → 发送 → 观察）
+                crate::dispatch::dispatch(
+                    &emitter,
+                    &hooks,
+                    OutputEvent::Title(TitleMessage {
+                        base: EventBase::default(),
+                        payload: TitlePayload { title },
+                    }),
+                    None,
+                )
+                .await;
+            }
+            None => tracing::debug!(session_id = %session_id, "标题生成跳过（无可用标题）"),
+        }
+    });
 }
 
 /// 处理工具调用：逐个拦截工具调用 → emit_to_history 同步 AssistantMessage → 执行整批工具 → 消费时机①

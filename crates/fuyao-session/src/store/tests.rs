@@ -234,6 +234,36 @@ async fn update_system_prompt_errors_on_missing_session() {
     assert!(matches!(result, Err(SessionError::NotFound(_))));
 }
 
+// ===== update_title 测试组 =====
+
+#[tokio::test]
+async fn update_title_updates_db_row() {
+    let store = temp_store().await;
+    let mut session = Session::new(None, None);
+    // create 时 title 默认 "新会话"
+    store.create(&mut session).await.unwrap();
+    assert_eq!(session.title.as_deref(), Some("新会话"));
+
+    store
+        .update_title(&session.id, "Rust 异步讨论")
+        .await
+        .unwrap();
+
+    // 通过 get 验证 title 已更新，且其他字段未被破坏
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert_eq!(loaded.title.as_deref(), Some("Rust 异步讨论"));
+    // 其他字段保持原值
+    assert_eq!(loaded.compression_count, 0);
+    assert!(loaded.last_compacted_seq.is_none());
+}
+
+#[tokio::test]
+async fn update_title_errors_on_missing_session() {
+    let store = temp_store().await;
+    let result = store.update_title("nonexistent", "标题").await;
+    assert!(matches!(result, Err(SessionError::NotFound(_))));
+}
+
 // ===== load_visible_messages 测试组 =====
 
 #[tokio::test]

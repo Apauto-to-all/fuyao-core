@@ -160,6 +160,47 @@ impl super::SessionStore {
         Ok(())
     }
 
+    /// 更新 session 的 title（标题自动生成后异步落库）
+    ///
+    /// 单字段 UPDATE，不动其他字段、不动 messages 表。由 react 层 fire-and-forget
+    /// spawn 的标题生成任务调用——spawn 的 future 是 `'static` 的，无法借用 `&mut Session`，
+    /// 故走单字段 SQL 而非全量 `update(session)`。
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]：session_id 在数据库中不存在
+    pub async fn update_title(
+        &self,
+        session_id: &str,
+        new_title: &str,
+    ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        // 校验 session 存在（与 update_system_prompt 一致，避免给不存在的 session 写脏数据）
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(SessionError::NotFound(session_id.to_string()));
+        }
+
+        sqlx::query("UPDATE sessions SET title = ?2 WHERE id = ?1")
+            .bind(session_id)
+            .bind(new_title)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            session_id = session_id,
+            title = new_title,
+            "会话标题已更新（自动生成）"
+        );
+        Ok(())
+    }
+
     /// 加载模型可见窗口消息
     ///
     /// 返回「最近一条 compaction 消息（若有）及之后的所有消息」。
