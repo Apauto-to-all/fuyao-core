@@ -1,7 +1,7 @@
 //! 消息/请求构造器
 //!
 //! 从 ReAct 循环抽出的纯构造逻辑：
-//! - [`build_chat_request`]：从 session.messages 凑 ChatRequest
+//! - [`build_chat_request`]：从 DB 加载可见消息凑 ChatRequest（async，走 store 查询）
 //! - [`resolve_model`]：从 MessageParams 解析 model + provider_id + StreamOptions
 //! - 各类 Assistant Payload 构造器（事件用）
 //! - 工具调用拦截回灌用的双向转换函数
@@ -12,10 +12,11 @@
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
+use fuyao_api::MessageParams;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{MessageParams, Session};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
+use fuyao_session::SessionStore;
 
 /// 解析后的模型信息（一轮 ReAct 用）
 ///
@@ -32,18 +33,37 @@ pub(crate) struct ResolvedModel {
     pub options: StreamOptions,
 }
 
-/// 从 session 的内存历史凑 ChatRequest
+/// 从 DB 加载可见消息凑 ChatRequest
 ///
 /// 系统提示词单独填 request.system（不进 messages 数组），
 /// messages 只装 user/assistant/tool 对话历史。
 ///
+/// **事件级落库模式下消息不在内存**：每次构造 ChatRequest 都从 DB 查询
+/// 可见窗口（走 `idx_messages_session_seq` 索引，毫秒级）。
+///
 /// **配对兜底**：OpenAI/Anthropic 协议要求每个 assistant 的 tool_call 都有对应的
 /// tool 结果消息。被拦截 Block、中断的工具调用不会有结果——这里在拼消息时
 /// 为缺结果的 tool_call 补一条 error tool_result（content 标记中断）。
-pub(crate) fn build_chat_request(session: &Session) -> ChatRequest {
+pub(crate) async fn build_chat_request(
+    store: &SessionStore,
+    session_id: &str,
+    system_prompt: Option<&str>,
+) -> ChatRequest {
+    let history = match store.load_visible_messages(session_id).await {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            tracing::warn!(
+                session_id = session_id,
+                cause = %e,
+                "加载可见消息失败，本轮 LLM 调用将看到空历史"
+            );
+            Vec::new()
+        }
+    };
+
     // 先收集所有已有 tool 结果的 tool_call_id（用于配对检查）
     let mut answered_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for m in &session.messages {
+    for m in &history {
         if m.role == "tool"
             && let Some(id) = &m.tool_call_id
         {
@@ -51,8 +71,8 @@ pub(crate) fn build_chat_request(session: &Session) -> ChatRequest {
         }
     }
 
-    let mut messages = Vec::with_capacity(session.messages.len());
-    for m in &session.messages {
+    let mut messages = Vec::with_capacity(history.len());
+    for m in &history {
         messages.push(ChatMessage {
             role: m.role.clone(),
             content: m.content.clone(),
@@ -89,7 +109,7 @@ pub(crate) fn build_chat_request(session: &Session) -> ChatRequest {
 
     ChatRequest {
         messages,
-        system: session.system_prompt.clone(),
+        system: system_prompt.map(String::from),
     }
 }
 
@@ -284,19 +304,48 @@ mod tests {
         msg
     }
 
-    #[test]
-    fn pairing_fills_missing_tool_results() {
-        // assistant 调用 3 个工具，只有 1 个有结果 → 补 2 条 error tool_result
+    /// 构造临时 SessionStore + session（事件级落库模式下 pairing 测试需要真实 DB）
+    async fn temp_store_with_session() -> (fuyao_session::SessionStore, Session) {
+        let dir = std::env::temp_dir()
+            .join("fuyao_builders_test")
+            .join(uuid::Uuid::new_v4().to_string());
+        let store = fuyao_session::SessionStore::new(dir.join("test.db"))
+            .await
+            .expect("构造 SessionStore 失败");
         let mut session = Session::new(None, Some("系统提示词".to_string()));
-        session.messages.push(Message::user("问题".to_string()));
-        session
-            .messages
-            .push(assistant_with_calls(&["c1", "c2", "c3"]));
-        session
-            .messages
-            .push(Message::tool_result("c2".into(), "结果2".into()));
+        session.id = "test_session".to_string();
+        store.create(&session).await.unwrap();
+        (store, session)
+    }
 
-        let request = build_chat_request(&session);
+    /// 把消息落进 DB（事件级落库模式）
+    async fn insert(store: &fuyao_session::SessionStore, session_id: &str, mut msg: Message) {
+        store
+            .insert_message(session_id, &mut msg)
+            .await
+            .expect("insert 失败");
+    }
+
+    #[tokio::test]
+    async fn pairing_fills_missing_tool_results() {
+        // assistant 调用 3 个工具，只有 1 个有结果 → 补 2 条 error tool_result
+        let (store, session) = temp_store_with_session().await;
+        insert(&store, &session.id, Message::user("问题".to_string())).await;
+        insert(
+            &store,
+            &session.id,
+            assistant_with_calls(&["c1", "c2", "c3"]),
+        )
+        .await;
+        insert(
+            &store,
+            &session.id,
+            Message::tool_result("c2".into(), "结果2".into()),
+        )
+        .await;
+
+        let request =
+            build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
 
         // 应有：user + assistant + 1 真实结果 + 2 补充 error 结果 = 5 条
         let tool_msgs: Vec<_> = request
@@ -319,33 +368,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pairing_no_op_when_all_answered() {
+    #[tokio::test]
+    async fn pairing_no_op_when_all_answered() {
         // 所有 tool_call 都有结果 → 不补充
-        let mut session = Session::new(None, Some("系统提示词".to_string()));
-        session.messages.push(assistant_with_calls(&["c1", "c2"]));
-        session
-            .messages
-            .push(Message::tool_result("c1".into(), "结果1".into()));
-        session
-            .messages
-            .push(Message::tool_result("c2".into(), "结果2".into()));
+        let (store, session) = temp_store_with_session().await;
+        insert(&store, &session.id, assistant_with_calls(&["c1", "c2"])).await;
+        insert(
+            &store,
+            &session.id,
+            Message::tool_result("c1".into(), "结果1".into()),
+        )
+        .await;
+        insert(
+            &store,
+            &session.id,
+            Message::tool_result("c2".into(), "结果2".into()),
+        )
+        .await;
 
-        let request = build_chat_request(&session);
+        let request =
+            build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
         let tool_count = request.messages.iter().filter(|m| m.role == "tool").count();
         assert_eq!(tool_count, 2, "全部有结果时不补充");
     }
 
-    #[test]
-    fn pairing_ignores_assistant_without_tool_calls() {
+    #[tokio::test]
+    async fn pairing_ignores_assistant_without_tool_calls() {
         // 无工具调用的 assistant 消息不触发补充
-        let mut session = Session::new(None, Some("系统提示词".to_string()));
-        session.messages.push(Message::user("你好".to_string()));
-        session
-            .messages
-            .push(Message::assistant(Some("你好".to_string())));
+        let (store, session) = temp_store_with_session().await;
+        insert(&store, &session.id, Message::user("你好".to_string())).await;
+        insert(
+            &store,
+            &session.id,
+            Message::assistant(Some("你好".to_string())),
+        )
+        .await;
 
-        let request = build_chat_request(&session);
+        let request =
+            build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
         assert_eq!(request.messages.len(), 2, "无工具调用时消息数不变");
     }
 

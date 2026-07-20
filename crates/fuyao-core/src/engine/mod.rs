@@ -161,18 +161,12 @@ impl Engine {
         let system_prompt = build_system_prompt(&self.params.agent_paths, &params.agent_config);
 
         // 创建 Session（8 位 UUID）
-        let mut session = Session::new(None, Some(system_prompt));
+        let session = Session::new(None, Some(system_prompt));
 
-        // 落库
-        self.store.create(&mut session).await?;
+        // 落库元数据（消息产生时由 emit_to_history 单条 insert_message 落库）
+        self.store.create(&session).await?;
 
         let session_id = session.id.clone();
-        let messages = std::mem::take(&mut session.messages);
-        // task 接管 session（含 system_prompt + messages）
-        let session = Session {
-            messages,
-            ..session
-        };
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         let handle = self

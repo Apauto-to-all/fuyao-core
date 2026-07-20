@@ -126,7 +126,10 @@ mod tests {
         // 之后的是 keep_recent 副本（kind = Message）
         for m in &after[1..] {
             assert_eq!(m.kind, MessageKind::Message);
-            assert!(m.seq > new_seq, "keep_recent 副本 seq 应大于 compaction 边界 seq");
+            assert!(
+                m.seq > new_seq,
+                "keep_recent 副本 seq 应大于 compaction 边界 seq"
+            );
         }
 
         // 可见窗口显著短于原始（compaction 边界 + 少量 keep_recent 副本）

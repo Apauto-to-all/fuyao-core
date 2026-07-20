@@ -8,7 +8,7 @@
 //!
 //! 双队列（guide / pending）：
 //! - guide：直接消费的队列，触发消费时机时一次性全部取出，每条变一条 user message
-//!   注入 session.messages，回循环顶部调 LLM
+//!   落 DB（事件级落库），回循环顶部调 LLM
 //! - pending：排队队列，AI 不再调工具（最终回复）后才一次性全部倒进 guide
 //!
 //! 两个消费时机（详见 [`turn::run_turn`]）：
@@ -18,7 +18,7 @@
 //! 中断通道与队列分离：Interrupt 走独立 `rx_interrupt`（mpsc），
 //! select! 中断点只监听它——不会误取 User/Plugin。
 //!
-//! 工具结果不走队列：它是 ReAct 循环内部中间产物，直接 push 进 session.messages。
+//! 工具结果不走队列：它是 ReAct 循环内部中间产物，产生即落 DB（事件级落库）。
 
 mod builders;
 pub(crate) mod queue;
@@ -151,7 +151,7 @@ pub(crate) async fn run_session(
         }
         if !msgs.is_empty() {
             // === 上下文压缩检查（pre-turn）===
-            // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库 → 重建 messages
+            // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库 → 复制 keep_recent 为新 seq
             // 失败 log warn 跳过本次压缩，主流程继续
             run_pre_turn_compression(&ctx, &mut session, &msgs).await;
 
@@ -163,7 +163,7 @@ pub(crate) async fn run_session(
                     session_id = %ctx.emitter.session_id(),
                     "session 收到 shutdown 信号，正在落库退出"
                 );
-                let _ = ctx.store.update(&mut session).await;
+                let _ = ctx.store.update(&session).await;
                 break;
             }
 
@@ -171,7 +171,7 @@ pub(crate) async fn run_session(
             // ReAct 多轮复用同一份 model（一个 turn 一个模型）
             // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
             let first_params = msgs.first().map(|m| m.params.clone()).unwrap_or_default();
-            // 一次性全部注入：每条经 emit_to_history（拦截 → push Message::user → 发送 → 观察）
+            // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
             queue::inject_messages(&ctx, &mut session, msgs).await;
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
         } else {
@@ -185,7 +185,7 @@ pub(crate) async fn run_session(
                         "session 收到 shutdown 信号，正在落库退出"
                     );
                     // 落库保护 in-flight 状态（失败仅 warn，不阻塞关闭）
-                    if let Err(e) = ctx.store.update(&mut session).await {
+                    if let Err(e) = ctx.store.update(&session).await {
                         tracing::warn!(
                             session_id = %ctx.emitter.session_id(),
                             cause = %e,
@@ -219,7 +219,7 @@ pub(crate) async fn run_session(
 ///
 /// 在主循环注入新消息前、调 LLM 前，根据上一轮真实 usage 判定要不要压缩。
 /// 触发条件满足时：调一次独立 LLM（`tools=[]`）拿摘要 → `mark_compaction` 落库 →
-/// 重建 `session.messages` 为 `[compaction 边界] + [tail 保留窗口]`。
+/// 复制 keep_recent 为新 seq（下次 `load_visible_messages` 自然看到 compaction 边界 + keep_recent）。
 ///
 /// 失败处理（对齐 opencode "失败保持边界" + hermes 分级）：
 /// - 摘要为空 / 无可压缩内容：log warn 跳过
@@ -244,7 +244,7 @@ async fn run_pre_turn_compression(
     // 解析本轮主模型的 model_id 和 Provider 实例
     //
     // **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，
-    // 否则 session.messages 原样发的请求会因为 endpoint 切换导致前缀缓存失效。
+    // 否则原样发的请求会因为 endpoint 切换导致前缀缓存失效。
     // model_id 解析顺序与 turn.rs::resolve_model 一致：
     //   1. incoming[0].params.model_id = Some(...) → 用它
     //   2. None → 读 [models.default] 兜底
@@ -341,6 +341,19 @@ async fn run_pre_turn_compression(
     )
     .await;
 
+    // 从 DB 加载当前可见消息（事件级落库模式下消息不在内存）
+    let visible_messages = match ctx.store.load_visible_messages(session.id.as_str()).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "压缩前加载可见消息失败，跳过本次压缩"
+            );
+            return;
+        }
+    };
+
     // 执行层：生成摘要（原消息原样发，前缀缓存完整命中）
     //
     // 流式增量通过 channel 转发到并发的 Delta 事件发送任务：
@@ -380,7 +393,7 @@ async fn run_pre_turn_compression(
         biased;
         s = fuyao_session::generate_summary(
             session.system_prompt.as_deref(),
-            &session.messages,
+            &visible_messages,
             &provider,
             &model_id,
             context_length,
@@ -406,26 +419,26 @@ async fn run_pre_turn_compression(
     // 等 Delta 消费者把剩余积压推完（summary 完成后 on_delta/delta_tx drop，recv 返回 None 退出）
     let _ = (&mut delta_consumer).await;
 
-    // 落地层：mark_compaction + 重建 messages（返回 new_seq 供 Ended 事件）
+    // 落地层：mark_compaction + 复制 keep_recent 为新 seq
     match fuyao_session::apply(
-        &session.messages,
+        &visible_messages,
         &summary,
         ctx.emitter.session_id(),
         &ctx.compression_config,
         context_length,
-        &ctx.store,
+        ctx.store.as_ref(),
     )
     .await
     {
-        Ok((new_messages, new_seq)) => {
+        Ok(new_seq) => {
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
             // X 已被压进摘要后不再误导模型
             let new_prompt = fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.agent_config);
 
             // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
-            // messages 已重建（压缩核心成果保住），system_prompt 内存更新照常进行——
-            // 下轮请求已经会用新 prompt，DB 字段下次 update session 时会自然同步
+            // keep_recent 已复制，system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，
+            // DB 字段下次 update session 时会自然同步
             if let Err(e) = ctx
                 .store
                 .update_system_prompt(ctx.emitter.session_id(), &new_prompt)
@@ -447,9 +460,8 @@ async fn run_pre_turn_compression(
                 state.record_compaction(summary.tokens_before as u32, summary.tokens_after as u32);
             }
 
-            // 写回内存 session（messages + system_prompt）
+            // 写回内存 session 的 system_prompt（messages 不在内存，无需重建）
             session.system_prompt = Some(new_prompt);
-            session.messages = new_messages;
 
             // 发 Compression Ended 事件：apply 落库成功后，让前端移除"压缩中"状态、展示统计
             dispatch::dispatch(

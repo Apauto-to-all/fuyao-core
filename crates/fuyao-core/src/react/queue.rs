@@ -3,10 +3,10 @@
 //! guide / pending 两个对等队列的核心操作：
 //! - [`consume_all_guide`]：一次性取出 guide 全部消息（非阻塞）
 //! - [`drain_pending_to_guide`]：pending 全部倒进 guide（无条件，幂等）
-//! - [`inject_messages`]：把一批队列消息经 `emit_to_history` 注入 session.messages
+//! - [`inject_messages`]：把一批队列消息经 `emit_to_history` 单条落 DB
 //!
 //! 消费语义（一次性全取）：触发消费时机时，guide 有多少条全部取出，
-//! 每条经 `emit_to_history`（拦截 → push Message::user → 发送事件 → 观察），
+//! 每条经 `emit_to_history`（拦截 → `store.insert_message` 落 DB → 发送事件 → 观察），
 //! 与 assistant / tool_result 走完全相同的统一管道。
 //!
 //! User 消息的拦截/发送/观察**全在消费时刻**统一发生（入队纯排队，无 side effect）。
@@ -37,16 +37,16 @@ pub(crate) fn drain_pending_to_guide(guide: &SharedQueue, pending: &SharedQueue)
     }
 }
 
-/// 把一批队列消息经 `emit_to_history` 注入 session.messages
+/// 把一批队列消息经 `emit_to_history` 单条落 DB
 ///
 /// 每条 `InboundUser` 的 `message`（output 侧 UserMessage）取出包成
-/// `OutputEvent::User`，经统一管道：拦截 → 构造 `Message::user` push 进 session.messages
-/// → 发送事件给 UI → 观察钩子。
+/// `OutputEvent::User`，经统一管道：拦截 → 构造 `Message::user` 调
+/// `store.insert_message` 单条落 DB → 发送事件给 UI → 观察钩子。
 ///
 /// 与 assistant / tool_result 完全对称——拦截/存储/发送三者同源，插件可在消费时刻
 /// 改写或阻断 user 消息（修复"拦截裂缝在 user 消息上重现"的结构性缺陷）。
 ///
-/// Block 时：该消息不 push、不发（插件的责任，与 assistant Block 语义一致）。
+/// Block 时：该消息不落库、不发（插件的责任，与 assistant Block 语义一致）。
 pub(crate) async fn inject_messages(
     ctx: &SessionCtx,
     session: &mut Session,
@@ -57,6 +57,7 @@ pub(crate) async fn inject_messages(
         let _ = dispatch::emit_to_history(
             &ctx.emitter,
             &ctx.hooks,
+            ctx.store.as_ref(),
             session,
             event,
             user_msg_from_event,

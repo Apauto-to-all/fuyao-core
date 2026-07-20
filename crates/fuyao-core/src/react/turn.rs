@@ -82,8 +82,14 @@ pub(crate) async fn run_turn(
         // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
         // 每次 loop 顶部新建；retry.rs 在重试时清空复用，保证不携带上一次的部分结果。
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));
-        // 本轮的 ChatRequest（重试间复用同一份——一次 LLM 调用内 session.messages 不变）
-        let request = build_chat_request(session);
+        // 本轮的 ChatRequest（重试间复用同一份——一次 LLM 调用内 DB 历史不变）
+        // 消息已不在内存，每次构造时从 DB 查可见窗口
+        let request = build_chat_request(
+            ctx.store.as_ref(),
+            ctx.emitter.session_id(),
+            session.system_prompt.as_deref(),
+        )
+        .await;
 
         // 中断点①：流式期间（含重试 sleep 期间——select! drop future 即取消 sleep）
         // run_stream_with_retry 内部按错误类型自动重试，发 OutputEvent::Retry 给 UI。
@@ -103,7 +109,7 @@ pub(crate) async fn run_turn(
                             let s = state.lock().unwrap_or_else(|e| e.into_inner());
                             classify(&s)
                         };
-                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks, session).await;
+                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref(), session).await;
                         persist(ctx.emitter.session_id(), session, &ctx.store).await;
                         return;
                     }
@@ -176,7 +182,7 @@ async fn handle_final_reply(
     // 回传本轮真实 usage 给主循环（pre-turn 压缩触发判定用）
     *ctx.last_usage.lock().await = Some(result.usage.clone());
 
-    // 经 emit_to_history：拦截 → 闭包构造 Message（填 token + cost）→ 自动累积 session.total_* → push → 发送事件
+    // 经 emit_to_history：拦截 → 闭包构造 Message（填 token + cost）→ 自动累积 session.total_* → 落 DB → 发送事件
     // 拦截不改 usage（token 是模型给的客观值），计费用原始 result.usage。
     let model_id = params.model_config.model_id.as_deref();
     let usage = result.usage.clone();
@@ -185,8 +191,13 @@ async fn handle_final_reply(
         base: EventBase::default(),
         payload: assistant_msg_to_payload(result),
     });
-    let _ =
-        crate::dispatch::emit_to_history(&ctx.emitter, &ctx.hooks, session, event, |ev| match ev {
+    let _ = crate::dispatch::emit_to_history(
+        &ctx.emitter,
+        &ctx.hooks,
+        ctx.store.as_ref(),
+        session,
+        event,
+        |ev| match ev {
             OutputEvent::Assistant(m) => {
                 let mut msg = Message::assistant(m.payload.content.clone());
                 msg.reasoning = m.payload.reasoning.clone();
@@ -197,8 +208,9 @@ async fn handle_final_reply(
                 Some(msg)
             }
             _ => None,
-        })
-        .await;
+        },
+    )
+    .await;
     // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
     // 消费时机②：① pending 全倒 guide ② guide 全取注入
@@ -208,9 +220,9 @@ async fn handle_final_reply(
         // guide 和 pending 都空：落库，turn 结束
         persist(ctx.emitter.session_id(), session, &ctx.store).await;
         // 首轮最终回复后异步生成标题（fire-and-forget，不阻塞主循环）
-        maybe_spawn_title_generation(ctx, session, result);
+        maybe_spawn_title_generation(ctx, result).await;
     } else {
-        // 有消息：全部注入（每条经 emit_to_history 拦截→push→发送→观察），回 run_turn 顶部再调一轮 LLM
+        // 有消息：全部注入（每条经 emit_to_history 拦截→落 DB→发送→观察），回 run_turn 顶部再调一轮 LLM
         queue::inject_messages(ctx, session, msgs).await;
     }
 }
@@ -219,7 +231,7 @@ async fn handle_final_reply(
 ///
 /// 触发条件（同时满足）：
 /// - `[session.title] enabled = true`
-/// - `session.messages` 中 `role=user` 的消息数严格等于 1（首轮判定：计数法比
+/// - DB 可见消息中 `role=user` 的消息数严格等于 1（首轮判定：计数法比
 ///   `title=="新会话"` 更稳——用户可能改过 title）
 /// - 能取到首条 user content 与本轮 assistant 文本
 ///
@@ -230,31 +242,46 @@ async fn handle_final_reply(
 ///
 /// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
 /// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
-fn maybe_spawn_title_generation(ctx: &SessionCtx, session: &Session, result: &StreamResult) {
+async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult) {
     let title_cfg = &fuyao_api::get_config().session.title;
     if !title_cfg.enabled {
         return;
     }
 
+    // 从 DB 加载可见消息（事件级落库模式下消息不在内存）
+    let visible = match ctx
+        .store
+        .load_visible_messages(ctx.emitter.session_id())
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "标题生成前加载可见消息失败，跳过"
+            );
+            return;
+        }
+    };
+
     // 计数法判定首轮
-    let user_count = session.messages.iter().filter(|m| m.role == "user").count();
+    let user_count = visible.iter().filter(|m| m.role == "user").count();
     if user_count != 1 {
         return;
     }
 
     // 取首条 user content + 本轮 assistant 文本（StreamResult.text 是本轮流式累积全文）
-    let user_content = session
-        .messages
+    let user_content = visible
         .iter()
         .find(|m| m.role == "user")
         .and_then(|m| m.content.clone())
         .unwrap_or_default();
     let assistant_content = result.text.clone();
-    // 标题生成回退用的主模型 ID：从 session 最后一条 assistant 消息读取
+    // 标题生成回退用的主模型 ID：从可见消息最后一条 assistant 消息读取
     // （emit_to_history 闭包构造 Message 时已把 model_id 存进字段）。读不到则空串，
     // maybe_generate_title 内部会因 model_id 无法解析返回 None。
-    let main_model_id = session
-        .messages
+    let main_model_id = visible
         .iter()
         .rev()
         .find(|m| m.role == "assistant")
@@ -340,7 +367,7 @@ async fn handle_tool_calls(
     }
 
     // 步骤2：用 effective_tool_calls 构造 effective_result → AssistantMessage 事件
-    // 经 emit_to_history：拦截整个 AssistantMessage（同步 content/reasoning）→ push messages → 发送
+    // 经 emit_to_history：拦截整个 AssistantMessage（同步 content/reasoning）→ 落 DB → 发送
     let effective_result = StreamResult {
         text: result.text.clone(),
         reasoning: result.reasoning.clone(),
@@ -354,8 +381,13 @@ async fn handle_tool_calls(
         base: EventBase::default(),
         payload: assistant_with_tool_calls_to_payload(&effective_result),
     });
-    let _ =
-        crate::dispatch::emit_to_history(&ctx.emitter, &ctx.hooks, session, event, |ev| match ev {
+    let _ = crate::dispatch::emit_to_history(
+        &ctx.emitter,
+        &ctx.hooks,
+        ctx.store.as_ref(),
+        session,
+        event,
+        |ev| match ev {
             OutputEvent::Assistant(m) => {
                 // tool_calls 字段以 effective_result.tool_calls（已拦截 ToolCall 事件）为准
                 let tool_calls_json: Vec<serde_json::Value> = effective_result
@@ -381,8 +413,9 @@ async fn handle_tool_calls(
                 Some(msg)
             }
             _ => None,
-        })
-        .await;
+        },
+    )
+    .await;
     // 拦截 Block：消息不进历史、不计费——插件的责任
 
     // 若全部工具调用被拦截（effective 为空）或 AssistantMessage 被 Block，无需执行
@@ -421,12 +454,26 @@ async fn handle_tool_calls(
                 if let Some(ref interrupt_msg) = cmd {
                     emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
                     // 为 effective 中未完成的 tool_call 补发中断式 ToolResult（也走 emit_to_history）
-                    let answered: std::collections::HashSet<String> = session
-                        .messages
-                        .iter()
-                        .filter(|m| m.role == "tool")
-                        .filter_map(|m| m.tool_call_id.clone())
-                        .collect();
+                    // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
+                    let answered: std::collections::HashSet<String> = match ctx
+                        .store
+                        .load_visible_messages(ctx.emitter.session_id())
+                        .await
+                    {
+                        Ok(msgs) => msgs
+                            .iter()
+                            .filter(|m| m.role == "tool")
+                            .filter_map(|m| m.tool_call_id.clone())
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = ctx.emitter.session_id(),
+                                cause = %e,
+                                "中断补发前加载可见消息失败，按全部未完成处理"
+                            );
+                            std::collections::HashSet::new()
+                        }
+                    };
                     for tc in &effective_result.tool_calls {
                         if !answered.contains(&tc.id) {
                             let ev = make_interrupt_tool_result_event(
@@ -465,14 +512,13 @@ async fn handle_tool_calls(
 }
 
 /// 落库（边界时刻调用）
-async fn persist(
-    session_id: &str,
-    session: &mut Session,
-    store: &Arc<fuyao_session::SessionStore>,
-) {
-    session.message_count = session.messages.len() as i64;
+///
+/// 消息已在产生时经 emit_to_history → insert_message 落库，本函数只同步 sessions
+/// 表的元数据（统计字段、ended_at 等）。message_count 由 emit_to_history 维护
+/// 内存计数器，update 时自然同步到 DB。
+async fn persist(session_id: &str, session: &Session, store: &Arc<fuyao_session::SessionStore>) {
     if let Err(e) = store.update(session).await {
-        tracing::warn!(session_id = session_id, cause = %e, "session 落库失败");
+        tracing::warn!(session_id = session_id, cause = %e, "session 元数据落库失败");
     }
 }
 
@@ -493,9 +539,9 @@ fn make_interrupt_tool_result_event(
     })
 }
 
-/// 把工具执行结果经 emit_to_history 推进 session.messages（拦截后构造 Message）
+/// 把工具执行结果经 emit_to_history 单条落 DB（拦截后构造 Message）
 ///
-/// 工具完成时立即调用：拦截 → push Message::tool_result → 发送事件 → 观察。
+/// 工具完成时立即调用：拦截 → `insert_message` 落 DB（Message::tool_result）→ 发送事件 → 观察。
 /// 保证「拦截→存储→发送」三者一致；中断时已完成的也不丢。
 async fn push_tool_result_to_history(
     ctx: &SessionCtx,
@@ -513,21 +559,27 @@ async fn push_tool_result_to_history(
     push_tool_result_event_to_history(ctx, session, event).await;
 }
 
-/// 把预构造的 ToolResult 事件经 emit_to_history 推进 session.messages
+/// 把预构造的 ToolResult 事件经 emit_to_history 单条落 DB
 ///
-/// 用于中断补发：事件由调用方构造（content 标记中断原因），拦截后 push Message::tool_result。
+/// 用于中断补发：事件由调用方构造（content 标记中断原因），拦截后落 DB（Message::tool_result）。
 async fn push_tool_result_event_to_history(
     ctx: &SessionCtx,
     session: &mut Session,
     event: OutputEvent,
 ) {
-    let _ =
-        crate::dispatch::emit_to_history(&ctx.emitter, &ctx.hooks, session, event, |ev| match ev {
+    let _ = crate::dispatch::emit_to_history(
+        &ctx.emitter,
+        &ctx.hooks,
+        ctx.store.as_ref(),
+        session,
+        event,
+        |ev| match ev {
             OutputEvent::ToolResult(m) => Some(Message::tool_result(
                 m.payload.tool_call_id.clone(),
                 m.payload.content.clone(),
             )),
             _ => None,
-        })
-        .await;
+        },
+    )
+    .await;
 }

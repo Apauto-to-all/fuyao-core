@@ -617,15 +617,14 @@ async fn shutdown_terminates_active_session_and_persists() {
     let store = fuyao_session::SessionStore::new(db_path)
         .await
         .expect("重新打开 store 失败");
-    let persisted = store
-        .get(&session_id)
+    let persisted_msgs = store
+        .load_visible_messages(&session_id)
         .await
-        .expect("DB 查询失败")
-        .expect("session 应在 DB 中存在");
+        .expect("DB 查询失败");
     assert!(
-        persisted.messages.len() >= 2,
+        persisted_msgs.len() >= 2,
         "DB 中应至少有 user + assistant 两条消息，实际: {}",
-        persisted.messages.len()
+        persisted_msgs.len()
     );
 }
 

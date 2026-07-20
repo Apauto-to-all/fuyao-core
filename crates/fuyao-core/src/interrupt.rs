@@ -9,7 +9,7 @@
 //! - [`TurnState`]：单轮共享状态，stream 写、中断分支读（部分结果）。
 //! - [`classify`]：集中判断中断场景（避开归档 phase 散落在循环三处的债）。
 //! - [`handle_interrupt`]：经 emit_to_history 把补发的 AssistantMessage + 中断式
-//!   ToolResult 落进 session.messages（拦截 → push → 发送）。
+//!   ToolResult 落进 DB（拦截 → insert_message → 发送）。
 //!
 //! 锁安全：用 `std::sync::Mutex` + block scope 包裹，**不跨 await 持锁**。
 //! 中断分支先 clone 出所需数据再释放锁，然后才 await 发事件。
@@ -29,6 +29,7 @@ use fuyao_api::message::output::{
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::ToolCallData;
+use fuyao_session::SessionStore;
 use std::sync::{Arc, Mutex};
 
 /// 单轮共享状态
@@ -89,15 +90,15 @@ pub(crate) fn classify(state: &TurnState) -> InterruptKind {
     }
 }
 
-/// 处理中断：经 emit_to_history 把补发消息落进 session.messages
+/// 处理中断：经 emit_to_history 把补发消息落进 DB
 ///
 /// 中断通知事件（`OutputEvent::Interrupt`）已由调用方在 select! 命中时发出，
-/// 此处只补增量结果（拦截 → push 进历史 → 发送事件 → 观察）：
+/// 此处只补增量结果（拦截 → 单条落 DB → 发送事件 → 观察）：
 /// - `StreamingWithToolCalls`：补发部分 AssistantMessage（含累积的 tool_calls，
 ///   finish_reason=interrupted）+ 为每个 tool_call 补发中断式 ToolResult。
 /// - `Streaming`：补发部分 AssistantMessage（finish_reason=interrupted，含累积的文本）。
 ///
-/// 补发的消息进 session.messages 后，下轮 build_chat_request 会自然看到
+/// 补发的消息落 DB 后，下轮 build_chat_request 会从 DB 自然看到
 /// 「assistant 调了工具 → 工具结果（中断式）」的完整上下文。
 pub(crate) async fn handle_interrupt(
     state: &SharedTurnState,
@@ -105,6 +106,7 @@ pub(crate) async fn handle_interrupt(
     interrupt: &InterruptPayload,
     emitter: &Emitter,
     hooks: &SharedHooks,
+    store: &SessionStore,
     session: &mut Session,
 ) {
     // 先 clone 出所需数据再释放锁（不跨 await 持锁）
@@ -121,7 +123,7 @@ pub(crate) async fn handle_interrupt(
                 .filter(|tc| !tc.id.is_empty() && !tc.name.is_empty())
                 .collect();
 
-            // 1. 补发中断 AssistantMessage（含累积的 tool_calls）→ push session.messages
+            // 1. 补发中断 AssistantMessage（含累积的 tool_calls）→ 落 DB
             let event = OutputEvent::Assistant(AssistantMessage {
                 base: EventBase::default(),
                 payload: AssistantPayload {
@@ -156,12 +158,12 @@ pub(crate) async fn handle_interrupt(
                 },
             });
             // 闭包借用 valid_tool_calls：tool_calls 字段以累积的为准（与事件 payload 一致）
-            let _ = dispatch::emit_to_history(emitter, hooks, session, event, |ev| {
+            let _ = dispatch::emit_to_history(emitter, hooks, store, session, event, |ev| {
                 build_interrupted_assistant_msg(ev, &valid_tool_calls)
             })
             .await;
 
-            // 2. 为每个有效 tool_call 补发中断式 ToolResult → push session.messages
+            // 2. 为每个有效 tool_call 补发中断式 ToolResult → 落 DB
             for tc in valid_tool_calls {
                 let event = make_interrupt_tool_result(
                     tc.id.clone(),
@@ -169,7 +171,7 @@ pub(crate) async fn handle_interrupt(
                     &interrupt.source,
                     &interrupt.reason,
                 );
-                let _ = dispatch::emit_to_history(emitter, hooks, session, event, |ev| {
+                let _ = dispatch::emit_to_history(emitter, hooks, store, session, event, |ev| {
                     build_tool_result_msg(ev)
                 })
                 .await;
@@ -201,16 +203,24 @@ pub(crate) async fn handle_interrupt(
                         cached_tokens: 0,
                     },
                 });
-                let _ = dispatch::emit_to_history(emitter, hooks, session, event, |ev| match ev {
-                    OutputEvent::Assistant(m) => {
-                        let mut msg = Message::assistant(m.payload.content.clone());
-                        msg.reasoning = m.payload.reasoning.clone();
-                        msg.finish_reason = Some("interrupted".to_string());
-                        Some(msg)
-                    }
-                    _ => None,
-                })
-                .await;
+                let _ =
+                    dispatch::emit_to_history(
+                        emitter,
+                        hooks,
+                        store,
+                        session,
+                        event,
+                        |ev| match ev {
+                            OutputEvent::Assistant(m) => {
+                                let mut msg = Message::assistant(m.payload.content.clone());
+                                msg.reasoning = m.payload.reasoning.clone();
+                                msg.finish_reason = Some("interrupted".to_string());
+                                Some(msg)
+                            }
+                            _ => None,
+                        },
+                    )
+                    .await;
             }
         }
     }
@@ -320,6 +330,9 @@ mod tests {
         assert_eq!(classify(&state), InterruptKind::Streaming);
     }
 
+    /// 验证 Streaming 中断补发的 AssistantMessage 经 emit_to_history 落进 DB
+    ///
+    /// 消息已不在内存（事件级落库），通过 load_visible_messages 验证。
     #[tokio::test]
     async fn handle_interrupt_streaming_emits_partial_assistant() {
         let state = Arc::new(Mutex::new(TurnState::new()));
@@ -336,13 +349,24 @@ mod tests {
             reason: "用户取消".into(),
             source: InterruptSource::User,
         };
-        let mut session = Session::default();
+
+        // 构造临时 store + session（消息进 DB）
+        let dir =
+            std::env::temp_dir().join(format!("fuyao_interrupt_test_{}", uuid::Uuid::new_v4()));
+        let store = fuyao_session::SessionStore::new(dir.join("test.db"))
+            .await
+            .expect("构造 SessionStore 失败");
+        let mut session = fuyao_api::Session::new(None, None);
+        session.id = "sess1".to_string();
+        store.create(&session).await.unwrap();
+
         handle_interrupt(
             &state,
             InterruptKind::Streaming,
             &interrupt,
             &emitter,
             &hooks,
+            &store,
             &mut session,
         )
         .await;
@@ -354,12 +378,10 @@ mod tests {
             }
             _ => panic!("应为 Assistant 事件"),
         }
-        // 补发的 assistant 消息应进 session.messages
-        assert_eq!(session.messages.len(), 1, "中断补发应 push 到 messages");
-        assert_eq!(session.messages[0].content.as_deref(), Some("部分回复"));
-        assert_eq!(
-            session.messages[0].finish_reason.as_deref(),
-            Some("interrupted")
-        );
+        // 补发的 assistant 消息应进 DB
+        let visible = store.load_visible_messages("sess1").await.unwrap();
+        assert_eq!(visible.len(), 1, "中断补发应落 DB");
+        assert_eq!(visible[0].content.as_deref(), Some("部分回复"));
+        assert_eq!(visible[0].finish_reason.as_deref(), Some("interrupted"));
     }
 }

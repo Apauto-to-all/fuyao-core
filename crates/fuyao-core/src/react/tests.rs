@@ -320,7 +320,10 @@ async fn make_harness_with_hooks(
 ) -> TestHarness {
     let store = temp_store().await;
     let mut session = Session::new(None, Some("系统提示词".to_string()));
-    store.create(&mut session).await.unwrap();
+    // 强制 session.id 与 emitter 的 session_id 一致
+    // （build_chat_request 用 emitter.session_id() 查 DB，必须匹配）
+    session.id = "test_session".to_string();
+    store.create(&session).await.unwrap();
     let (tx_event, rx_event) = mpsc::channel(128);
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
     // 包成 ProviderRegistry：测试里所有 model_id 都用 "test/..."，统一走 test provider。
@@ -380,11 +383,28 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
     }
 }
 
-/// 预置一条 user 消息进 session（模拟主循环 inject 后的状态）
-fn preload_user(h: &mut TestHarness, content: &str) {
-    h.session
-        .messages
-        .push(fuyao_api::Message::user(content.to_string()));
+/// 预置一条 user 消息进 DB（模拟主循环 inject 后的状态）
+///
+/// 消息已不在内存（事件级落库），直接调 store.insert_message 落 DB。
+/// 同步维护 session.message_count（emit_to_history 正常路径也会 +1，
+/// preload 走捷径直接 insert，需手动同步计数器避免后续 persist/update 时计数丢失）。
+async fn preload_user(h: &mut TestHarness, content: &str) {
+    let mut msg = fuyao_api::Message::user(content.to_string());
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut msg)
+        .await
+        .expect("preload 落库失败");
+    h.session.message_count += 1;
+}
+
+/// 从 DB 加载可见消息（事件级落库模式下消息不在内存）
+async fn visible_messages(h: &TestHarness) -> Vec<fuyao_api::Message> {
+    h.ctx
+        .store
+        .load_visible_messages(&h.session.id)
+        .await
+        .expect("加载可见消息失败")
 }
 
 /// 无工具单轮：user → 流式回复 → AssistantMessage
@@ -392,7 +412,7 @@ fn preload_user(h: &mut TestHarness, content: &str) {
 async fn single_turn_no_tools() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("你好")]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "用户问题");
+    preload_user(&mut h, "用户问题").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
@@ -404,10 +424,11 @@ async fn single_turn_no_tools() {
     for ev in &events {
         assert_eq!(event_session_id(ev), Some("test_session"));
     }
-    // user + assistant
-    assert_eq!(h.session.messages.len(), 2);
-    assert_eq!(h.session.messages[0].role, "user");
-    assert_eq!(h.session.messages[1].role, "assistant");
+    // user + assistant（事件级落库，从 DB 查询验证）
+    let msgs = visible_messages(&h).await;
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[1].role, "assistant");
 }
 
 /// 有工具循环：先工具调用 → 执行 echo → 再最终回复
@@ -418,7 +439,7 @@ async fn react_loop_with_tool() {
         MockProvider::text_response("工具执行完毕"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "调工具");
+    preload_user(&mut h, "调工具").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
@@ -427,11 +448,9 @@ async fn react_loop_with_tool() {
         .iter()
         .any(|e| matches!(e, OutputEvent::ToolResult(m) if m.payload.tool_name == "echo"));
     assert!(has_tool_result, "应有 ToolResult 事件");
-    assert!(
-        h.session.messages.len() >= 3,
-        "应含 user/assistant/tool 至少 3 条"
-    );
-    let last = h.session.messages.last().unwrap();
+    let msgs = visible_messages(&h).await;
+    assert!(msgs.len() >= 3, "应含 user/assistant/tool 至少 3 条");
+    let last = msgs.last().unwrap();
     assert_eq!(last.role, "assistant");
 }
 
@@ -443,13 +462,12 @@ async fn tool_result_in_messages() {
         MockProvider::text_response("完成"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "test");
+    preload_user(&mut h, "test").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
-    let tool_msg = h
-        .session
-        .messages
+    let msgs = visible_messages(&h).await;
+    let tool_msg = msgs
         .iter()
         .find(|m| m.role == "tool")
         .expect("应有 tool 角色消息");
@@ -464,7 +482,7 @@ async fn llm_error_emits_error_event() {
         "无效密钥".into(),
     ))]]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "test");
+    preload_user(&mut h, "test").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
@@ -488,17 +506,16 @@ async fn guide_all_consumed_on_tool_complete() {
         MockProvider::text_response("done"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "原始问题");
+    preload_user(&mut h, "原始问题").await;
     // 工具执行期间用户补充 2 条 guide 消息（模拟入队）
     h.ctx.guide.lock().unwrap().push_back(make_inbound("补充1"));
     h.ctx.guide.lock().unwrap().push_back(make_inbound("补充2"));
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
-    // session.messages 应含：原始user + assistant(tool_calls) + tool + 补充1 + 补充2 + assistant(最终)
-    let user_msgs: Vec<_> = h
-        .session
-        .messages
+    // 可见消息应含：原始user + assistant(tool_calls) + tool + 补充1 + 补充2 + assistant(最终)
+    let user_msgs: Vec<_> = visible_messages(&h)
+        .await
         .iter()
         .filter(|m| m.role == "user")
         .map(|m| m.content.clone().unwrap_or_default())
@@ -526,7 +543,7 @@ async fn pending_before_guide_on_final_reply() {
         MockProvider::text_response("回复2"),
     ]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "第一条");
+    preload_user(&mut h, "第一条").await;
     // 预置 pending 1 条 + guide 1 条（最终回复后应都被消费）
     h.ctx
         .pending
@@ -541,10 +558,9 @@ async fn pending_before_guide_on_final_reply() {
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
-    // 两条都应进 messages
-    let user_msgs: Vec<_> = h
-        .session
-        .messages
+    // 两条都应进 DB
+    let user_msgs: Vec<_> = visible_messages(&h)
+        .await
         .iter()
         .filter(|m| m.role == "user")
         .map(|m| m.content.clone().unwrap_or_default())
@@ -567,12 +583,13 @@ async fn pending_before_guide_on_final_reply() {
 async fn both_empty_turn_ends() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("回复")]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "问题");
+    preload_user(&mut h, "问题").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // user + assistant，没有多余消息
-    assert_eq!(h.session.messages.len(), 2);
+    let msgs = visible_messages(&h).await;
+    assert_eq!(msgs.len(), 2);
 }
 
 /// 回归：task 空闲时只发 pending 也能触发新 turn（pending 不应死信）
@@ -588,7 +605,8 @@ async fn pending_consumed_when_task_idle() {
 
     let store = temp_store().await;
     let mut session = Session::new(None, Some("系统提示词".to_string()));
-    store.create(&mut session).await.unwrap();
+    session.id = "test_session".to_string();
+    store.create(&session).await.unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -675,7 +693,8 @@ async fn plugin_message_routes_through_dispatch() {
 
     let store = temp_store().await;
     let mut session = Session::new(None, Some("系统提示词".to_string()));
-    store.create(&mut session).await.unwrap();
+    session.id = "plugin_session".to_string();
+    store.create(&session).await.unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -770,7 +789,7 @@ async fn interrupt_during_streaming() {
     let (provider, txs) = ControllableProvider::with_batches(1);
     let provider: Arc<dyn Provider> = Arc::new(provider);
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "test");
+    preload_user(&mut h, "test").await;
 
     let tx_interrupt = h.tx_interrupt.clone();
 
@@ -787,8 +806,12 @@ async fn interrupt_during_streaming() {
     tokio::pin!(turn_fut);
     let interrupter = async {
         // 等 run_turn 跑起来并挂起在流的第二个事件上
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        // 事件级落库模式下 run_turn 启动路径多了 DB 查询（build_chat_request），
+        // yield_now 次数比内存模式多给一些，确保 TextDelta 已消费到 TurnState
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         tx_interrupt
             .send(InterruptMessage {
                 base: fuyao_api::message::EventBase::default(),
@@ -862,7 +885,7 @@ async fn interrupt_during_tool_execution() {
         .build();
 
     let mut h = make_harness(provider, Arc::new(tools)).await;
-    preload_user(&mut h, "调工具");
+    preload_user(&mut h, "调工具").await;
 
     let tx_interrupt = h.tx_interrupt.clone();
 
@@ -870,8 +893,10 @@ async fn interrupt_during_tool_execution() {
     tokio::pin!(turn_fut);
     let interrupter = async {
         // 等 run_turn 跑完流式（工具调用）并进入工具执行阻塞
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         tx_interrupt
             .send(InterruptMessage {
                 base: fuyao_api::message::EventBase::default(),
@@ -916,10 +941,10 @@ async fn interrupt_during_tool_execution() {
     );
 }
 
-/// 落库验证：跑完一轮含工具调用的 ReAct，落库后重新加载，messages 完整持久化
+/// 落库验证：跑完一轮含工具调用的 ReAct，从 DB 重新加载 messages 完整持久化
 ///
-/// 验证 persist() → store.update() 确实把完整 messages 序列化进 DB，
-/// 不只更新 message_count。从 store.get() 重新加载验证完整性。
+/// 验证事件级落库（emit_to_history → store.insert_message）确实把完整消息写进 DB。
+/// 事件级落库模式下消息产生即落库，从 store.load_visible_messages 重新查验证完整性。
 #[tokio::test]
 async fn messages_persisted_to_db() {
     let provider = Arc::new(MockProvider::new(vec![
@@ -927,38 +952,26 @@ async fn messages_persisted_to_db() {
         MockProvider::text_response("完成"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "调工具");
+    preload_user(&mut h, "调工具").await;
     let session_id = h.session.id.clone();
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
-    // 内存中的 messages（run_turn 后的完整状态）
-    let expected_count = h.session.messages.len();
-    assert!(
-        expected_count >= 4,
-        "应含 user/assistant(tool_calls)/tool/assistant(最终) 至少 4 条"
-    );
-
-    // 从 DB 重新加载，验证持久化的完整性
+    // 从 DB 重新加载可见消息，验证持久化的完整性
     let reloaded = h
         .ctx
         .store
-        .get(&session_id)
+        .load_visible_messages(&session_id)
         .await
-        .expect("get 不应失败")
-        .expect("session 应已落库");
-    assert_eq!(
-        reloaded.messages.len(),
-        expected_count,
-        "重新加载的 messages 数应与内存一致（持久化完整）"
-    );
-    assert_eq!(
-        reloaded.message_count as usize, expected_count,
-        "message_count 应与实际 messages 数一致"
+        .expect("load_visible_messages 不应失败");
+    assert!(
+        reloaded.len() >= 4,
+        "应含 user/assistant(tool_calls)/tool/assistant(最终) 至少 4 条，实际 {}",
+        reloaded.len()
     );
 
     // 验证关键消息类型完整保留
-    let roles: Vec<_> = reloaded.messages.iter().map(|m| m.role.as_str()).collect();
+    let roles: Vec<_> = reloaded.iter().map(|m| m.role.as_str()).collect();
     assert!(roles.contains(&"user"), "应含 user 消息");
     assert!(roles.contains(&"tool"), "应含 tool 消息");
     assert!(
@@ -968,7 +981,6 @@ async fn messages_persisted_to_db() {
 
     // 验证 tool 消息的 tool_call_id 回填正确
     let tool_msg = reloaded
-        .messages
         .iter()
         .find(|m| m.role == "tool")
         .expect("应有 tool 消息");
@@ -976,6 +988,20 @@ async fn messages_persisted_to_db() {
         tool_msg.tool_call_id.as_deref(),
         Some("tc_99"),
         "tool 消息应回填正确的 tool_call_id"
+    );
+
+    // 验证 session.message_count 计数器与 DB 行数一致（事件级落库计数器维护）
+    let reloaded_session = h
+        .ctx
+        .store
+        .get(&session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
+    assert_eq!(
+        reloaded_session.message_count as usize,
+        reloaded.len(),
+        "message_count 应与可见消息数一致"
     );
 }
 
@@ -996,7 +1022,7 @@ async fn usage_flows_to_final_assistant_message() {
         MockProvider::text_response_with_usage("回复内容", usage),
     ]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "提问");
+    preload_user(&mut h, "提问").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
@@ -1082,7 +1108,7 @@ async fn cost_accumulated_per_assistant_message() {
     ]));
 
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "测费用累积");
+    preload_user(&mut h, "测费用累积").await;
 
     // 用带 model_id 的 params，让累积逻辑能查到价格表
     let mut params = test_params();
@@ -1119,11 +1145,11 @@ async fn cost_accumulated_per_assistant_message() {
     );
 
     // === 验证 3：持久化的 Message 字段携带 token（usage 持久化洞修复） ===
-    let assistant_msgs: Vec<_> = h
-        .session
-        .messages
+    let assistant_msgs: Vec<_> = visible_messages(&h)
+        .await
         .iter()
         .filter(|m| m.role == "assistant")
+        .cloned()
         .collect();
     assert_eq!(
         assistant_msgs.len(),
@@ -1176,7 +1202,7 @@ async fn cost_accumulated_per_assistant_message() {
 use fuyao_hooks::{HooksRegistry, InterceptResult};
 
 /// 拦截修改最终 Assistant content 后：
-/// - session.messages 里的 Message 携带修改后内容
+/// - DB 里的 Message 携带修改后内容
 /// - 下轮 build_chat_request 用的是修改后内容（拦截→存储→消费三者一致）
 #[tokio::test]
 async fn intercept_modifies_final_assistant_in_history_and_next_request() {
@@ -1207,25 +1233,27 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     }
 
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
-    preload_user(&mut h, "用户问题");
+    preload_user(&mut h, "用户问题").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
-    // 1. session.messages 最后一条是修改后的内容
-    let last_msg = h
-        .session
-        .messages
-        .last()
-        .expect("应有 assistant 消息进历史");
+    // 1. DB 最后一条是修改后的内容
+    let msgs = visible_messages(&h).await;
+    let last_msg = msgs.last().expect("应有 assistant 消息进 DB");
     assert_eq!(last_msg.role, "assistant");
     assert_eq!(
         last_msg.content.as_deref(),
         Some("[脱敏]原始内容"),
-        "session.messages 应携带拦截后的内容"
+        "DB 应携带拦截后的内容"
     );
 
     // 2. 下轮 build_chat_request 用的是修改后内容（端到端一致性）
-    let request = super::builders::build_chat_request(&h.session);
+    let request = super::builders::build_chat_request(
+        h.ctx.store.as_ref(),
+        &h.session.id,
+        h.session.system_prompt.as_deref(),
+    )
+    .await;
     let assistant_in_request = request
         .messages
         .iter()
@@ -1238,7 +1266,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     );
 }
 
-/// 拦截 Block 最终 Assistant 后：session.messages 不含 assistant 消息（不计费、不进历史）
+/// 拦截 Block 最终 Assistant 后：DB 不含 assistant 消息（不计费、不进历史）
 #[tokio::test]
 async fn intercept_block_skips_final_assistant_in_history() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
@@ -1263,16 +1291,14 @@ async fn intercept_block_skips_final_assistant_in_history() {
     }
 
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
-    preload_user(&mut h, "用户问题");
+    preload_user(&mut h, "用户问题").await;
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
-    // Block：不应有任何 assistant 消息进 session.messages（只有 preload 的 user）
-    let has_assistant = h.session.messages.iter().any(|m| m.role == "assistant");
-    assert!(
-        !has_assistant,
-        "Block 时 assistant 消息不应进 session.messages"
-    );
+    // Block：不应有任何 assistant 消息进 DB（只有 preload 的 user）
+    let msgs = visible_messages(&h).await;
+    let has_assistant = msgs.iter().any(|m| m.role == "assistant");
+    assert!(!has_assistant, "Block 时 assistant 消息不应进 DB");
     // total_cost 也应为 0（拦截 Block 的消息不计费）
     assert_eq!(h.session.total_cost, 0.0, "Block 时不应累积任何费用");
 }
@@ -1324,27 +1350,32 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
     };
-    let mut session = Session::default();
+    let mut session = Session {
+        id: "test_session".to_string(),
+        ..Session::default()
+    };
+    ctx.store.create(&session).await.unwrap();
 
     // 投两条消息进队列，注入后应都被拦截改写
     let msgs = vec![make_inbound("秘密1"), make_inbound("秘密2")];
     queue::inject_messages(&ctx, &mut session, msgs).await;
 
-    // 验证：session.messages 里的 content 是拦截后的（带 [脱敏] 前缀）
-    assert_eq!(session.messages.len(), 2, "两条 user 消息应都进历史");
+    // 验证：DB 里的 content 是拦截后的（带 [脱敏] 前缀）
+    let visible: Vec<_> = ctx.store.load_visible_messages(&session.id).await.unwrap();
+    assert_eq!(visible.len(), 2, "两条 user 消息应都进 DB");
     assert_eq!(
-        session.messages[0].content.as_deref(),
+        visible[0].content.as_deref(),
         Some("[脱敏]秘密1"),
-        "user 消息经拦截后内容应进 session.messages"
+        "user 消息经拦截后内容应进 DB"
     );
     assert_eq!(
-        session.messages[1].content.as_deref(),
+        visible[1].content.as_deref(),
         Some("[脱敏]秘密2"),
         "第二条 user 消息也应被拦截改写"
     );
 }
 
-/// 插件/系统来源的 source 字段完整流到 session.messages 的产出事件（消费时刻发 UI）
+/// 插件/系统来源的 source 字段完整流到 DB 的产出事件（消费时刻发 UI）
 ///
 /// 验证修复错误①：source 字段不再丢失。检查 inject_messages 走 emit_to_history 后
 /// 发出的事件携带原始 source（含 Plugin 名称）。
@@ -1375,7 +1406,11 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
     };
-    let mut session = Session::default();
+    let mut session = Session {
+        id: "test_session".to_string(),
+        ..Session::default()
+    };
+    ctx.store.create(&session).await.unwrap();
 
     // 构造一条 Plugin 来源消息（模拟 SessionSender.send_user 注入）
     let inbound = fuyao_api::InboundUser {

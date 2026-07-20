@@ -306,7 +306,10 @@ async fn load_visible_returns_only_after_boundary() {
 
     // 再加一条新消息
     let mut new_msg = Message::user("new1".to_string());
-    store.insert_message(&session.id, &mut new_msg).await.unwrap();
+    store
+        .insert_message(&session.id, &mut new_msg)
+        .await
+        .unwrap();
 
     let visible = store.load_visible_messages(&session.id).await.unwrap();
     // 只看到 compaction 边界（seq=4）+ 之后的消息（seq=5）
