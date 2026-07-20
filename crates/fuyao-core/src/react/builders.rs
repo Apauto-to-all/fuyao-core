@@ -2,7 +2,7 @@
 //!
 //! 从 ReAct 循环抽出的纯构造逻辑：
 //! - [`build_chat_request`]：从 session.messages 凑 ChatRequest
-//! - [`build_model_and_options`]：从 MessageParams 解析 model + StreamOptions
+//! - [`resolve_model`]：从 MessageParams 解析 model + provider_id + StreamOptions
 //! - 各类 Assistant Payload 构造器（事件用）
 //! - 工具调用拦截回灌用的双向转换函数
 //! - [`fill_assistant_message_usage_and_cost`]：填 assistant Message 的 token + cost 字段
@@ -16,6 +16,21 @@ use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayl
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_api::{MessageParams, Session};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
+
+/// 解析后的模型信息（一轮 ReAct 用）
+///
+/// `provider_id` 用于从 `ProviderRegistry` 查 Provider 实例；`model` 是裸模型名，
+/// 喂给 `provider.stream_chat`。两者从 `MessageParams.model_id`（形如
+/// `"provider_id/model_id"`）拆分而来——model_id=None 时回退 `[models.default]`。
+#[derive(Debug)]
+pub(crate) struct ResolvedModel {
+    /// Provider ID（小写，给 ProviderRegistry.get 用）
+    pub provider_id: String,
+    /// 裸模型名（给 provider.stream_chat 用，不带 provider_id 前缀）
+    pub model: String,
+    /// 流式选项
+    pub options: StreamOptions,
+}
 
 /// 从 session 的内存历史凑 ChatRequest
 ///
@@ -78,24 +93,60 @@ pub(crate) fn build_chat_request(session: &Session) -> ChatRequest {
     }
 }
 
-/// 从 MessageParams 解析模型名 + 构建流式选项
+/// 从 MessageParams 解析本轮模型信息
 ///
-/// model_id 格式 "provider/model" → 取 '/' 后的 model 部分。
-/// 思考控制参数（thinking_type / reasoning_effort）透传给 StreamOptions。
+/// model_id 解析顺序：
+/// 1. **`MessageParams.model_id = Some("provider_id/model_id")`**：直接拆分
+/// 2. **`MessageParams.model_id = None`**：读全局 `[models.default]` 配置兜底
+///    - 配了 `[models.default]` → 用它的 `model` 字段（同样是 `"provider_id/model_id"` 格式）
+///    - 没配 → 返回 `Err`（fail-loud：用户必须显式指定或配 default，引擎不猜）
+///
+/// **model_id 格式必须是 `"provider_id/model_id"`**——不带 `/` 视为格式错误返回 `Err`。
+/// 这与 provider_id 路由契约一致（ProviderRegistry 按 provider_id 查实例）。
+///
+/// 思考控制参数（thinking_type / reasoning_effort）透传给 `StreamOptions`。
 /// 工具定义从 registry 序列化（非空时带 tools 字段）。
-// TODO: model_id 为 None 时用配置的默认模型（当前空串，provider 自行处理）
-pub(crate) fn build_model_and_options(
+///
+/// 返回的 `ResolvedModel` 由调用方（turn.rs）继续从 `ctx.providers.get(provider_id)`
+/// 查 Provider 实例——本函数不查 registry（保持纯构造器职责，与 IO 解耦）。
+pub(crate) fn resolve_model(
     params: &MessageParams,
     tools: &ToolRegistry,
-) -> (String, StreamOptions) {
-    let model = params
-        .model_config
-        .model_id
-        .as_deref()
-        .and_then(|id| id.split('/').nth(1))
-        .unwrap_or("")
-        .to_string();
+) -> Result<ResolvedModel, String> {
+    // 1. 确定 model_id 字符串：显式指定 → 用它；None → 读 [models.default]
+    let model_id: String = match params.model_config.model_id.as_deref() {
+        Some(id) => id.to_string(),
+        None => {
+            // 读全局配置（已由 init 阶段加载进 get_config）
+            let default_ref = fuyao_api::get_config()
+                .models
+                .default
+                .as_ref()
+                .map(|r| r.model.clone())
+                .filter(|s| !s.is_empty());
+            match default_ref {
+                Some(id) => id,
+                None => {
+                    return Err(
+                        "未指定模型：MessageParams.model_id 为空且未配置 [models.default]"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    };
 
+    // 2. 拆 "provider_id/model_id" 格式
+    let (provider_id, model) = match model_id.split_once('/') {
+        Some((p, m)) if !p.is_empty() && !m.is_empty() => (p.to_lowercase(), m.to_string()),
+        _ => {
+            return Err(format!(
+                "model_id 格式错误（应为 provider_id/model_id）: {model_id}"
+            ));
+        }
+    };
+
+    // 3. 构造 StreamOptions
     let tool_defs = tools.definitions_json();
     let options = StreamOptions {
         temperature: None,
@@ -109,7 +160,11 @@ pub(crate) fn build_model_and_options(
         reasoning_effort: params.model_config.reasoning_effort.clone(),
     };
 
-    (model, options)
+    Ok(ResolvedModel {
+        provider_id,
+        model,
+        options,
+    })
 }
 
 /// 从流式结果构建 AssistantPayload（无工具调用，最终回复事件）
@@ -208,6 +263,7 @@ pub(crate) fn tool_call_event_to_data(event: &OutputEvent) -> Option<ToolCallDat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ToolRegistryBuilder;
     use fuyao_api::{Message, Session};
 
     /// 构造带工具调用的 assistant Message
@@ -291,5 +347,69 @@ mod tests {
 
         let request = build_chat_request(&session);
         assert_eq!(request.messages.len(), 2, "无工具调用时消息数不变");
+    }
+
+    // ===== resolve_model 单测 =====
+    //
+    // set_config 是 OnceLock（只能 set 一次），单元测试不能 set；这里覆盖默认状态
+    // （get_config 返回 FuyaoConfig::default()，其中 models.default = None）。
+    // "None + 配 [models.default] → 用 default" 的正向用例由 fuyao-app 集成测试覆盖
+    // （集成测试是独立二进制，OnceLock 不串扰）。
+
+    fn empty_registry() -> ToolRegistry {
+        ToolRegistryBuilder::default().build()
+    }
+
+    fn params_with_model(model_id: Option<&str>) -> MessageParams {
+        MessageParams {
+            model_config: fuyao_api::ModelConfig {
+                model_id: model_id.map(String::from),
+                thinking_type: None,
+                reasoning_effort: None,
+            },
+        }
+    }
+
+    #[test]
+    fn resolve_model_explicit_id_splits_provider_and_model() {
+        let tools = empty_registry();
+        let params = params_with_model(Some("DeepSeek/deepseek-v4-flash"));
+        let r = resolve_model(&params, &tools).expect("显式 model_id 应解析成功");
+        // provider_id 小写化
+        assert_eq!(r.provider_id, "deepseek");
+        // model 保持原样
+        assert_eq!(r.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn resolve_model_none_without_default_returns_err() {
+        // 默认状态：未 set_config，get_config 返回 default（models.default = None）
+        let tools = empty_registry();
+        let params = params_with_model(None);
+        let err = resolve_model(&params, &tools).expect_err("无 default 应返回 Err");
+        assert!(err.contains("未指定模型"), "错误信息应明确：{err}");
+        assert!(
+            err.contains("[models.default]"),
+            "错误信息应指引配置项：{err}"
+        );
+    }
+
+    #[test]
+    fn resolve_model_invalid_format_no_slash_returns_err() {
+        let tools = empty_registry();
+        let params = params_with_model(Some("invalid-no-slash"));
+        let err = resolve_model(&params, &tools).expect_err("格式错误应返回 Err");
+        assert!(err.contains("格式错误"), "错误信息应明确：{err}");
+    }
+
+    #[test]
+    fn resolve_model_empty_provider_or_model_returns_err() {
+        let tools = empty_registry();
+        // "/model" — provider 空
+        let params = params_with_model(Some("/model"));
+        resolve_model(&params, &tools).expect_err("provider 空应报错");
+        // "provider/" — model 空
+        let params = params_with_model(Some("provider/"));
+        resolve_model(&params, &tools).expect_err("model 空应报错");
     }
 }

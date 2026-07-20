@@ -52,25 +52,6 @@ pub fn create_provider(provider_id: &str, agent_paths: &AgentPaths) -> Option<Op
     OpenAIProvider::new(provider_id, agent_paths)
 }
 
-/// 根据模型 ID 创建 Provider
-///
-/// 解析 "provider_id/model_id" 格式，创建对应 Provider 的实例。
-///
-/// # Arguments
-/// * `model_id` - 模型 ID（如 "aliyun/qwen3.6-plus"）
-/// * `agent_paths` - Agent 三层目录的身份证明
-///
-/// # Returns
-/// (provider_id, model_id, OpenAIProvider) 元组，如果配置不完整返回 None
-pub fn create_provider_with_model(
-    model_id: &str,
-    agent_paths: &AgentPaths,
-) -> Option<(String, String, OpenAIProvider)> {
-    let (provider_id, model_name) = parse_model_id(model_id).ok()?;
-    let provider = create_provider(&provider_id, agent_paths)?;
-    Some((provider_id, model_name, provider))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,39 +151,5 @@ mod tests {
         assert!(result.is_none());
 
         clear_cache(&paths);
-    }
-
-    #[test]
-    fn create_provider_with_model_valid() {
-        let paths = unique_paths("model_valid");
-        let key = crate::registry::agent_paths_cache_key(&paths);
-
-        let provider =
-            create_test_provider_with_api_key("aliyun", Some("test-key".to_string()), None);
-
-        register_provider("aliyun", provider, &key);
-
-        let result = create_provider_with_model("aliyun/qwen3.6-plus", &paths);
-        assert!(result.is_some());
-
-        let (provider_id, model_name, _provider) = result.expect("结果必须存在");
-        assert_eq!(provider_id, "aliyun");
-        assert_eq!(model_name, "qwen3.6-plus");
-
-        clear_cache(&paths);
-    }
-
-    #[test]
-    fn create_provider_with_model_invalid_format() {
-        let paths = unique_paths("invalid_fmt");
-        let result = create_provider_with_model("invalid-model-id", &paths);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn create_provider_with_model_provider_not_found() {
-        let paths = unique_paths("provider_not_found");
-        let result = create_provider_with_model("nonexistent/model", &paths);
-        assert!(result.is_none());
     }
 }

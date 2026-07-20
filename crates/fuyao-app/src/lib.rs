@@ -29,8 +29,6 @@ pub struct AppContext {
     pub mcp_manager: Option<Arc<MCPManager>>,
     /// 日志 guard：drop 时 flush 文件缓冲，须存活到引擎结束。
     pub log_guard: LogGuard,
-    /// 推断出的默认 model_id（消息级缺省时兜底用）
-    pub default_model_id: String,
 }
 
 /// 装配错误
@@ -52,7 +50,6 @@ pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), Setu
     // 1. 配置 / 日志 / Provider 准备
     let init::InitResult {
         provider,
-        default_model_id,
         log_guard,
     } = init_engine(agent_paths.clone()).await.map_err(|e| {
         tracing::error!(cause = %e, "引擎装配准备失败");
@@ -72,14 +69,13 @@ pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), Setu
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
     let engine = Engine::new(EngineParams { agent_paths }, provider, tools, plugin_host).await;
 
-    tracing::info!(model_id = %default_model_id, "引擎启动完成");
+    tracing::info!("引擎启动完成");
 
     Ok((
         engine,
         AppContext {
             mcp_manager,
             log_guard,
-            default_model_id,
         },
     ))
 }

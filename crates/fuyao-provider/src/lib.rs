@@ -12,7 +12,7 @@ mod resolver;
 mod retry;
 mod stream_decoder;
 
-pub use client::{ClientError, create_provider, create_provider_with_model, parse_model_id};
+pub use client::{ClientError, create_provider, parse_model_id};
 pub use error::ProviderError;
 pub use openai::OpenAIProvider;
 pub use provider::{
@@ -20,8 +20,8 @@ pub use provider::{
     StreamEvent, StreamOptions, StreamUsage, ToolCallData,
 };
 pub use registry::{
-    agent_paths_cache_key, clear_cache, get_model, get_provider, list_models, list_providers,
-    register_model, register_provider,
+    ProviderRegistry, agent_paths_cache_key, clear_cache, get_model, get_provider, list_models,
+    list_providers, register_model, register_provider,
 };
 pub use resolver::{get_base_url, resolve_api_key};
 pub use retry::{backoff_duration, is_retryable};

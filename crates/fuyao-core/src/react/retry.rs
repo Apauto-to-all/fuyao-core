@@ -48,7 +48,10 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{RetryMessage, RetryPayload};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::{StreamDecoder, StreamError, StreamOptions, backoff_duration, is_retryable};
+use fuyao_provider::{
+    Provider, StreamDecoder, StreamError, StreamOptions, backoff_duration, is_retryable,
+};
+use std::sync::Arc;
 
 /// 驱动一次完整的「LLM 调用 + 重试」过程
 ///
@@ -60,6 +63,9 @@ use fuyao_provider::{StreamDecoder, StreamError, StreamOptions, backoff_duration
 /// 部分结果（发增量 AssistantMessage）。重试成功时 state 持最终一轮的累积结果；
 /// 重试失败（错误冒泡）时 state 持最后一次尝试的累积结果（可能为空）。
 ///
+/// `provider` 由调用方传入（`turn.rs` 从 `ProviderRegistry` 按 provider_id 解析后传入）。
+/// retry / stream 不直接接 `ProviderRegistry`——保持职责单一（只关心一个 Provider 实例）。
+///
 /// 重试期间发 [`OutputEvent::Retry`]（含 attempt / wait_ms / cause）经 dispatch 管道。
 /// 退避 sleep 期间外层 select! 可随时 drop 本 future 触发中断（sleep 自然取消）。
 ///
@@ -69,6 +75,7 @@ pub(crate) async fn run_stream_with_retry(
     request: fuyao_provider::ChatRequest,
     model: &str,
     options: &StreamOptions,
+    provider: &Arc<dyn Provider>,
     state: &SharedTurnState,
 ) -> Result<StreamResult, StreamError> {
     let max_retries = get_config().llm.retry.max_retries;
@@ -91,7 +98,7 @@ pub(crate) async fn run_stream_with_retry(
             request.clone(),
             model,
             options.clone(),
-            &ctx.provider,
+            provider,
             &ctx.emitter,
             &ctx.hooks,
             &mut decoder,

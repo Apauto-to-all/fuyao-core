@@ -18,6 +18,7 @@ use fuyao_api::{
 };
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
+use fuyao_provider::ProviderRegistry;
 use fuyao_session::SessionStore;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -51,8 +52,16 @@ pub struct Engine {
     /// 会话存储层（Arc 共享给各 session task）
     store: Arc<SessionStore>,
 
-    /// LLM 提供者（Arc 共享给各 session task）
-    provider: Arc<dyn fuyao_provider::Provider>,
+    /// Provider 实例注册表（多 Provider 路由）
+    ///
+    /// 引擎级共享：持有所有已注册 Provider 的构造好的实例（按 provider_id 索引）。
+    /// 每条消息的 `MessageParams.model_id` 形如 `"provider_id/model_id"`——
+    /// session task 在执行该轮 LLM 调用前，从 model_id 拆出 provider_id，
+    /// 从本注册表取对应 Provider 实例，实现"不同 session / 不同消息用不同 Provider"。
+    ///
+    /// 与旧"引擎持单个 `Arc<dyn Provider>`"模型的差异：旧模型启动时按 default
+    /// model_id 选一个 Provider，所有调用都打到这里；新模型按消息的 provider_id 路由。
+    providers: Arc<ProviderRegistry>,
 
     /// 工具注册表（引擎级共享，所有 session task 共用同一份）
     tools: Arc<ToolRegistry>,
@@ -104,12 +113,16 @@ impl Engine {
     /// `tools` 由装配方注入（如从 `fuyao_tools::all_tools()` 转换），引擎持有后
     /// 所有 session task 共享同一份工具表。
     ///
+    /// `providers` 是 Provider 实例注册表（多 Provider 路由）：启动时由装配方从
+    /// 已注册 Provider 配置批量构造实例（`ProviderRegistry::from_registered`），
+    /// 每条消息的 `MessageParams.model_id` 决定本轮走哪个 Provider。
+    ///
     /// `plugin_host` 是插件工厂集合，引擎级共享。每个 session 启动时调用
     /// [`PluginHost::create_instances`] 生成该 session 的独立实例，
     /// 各实例 register 到该 session 私有的 HooksRegistry。拦截/观察在 session task 内执行。
     pub async fn new(
         params: EngineParams,
-        provider: Arc<dyn fuyao_provider::Provider>,
+        providers: ProviderRegistry,
         tools: ToolRegistry,
         plugin_host: PluginHost,
     ) -> Self {
@@ -125,7 +138,7 @@ impl Engine {
 
         Self {
             store: Arc::new(store),
-            provider,
+            providers: Arc::new(providers),
             tools: Arc::new(tools),
             plugin_host: Arc::new(plugin_host),
             sessions: Mutex::new(std::collections::HashMap::new()),
@@ -251,7 +264,7 @@ impl Engine {
             shutdown_token.clone(),
             session,
             Arc::clone(&self.store),
-            Arc::clone(&self.provider),
+            Arc::clone(&self.providers),
             Arc::clone(&self.tools),
             hooks,
             self.params.agent_paths.clone(),

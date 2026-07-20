@@ -14,8 +14,8 @@
 
 use super::SessionCtx;
 use super::builders::{
-    assistant_msg_to_payload, assistant_with_tool_calls_to_payload, build_chat_request,
-    build_model_and_options, tool_call_data_to_event, tool_call_event_to_data,
+    ResolvedModel, assistant_msg_to_payload, assistant_with_tool_calls_to_payload,
+    build_chat_request, resolve_model, tool_call_data_to_event, tool_call_event_to_data,
 };
 use crate::interrupt::{
     SharedTurnState, TurnState, classify, emit_interrupt_event, handle_interrupt,
@@ -28,6 +28,7 @@ use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::InterruptMessage;
 use fuyao_api::message::output::{AssistantMessage, TitleMessage, TitlePayload};
 use fuyao_api::{Message, MessageParams, Session};
+use fuyao_provider::Provider;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
@@ -41,7 +42,41 @@ pub(crate) async fn run_turn(
     rx_interrupt: &mut Receiver<InterruptMessage>,
     params: MessageParams,
 ) {
-    let (model, options) = build_model_and_options(&params, &ctx.tools);
+    // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
+    // 任一失败：发 Error 事件 + 落库 + 结束本轮（配置错误，永久不可恢复）
+    let resolved: ResolvedModel = match resolve_model(&params, &ctx.tools) {
+        Ok(r) => r,
+        Err(msg) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %msg,
+                "模型解析失败（model_id 无效或未配置 [models.default]）"
+            );
+            emit_config_error(ctx, &msg).await;
+            persist(ctx.emitter.session_id(), session, &ctx.store).await;
+            return;
+        }
+    };
+    let provider: Arc<dyn Provider> = match ctx.providers.get(&resolved.provider_id) {
+        Some(p) => p,
+        None => {
+            let msg = format!(
+                "Provider '{}' 未注册（可用: {:?}）",
+                resolved.provider_id,
+                ctx.providers.provider_ids()
+            );
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %msg,
+                "Provider 实例未找到"
+            );
+            emit_config_error(ctx, &msg).await;
+            persist(ctx.emitter.session_id(), session, &ctx.store).await;
+            return;
+        }
+    };
+    let model = resolved.model.clone();
+    let options = resolved.options.clone();
 
     loop {
         // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
@@ -54,8 +89,9 @@ pub(crate) async fn run_turn(
         // run_stream_with_retry 内部按错误类型自动重试，发 OutputEvent::Retry 给 UI。
         // 中断：外层 select! drop retry future → 退避 sleep 取消 → 中断分支胜出。
         let stream_result = {
-            let retry_fut =
-                super::retry::run_stream_with_retry(ctx, request, &model, &options, &state);
+            let retry_fut = super::retry::run_stream_with_retry(
+                ctx, request, &model, &options, &provider, &state,
+            );
             tokio::pin!(retry_fut);
             tokio::select! {
                 result = &mut retry_fut => result,
@@ -110,6 +146,21 @@ pub(crate) async fn run_turn(
             }
         }
     }
+}
+
+/// 发"配置类错误"事件（永久不可恢复）
+///
+/// 统一处理 model_id 解析失败 / Provider 实例未注册等配置错误：发 `OutputEvent::Error`，
+/// `recoverable: false`（与 LLM 调用失败共用 Error 通道，但 message 精准指向配置问题）。
+async fn emit_config_error(ctx: &SessionCtx, message: &str) {
+    let error_event = OutputEvent::Error(fuyao_api::message::output::ErrorMessage {
+        base: EventBase::default(),
+        payload: fuyao_api::message::output::ErrorPayload {
+            message: message.to_string(),
+            recoverable: false,
+        },
+    });
+    crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event, None).await;
 }
 
 /// 处理最终回复（AI 不调用工具，一轮 ReAct 结束）
@@ -177,7 +228,7 @@ async fn handle_final_reply(
 /// `SessionStore::update_title` 单字段 SQL 落库，内存态不更新（下次 resume 时
 /// 从 DB 自然读回）。
 ///
-/// 多 session 并发天然安全：clone `Arc<store>` / `Arc<provider>` / `emitter` /
+/// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
 /// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
 fn maybe_spawn_title_generation(ctx: &SessionCtx, session: &Session, result: &StreamResult) {
     let title_cfg = &fuyao_api::get_config().session.title;
@@ -212,6 +263,7 @@ fn maybe_spawn_title_generation(ctx: &SessionCtx, session: &Session, result: &St
 
     // clone 'static 依赖进 spawn（所有字段都是 Send + 'static）
     let store = Arc::clone(&ctx.store);
+    let providers = Arc::clone(&ctx.providers);
     let emitter = ctx.emitter.clone();
     let hooks = ctx.hooks.clone();
     let agent_paths = ctx.agent_paths.clone();
@@ -222,6 +274,7 @@ fn maybe_spawn_title_generation(ctx: &SessionCtx, session: &Session, result: &St
             &user_content,
             &assistant_content,
             &main_model_id,
+            &providers,
             &agent_paths,
         )
         .await

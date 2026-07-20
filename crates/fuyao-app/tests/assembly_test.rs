@@ -87,16 +87,14 @@ async fn assembled_engine_runs_react_loop() {
     let (agent_paths, _home) = temp_agent_paths();
     let (registry, _mcp_manager) = build_tool_registry().await;
 
-    let provider = std::sync::Arc::new(MockProvider {
-        events: text_events("装配后回复"),
-    }) as std::sync::Arc<dyn fuyao_provider::Provider>;
-
     let plugin_host = PluginHost::new();
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        provider,
+        as_providers(MockProvider {
+            events: text_events("装配后回复"),
+        }),
         registry,
         plugin_host,
     )
@@ -160,7 +158,7 @@ async fn shutdown_with_no_mcp_manager_does_not_panic() {
         EngineParams {
             agent_paths: fuyao_api::AgentPaths::default(),
         },
-        std::sync::Arc::new(MockProvider {
+        as_providers(MockProvider {
             events: text_events("ok"),
         }),
         fuyao_core::ToolRegistry::builder().build(),
@@ -171,7 +169,6 @@ async fn shutdown_with_no_mcp_manager_does_not_panic() {
     let ctx = fuyao_app::AppContext {
         mcp_manager: None,
         log_guard: fuyao_app::LogGuard::default(),
-        default_model_id: "test".to_string(),
     };
 
     // 不应 panic：engine.shutdown() + mcp_manager=None（跳过 stop_all）+ ctx drop
@@ -182,11 +179,12 @@ async fn shutdown_with_no_mcp_manager_does_not_panic() {
 // RetryRunner 端到端：OutputEvent::Retry 在 session 内被发出
 // ============================================================================
 
-/// 辅助：把任意 Provider 包成 Arc<dyn Provider>
-fn as_provider<P: fuyao_provider::Provider + 'static>(
-    p: P,
-) -> std::sync::Arc<dyn fuyao_provider::Provider> {
-    std::sync::Arc::new(p)
+/// 辅助：把任意 Provider 包成 ProviderRegistry（统一 provider_id="test"）
+///
+/// 引擎层按消息级 model_id 的 provider_id 部分从 registry 取实例。
+/// 本测试所有用例都用 "test/..." 形式的 model_id，统一走 test provider。
+fn as_providers<P: fuyao_provider::Provider + 'static>(p: P) -> fuyao_provider::ProviderRegistry {
+    fuyao_provider::ProviderRegistry::with_instance("test", std::sync::Arc::new(p))
 }
 
 /// 可恢复错误：首次 RateLimit → 应发 OutputEvent::Retry → 重试成功产出 Assistant
@@ -210,7 +208,7 @@ async fn retry_runner_emits_retry_event_then_succeeds() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(provider),
+        as_providers(provider),
         registry,
         PluginHost::new(),
     )
@@ -284,7 +282,7 @@ async fn retry_runner_no_retry_on_auth_error() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(provider),
+        as_providers(provider),
         registry,
         PluginHost::new(),
     )
@@ -363,7 +361,7 @@ async fn retry_runner_no_retry_after_first_chunk() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(AlwaysFirstChunkThenError),
+        as_providers(AlwaysFirstChunkThenError),
         registry,
         PluginHost::new(),
     )
@@ -443,7 +441,7 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(AlwaysRateLimit),
+        as_providers(AlwaysRateLimit),
         registry,
         PluginHost::new(),
     )
@@ -500,7 +498,7 @@ async fn shutdown_blocks_send_with_shutdown_error() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(MockProvider {
+        as_providers(MockProvider {
             events: text_events("ok"),
         }),
         fuyao_core::ToolRegistry::builder().build(),
@@ -532,7 +530,7 @@ async fn shutdown_returns_none_for_recv() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(MockProvider {
+        as_providers(MockProvider {
             events: text_events("ok"),
         }),
         fuyao_core::ToolRegistry::builder().build(),
@@ -568,7 +566,7 @@ async fn shutdown_terminates_active_session_and_persists() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(MockProvider {
+        as_providers(MockProvider {
             events: text_events("对话已结束"),
         }),
         registry,
@@ -651,7 +649,7 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
         EngineParams {
             agent_paths: agent_paths.clone(),
         },
-        as_provider(provider),
+        as_providers(provider),
         registry,
         PluginHost::new(),
     )

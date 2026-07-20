@@ -13,7 +13,7 @@ use fuyao_api::message::output::{
     UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
 };
 use fuyao_provider::{
-    BoxStream, ChatResponse, FinishReason, StreamError, StreamEvent, StreamUsage,
+    BoxStream, ChatResponse, FinishReason, Provider, StreamError, StreamEvent, StreamUsage,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
@@ -233,6 +233,22 @@ fn echo_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::builder().register(entry).build())
 }
 
+/// 测试用 MessageParams：携带 `test/...` 形式的 model_id
+///
+/// 必须带 model_id——否则 turn.rs::resolve_model 在 None + 无 [models.default] 时
+/// 返回 Err，走配置错误分支结束 turn，测试 ReAct 行为就跑不起来。所有测试的
+/// ProviderRegistry 都用 `with_instance("test", ...)` 构造，model_id 拆出的
+/// provider_id = "test" 能匹配到。
+fn test_params() -> MessageParams {
+    MessageParams {
+        model_config: fuyao_api::ModelConfig {
+            model_id: Some("test/test-model".to_string()),
+            thinking_type: None,
+            reasoning_effort: None,
+        },
+    }
+}
+
 /// 构造测试用 InboundUser（默认 Guide 模式 + User 来源）
 fn make_inbound(content: &str) -> fuyao_api::InboundUser {
     fuyao_api::InboundUser {
@@ -244,7 +260,7 @@ fn make_inbound(content: &str) -> fuyao_api::InboundUser {
                 source: UserMessageSource::User,
             },
         },
-        params: MessageParams::default(),
+        params: test_params(),
     }
 }
 
@@ -259,7 +275,7 @@ fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> fuyao_api::In
                 source: UserMessageSource::User,
             },
         },
-        params: MessageParams::default(),
+        params: test_params(),
     }
 }
 
@@ -307,9 +323,14 @@ async fn make_harness_with_hooks(
     store.create(&mut session).await.unwrap();
     let (tx_event, rx_event) = mpsc::channel(128);
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
+    // 包成 ProviderRegistry：测试里所有 model_id 都用 "test/..."，统一走 test provider。
+    // turn.rs 从 ctx.providers.get(provider_id) 取实例，必须找到才能继续。
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
     let ctx = SessionCtx {
         store,
-        provider,
+        providers,
         tools,
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
@@ -373,13 +394,7 @@ async fn single_turn_no_tools() {
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     preload_user(&mut h, "用户问题");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     let events = collect_events(&mut h.rx_event).await;
     let has_assistant = events.iter().any(
@@ -405,13 +420,7 @@ async fn react_loop_with_tool() {
     let mut h = make_harness(provider, echo_registry()).await;
     preload_user(&mut h, "调工具");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     let events = collect_events(&mut h.rx_event).await;
     let has_tool_result = events
@@ -436,13 +445,7 @@ async fn tool_result_in_messages() {
     let mut h = make_harness(provider, echo_registry()).await;
     preload_user(&mut h, "test");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     let tool_msg = h
         .session
@@ -463,13 +466,7 @@ async fn llm_error_emits_error_event() {
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     preload_user(&mut h, "test");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     let events = collect_events(&mut h.rx_event).await;
     let has_error = events
@@ -496,13 +493,7 @@ async fn guide_all_consumed_on_tool_complete() {
     h.ctx.guide.lock().unwrap().push_back(make_inbound("补充1"));
     h.ctx.guide.lock().unwrap().push_back(make_inbound("补充2"));
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // session.messages 应含：原始user + assistant(tool_calls) + tool + 补充1 + 补充2 + assistant(最终)
     let user_msgs: Vec<_> = h
@@ -548,13 +539,7 @@ async fn pending_before_guide_on_final_reply() {
         .unwrap()
         .push_back(make_inbound_with_mode("引导消息", UserMessageMode::Guide));
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // 两条都应进 messages
     let user_msgs: Vec<_> = h
@@ -584,13 +569,7 @@ async fn both_empty_turn_ends() {
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     preload_user(&mut h, "问题");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // user + assistant，没有多余消息
     assert_eq!(h.session.messages.len(), 2);
@@ -624,6 +603,9 @@ async fn pending_consumed_when_task_idle() {
     let (tx_event, mut rx_event) = mpsc::channel(128);
 
     // 启动 session 执行流（两队列都空，task 进入 select! 等待）
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
     let task = tokio::spawn(run_session(
         "test_session".to_string(),
         Arc::clone(&guide),
@@ -634,7 +616,7 @@ async fn pending_consumed_when_task_idle() {
         tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
-        provider,
+        providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
@@ -705,6 +687,9 @@ async fn plugin_message_routes_through_dispatch() {
     let (tx_plugin, rx_plugin) = mpsc::channel::<fuyao_api::message::input::PluginMessage>(16);
     let (tx_event, mut rx_event) = mpsc::channel(128);
 
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
     let task = tokio::spawn(run_session(
         "plugin_session".to_string(),
         Arc::clone(&guide),
@@ -715,7 +700,7 @@ async fn plugin_message_routes_through_dispatch() {
         tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
-        provider,
+        providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
@@ -798,12 +783,7 @@ async fn interrupt_during_streaming() {
 
     // run_turn 与"发中断"并发：run_turn 先消费 TextDelta，然后挂起在第二个事件上；
     // yield_now 让出调度让 run_turn 进入挂起态，再发中断。
-    let turn_fut = turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    );
+    let turn_fut = turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params());
     tokio::pin!(turn_fut);
     let interrupter = async {
         // 等 run_turn 跑起来并挂起在流的第二个事件上
@@ -886,12 +866,7 @@ async fn interrupt_during_tool_execution() {
 
     let tx_interrupt = h.tx_interrupt.clone();
 
-    let turn_fut = turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    );
+    let turn_fut = turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params());
     tokio::pin!(turn_fut);
     let interrupter = async {
         // 等 run_turn 跑完流式（工具调用）并进入工具执行阻塞
@@ -955,13 +930,7 @@ async fn messages_persisted_to_db() {
     preload_user(&mut h, "调工具");
     let session_id = h.session.id.clone();
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // 内存中的 messages（run_turn 后的完整状态）
     let expected_count = h.session.messages.len();
@@ -1029,13 +998,7 @@ async fn usage_flows_to_final_assistant_message() {
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     preload_user(&mut h, "提问");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     let events = collect_events(&mut h.rx_event).await;
     let assistant = events
@@ -1122,7 +1085,7 @@ async fn cost_accumulated_per_assistant_message() {
     preload_user(&mut h, "测费用累积");
 
     // 用带 model_id 的 params，让累积逻辑能查到价格表
-    let mut params = MessageParams::default();
+    let mut params = test_params();
     params.model_config.model_id = Some("test/cost-model".to_string());
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, params).await;
@@ -1246,13 +1209,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
     preload_user(&mut h, "用户问题");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // 1. session.messages 最后一条是修改后的内容
     let last_msg = h
@@ -1308,13 +1265,7 @@ async fn intercept_block_skips_final_assistant_in_history() {
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
     preload_user(&mut h, "用户问题");
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        MessageParams::default(),
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params()).await;
 
     // Block：不应有任何 assistant 消息进 session.messages（只有 preload 的 user）
     let has_assistant = h.session.messages.iter().any(|m| m.role == "assistant");
@@ -1355,7 +1306,10 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     let store = temp_store().await;
     let ctx = SessionCtx {
         store,
-        provider: Arc::new(MockProvider::new(vec![])) as Arc<dyn Provider>,
+        providers: Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+            "test",
+            Arc::new(MockProvider::new(vec![])),
+        )),
         tools: Arc::new(ToolRegistry::builder().build()),
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
@@ -1403,7 +1357,10 @@ async fn inject_messages_preserves_plugin_source_in_event() {
     let store = temp_store().await;
     let ctx = SessionCtx {
         store,
-        provider: Arc::new(MockProvider::new(vec![])) as Arc<dyn Provider>,
+        providers: Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+            "test",
+            Arc::new(MockProvider::new(vec![])),
+        )),
         tools: Arc::new(ToolRegistry::builder().build()),
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
@@ -1432,7 +1389,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
                 }),
             },
         },
-        params: MessageParams::default(),
+        params: test_params(),
     };
     queue::inject_messages(&ctx, &mut session, vec![inbound]).await;
 

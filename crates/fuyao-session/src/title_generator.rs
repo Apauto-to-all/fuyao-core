@@ -3,12 +3,12 @@
 //! 首轮对话后异步生成简短标题：
 //! - 用用户消息 + AI 回答（各截断 `[session.title] snippet_max_chars` 字符）喂给 LLM
 //! - 模型优先级：`[models.fast]` → 当前引擎模型 → 放弃
-//! - 内部自建 Provider（`create_provider_with_model`），支持 fast 跨 Provider 配置
+//! - 从引擎级共享的 ProviderRegistry 取 Provider 实例（fast 可能跨 Provider）
 //! - 用非流式 `provider.chat()`（标题是短文本，无需流式增量）
 //! - 只生成标题文本；落库（`SessionStore::update_title`）与事件发布由调用方负责（职责分离）
 
 use fuyao_api::{AgentPaths, get_config};
-use fuyao_provider::{ChatMessage, ChatRequest, Provider, create_provider_with_model};
+use fuyao_provider::{ChatMessage, ChatRequest, ProviderRegistry, parse_model_id};
 
 /// 标题生成系统提示词
 const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题（3-7 个词）。\
@@ -24,7 +24,8 @@ const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题�
 /// - `user_message`：用户消息原文（内部截断）
 /// - `assistant_response`：AI 回答原文（内部截断）
 /// - `main_model_id`：当前引擎使用的模型 ID（格式 provider_id/model_id），fast 不可用时回退
-/// - `agent_paths`：Agent 三层目录（用于 Provider 创建与注册表查找）
+/// - `providers`：引擎级共享的 Provider 实例注册表（fast 可能跨 Provider 配置）
+/// - `agent_paths`：Agent 三层目录（注册表查找用，保留以备未来扩展）
 ///
 /// # 返回
 /// - `Some(String)`：清洗后的标题（已去引号/前缀/限长）
@@ -33,7 +34,8 @@ pub async fn maybe_generate_title(
     user_message: &str,
     assistant_response: &str,
     main_model_id: &str,
-    agent_paths: &AgentPaths,
+    providers: &ProviderRegistry,
+    _agent_paths: &AgentPaths,
 ) -> Option<String> {
     let config = get_config();
 
@@ -41,14 +43,7 @@ pub async fn maybe_generate_title(
     if let Some(fast_ref) = config.models.fast.as_ref()
         && !fast_ref.model.is_empty()
     {
-        match generate_title(
-            user_message,
-            assistant_response,
-            &fast_ref.model,
-            agent_paths,
-        )
-        .await
-        {
+        match generate_title(user_message, assistant_response, &fast_ref.model, providers).await {
             Some(title) => return Some(title),
             None => {
                 tracing::warn!(
@@ -60,19 +55,28 @@ pub async fn maybe_generate_title(
     }
 
     // 2. 回退到当前引擎模型；3. 再失败则放弃（返回 None）
-    generate_title(user_message, assistant_response, main_model_id, agent_paths).await
+    generate_title(user_message, assistant_response, main_model_id, providers).await
 }
 
 /// 调用 LLM 生成标题（单次尝试）
 ///
-/// 内部完成：创建 Provider → 截断输入 → 发非流式请求 → 清洗标题。
+/// 内部完成：按 model_id 从 ProviderRegistry 取 Provider → 截断输入 →
+/// 发非流式请求 → 清洗标题。
+///
+/// 失败情形（返回 None）：
+/// - model_id 格式错误（无 `/`）
+/// - Provider 实例未注册（init 时该 provider 创建失败）
+/// - LLM 调用失败（网络 / 鉴权 / 模型不存在等）
+/// - 响应为空或清洗后为空
 async fn generate_title(
     user_message: &str,
     assistant_response: &str,
     model_id: &str,
-    agent_paths: &AgentPaths,
+    providers: &ProviderRegistry,
 ) -> Option<String> {
-    let (_provider_id, model_name, provider) = create_provider_with_model(model_id, agent_paths)?;
+    // 解析 "provider_id/model_id" → 取 Provider 实例 + 裸模型名
+    let (provider_id, model_name) = parse_model_id(model_id).ok()?;
+    let provider = providers.get(&provider_id)?;
 
     let title_cfg = &get_config().session.title;
     let user_snippet = truncate_chars(user_message, title_cfg.snippet_max_chars);

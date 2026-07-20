@@ -7,17 +7,102 @@
 //! - 同一个 agent_paths 的多次调用复用缓存
 //! - 不同 agent_paths 可以有不同的 Provider 配置
 
+use crate::openai::OpenAIProvider;
+use crate::provider::Provider as ProviderTrait;
 use fuyao_api::{AgentPaths, Model, Provider};
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
-/// 全局 Provider 缓存
+/// 全局 Provider 配置缓存（provider_id → Provider 配置，按 agent_paths 维度隔离）
 static PROVIDER_CACHE: LazyLock<Mutex<HashMap<String, HashMap<String, Provider>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// 全局 Model 缓存
 static MODEL_CACHE: LazyLock<Mutex<HashMap<String, HashMap<String, Model>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Provider 实例注册表（多 Provider 路由）
+///
+/// 与上面的全局 PROVIDER_CACHE（Provider **配置**）不同：本结构持有
+/// 已构造好的 `Arc<dyn Provider>` **实例**，按 `provider_id` 查询。
+///
+/// 引擎级共享（Engine 持有 `Arc<ProviderRegistry>`）。每条消息的
+/// `MessageParams.model_id` 形如 `"provider_id/model_id"`——拆出 `provider_id`
+/// 从本注册表取 Provider 实例，实现"不同 session / 不同消息用不同 Provider"。
+///
+/// 与旧"引擎持单个 `Arc<dyn Provider>`"模型的差异：
+/// - 旧：启动时按 default model_id 选一个 Provider 实例，所有调用都打到这里
+/// - 新：启动时把所有已注册 Provider 都建实例；每次调用按消息的 provider_id 路由
+///
+/// 失败容错：单个 Provider 实例构造失败（如 API Key 缺失）不影响其他——
+/// `from_registered` 跳过失败的并记 WARN，调用方用到该 provider_id 时
+/// `get` 返回 None，由上层报错（消息级 fail-loud）。
+#[derive(Clone, Default)]
+pub struct ProviderRegistry {
+    /// provider_id → Provider 实例（key 已小写规范化）
+    instances: HashMap<String, Arc<dyn ProviderTrait>>,
+}
+
+impl ProviderRegistry {
+    /// 从全局配置注册表批量构造 Provider 实例
+    ///
+    /// 遍历 `list_providers(agent_paths)` 的每个 provider_id，调
+    /// [`OpenAIProvider::new`] 建实例。单个失败（API Key 未配等）仅记 WARN 跳过，
+    /// 其余成功的照常注册——支持渐进配置（部分 provider 配错也能启动引擎）。
+    ///
+    /// 调用方应在返回后检查 [`is_empty`](Self::is_empty)：空表示所有 provider
+    /// 都建实例失败（通常是配置文件 / 环境变量都没设），引擎无法启动。
+    pub fn from_registered(agent_paths: &AgentPaths) -> Self {
+        let mut instances: HashMap<String, Arc<dyn ProviderTrait>> = HashMap::new();
+        let providers = list_providers(agent_paths);
+        for provider_id in providers.keys() {
+            match OpenAIProvider::new(provider_id, agent_paths) {
+                Some(p) => {
+                    instances.insert(provider_id.to_lowercase(), Arc::new(p));
+                }
+                None => {
+                    tracing::warn!(
+                        provider = %provider_id,
+                        "Provider 实例创建失败（通常是 API Key 未配置），该 provider 将不可用"
+                    );
+                }
+            }
+        }
+        Self { instances }
+    }
+
+    /// 按 provider_id 查 Provider 实例
+    ///
+    /// key 大小写不敏感（内部已小写规范化）。找不到返回 None——由调用方
+    /// （通常是 `turn.rs`）转成 `OutputEvent::Error` 给 UI，错误信息精准指向
+    /// 哪个 provider_id 未注册。
+    pub fn get(&self, provider_id: &str) -> Option<Arc<dyn ProviderTrait>> {
+        self.instances.get(&provider_id.to_lowercase()).cloned()
+    }
+
+    /// 是否没有任何可用 Provider 实例
+    pub fn is_empty(&self) -> bool {
+        self.instances.is_empty()
+    }
+
+    /// 列出所有已注册实例的 provider_id（小写，用于诊断/日志）
+    pub fn provider_ids(&self) -> Vec<String> {
+        self.instances.keys().cloned().collect()
+    }
+}
+
+impl ProviderRegistry {
+    /// 手动注入一个 Provider 实例（带 provider_id 标签）
+    ///
+    /// 生产代码用 [`from_registered`](Self::from_registered) 从配置构造；
+    /// 此方法供调用方（如装配层 / 测试）直接注入已构造的 Provider 实例，
+    /// 例如把 MockProvider 包成 registry 供单元测试用。
+    pub fn with_instance(provider_id: &str, instance: Arc<dyn ProviderTrait>) -> Self {
+        let mut instances = HashMap::new();
+        instances.insert(provider_id.to_lowercase(), instance);
+        Self { instances }
+    }
+}
 
 /// 生成 agent_paths 缓存 key
 pub fn agent_paths_cache_key(agent_paths: &AgentPaths) -> String {
@@ -262,5 +347,80 @@ mod tests {
 
         assert!(get_provider("aliyun", &paths).is_none());
         assert!(get_model("aliyun/qwen3.6-plus", &paths).is_none());
+    }
+
+    // ===== ProviderRegistry 单测 =====
+    //
+    // MockProvider 是最小 Provider 实现：所有方法返回空/默认值，仅用于占位。
+    // ProviderRegistry 本身不关心 Provider 内部行为，只关心按 provider_id 路由。
+
+    /// 最小 Provider 实现（测试占位用）
+    struct MockProvider;
+
+    #[async_trait::async_trait]
+    impl ProviderTrait for MockProvider {
+        fn stream_chat(
+            &self,
+            _request: crate::provider::ChatRequest,
+            _model: &str,
+            _options: crate::provider::StreamOptions,
+        ) -> crate::provider::BoxStream<
+            Result<crate::provider::StreamEvent, crate::provider::StreamError>,
+        > {
+            // 空流——ProviderRegistry 不关心 Provider 行为
+            Box::pin(futures_util::stream::empty())
+        }
+
+        async fn chat(
+            &self,
+            _request: crate::provider::ChatRequest,
+            _model: &str,
+        ) -> Result<crate::provider::ChatResponse, crate::provider::StreamError> {
+            Ok(crate::provider::ChatResponse {
+                content: None,
+                reasoning: None,
+                tool_calls: None,
+                usage: crate::provider::StreamUsage::default(),
+                finish_reason: crate::provider::FinishReason::Stop,
+            })
+        }
+    }
+
+    #[test]
+    fn provider_registry_with_instance_lookup() {
+        let instance: Arc<dyn ProviderTrait> = Arc::new(MockProvider);
+        let registry = ProviderRegistry::with_instance("aliyun", instance);
+
+        // 大小写不敏感查询
+        assert!(registry.get("aliyun").is_some());
+        assert!(registry.get("ALIYUN").is_some());
+        assert!(registry.get("Aliyun").is_some());
+        assert!(registry.get("nonexistent").is_none());
+        assert!(!registry.is_empty());
+    }
+
+    #[test]
+    fn provider_registry_default_is_empty() {
+        let registry = ProviderRegistry::default();
+        assert!(registry.is_empty());
+        assert!(registry.get("any").is_none());
+    }
+
+    #[test]
+    fn provider_registry_provider_ids_returns_lowercased() {
+        let instance: Arc<dyn ProviderTrait> = Arc::new(MockProvider);
+        let registry = ProviderRegistry::with_instance("DeepSeek", instance);
+        let ids = registry.provider_ids();
+        assert_eq!(ids, vec!["deepseek".to_string()]);
+    }
+
+    /// from_registered 在没有注册任何 provider 时返回空 registry（不 panic）
+    #[test]
+    fn provider_registry_from_registered_empty_when_no_provider() {
+        let paths = unique_paths("from_empty");
+        let registry = ProviderRegistry::from_registered(&paths);
+        assert!(registry.is_empty());
+        // 清理（虽然没注册什么，保险起见）
+        clear_cache(&paths);
     }
 }

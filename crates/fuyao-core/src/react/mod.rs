@@ -42,7 +42,7 @@ use fuyao_api::message::output::{
 };
 use fuyao_api::{CompressionConfig, EventBase, InboundUser, Session};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::{Provider, StreamUsage};
+use fuyao_provider::{ProviderRegistry, StreamUsage};
 use fuyao_session::CompressionRuntimeState;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -51,13 +51,14 @@ use tokio_util::sync::CancellationToken;
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
 ///
-/// 聚合 store / provider / tools / hooks / agent_paths / emitter / guide / pending
+/// 聚合 store / providers / tools / hooks / agent_paths / emitter / guide / pending
 /// 这些所有 turn 都需要的共享只读依赖 + 双队列，避免 run_turn 参数列表过长。
 /// 不含可变状态（session / rx_interrupt）——那些作为独立 &mut 参数传入。
 /// 由 run_session 构造一次，整个 task 期间以 `&SessionCtx` 不可变借用复用。
 pub(crate) struct SessionCtx {
     pub store: Arc<fuyao_session::SessionStore>,
-    pub provider: Arc<dyn Provider>,
+    /// Provider 实例注册表（按消息级 provider_id 路由）
+    pub providers: Arc<ProviderRegistry>,
     pub tools: Arc<ToolRegistry>,
     /// 钩子注册表（引擎级共享，透传给本 session 的 dispatch 管道）
     pub hooks: SharedHooks,
@@ -113,7 +114,7 @@ pub(crate) async fn run_session(
     shutdown_token: CancellationToken,
     mut session: Session,
     store: Arc<fuyao_session::SessionStore>,
-    provider: Arc<dyn Provider>,
+    providers: Arc<ProviderRegistry>,
     tools: Arc<ToolRegistry>,
     hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
@@ -124,7 +125,7 @@ pub(crate) async fn run_session(
 
     let ctx = SessionCtx {
         store,
-        provider,
+        providers,
         tools,
         hooks,
         agent_paths,
@@ -240,13 +241,62 @@ async fn run_pre_turn_compression(
         }
     };
 
-    // 解析当前模型上下文长度（用 incoming 第一条消息的 model_id）
-    // ponytail: 多 guide 消息 model 不一致用第一条（与 run_turn 内 "取第一条 params" 一致）
-    let model_id = incoming
+    // 解析本轮主模型的 model_id 和 Provider 实例
+    //
+    // **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，
+    // 否则 session.messages 原样发的请求会因为 endpoint 切换导致前缀缓存失效。
+    // model_id 解析顺序与 turn.rs::resolve_model 一致：
+    //   1. incoming[0].params.model_id = Some(...) → 用它
+    //   2. None → 读 [models.default] 兜底
+    //   3. 都没有 → 无法确定主模型，跳过本次压缩（warn 记录原因）
+    let model_id: String = match incoming
         .first()
         .and_then(|m| m.params.model_config.model_id.as_deref())
-        .unwrap_or("");
-    let context_length = fuyao_provider::get_model(model_id, &ctx.agent_paths)
+    {
+        Some(id) => id.to_string(),
+        None => match fuyao_api::get_config()
+            .models
+            .default
+            .as_ref()
+            .map(|r| r.model.clone())
+            .filter(|s| !s.is_empty())
+        {
+            Some(id) => id,
+            None => {
+                tracing::warn!(
+                    session_id = ctx.emitter.session_id(),
+                    "压缩跳过：本轮主模型未指定且未配置 [models.default]"
+                );
+                return;
+            }
+        },
+    };
+
+    // 拆 provider_id → 从 registry 取 Provider 实例（与主对话 stream_chat 同一个）
+    let provider_id = match model_id.split_once('/') {
+        Some((p, _)) if !p.is_empty() => p.to_lowercase(),
+        _ => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                model_id = %model_id,
+                "压缩跳过：model_id 格式错误"
+            );
+            return;
+        }
+    };
+    let provider = match ctx.providers.get(&provider_id) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                provider_id = %provider_id,
+                "压缩跳过：Provider 实例未注册"
+            );
+            return;
+        }
+    };
+
+    let context_length = fuyao_provider::get_model(&model_id, &ctx.agent_paths)
         .map(|m| m.limit.context)
         .unwrap_or(ctx.compression_config.fallback_context);
 
@@ -331,8 +381,8 @@ async fn run_pre_turn_compression(
         s = fuyao_session::generate_summary(
             session.system_prompt.as_deref(),
             &session.messages,
-            &ctx.provider,
-            model_id,
+            &provider,
+            &model_id,
             context_length,
             &ctx.compression_config,
             &mut on_delta,
