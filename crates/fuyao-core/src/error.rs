@@ -25,7 +25,13 @@ pub enum EngineError {
     #[error("提供者错误: {0}")]
     Provider(String),
 
-    /// 引擎已关闭，无法接受新请求
+    /// 引擎已关闭（`Engine::shutdown` 已调用）
+    ///
+    /// shutdown 后所有 `send` / `recv` 调用立即返回此错误（或 None）：
+    /// - `send`：返回 `Err(Shutdown)`（区分于 `SessionNotFound`，明确告知是引擎已关而非编号错）
+    /// - `recv`：先 drain 残余事件，再返回 None（让消费者收完 shutdown 前最后几条产出）
+    ///
+    /// 这是「同步校验错误」——调用函数瞬间即可判断，符合 01 文档错误处理原则。
     #[error("引擎已关闭")]
     Shutdown,
 }

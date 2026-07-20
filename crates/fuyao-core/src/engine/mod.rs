@@ -19,9 +19,21 @@ use fuyao_api::{
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_session::SessionStore;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinError;
+use tokio_util::sync::CancellationToken;
 pub use types::SessionId;
+
+/// shutdown 等待单个 session task 退出的超时阈值
+///
+/// task 收到 shutdown_token.cancel() 后，run_session 主循环 select! 立即胜出，
+/// break 前会做一次 store.update 落库（保护 in-flight 状态）——通常毫秒级完成。
+/// 10 秒阈值是为了兜住极端情况（如 DB 写入阻塞、压缩 LLM 调用在途），
+/// 超时则强制 abort task，对齐设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障。
+const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 引擎
 ///
@@ -64,6 +76,23 @@ pub struct Engine {
 
     /// 引擎启动参数（引擎级，含 agent_paths 等，后续可拓展）
     params: EngineParams,
+
+    /// 引擎是否已 shutdown（AtomicBool 同步快路径）
+    ///
+    /// shutdown 后置 true，作为 send / recv 的同步快路径检查：
+    /// - `send` 立即返回 `Err(EngineError::Shutdown)`（区分于 `SessionNotFound`）
+    /// - `recv` 先 drain 残余事件，再返回 None（不丢 shutdown 前最后几条事件）
+    ///
+    /// 用 AtomicBool 而非 CancellationToken：send/recv 入口检查需同步、不 await，
+    /// AtomicBool 满足零开销同步语义；task 内的取消信号另用 `shutdown_token`。
+    shutdown: Arc<AtomicBool>,
+
+    /// 引擎级关闭信号（cancel 后所有 session task 的 select! 同时收到）
+    ///
+    /// 每个 session 在 `assemble_session` 时用 `child_token()` 派生子 token，
+    /// 既支持引擎级一次 cancel 全部（Engine::shutdown 调 root.cancel），
+    /// 也为未来「单 session 销毁」扩展点（cancel 单个 child）预留。
+    shutdown_token: CancellationToken,
 }
 
 impl Engine {
@@ -103,6 +132,8 @@ impl Engine {
             tx_event,
             rx_event: Mutex::new(rx_event),
             params,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            shutdown_token: CancellationToken::new(),
         }
     }
 
@@ -194,6 +225,11 @@ impl Engine {
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let (tx_plugin, rx_plugin) = mpsc::channel::<PluginMessage>(16);
 
+        // 该 session 的关闭信号（引擎级 shutdown_token 的 child_token）
+        //   Engine::shutdown 调 root.cancel → 所有 child 同时 cancel
+        //   未来扩展「单 session 销毁」时可单独 cancel 这个 child
+        let shutdown_token = self.shutdown_token.child_token();
+
         // 装配该 session 的 hooks（per-session：create_instances + register + SessionSender）
         let hooks = self
             .assemble_session_hooks(
@@ -212,6 +248,7 @@ impl Engine {
             rx_inbound,
             rx_interrupt,
             rx_plugin,
+            shutdown_token.clone(),
             session,
             Arc::clone(&self.store),
             Arc::clone(&self.provider),
@@ -229,6 +266,7 @@ impl Engine {
             tx_interrupt,
             tx_plugin,
             task,
+            shutdown_token,
         }
     }
 
@@ -322,6 +360,11 @@ impl Engine {
         event: InputEvent,
         params: MessageParams,
     ) -> Result<(), EngineError> {
+        // shutdown 同步快路径检查：已关闭立即拒绝（区分于 SessionNotFound）
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EngineError::Shutdown);
+        }
+
         let sessions = self.sessions.lock().await;
         let handle = sessions
             .get(id)
@@ -378,17 +421,76 @@ impl Engine {
     /// 引擎关闭是危险操作，不混入对话级的事件流（不走 send），
     /// 由独立的关闭方法触发。
     ///
-    /// 关闭流程（后续实现）：
-    /// - 停止接收新的对话级事件
-    /// - 等待所有活跃 session 的当前执行完成或优雅中断
-    /// - 落库未持久化的状态
-    /// - 关闭 DB 连接、释放资源
-    // TODO: 实现引擎关闭流程（drop 所有 session task + 落库 + 释放资源）
+    /// 关闭流程（学 opencode 优雅停机 + 对齐设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障）：
+    /// 1. shutdown flag 置位（`AtomicBool::store(true)`）→ 后续 `send` 立即返回 `Err(Shutdown)`，
+    ///    `recv` 先 drain 残余事件再返回 None（不丢 shutdown 前最后几条产出）
+    /// 2. cancel 引擎级 shutdown_token → 所有 session task 的 select! 同时收到 cancelled 信号
+    /// 3. 每个 session task 优雅退出：select! 监听 cancelled → break 主循环 →
+    ///    退出前调一次 `store.update(session)` 落库（保护 in-flight 状态，失败仅 warn 不阻塞）
+    /// 4. 等待所有 task 实际退出（`tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, task)`）：
+    ///    超时则 `task.abort()` 兜底强杀
+    /// 5. 清空 sessions 调度表 + 发 INFO 日志（含正常退出计数）
+    ///
+    /// **fire-and-forget task**（如 title 生成等 spawn 的独立 task）：**不显式 abort**，
+    /// 靠 runtime 关闭自然终止（对齐 opencode + 文档 01.1:935 已记录决策）。
     pub async fn shutdown(&self) {
-        // 第二步：清空调度表，drop 所有 SessionHandle（task 句柄 drop 不 abort，但通道关闭后 task 自然退出）
-        let mut sessions = self.sessions.lock().await;
-        sessions.clear();
-        tracing::info!("引擎关闭（session 调度表已清空）");
+        // 1. flag 置位：后续 send / recv 立即走快路径拒绝
+        self.shutdown.store(true, Ordering::Release);
+
+        // 2. cancel 引擎级 token：所有 session task 的 child_token 同时 cancel
+        self.shutdown_token.cancel();
+
+        // 3. 取出所有 SessionHandle 的所有权（drain 出 hashmap 才能 move task 去 await）
+        let handles: Vec<(SessionId, SessionHandle)> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.drain().collect()
+        };
+
+        // 4. 等待每个 task 退出（超时兜底 abort）
+        //    串行 await——并发 await 需 JoinSet，shutdown 是低频操作，串行足够；
+        //    且每个 task 已被 cancel，正常情况下都是毫秒级退出。
+        //
+        //    AbortHandle 提前拿：timeout 会消费 JoinHandle（future），
+        //    超时后 JoinHandle 已 drop 无法调 task.abort()；
+        //    AbortHandle 是独立的句柄（&self 方法返回），与 JoinHandle 无 ownership 关系，
+        //    timeout 超时后调 abort_handle.abort() 强杀 task。
+        let total = handles.len();
+        let mut finished = 0usize;
+        let mut panicked = 0usize;
+        let mut aborted = 0usize;
+        for (id, handle) in handles {
+            let abort_handle = handle.task.abort_handle();
+            match tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, handle.task).await {
+                Ok(Ok(())) => {
+                    finished += 1;
+                }
+                Ok(Err(join_err)) => {
+                    panicked += 1;
+                    tracing::warn!(
+                        session_id = %id,
+                        cause = %format_join_error(join_err),
+                        "session task panic 退出（已由 task 内 panic 防护或 runtime 兜底）"
+                    );
+                }
+                Err(_) => {
+                    abort_handle.abort();
+                    aborted += 1;
+                    tracing::warn!(
+                        session_id = %id,
+                        timeout_secs = SHUTDOWN_TASK_TIMEOUT.as_secs(),
+                        "session task 超时未退出，强制 abort（兜底）"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            total,
+            finished,
+            panicked,
+            aborted,
+            "引擎关闭完成（所有 session task 已处理）"
+        );
     }
 
     /// 出事件（单一出口）
@@ -397,7 +499,31 @@ impl Engine {
     /// 所有对话的产出都从此口流出，没有第二个出口。
     ///
     /// 返回 `None` 表示引擎已关闭、通道已断。
+    ///
+    /// shutdown 后调用：先 drain 残余事件（不丢 shutdown 前最后几条产出），
+    /// 队列空了再返回 None——让消费者能完整收完 shutdown 前的事件流后优雅退出。
     pub async fn recv(&self) -> Option<OutputEvent> {
+        // shutdown 后走快路径：drain 残余事件，再返回 None
+        if self.shutdown.load(Ordering::Acquire) {
+            return self.rx_event.lock().await.try_recv().ok();
+        }
         self.rx_event.lock().await.recv().await
+    }
+}
+
+/// 把 `JoinError` 格式化为可读字符串（用于日志）
+///
+/// panic 类型的任务退出原因通常含 payload，转字符串供 WARN 日志输出。
+/// owned 传入：`try_into_panic` 消费 JoinError。
+fn format_join_error(err: JoinError) -> String {
+    if err.is_panic() {
+        match err.try_into_panic() {
+            Ok(payload) => fuyao_hooks::panic_payload_to_string(&*payload),
+            Err(_) => "task panic（payload 不可恢复）".to_string(),
+        }
+    } else if err.is_cancelled() {
+        "task 被取消".to_string()
+    } else {
+        format!("task 退出异常: {err}")
     }
 }

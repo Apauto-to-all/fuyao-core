@@ -47,6 +47,7 @@ use fuyao_session::CompressionRuntimeState;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio_util::sync::CancellationToken;
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
 ///
@@ -76,6 +77,13 @@ pub(crate) struct SessionCtx {
     pub compression_state: Arc<std::sync::Mutex<CompressionRuntimeState>>,
     /// 压缩配置（从全局 config 读取，启动时定死）
     pub compression_config: CompressionConfig,
+    /// 该 session 的关闭信号（Engine::shutdown 时 cancel）
+    ///
+    /// 引擎级 shutdown_token 的 child_token：Engine::shutdown 调 root.cancel →
+    /// 所有 child 同时 cancel → 本 session 主循环 select! 收到信号优雅退出。
+    /// 目前只在主循环 idle select! 监听；未来若需 turn 中途响应，可在 turn.rs
+    /// 的 select! 中段也加一路监听（行为同中断，但优先级更高）。
+    pub shutdown_token: CancellationToken,
 }
 
 /// session 的独立执行流
@@ -102,6 +110,7 @@ pub(crate) async fn run_session(
     mut rx_inbound: Receiver<InboundUser>,
     mut rx_interrupt: Receiver<InterruptMessage>,
     mut rx_plugin: Receiver<PluginMessage>,
+    shutdown_token: CancellationToken,
     mut session: Session,
     store: Arc<fuyao_session::SessionStore>,
     provider: Arc<dyn Provider>,
@@ -126,9 +135,10 @@ pub(crate) async fn run_session(
         last_usage: Arc::new(Mutex::new(None)),
         compression_state: Arc::new(std::sync::Mutex::new(CompressionRuntimeState::default())),
         compression_config: fuyao_api::get_config().session.compression.clone(),
+        shutdown_token: shutdown_token.clone(),
     };
 
-    // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断
+    // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断/shutdown
     loop {
         // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
         // → 此时 pending 与 guide 语义等价，立即解禁进 guide 触发新 turn
@@ -144,6 +154,18 @@ pub(crate) async fn run_session(
             // 失败 log warn 跳过本次压缩，主流程继续
             run_pre_turn_compression(&ctx, &mut session, &msgs).await;
 
+            // shutdown 检查（pre-turn 后）：避免压缩后又开新 turn
+            // shutdown_token 在 run_pre_turn_compression 期间被 cancel 的情况下，
+            // 这里 break 让 session 优雅退出（保护刚压缩完的状态不被新 turn 截断）
+            if ctx.shutdown_token.is_cancelled() {
+                tracing::info!(
+                    session_id = %ctx.emitter.session_id(),
+                    "session 收到 shutdown 信号，正在落库退出"
+                );
+                let _ = ctx.store.update(&mut session).await;
+                break;
+            }
+
             // 取第一条消息的 params（决定本轮 model/options）
             // ReAct 多轮复用同一份 model（一个 turn 一个模型）
             // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
@@ -152,8 +174,25 @@ pub(crate) async fn run_session(
             queue::inject_messages(&ctx, &mut session, msgs).await;
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
         } else {
-            // guide 空：等入站消息（过管道入队）/ 中断 / Plugin 通知
+            // guide 空：等入站消息（过管道入队）/ 中断 / Plugin 通知 / shutdown
             tokio::select! {
+                biased;
+                // shutdown 优先胜出（即使有消息积压也先退出）
+                _ = ctx.shutdown_token.cancelled() => {
+                    tracing::info!(
+                        session_id = %ctx.emitter.session_id(),
+                        "session 收到 shutdown 信号，正在落库退出"
+                    );
+                    // 落库保护 in-flight 状态（失败仅 warn，不阻塞关闭）
+                    if let Err(e) = ctx.store.update(&mut session).await {
+                        tracing::warn!(
+                            session_id = %ctx.emitter.session_id(),
+                            cause = %e,
+                            "shutdown 落库失败，session 状态可能丢失最近一条未持久化的消息"
+                        );
+                    }
+                    break;
+                }
                 Some(inbound) = rx_inbound.recv() => {
                     // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察
                     handle_inbound_user(&ctx, inbound).await;

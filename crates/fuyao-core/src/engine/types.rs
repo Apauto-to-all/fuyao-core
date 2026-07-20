@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 // InboundUser 已提升到 fuyao-api，供 fuyao-hooks 的 SessionSender 引用（避免 hooks 反向依赖 core）
 //
@@ -31,12 +32,14 @@ pub(crate) type SharedQueue = Arc<Mutex<VecDeque<InboundUser>>>;
 /// 活跃 session 的句柄
 ///
 /// Engine 的调度表（session_id → SessionHandle）持有它。
-/// 双队列 + 入站通道 + 中断通道 + Plugin 通道分离：
+/// 双队列 + 入站通道 + 中断通道 + Plugin 通道 + 关闭信号分离：
 /// - `guide`：引导队列，直接消费，驱动 ReAct 循环
 /// - `pending`：排队队列，AI 不再调工具（最终回复）后才解禁转入 guide
 /// - `tx_inbound`：入站通道（User 消息送进 session task 过管道）
 /// - `tx_interrupt`：中断通道，select! 中断点监听（与队列正交）
 /// - `tx_plugin`：Plugin 通道，插件通知送进 session task 过 dispatch 管道（不参与 ReAct）
+/// - `task`：session 独立执行流任务句柄（shutdown 时 await 等退出 / 超时 abort 兜底）
+/// - `shutdown_token`：该 session 的关闭信号（Engine::shutdown 时 cancel）
 #[allow(dead_code)]
 pub(crate) struct SessionHandle {
     /// 引导队列（直接消费）
@@ -49,6 +52,11 @@ pub(crate) struct SessionHandle {
     pub tx_interrupt: Sender<InterruptMessage>,
     /// Plugin 通道发送端（Plugin 通知，过 dispatch 管道发外部）
     pub tx_plugin: Sender<PluginMessage>,
-    /// session 独立执行流的任务句柄（shutdown 时用于优雅 abort）
+    /// session 独立执行流的任务句柄（shutdown 时 await 等退出 / 超时 abort 兜底）
     pub task: JoinHandle<()>,
+    /// 该 session 的关闭信号（Engine::shutdown 时 cancel，task select! 监听）
+    ///
+    /// 派生自引擎级 shutdown_token（`child_token()`），目前 Engine::shutdown
+    /// 一次性 cancel 所有 session；保留 child_token 形态为未来「单 session 销毁」扩展点。
+    pub shutdown_token: CancellationToken,
 }

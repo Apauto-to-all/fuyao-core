@@ -487,3 +487,204 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
         "attempt 应递增 1, 2, 3, ...，实际: {retry_attempts:?}"
     );
 }
+
+// ============================================================================
+// Engine::shutdown 完整流程：flag 拒绝 / recv 返回 None / 落库 / task 退出
+// ============================================================================
+
+/// shutdown 后 send 立即返回 `Err(EngineError::Shutdown)`（而非 SessionNotFound）
+#[tokio::test]
+async fn shutdown_blocks_send_with_shutdown_error() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    engine.shutdown().await;
+
+    // shutdown 后 send 应立即返回 Shutdown 错误
+    let (event, params) = guide_user_message("shutdown 后的发送", "test/model");
+    let result = engine.send(&session_id, event, params).await;
+    assert!(
+        matches!(result, Err(fuyao_core::EngineError::Shutdown)),
+        "shutdown 后 send 应返回 Err(Shutdown)，实际: {result:?}"
+    );
+}
+
+/// shutdown 后 recv 返回 None（在 drain 完残余事件后）
+#[tokio::test]
+async fn shutdown_returns_none_for_recv() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        PluginHost::new(),
+    )
+    .await;
+
+    let _session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    // 不发消息，直接 shutdown；task 在 select! 收到 cancelled 后退出
+    engine.shutdown().await;
+
+    // recv 应最终返回 None（shutdown 后通道 drain 完）
+    let result = tokio::time::timeout(Duration::from_secs(2), engine.recv()).await;
+    match result {
+        Ok(None) => { /* 期望：返回 None */ }
+        Ok(Some(ev)) => panic!("shutdown 后 recv 应返回 None，实际收到事件: {ev:?}"),
+        Err(_) => panic!("recv 在 shutdown 后 2 秒未返回（卡住）"),
+    }
+}
+
+/// shutdown 把活跃 session task 的退出路径覆盖——
+/// 通过「正常跑完一轮对话 + shutdown」验证 task 优雅退出 + 落库
+#[tokio::test]
+async fn shutdown_terminates_active_session_and_persists() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(MockProvider {
+            events: text_events("对话已结束"),
+        }),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    let (event, params) = guide_user_message("你好", "test/model");
+    engine
+        .send(&session_id, event, params)
+        .await
+        .expect("发消息失败");
+
+    // 收到 Assistant 事件（证明 ReAct 跑完了）
+    let mut got_assistant = false;
+    for _ in 0..50 {
+        if let Ok(Some(OutputEvent::Assistant(a))) =
+            tokio::time::timeout(Duration::from_millis(500), engine.recv()).await
+        {
+            assert!(
+                a.payload
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("对话已结束"),
+                "Assistant 应含「对话已结束」"
+            );
+            got_assistant = true;
+            break;
+        }
+    }
+    assert!(got_assistant, "应收到 Assistant 事件");
+
+    // shutdown：此时 task 应在 idle（turn 跑完后），select! 立即响应 cancelled 退出
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(3), engine.shutdown()).await;
+    assert!(
+        shutdown_done.is_ok(),
+        "shutdown 应在 3 秒内完成（task 应立即响应 cancelled 退出）"
+    );
+
+    // 从 DB 验证落库（user + assistant 两条消息）
+    let db_path = agent_paths.sessions_db_path();
+    let store = fuyao_session::SessionStore::new(db_path)
+        .await
+        .expect("重新打开 store 失败");
+    let persisted = store
+        .get(&session_id)
+        .await
+        .expect("DB 查询失败")
+        .expect("session 应在 DB 中存在");
+    assert!(
+        persisted.messages.len() >= 2,
+        "DB 中应至少有 user + assistant 两条消息，实际: {}",
+        persisted.messages.len()
+    );
+}
+
+/// 持续错误的重试场景下 shutdown 不卡——
+/// 验证 task 在「正在 retry 退避」时 shutdown 也能立即退出
+#[tokio::test]
+async fn shutdown_unblocks_task_in_retry_backoff() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    // 持续 RateLimit（retry_after_ms 设大，模拟退避 sleep 中）
+    let provider = common::FlakyThenSuccessProvider::new(
+        vec![fuyao_provider::StreamError::RateLimit {
+            retry_after_ms: Some(10000),
+            retry_after_secs: None,
+        }],
+        text_events("永远到不了"),
+    );
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_provider(provider),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    let (event, params) = guide_user_message("触发持续重试", "test/model");
+    engine
+        .send(&session_id, event, params)
+        .await
+        .expect("发消息失败");
+
+    // 等收到一个 Retry 事件，确认进入退避 sleep
+    let mut entered_backoff = false;
+    for _ in 0..20 {
+        if let Ok(Some(OutputEvent::Retry(_))) =
+            tokio::time::timeout(Duration::from_millis(500), engine.recv()).await
+        {
+            entered_backoff = true;
+            break;
+        }
+    }
+    assert!(entered_backoff, "应至少收到一个 Retry 事件（已进入退避）");
+
+    // shutdown：task 此时在 retry 的 sleep 中（或 select! 等流式）
+    // 应在 SHUTDOWN_TASK_TIMEOUT 之前完成（task 因 token cancelled 或 abort 兜底退出）
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(15), engine.shutdown()).await;
+    assert!(
+        shutdown_done.is_ok(),
+        "shutdown 应在 15 秒内完成（即便 task 卡在 retry 退避 sleep 中，token cancelled 也能让 select! 胜出）"
+    );
+}

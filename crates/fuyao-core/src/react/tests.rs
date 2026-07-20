@@ -322,6 +322,7 @@ async fn make_harness_with_hooks(
             fuyao_session::CompressionRuntimeState::default(),
         )),
         compression_config: fuyao_api::CompressionConfig::default(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     };
     TestHarness {
         ctx,
@@ -630,6 +631,7 @@ async fn pending_consumed_when_task_idle() {
         rx_inbound,
         rx_interrupt,
         rx_plugin,
+        tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
         provider,
@@ -710,6 +712,7 @@ async fn plugin_message_routes_through_dispatch() {
         rx_inbound,
         rx_interrupt,
         rx_plugin,
+        tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
         provider,
@@ -1365,6 +1368,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
             fuyao_session::CompressionRuntimeState::default(),
         )),
         compression_config: fuyao_api::CompressionConfig::default(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     };
     let mut session = Session::default();
 
@@ -1412,6 +1416,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
             fuyao_session::CompressionRuntimeState::default(),
         )),
         compression_config: fuyao_api::CompressionConfig::default(),
+        shutdown_token: tokio_util::sync::CancellationToken::new(),
     };
     let mut session = Session::default();
 
