@@ -31,15 +31,56 @@ model = "deepseek/deepseek-v4-flash"
 DEEPSEEK_API_KEY=sk-xxxxxxxx
 ```
 
+### 多 Provider 共存
+
+所有 `[providers.*]` 段都会被注册进 `ProviderRegistry`，按每条消息的 `MessageParams.model_id` 路由：
+
+```toml
+[providers.deepseek]
+name = "DeepSeek"
+api_key_env_vars = ["DEEPSEEK_API_KEY"]
+# ...
+
+[providers.aliyun]
+name = "Aliyun"
+api_key_env_vars = ["DASHSCOPE_API_KEY"]
+
+[providers.aliyun.options]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[providers.aliyun.models."qwen3.6-plus"]
+name = "qwen3.6-plus"
+
+# 默认模型（MessageParams.model_id = None 时用）
+[models.default]
+model = "deepseek/deepseek-v4-flash"
+
+# 轻量任务模型（标题生成、压缩摘要等用）
+[models.fast]
+model = "aliyun/qwen3.6-plus"
+```
+
+```rust
+// 用默认模型
+engine.send(&id, InputEvent::User(msg), MessageParams::default()).await?;
+
+// 显式指定 aliyun 的模型
+let params = MessageParams {
+    model_config: ModelConfig {
+        model_id: Some("aliyun/qwen3.6-plus".to_string()),
+        ..Default::default()
+    },
+};
+engine.send(&id, InputEvent::User(msg), params).await?;
+```
+
 ## 方式二：实现 Provider trait
 
 非 OpenAI 兼容的供应商，实现 Provider trait：
 
 ```rust
-use fuyao_provider::{Provider, StreamEvent, StreamError, BoxStream};
-use async_trait::async_trait;
+use fuyao_provider::{Provider, StreamEvent, StreamError, BoxStream, ChatRequest, ChatResponse, StreamOptions};
 
-#[async_trait]
 impl Provider for MyProvider {
     fn stream_chat(
         &self,
@@ -55,27 +96,51 @@ impl Provider for MyProvider {
         request: ChatRequest,
         model: &str,
     ) -> Result<ChatResponse, StreamError> {
-        // 非流式调用（上下文压缩用）
+        // 非流式调用（标题生成用）
     }
 }
 ```
 
-然后注册到注册表：
+然后用 `ProviderRegistry::with_instance` 装配进引擎：
 
 ```rust
-register_provider(&agent_paths, MyProvider::new(...));
-register_model(&agent_paths, model);
+use fuyao_provider::ProviderRegistry;
+use std::sync::Arc;
+
+let my_provider = Arc::new(MyProvider::new(/* ... */));
+let providers = ProviderRegistry::with_instance("my_provider", my_provider);
+
+let engine = Engine::new(
+    EngineParams { agent_paths },
+    providers,
+    tools,
+    plugin_host,
+).await;
 ```
 
 ## 验证
 
 ```rust
-let (engine, handle, _) = fuyao_app::start(agent_ctx).await?;
-handle.send_message("你好".to_string()).await;
+let (engine, app_ctx) = fuyao_app::start(agent_paths).await?;
+
+let session_id = engine.create_session(SessionParams::default()).await?;
+engine.send(&session_id, InputEvent::User(msg), MessageParams::default()).await?;
+
 // 观察 OutputEvent::Chunk 流式输出
+while let Some(event) = engine.recv().await {
+    if let OutputEvent::Assistant(_) = event { break; }
+}
 ```
+
+## 错误处理
+
+- **Provider 创建失败**（API Key 未配等）：`init_engine` 仅 WARN 跳过该 Provider，其他继续注册；若所有 Provider 都失败返 `InitError::NoProviderAvailable`
+- **错误的 model_id**（provider_id 未注册）：`resolve_model` 在 turn.rs build 阶段 fail-loud，发 `OutputEvent::Error`（错误信息含可用 provider 列表）
+- **错误的 model 名**（provider 存在但 model 不存在）：走 HTTP 404 链路，`is_retryable` 判 false 冒泡为 `OutputEvent::Error`
+- **413 上下文溢出**：归类为 `StreamError::ContextOverflow`，引擎不自动压缩，按「fail loud + 上层决策」原则报 Error 让上层处理
 
 ## 相关
 
-- [Provider 设计](../解释/Provider设计.md) — trait 抽象、SSE 解码、注册表
-- [配置项参考](../参考/配置项参考.md) — `[providers.*]` 全字段
+- [Provider 设计](../解释/Provider设计.md) — trait 抽象、SSE 解码、ProviderRegistry 多 Provider 路由
+- [配置项参考](../参考/配置项参考.md) — `[providers.*]` / `[models.*]` 全字段
+- [错误类型参考](../参考/错误类型参考.md) — StreamError / ProviderError 变体

@@ -15,20 +15,33 @@
 
 > 代码证据：`agents_def_paths(name)` 刻意不查 agent 层——agent_root 是数据隔离目录，定义库与 agent_id 隔离体系正交。
 
-## AgentContext：运行时上下文
+## Params 三件套：运行时参数
 
 ```text
-AgentContext {
-    model_config: ModelConfig      // 用哪个模型（model_id + thinking）
-    agent_config: AgentConfig      // 用哪个定义（definition name）
-    session_id: Option<String>     // 恢复哪个会话
-    agent_paths: AgentPaths        // 数据在哪（三层路径）
+EngineParams {                   // 引擎级，启动时定死
+    agent_paths: AgentPaths       // 数据在哪（三层路径）
+}
+
+SessionParams {                  // 对话级，创建对话时定死且不可变（前缀缓存红线）
+    agent_config: AgentConfig {
+        definition: Option<String>  // 用哪个定义（加载 agents/{definition}.md，None 时用 default）
+    }
+}
+
+MessageParams {                  // 消息级，每条消息自带
+    model_config: ModelConfig {
+        model_id: Option<String>        // 用哪个模型（provider_id/model_id，None 时用 [models.default]）
+        thinking_type: Option<...>      // 思考开关
+        reasoning_effort: Option<String>  // 思考强度档位
+    }
 }
 ```
 
-UI 层只需构造 AgentContext 即可启动引擎。
+UI 层只需在对应动作时提供对应 Params：
 
-SharedAgentCtx = Arc<Mutex<AgentContext>>——引用计数 + 互斥锁，多所有者共享同一份可变上下文。UI 通过 EngineHandle 的读-改-写模式运行时切换模型。
+- `start(agent_paths)` 或 `Engine::new(engine_params, ...)`：构造 `EngineParams`
+- `engine.create_session(SessionParams)` 或 `engine.resume_session(id, SessionParams)`：构造 `SessionParams`
+- `engine.send(id, InputEvent, MessageParams)`：构造 `MessageParams`
 
 ## agent_id 解析
 

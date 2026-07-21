@@ -2,7 +2,7 @@
 
 > 11 个 crate 的职责、依赖与公开 API 概要。详细 API 签名见 `cargo doc --workspace`。
 >
-> **可见性策略**：各 crate 内部模块均私有（`mod`），仅通过根层 `pub use` 导出公开符号。SDK 用户只依赖根层路径（如 `fuyao_api::AgentContext`），不可深入内部模块。
+> **可见性策略**：各 crate 内部模块均私有（`mod`），仅通过根层 `pub use` 导出公开符号。SDK 用户只依赖根层路径（如 `fuyao_api::EngineParams`），不可深入内部模块。
 
 ## 依赖层次
 
@@ -11,9 +11,9 @@ L4  fuyao-app ──── 装配入口（依赖几乎所有下层）
        │
 L3  fuyao-core（引擎内核）  fuyao-session  fuyao-tools
        │                       │              │
-       │  core 不依赖 session/tools            │
+       │  core 依赖 session（持 SessionStore 共享 DB）   │
        │                       └──────────────┘
-       │                       tools 依赖 session
+       │                       tools 依赖 session（todo_store 共用 sessions.db）
        │
 L2  fuyao-prompt    fuyao-guard
        │                │
@@ -28,35 +28,57 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：公共类型 + 配置系统 + 路径系统
 - **内部依赖**：无
-- **公开 API**：`AgentContext` / `AgentConfig` / `AgentPaths` / `ModelConfig` / `SharedAgentCtx`；`FuyaoConfig` 及全子配置；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`；`EventBase` / `InputEvent` / `OutputEvent` 及消息族；`Provider` trait / `Model`；`Session` / `Message` / `TodoItem`；`ToolDefinition` / `ToolResult` / `ToolCallContext`；`SkillDefinition` / `SkillMeta`；`AgentDefinition` / `AgentMode`；`MCPServerConfig`；`ApiError`
+- **公开 API**：
+  - **Params 三件套**：`EngineParams` / `SessionParams` / `MessageParams`（内层 `ModelConfig` / `AgentConfig`）；`AgentPaths`
+  - **配置**：`FuyaoConfig` 及全子配置（`CompressionConfig` / `SessionStorageConfig` / `TitleConfig` / `RetryConfig` / `LlmConfig` / `ToolsConfig` 等）；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`
+  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Plugin 三变体）/ `OutputEvent`（11 变体）及消息族（`InboundUser` / `InterruptSource` / `PluginEventSource` / `UserMessageMode` / `UserMessageSource` 等）
+  - **Provider 类型**：`Provider` trait / `Model` / `ModelCost` / `ModelLimit` / `ThinkingType` 等
+  - **会话类型**：`Session` / `Message` / `MessageKind` / `TodoItem`
+  - **工具类型**：`ToolDefinition` / `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn` / `ToolResult` / `ToolCallContext`
+  - **其他**：`AgentDefinition` / `AgentMode` / `SkillDefinition` / `SkillMeta` / `MCPServerConfig` / `ApiError` / `ConfigError`
 
 ## fuyao-provider（L1 能力）
 
-- **职责**：LLM 抽象 + 供应商注册 + 流式调用（reqwest 自建）
+- **职责**：LLM 抽象 + 供应商注册表 + 多 Provider 路由 + 流式调用（reqwest 自建）
 - **内部依赖**：api
-- **公开 API**：`Provider` trait；`OpenAIProvider`；`ChatRequest` / `ChatResponse` / `StreamEvent`；`create_provider` / `create_provider_with_model` / `parse_model_id`；注册表 `register_provider` / `register_model` / `list_models` / `list_providers` / `get_provider` / `get_model`；`StreamDecoder`；重试 `backoff_duration` / `is_retryable`
+- **公开 API**：
+  - **trait**：`Provider`（`stream_chat` / `chat`）
+  - **OpenAI 兼容实现**：`OpenAIProvider`
+  - **请求响应类型**：`ChatRequest` / `ChatResponse` / `ChatMessage` / `StreamEvent` / `StreamOptions` / `StreamUsage` / `ToolCallData` / `FinishReason` / `BoxStream`
+  - **错误**：`StreamError`（含 `Cancelled` 变体，shutdown 触发的非错误取消）/ `ProviderError` / `ClientError`
+  - **工厂**：`create_provider` / `parse_model_id`
+  - **注册表**：`register_provider` / `register_model` / `get_provider` / `get_model` / `list_providers` / `list_models` / `clear_cache` / `agent_paths_cache_key`
+  - **多 Provider 路由**：`ProviderRegistry`（`from_registered` / `get` / `is_empty` / `provider_ids` / `with_instance`）—— 按 provider_id 索引的实例集合
+  - **流式解码**：`StreamDecoder`
+  - **重试辅助**：`backoff_duration` / `is_retryable`
+  - **配置解析**：`get_base_url` / `resolve_api_key`
 
 ## fuyao-mcp（L1 能力）
 
 - **职责**：MCP 集成：MCPManager 管理多 Server
 - **内部依赖**：api（+ rmcp 官方 SDK）
-- **公开 API**：`MCPManager`（`new` / `from_config` / `start_all` / `stop_all` / `call_tool` / `refresh_tools` / `get_tool_definitions` / `get_server_status`）；`RegisteredTool`；`MCPManagerError`
+- **公开 API**：`MCPManager`（`new` / `from_config` / `start_all` / `stop_all` / `call_tool` / `refresh_tools` / `get_tool_definitions` / `get_server_status` / `get_tool_entries` / `disconnect`）；`RegisteredTool`；`MCPManagerError`
 
 ## fuyao-skills（L1 能力）
 
 - **职责**：Skills 三层发现 + frontmatter 解析
 - **内部依赖**：api
-- **公开 API**：`find_all_skills` / `find_skill_md_by_name`；`load_skill` / `load_skill_file`；re-export `SkillDefinition` / `SkillMeta`
+- **公开 API**：`find_all_skills` / `find_skill_md_by_name`；`load_skill` / `load_skill_file`；`LINKED_SUBDIRS`；re-export `SkillDefinition` / `SkillMeta`
 
 ## fuyao-hooks（L1 能力）
 
-- **职责**：钩子（拦截 + 观察 + 主动）+ Plugin 系统
+- **职责**：钩子（拦截 + 观察 + 主动）+ Plugin 两层模型（工厂 + session 实例）
 - **内部依赖**：api
-- **公开 API**：`Plugin` trait；`PluginHost`（`add` / `install` / `dispose_all` / `list`）；`PluginEmitter`；`HooksRegistry`；`InterceptResult` / `BeforeLlmOutput` / `LlmErrorAction`；钩子签名 `BeforeLlmFn` / `OutputInterceptFn` / `OutputObserveFn` / `OnLlmErrorFn` / `SendInputFn`；`SharedHooks`
+- **公开 API**：
+  - **Plugin 两层模型**：`Plugin` trait（工厂模板，`create_instance` 生成 session 独立实例）；`PluginInstance` trait（session 级，`register` 注册 hook 到该 session 私有 HooksRegistry）；`PluginHost`（引擎级工厂集合，`add` / `create_instances` / `list`）；`PluginInstallError`
+  - **发消息能力**：`SessionSender`（绑定该 session 的三条通道 tx_inbound/tx_interrupt/tx_plugin，方法 `send_user` / `send_user_with_mode` / `send_interrupt` / `send_plugin` / `send_plugin_data` / `send_plugin_full`）
+  - **钩子类型**：`HooksRegistry`（`new` / `init_send_inputs`）；`InterceptResult`（`Pass` / `Block`）；钩子签名 `OutputInterceptFn` / `OutputObserveFn` / `SendInputFn`
+  - **`SharedHooks`**：`Arc<tokio::sync::Mutex<HooksRegistry>>`
+  - **辅助**：`panic_payload_to_string`
 
 ## fuyao-prompt（L2 构建）
 
-- **职责**：提示词分层构建 + Agent 定义注册表
+- **职责**：提示词分层构建 + Agent 定义加载 + Agent 定义注册表
 - **内部依赖**：api, skills
 - **公开 API**：`build_system_prompt`；`load_agent_definition` / `load_agent_definition_from_agent_paths`；`AgentRegistry` + `AgentInfo` / `PagedAgents` / `UpdateContentRequest`；`PromptError`
 
@@ -64,29 +86,48 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：行为防护：循环检测
 - **内部依赖**：api, hooks
-- **公开 API**：`LoopGuardPlugin`（impl `Plugin`）；re-export `LoopGuardConfig`
+- **公开 API**：`LoopGuardPlugin`（impl `Plugin` 工厂，每 session 生成独立 `LoopGuardInstance` 持 per-session 计数器）；re-export `LoopGuardConfig`
 
 ## fuyao-core（L3 内核）
 
-- **职责**：引擎内核：dispatch / TurnExecutor(ReAct) / llm / tool_runner / interrupt
-- **内部依赖**：api, provider, hooks
-- **公开 API**：`Engine`；`EngineHandle`；re-export `SharedHooks` / `SharedTools` / `SharedAgentCtx`
+- **职责**：引擎内核（两层分离）：能力共享层（Engine）+ 对话执行层（session task）
+- **内部依赖**：api, provider, hooks, prompt, session
+- **公开 API**：
+  - **`Engine`**（五个动作 + shutdown）：`new(params, providers, tools, plugin_host)` / `create_session(SessionParams)` / `resume_session(id, SessionParams)` / `send(id, InputEvent, MessageParams)` / `recv()` / `end_session(id, reason)` / `shutdown()`
+  - **`SessionId`**：`String` 别名
+  - **`EngineError`**：`SessionNotFound` / `Storage` / `Provider` / `Shutdown`
+  - **工具注册**：`ToolRegistry` / `ToolRegistryBuilder` / `ToolEntry`
+  - **插件相关重导出**：`Plugin` / `PluginHost` / `PluginInstance` / `SessionSender` / `SharedHooks`
+
+> 引擎内核内部的 dispatch 管道（拦截→处理→发送→观察）、ReAct 循环（双队列 + 中断 + 重试）、tool_exec（智能调度）等模块为 crate 私有，仅通过上述根层 API 暴露。
 
 ## fuyao-session（L3 内核）
 
-- **职责**：SQLite 持久化 + 缓存 + Todo + 上下文压缩
-- **内部依赖**：api, hooks, prompt, provider
-- **公开 API**：`SessionContext` / `SessionPlugin`；`SessionManager` / `get_session_manager`；`SQLiteStore`；`TodoStore`；`calculate_cost`
+- **职责**：SQLite 持久化 + 上下文压缩 + 费用统计 + 标题生成
+- **内部依赖**：api
+- **公开 API**：
+  - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update` / `delete` / `list_all` / `count` / `insert_message` / `count_messages` / `load_visible_messages` / `load_full_history` / `mark_compaction` / `update_system_prompt` / `update_title` / `end_session`）
+  - **压缩模块**：`should_compress` / `generate_summary` / `apply` / `CompressionRuntimeState`（即 `CompressionState`）
+  - **费用统计**：`calculate_cost` / `fill_message_cost` / `accumulate_session_total`
+  - **标题生成**：`maybe_generate_title`
+  - **错误**：`SessionError`（`IoError` / `SqlxError` / `InvalidState` / `NotFound`）
 
 ## fuyao-tools（L3 内核）
 
-- **职责**：内置工具集 + 安全防护
-- **内部依赖**：api, prompt, skills, session
+- **职责**：内置工具集 + 安全防护 + todo 持久化（自建 TodoStore）
+- **内部依赖**：api, prompt, skills, sqlx
 - **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`
 - **内置工具**：read / write / edit / bash / grep / glob / webfetch / skill / todowrite
 
 ## fuyao-app（L4 装配）
 
-- **职责**：装配入口：`start` / `init_engine` / `setup`
-- **内部依赖**：api, core, guard, hooks, mcp, provider, session, tools
-- **公开 API**：`start` / `init_engine` / `setup`；`AppContext`（`mcp_manager` / `plugin_host` / `log_guard`）；`LogGuard`；`InitError` / `SetupError`
+- **职责**：装配入口：`start` / `init_engine` / `build_tool_registry` / `shutdown`
+- **内部依赖**：api, core, guard, hooks, mcp, provider, prompt, session, tools
+- **公开 API**：
+  - **`start(agent_paths)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → `Engine::new`）
+  - **`init_engine(agent_paths)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`
+  - **`build_tool_registry()`**：收集内置 + MCP 工具，返回 `(ToolRegistry, Option<Arc<MCPManager>>)`
+  - **`shutdown(engine, ctx)`**：有序停机（先 `engine.shutdown()` 再 `mcp_manager.stop_all()`）
+  - **`AppContext`**：`mcp_manager` / `log_guard`
+  - **`LogGuard`**：drop 时 flush 文件日志
+  - **错误**：`InitError`（`NoProviderAvailable` / `ConfigError`）/ `SetupError`（`Init`）

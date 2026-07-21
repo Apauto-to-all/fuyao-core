@@ -1,19 +1,30 @@
 # Guard 防护系统设计
 
-> 本文解释循环检测插件的三类钩子、无状态检测器、四级严重程度与重置语义。API 签名见 `cargo doc --workspace`；配置见 [配置项参考](../参考/配置项参考.md) 的 `[guard.loop]`。
+> 本文解释循环检测插件的工厂 + session 实例两层模型、三类钩子、无状态检测器、四级严重程度与重置语义。API 签名见 `cargo doc --workspace`；配置见 [配置项参考](../参考/配置项参考.md) 的 `[guard.loop]`。
 
-## 架构
+## 架构：工厂 + session 实例
 
 ```text
-LoopGuardPlugin（实现 Plugin trait，注册 3 个钩子）
-  └─ LoopGuardState（协调层，持有两个子检测器 + 中断 / 注入逻辑）
-       ├─ ToolLoopGuard（工具循环状态机）
-       │    └─ detectors.rs 纯函数（工具重复 / 序列检测）
-       └─ TextLoopGuard（文本循环状态机）
-            └─ detectors.rs 纯函数（文本自相似检测）
+LoopGuardPlugin（impl Plugin 工厂模板，引擎级共享）
+  │  持 config，无 per-session 状态
+  │  create_instance 每 session 新建独立 state
+  ↓
+LoopGuardInstance（impl PluginInstance，session 级）
+  │  register 三钩子（observe / intercept / send_input）
+  ↓ 持 Arc<Mutex<LoopGuardState>>（per-session 独立）
+  │
+LoopGuardState（协调层，持两个子检测器 + 中断 / 注入逻辑）
+  ├─ ToolLoopGuard（工具循环状态机）
+  │    └─ detectors.rs 纯函数（工具重复 / 序列检测）
+  └─ TextLoopGuard（文本循环状态机）
+       └─ detectors.rs 纯函数（文本自相似检测）
 ```
 
-Guard 经 Plugin 接入引擎（见 [Hooks 与 Plugin 设计](Hooks与Plugin设计.md)），不持有引擎内部 channel，所有主动发消息能力通过 `send_input` 钩子获取的 PluginEmitter 实现。
+Guard 经 Plugin 工厂接入引擎（见 [Hooks 与 Plugin 设计](Hooks与Plugin设计.md)），不持有引擎内部 channel，所有主动发消息能力通过 `send_input` 钩子获取的 `SessionSender` 实现。
+
+### 多 session 并发隔离
+
+多 session 并发时，每个 session 拥有独立的 `LoopGuardInstance` + 独立 `LoopGuardState`——session A 的循环计数、检测窗口完全不影响 session B。靠 `create_instance` 每 session 新建独立状态实现。
 
 ## 三个钩子
 
@@ -21,7 +32,7 @@ Guard 经 Plugin 接入引擎（见 [Hooks 与 Plugin 设计](Hooks与Plugin设�
 |------|------|------|------|
 | `output_observe` | 异步副作用 | UI **后** | 检测累积：处理 ToolCall / Chunk，跑检测器，设 pending |
 | `output_intercept` | 同步可修改 | UI **前** | 注入 / 修改：拦截 ToolResult，读 pending，追加或替换 content |
-| `send_input` | 引擎启动时 | — | 获取 PluginEmitter，后续发 Plugin / Interrupt / User 消息 |
+| `send_input` | 引擎启动时 | — | 获取 SessionSender，后续发 Plugin / Interrupt / User 消息 |
 
 > intercept 在事件到达 UI **之前**（可修改），observe 在事件到达 UI **之后**（只读副作用）。这意味着工具检测是"事后"的——ToolCall 已发给 UI，检测在 observe 跑，反应（注入警告）发生在**下一个** ToolResult 的 intercept。
 
@@ -58,10 +69,10 @@ Warn → Inject → Interrupt → Abort
 
 | 级别 | 触发 | 动作 |
 |------|------|------|
-| **Warn** | 第 threshold 次 | emit_plugin 通知 + 设 pending_warn（ToolResult 前追加警告） |
-| **Inject** | 再犯 | emit_plugin + 设 pending_inject（ToolResult 内容替换为拦截消息） |
-| **Interrupt** | 继续犯 | send_interrupt（中断当前轮）+ send_inject_message（注入引导消息到对话历史）|
-| **Abort** | interrupt_count ≥ 3 | send_interrupt（彻底终止，不再注入引导） |
+| **Warn** | 第 threshold 次 | `send_plugin` 通知 + 设 pending_warn（ToolResult 前追加警告） |
+| **Inject** | 再犯 | `send_plugin` + 设 pending_inject（ToolResult 内容替换为拦截消息） |
+| **Interrupt** | 继续犯 | `send_interrupt`（中断当前轮）+ `send_user`（注入引导消息到对话历史） |
+| **Abort** | interrupt_count ≥ 3 | `send_interrupt`（彻底终止，不再注入引导） |
 
 > 工具路径有 Inject 级别，文本路径只有 Warn → Interrupt（无 Inject）。
 
@@ -103,3 +114,7 @@ ToolCall 已经发给 UI 显示了。检测在 observe（UI 后）跑，反应�
 ### 为什么 Plugin 注入后不重置历史？
 
 注入引导消息后，如果 AI 仍执行相同操作，说明引导无效。保留历史 + 计数让检测器"记得"之前的循环，1 次重复就再次触发 Interrupt——快速升级，避免 AI 在无效循环中浪费 token。
+
+### 为什么是工厂 + session 实例两层模型？
+
+多 session 并发时，若所有 session 共享一个 LoopGuardState，session A 的工具调用历史会影响 session B 的检测判定。靠 `create_instance` 每 session 新建独立 state，各 session 的循环检测完全隔离。详见 [Hooks 与 Plugin 设计](Hooks与Plugin设计.md)。

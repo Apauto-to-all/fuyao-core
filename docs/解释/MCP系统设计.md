@@ -2,6 +2,8 @@
 
 > 本文解释 MCP 集成的生命周期管理、工具桥接、熔断恢复与安全防护。API 签名见 `cargo doc --workspace`；配置见 [配置 MCP 服务器](../指南/配置MCP服务器.md)。
 
+> **多 session 架构下的 MCP**：MCP 工具是**引擎级共享**——启动时由 `fuyao-app::build_tool_registry` 收集成 `ToolEntry` 注入 `ToolRegistry`，所有 session 共享同一份工具表（详见 [工具系统设计](工具系统设计.md)）。MCPManager 由 `AppContext` 持有保活，与 `Engine` 平级（不在 engine 内）。
+
 ## 架构分层
 
 ```text
@@ -25,10 +27,24 @@ MCPManager（lib.rs）       ← 编排器：管理多 Server 生命周期、工
 |------|------|
 | `from_config()` | 从 `[mcp_servers]` 配置创建管理器 |
 | `start_all()` | 批量启动，单个失败不阻塞其他，返回 (成功数, 失败数, 失败详情) |
-| `stop_all()` | 断开所有连接 + 清空工具 |
-| `get_tool_entries()` | 产出 (name, schema, handler) 三元组，供 EngineHandle::register_tool |
+| `stop_all()` | 断开所有连接 + 清空工具（每个连接执行 rmcp 的 `close_with_timeout` 优雅关闭） |
+| `get_tool_entries()` | 产出 (name, schema, handler) 三元组，供 `fuyao-app::build_tool_registry` 收集进 `ToolRegistry` |
+| `disconnect()` | 单连接优雅关闭（用 rmcp 的 `close_with_timeout`：先关 transport 让 server 退出、超时 kill 子进程） |
 
 工具发现是连接的副产物——连接成功即调 `list_all_tools()` 拉取工具列表，不需要额外步骤。
+
+### 装配流程（fuyao-app）
+
+```text
+build_tool_registry():
+  1. collect_builtin_tools()                ← 内置工具（按 [tools.enabled] 过滤）
+  2. collect_mcp_tools()                    ← MCP 工具（有配置时 start_all + get_tool_entries）
+     │   └─ 反序列化 schema 成 ToolDefinition 包成 ToolEntry
+  3. ToolRegistryBuilder::register_all(...) ← 全部注入
+  4. 返回 (ToolRegistry, Option<Arc<MCPManager>>)
+```
+
+`AppContext` 持有 `Option<Arc<MCPManager>>` 保活，应用退出时调 `fuyao_app::shutdown(engine, ctx)` 实现「先关 MCP 再退出」的有序停机。
 
 ## 双传输（stdio / HTTP）
 
