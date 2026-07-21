@@ -24,16 +24,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 pub use types::SessionId;
 
-/// shutdown 等待单个 session task 退出的超时阈值
+/// shutdown 等待所有 session task 退出的总超时阈值
 ///
-/// task 收到 shutdown_token.cancel() 后，run_session 主循环 select! 立即胜出，
-/// break 前会做一次 store.update 落库（保护 in-flight 状态）——通常毫秒级完成。
-/// 10 秒阈值是为了兜住极端情况（如 DB 写入阻塞、压缩 LLM 调用在途），
-/// 超时则强制 abort task，对齐设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障。
+/// task 收到 shutdown_token.cancel() 后，各 task 的 select! shutdown 分支立即胜出，
+/// break 前会走中断路径落库（保护 in-flight 状态）——通常毫秒级完成。
+/// 所有 task **并发退出**（用 JoinSet 同时 await），共享 10 秒总预算：
+/// 到点仍未退出的 task 统一 abort（JoinSet drop 自动 abort 所有未完成 task）。
+/// 这是设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
 const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 引擎
@@ -438,9 +439,13 @@ impl Engine {
     /// 2. cancel 引擎级 shutdown_token → 所有 session task 的 select! 同时收到 cancelled 信号
     /// 3. 每个 session task 优雅退出：select! 监听 cancelled → break 主循环 →
     ///    退出前调一次 `store.update(session)` 落库（保护 in-flight 状态，失败仅 warn 不阻塞）
-    /// 4. 等待所有 task 实际退出（`tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, task)`）：
-    ///    超时则 `task.abort()` 兜底强杀
-    /// 5. 清空 sessions 调度表 + 发 INFO 日志（含正常退出计数）
+    /// 4. **并发**等待所有 task 退出（JoinSet 同时 await，共享 `SHUTDOWN_TASK_TIMEOUT` 总预算）：
+    ///    超时则 JoinSet drop 自动 abort 所有未退出 task（兜底强杀）
+    /// 5. 发 INFO 日志（含正常退出 / panic / 超时 abort 计数）
+    ///
+    /// **并发等待的理由**：多 session 并发活跃时，各 task 的落库路径会竞争 SQLite WAL 写锁，
+    /// 串行 await 会让总耗时退化成 `sum(各 task 退出时间)`；用 JoinSet 并发等待把总耗时压成
+    /// `max(各 task 退出时间)`，且总超时上限固定为 `SHUTDOWN_TASK_TIMEOUT`，不受 session 数量影响。
     ///
     /// **fire-and-forget task**（如 title 生成等 spawn 的独立 task）：**不显式 abort**，
     /// 靠 runtime 关闭自然终止（对齐 opencode + 文档 01.1:935 已记录决策）。
@@ -451,55 +456,76 @@ impl Engine {
         // 2. cancel 引擎级 token：所有 session task 的 child_token 同时 cancel
         self.shutdown_token.cancel();
 
-        // 3. 取出所有 SessionHandle 的所有权（drain 出 hashmap 才能 move task 去 await）
+        // 3. 取出所有 SessionHandle 的所有权（drain 出 hashmap 才能 move task 进 JoinSet）
         let handles: Vec<(SessionId, SessionHandle)> = {
             let mut sessions = self.sessions.lock().await;
             sessions.drain().collect()
         };
 
-        // 4. 等待每个 task 退出（超时兜底 abort）
-        //    串行 await——并发 await 需 JoinSet，shutdown 是低频操作，串行足够；
-        //    且每个 task 已被 cancel，正常情况下都是毫秒级退出。
-        //
-        //    AbortHandle 提前拿：timeout 会消费 JoinHandle（future），
-        //    超时后 JoinHandle 已 drop 无法调 task.abort()；
-        //    AbortHandle 是独立的句柄（&self 方法返回），与 JoinHandle 无 ownership 关系，
-        //    timeout 超时后调 abort_handle.abort() 强杀 task。
         let total = handles.len();
+        if total == 0 {
+            tracing::info!(total = 0, "引擎关闭完成（无活跃 session）");
+            return;
+        }
+
+        // 4. 并发等待所有 task 退出（总超时 SHUTDOWN_TASK_TIMEOUT）
+        //    把 (session_id, JoinHandle) 塞进 JoinSet，join_next 逐个收（完成序），
+        //    用 tokio::time::timeout 给整个收尾过程一个总预算。
+        //
+        //    超时分支：break 后 set drop → 所有未完成 task 自动 abort。
+        //    JoinSet 是唯一持 JoinHandle 的所有者，drop 时 tokio 自动 abort 未完成的 task。
+        let mut set: JoinSet<(SessionId, Result<(), JoinError>)> = JoinSet::new();
+        for (id, handle) in handles {
+            set.spawn(async move { (id, handle.task.await) });
+        }
+
         let mut finished = 0usize;
         let mut panicked = 0usize;
-        let mut aborted = 0usize;
-        for (id, handle) in handles {
-            let abort_handle = handle.task.abort_handle();
-            match tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, handle.task).await {
-                Ok(Ok(())) => {
-                    finished += 1;
-                }
-                Ok(Err(join_err)) => {
-                    panicked += 1;
-                    tracing::warn!(
-                        session_id = %id,
-                        cause = %format_join_error(join_err),
-                        "session task panic 退出（已由 task 内 panic 防护或 runtime 兜底）"
-                    );
-                }
-                Err(_) => {
-                    abort_handle.abort();
-                    aborted += 1;
-                    tracing::warn!(
-                        session_id = %id,
-                        timeout_secs = SHUTDOWN_TASK_TIMEOUT.as_secs(),
-                        "session task 超时未退出，强制 abort（兜底）"
-                    );
+        let mut aborted_ids: Vec<SessionId> = Vec::new();
+
+        let timed_out = tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, async {
+            // 收完所有 task 退出结果（join_next 返回 None 表示 set 已空）
+            while let Some(joined) = set.join_next().await {
+                let (id, result) = joined.expect("JoinSet task panic");
+                match result {
+                    Ok(()) => finished += 1,
+                    Err(join_err) => {
+                        panicked += 1;
+                        tracing::warn!(
+                            session_id = %id,
+                            cause = %format_join_error(join_err),
+                            "session task panic 退出（已由 task 内 panic 防护或 runtime 兜底）"
+                        );
+                    }
                 }
             }
+        })
+        .await
+        .is_err();
+
+        // 超时兜底：set drop 自动 abort 所有未退出 task；记录它们的 session_id 供日志审计
+        if timed_out {
+            // set 还在里面残留的 task——直接 drain 出 session_id 记录。
+            // JoinSet 没有 "列举未完成 task" 的 API，但 set 本身被 drop 时会自动 abort，
+            // 这里只需在 drop 前把已知 session_id 记下来（通过 abort_all 后 join_next 拿剩余 JoinError）。
+            set.abort_all();
+            while let Some(joined) = set.join_next().await {
+                if let Ok((id, _)) = joined {
+                    aborted_ids.push(id);
+                }
+            }
+            tracing::warn!(
+                timeout_secs = SHUTDOWN_TASK_TIMEOUT.as_secs(),
+                aborted_count = aborted_ids.len(),
+                "shutdown 总超时，未退出的 session task 已强制 abort（兜底）"
+            );
         }
 
         tracing::info!(
             total,
             finished,
             panicked,
-            aborted,
+            aborted = aborted_ids.len(),
             "引擎关闭完成（所有 session task 已处理）"
         );
     }

@@ -169,6 +169,12 @@ pub enum StreamError {
     Connection(String),
     #[error("上下文溢出")]
     ContextOverflow,
+    /// 操作被取消（如引擎关闭）。非错误，不应触发重试
+    ///
+    /// 由 `RetryRunner` 在退避 sleep 期间收到 shutdown 信号时产生，
+    /// 冒泡到 `turn.rs` 后由 shutdown 分支走中断路径（不发 Error 事件）。
+    #[error("操作被取消")]
+    Cancelled,
 }
 
 #[cfg(test)]

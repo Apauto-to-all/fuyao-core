@@ -1,7 +1,7 @@
 //! 中断事件
 //!
 //! 定义中断相关的数据结构。
-//! 所有中断路径（用户、钩子、系统）统一走 InputEvent::Interrupt，
+//! 所有中断路径（用户、钩子、引擎关闭）统一走 InputEvent::Interrupt，
 //! 便于后续统计和维护。
 //!
 //! 中断是纯粹的停止信号，不耦合注入消息等附加行为。
@@ -18,8 +18,8 @@ pub enum InterruptSource {
     User,
     /// 钩子拦截中断（循环检测等）
     Hook,
-    /// 系统中断（超时、错误等自动触发）
-    System,
+    /// 引擎关闭时由 shutdown 流程触发（让活跃 session 立即落库退出）
+    Shutdown,
 }
 
 /// 中断事件 envelope
@@ -54,10 +54,10 @@ mod tests {
     fn interrupt_payload_holds_reason() {
         let payload = InterruptPayload {
             reason: "超时自动中断".into(),
-            source: InterruptSource::System,
+            source: InterruptSource::Shutdown,
         };
         assert_eq!(payload.reason, "超时自动中断");
-        assert_eq!(payload.source, InterruptSource::System);
+        assert_eq!(payload.source, InterruptSource::Shutdown);
     }
 
     #[test]
@@ -84,7 +84,7 @@ mod tests {
             base: EventBase::default(),
             payload: InterruptPayload {
                 reason: "测试".into(),
-                source: InterruptSource::System,
+                source: InterruptSource::Shutdown,
             },
         };
         assert!(!msg.base.id.is_empty());
@@ -108,7 +108,7 @@ mod tests {
             base: EventBase::default(),
             payload: InterruptPayload {
                 reason: "测试".into(),
-                source: InterruptSource::System,
+                source: InterruptSource::Shutdown,
             },
         };
         assert!(msg.base.timestamp > 0.0);

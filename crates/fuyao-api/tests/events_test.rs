@@ -345,7 +345,7 @@ fn interrupt_source_enum_equality() {
     // 钉死枚举可判等（Copy + Eq 契约，被依赖其语义的下游隐式假设）
     assert_eq!(InterruptSource::User, InterruptSource::User);
     assert_ne!(InterruptSource::User, InterruptSource::Hook);
-    assert_ne!(InterruptSource::User, InterruptSource::System);
+    assert_ne!(InterruptSource::User, InterruptSource::Shutdown);
 }
 
 // ---------------------------------------------------------------------------

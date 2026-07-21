@@ -65,7 +65,7 @@ mod tests {
             base: EventBase::default(),
             payload: InterruptPayload {
                 reason: "clone测试".into(),
-                source: InterruptSource::System,
+                source: InterruptSource::Shutdown,
             },
         };
         let cloned = msg.clone();

@@ -131,7 +131,16 @@ pub(crate) async fn run_stream_with_retry(
                     &e,
                 )
                 .await;
-                tokio::time::sleep(wait).await;
+                // 退避 sleep 期间若收到 shutdown 信号，立即冒泡 Cancelled
+                // （让 turn.rs 的 shutdown 分支走中断路径，不发 Error 事件）
+                // 不监听 rx_interrupt——重试与中断正交，sleep 期间被中断靠外层 select! drop future
+                tokio::select! {
+                    biased;
+                    _ = ctx.shutdown_token.cancelled() => {
+                        return Err(StreamError::Cancelled);
+                    }
+                    _ = tokio::time::sleep(wait) => {}
+                }
                 // 回 loop 顶部：attempt += 1，清空 state 重试
             }
         }

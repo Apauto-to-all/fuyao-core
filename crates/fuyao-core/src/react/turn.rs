@@ -11,6 +11,12 @@
 //!
 //! 中断：两段 select!——流式期间、工具执行期间。idle 段在 run_session 外层。
 //! 中断时保存部分结果（发增量事件），落库，结束本轮。
+//!
+//! shutdown：两段 select! 各有 `biased` 优先的 shutdown 分支（优先于 interrupt），
+//! 命中后走与 interrupt 完全对称的四步链（emit_interrupt_event → classify →
+//! handle_interrupt → persist），把已累积的部分结果落库后立即 return。
+//! retry.rs 的退避 sleep 也监听 shutdown_token，收到信号立即冒泡 Cancelled
+//! 让本层 shutdown 分支接管。这样 shutdown 不再依赖 10s abort 兜底。
 
 use super::SessionCtx;
 use super::builders::{
@@ -25,12 +31,24 @@ use crate::stream::StreamResult;
 use crate::tool_exec;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::input::InterruptMessage;
+use fuyao_api::message::input::{InterruptMessage, InterruptPayload, InterruptSource};
 use fuyao_api::message::output::{AssistantMessage, TitleMessage, TitlePayload};
 use fuyao_api::{Message, MessageParams, Session};
 use fuyao_provider::Provider;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
+
+/// 构造 shutdown 中断 payload（供两段 select! 的 shutdown 分支复用）
+///
+/// shutdown 中断语义：source=Shutdown / reason="引擎关闭"。
+/// 走与用户中断完全相同的 emit_interrupt_event + handle_interrupt 路径，
+/// 让 UI 收到标准 Interrupt 事件，DB 记录能区分「引擎关闭中断」vs「用户主动中断」。
+fn shutdown_interrupt_payload() -> InterruptPayload {
+    InterruptPayload {
+        reason: "引擎关闭".to_string(),
+        source: InterruptSource::Shutdown,
+    }
+}
 
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环注入 session.messages）
 ///
@@ -94,12 +112,27 @@ pub(crate) async fn run_turn(
         // 中断点①：流式期间（含重试 sleep 期间——select! drop future 即取消 sleep）
         // run_stream_with_retry 内部按错误类型自动重试，发 OutputEvent::Retry 给 UI。
         // 中断：外层 select! drop retry future → 退避 sleep 取消 → 中断分支胜出。
+        // shutdown：retry.rs 退避 sleep 期间收到 shutdown 信号会冒泡 Cancelled，
+        //          本 select! 的 shutdown 分支也并发监听 token，谁先到谁接管。
         let stream_result = {
             let retry_fut = super::retry::run_stream_with_retry(
                 ctx, request, &model, &options, &provider, &state,
             );
             tokio::pin!(retry_fut);
             tokio::select! {
+                biased;
+                // shutdown 优先（高于 interrupt）：立即落库退出，不等流式结束
+                _ = ctx.shutdown_token.cancelled() => {
+                    let payload = shutdown_interrupt_payload();
+                    emit_interrupt_event(&payload, &ctx.emitter, &ctx.hooks).await;
+                    let kind = {
+                        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+                        classify(&s)
+                    };
+                    handle_interrupt(&state, kind, &payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref(), session).await;
+                    persist(ctx.emitter.session_id(), session, &ctx.store).await;
+                    return;
+                }
                 result = &mut retry_fut => result,
                 // 中断通道独立：此处只会收到 Interrupt
                 interrupt_msg = rx_interrupt.recv() => {
@@ -427,9 +460,12 @@ async fn handle_tool_calls(
         return;
     }
 
-    // 步骤3：中断点②——工具执行期间
+    // 步骤3：中断点②——工具执行期间（含 shutdown）
     // execute_tools 通过 result_tx 通知完成（一个一个通知）；本循环边收边走 emit_to_history
-    // 中断时 channel 里已完成的也 push 进 messages（不丢），未完成的补发中断式 ToolResult。
+    // 中断/shutdown 时 channel 里已完成的也 push 进 messages（不丢），未完成的补发中断式 ToolResult。
+    //
+    // shutdown 与 interrupt 的落库逻辑完全相同（发 Interrupt 通知 → 补未完成 tool_result），
+    // 抽 `emit_interrupt_and_complete_tool_results` 复用，唯一差异是 payload 的 source/reason。
     let tool_calls_for_exec = effective_result.tool_calls.clone();
     let (result_tx, mut result_rx) =
         tokio::sync::mpsc::channel::<tool_exec::ToolExecResult>(tool_calls_for_exec.len());
@@ -444,7 +480,21 @@ async fn handle_tool_calls(
 
     loop {
         tokio::select! {
-            biased; // 中断优先，保证及时响应
+            biased; // shutdown / 中断优先，保证及时响应
+            // shutdown 优先（高于 interrupt）：立即清空已完成工具结果 + 落库退出
+            // 工具执行 fut 被 drop → JoinSet drop → tokio 自动 abort 所有未完成工具 task
+            _ = ctx.shutdown_token.cancelled() => {
+                // 清空 channel 把已完成的 push 进 messages（不丢已完成结果）
+                while let Ok(r) = result_rx.try_recv() {
+                    push_tool_result_to_history(ctx, session, r).await;
+                }
+                emit_interrupt_and_complete_tool_results(
+                    ctx, session, &effective_result.tool_calls,
+                    &shutdown_interrupt_payload(),
+                ).await;
+                persist(ctx.emitter.session_id(), session, &ctx.store).await;
+                return;
+            }
             cmd = rx_interrupt.recv() => {
                 // 收到 Interrupt 或通道关闭（None）：清空 channel 把已完成的 push 进 messages
                 // 用 try_recv 非阻塞清空（exec_fut 可能还在跑，recv 会阻塞）
@@ -452,39 +502,10 @@ async fn handle_tool_calls(
                     push_tool_result_to_history(ctx, session, r).await;
                 }
                 if let Some(ref interrupt_msg) = cmd {
-                    emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
-                    // 为 effective 中未完成的 tool_call 补发中断式 ToolResult（也走 emit_to_history）
-                    // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
-                    let answered: std::collections::HashSet<String> = match ctx
-                        .store
-                        .load_visible_messages(ctx.emitter.session_id())
-                        .await
-                    {
-                        Ok(msgs) => msgs
-                            .iter()
-                            .filter(|m| m.role == "tool")
-                            .filter_map(|m| m.tool_call_id.clone())
-                            .collect(),
-                        Err(e) => {
-                            tracing::warn!(
-                                session_id = ctx.emitter.session_id(),
-                                cause = %e,
-                                "中断补发前加载可见消息失败，按全部未完成处理"
-                            );
-                            std::collections::HashSet::new()
-                        }
-                    };
-                    for tc in &effective_result.tool_calls {
-                        if !answered.contains(&tc.id) {
-                            let ev = make_interrupt_tool_result_event(
-                                tc.id.clone(),
-                                tc.name.clone(),
-                                &interrupt_msg.payload.source,
-                                &interrupt_msg.payload.reason,
-                            );
-                            push_tool_result_event_to_history(ctx, session, ev).await;
-                        }
-                    }
+                    emit_interrupt_and_complete_tool_results(
+                        ctx, session, &effective_result.tool_calls,
+                        &interrupt_msg.payload,
+                    ).await;
                 }
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
                 return;
@@ -582,4 +603,55 @@ async fn push_tool_result_event_to_history(
         },
     )
     .await;
+}
+
+/// 发 Interrupt 通知 + 为未完成 tool_call 补发中断式 ToolResult（落 DB）
+///
+/// 工具执行期间收到 interrupt 或 shutdown 信号时复用本函数（payload 由调用方决定）。
+/// 调用方应在调用本函数前**先用 `try_recv` 清空 channel** 把已完成的工具结果 push 进 history，
+/// 本函数只负责「通知 + 补未完成」两步。
+///
+/// 未完成判定：从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存），
+/// effective 中不在 answered 集合的 tool_call 视为未完成，逐个补发中断式 ToolResult。
+async fn emit_interrupt_and_complete_tool_results(
+    ctx: &SessionCtx,
+    session: &mut Session,
+    effective_tool_calls: &[fuyao_provider::ToolCallData],
+    payload: &InterruptPayload,
+) {
+    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
+
+    // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
+    let answered: std::collections::HashSet<String> = match ctx
+        .store
+        .load_visible_messages(ctx.emitter.session_id())
+        .await
+    {
+        Ok(msgs) => msgs
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "中断补发前加载可见消息失败，按全部未完成处理"
+            );
+            std::collections::HashSet::new()
+        }
+    };
+
+    // 为 effective 中未完成的 tool_call 补发中断式 ToolResult（也走 emit_to_history）
+    for tc in effective_tool_calls {
+        if !answered.contains(&tc.id) {
+            let ev = make_interrupt_tool_result_event(
+                tc.id.clone(),
+                tc.name.clone(),
+                &payload.source,
+                &payload.reason,
+            );
+            push_tool_result_event_to_history(ctx, session, ev).await;
+        }
+    }
 }

@@ -6,7 +6,7 @@ use fuyao_api::get_config;
 /// 判断错误是否可重试
 ///
 /// 可重试：RateLimit、Timeout、Connection、5xx ApiError
-/// 不可重试：AuthError、StreamParseError、ContextOverflow、4xx ApiError
+/// 不可重试：AuthError、StreamParseError、ContextOverflow、4xx ApiError、Cancelled
 pub fn is_retryable(e: &StreamError) -> bool {
     match e {
         StreamError::RateLimit { .. } | StreamError::Timeout | StreamError::Connection(_) => true,
@@ -21,9 +21,11 @@ pub fn is_retryable(e: &StreamError) -> bool {
             matches!(digits.as_str(), "500" | "502" | "503" | "504" | "529")
         }
         // ContextOverflow 不重试，应触发压缩
+        // Cancelled 不重试（非错误，由 shutdown 流程触发，冒泡给上层走中断路径）
         StreamError::ContextOverflow
         | StreamError::AuthError(_)
-        | StreamError::StreamParseError(_) => false,
+        | StreamError::StreamParseError(_)
+        | StreamError::Cancelled => false,
     }
 }
 
@@ -189,6 +191,12 @@ mod tests {
     #[test]
     fn is_not_retryable_context_overflow() {
         assert!(!is_retryable(&StreamError::ContextOverflow));
+    }
+
+    #[test]
+    fn is_not_retryable_cancelled() {
+        // 取消不是错误（shutdown 触发），不应重试，应立即冒泡给上层走中断路径
+        assert!(!is_retryable(&StreamError::Cancelled));
     }
 
     #[test]

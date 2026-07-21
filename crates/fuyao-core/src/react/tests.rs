@@ -941,6 +941,163 @@ async fn interrupt_during_tool_execution() {
     );
 }
 
+/// shutdown-流式期间：ControllableProvider 吐 TextDelta 后挂起 → cancel shutdown_token
+///
+/// 验证 turn.rs 流式 select! 的 shutdown 分支（biased 优先）：
+/// - 收到 Interrupt 事件（source=Shutdown，reason=引擎关闭）
+/// - 补发部分 AssistantMessage（finish_reason=interrupted，含已累积文本）
+/// - turn 在 2s 内结束（不依赖 10s abort 兜底）
+#[tokio::test]
+async fn shutdown_during_streaming() {
+    // 准备 1 轮事件流（shutdown 发生在首轮流式期间）
+    let (provider, txs) = ControllableProvider::with_batches(1);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&mut h, "test").await;
+
+    // 先 clone shutdown_token，turn_fut 借用 &h.ctx 后仍能在 interrupter 里 cancel
+    let shutdown_token = h.ctx.shutdown_token.clone();
+
+    // 喂一个 TextDelta（run_turn 启动后消费，进入流式 select! 挂起在第二个事件上）
+    txs[0]
+        .send(Ok(StreamEvent::TextDelta {
+            content: "你好".to_string(),
+        }))
+        .unwrap();
+
+    let turn_fut = turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params());
+    tokio::pin!(turn_fut);
+    let canceller = async {
+        // 等 run_turn 跑起来并挂起在流的第二个事件上
+        // 事件级落库模式下启动路径含 DB 查询，yield_now 多给一些
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shutdown_token.cancel();
+    };
+    tokio::select! {
+        _ = &mut turn_fut => {}
+        _ = canceller => {
+            // shutdown 信号已发，等 turn_fut 自己因 select! shutdown 分支结束
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在 shutdown 后立即结束（不依赖 10s abort）");
+        }
+    }
+
+    let events = collect_events(&mut h.rx_event).await;
+    // 断言 Interrupt 通知事件（source=Shutdown）
+    let interrupt = events.iter().find_map(|e| match e {
+        OutputEvent::Interrupt(m) => Some(m),
+        _ => None,
+    });
+    let interrupt = interrupt.expect("应有 Interrupt 事件");
+    assert_eq!(
+        interrupt.payload.source,
+        fuyao_api::message::input::InterruptSource::Shutdown,
+        "shutdown 触发的中断 source 应为 Shutdown"
+    );
+    assert_eq!(interrupt.payload.reason, "引擎关闭");
+    // 断言部分 AssistantMessage（finish_reason=interrupted，content 含已吐出的"你好"）
+    let partial = events.iter().find_map(|e| match e {
+        OutputEvent::Assistant(m) if m.payload.finish_reason.as_deref() == Some("interrupted") => {
+            Some(m)
+        }
+        _ => None,
+    });
+    let partial = partial.expect("应有 finish_reason=interrupted 的 AssistantMessage");
+    assert_eq!(
+        partial.payload.content.as_deref(),
+        Some("你好"),
+        "部分 AssistantMessage 应含已累积的文本"
+    );
+}
+
+/// shutdown-工具执行期间：阻塞式工具 handler 卡住 → cancel shutdown_token
+///
+/// 验证 turn.rs 工具执行 select! 的 shutdown 分支（biased 优先）：
+/// - 收到 Interrupt 事件（source=Shutdown）
+/// - 已完成的工具结果不丢（push 进 history）
+/// - 未完成的 tool_call 补发中断式 ToolResult（content 含 [Shutdown][引擎关闭]）
+/// - turn 在 2s 内结束（不依赖 10s abort 兜底，工具 handler sleep 30s 也不会卡住）
+#[tokio::test]
+async fn shutdown_during_tool_execution() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::tool_call_response(
+        "tc_shutdown",
+        "blocking_tool",
+        r#"{}"#,
+    )]));
+
+    // 注册阻塞工具：handler 等一个永不到来的信号，确保 shutdown 前不会完成
+    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx| {
+        Box::pin(async {
+            // 永不完成：sleep 30 秒，足够测试发 shutdown 信号
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            "unreachable".to_string()
+        })
+    });
+    let tools = ToolRegistry::builder()
+        .register(crate::ToolEntry {
+            definition: fuyao_api::ToolDefinition::new("blocking_tool", "阻塞测试工具"),
+            handler: blocking_handler,
+        })
+        .build();
+
+    let mut h = make_harness(provider, Arc::new(tools)).await;
+    preload_user(&mut h, "调工具").await;
+
+    let shutdown_token = h.ctx.shutdown_token.clone();
+
+    let turn_fut = turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, test_params());
+    tokio::pin!(turn_fut);
+    let canceller = async {
+        // 等 run_turn 跑完流式（工具调用）并进入工具执行阻塞
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        shutdown_token.cancel();
+    };
+    tokio::select! {
+        _ = &mut turn_fut => {}
+        _ = canceller => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在 shutdown 后立即结束（工具 handler sleep 30s 也不应卡住）");
+        }
+    }
+
+    let events = collect_events(&mut h.rx_event).await;
+    // 断言 Interrupt 事件 source=Shutdown
+    let interrupt = events.iter().find_map(|e| match e {
+        OutputEvent::Interrupt(m) => Some(m),
+        _ => None,
+    });
+    let interrupt = interrupt.expect("应有 Interrupt 事件");
+    assert_eq!(
+        interrupt.payload.source,
+        fuyao_api::message::input::InterruptSource::Shutdown
+    );
+    // 中断式 ToolResult：content 格式 [{source:?}][{reason}]
+    let tool_result = events.iter().find_map(|e| match e {
+        OutputEvent::ToolResult(m) if m.payload.tool_name == "blocking_tool" => Some(m),
+        _ => None,
+    });
+    let tool_result = tool_result.expect("应有 blocking_tool 的中断式 ToolResult");
+    assert_eq!(tool_result.payload.tool_call_id, "tc_shutdown");
+    assert!(
+        tool_result.payload.content.contains("Shutdown"),
+        "中断式 ToolResult content 应含 Shutdown 来源: {}",
+        tool_result.payload.content
+    );
+    assert!(
+        tool_result.payload.content.contains("引擎关闭"),
+        "中断式 ToolResult content 应含「引擎关闭」原因: {}",
+        tool_result.payload.content
+    );
+}
+
 /// 落库验证：跑完一轮含工具调用的 ReAct，从 DB 重新加载 messages 完整持久化
 ///
 /// 验证事件级落库（emit_to_history → store.insert_message）确实把完整消息写进 DB。

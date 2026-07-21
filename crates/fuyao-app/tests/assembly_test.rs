@@ -635,10 +635,10 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
     let (agent_paths, _home) = temp_agent_paths();
     let (registry, _mcp_manager) = build_tool_registry().await;
 
-    // 持续 RateLimit（retry_after_ms 设大，模拟退避 sleep 中）
+    // 持续 RateLimit（retry_after_ms 设大，模拟退避 sleep 中——故意远超 shutdown 超时阈值）
     let provider = common::FlakyThenSuccessProvider::new(
         vec![fuyao_provider::StreamError::RateLimit {
-            retry_after_ms: Some(10000),
+            retry_after_ms: Some(30000),
             retry_after_secs: None,
         }],
         text_events("永远到不了"),
@@ -677,11 +677,121 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
     }
     assert!(entered_backoff, "应至少收到一个 Retry 事件（已进入退避）");
 
-    // shutdown：task 此时在 retry 的 sleep 中（或 select! 等流式）
-    // 应在 SHUTDOWN_TASK_TIMEOUT 之前完成（task 因 token cancelled 或 abort 兜底退出）
-    let shutdown_done = tokio::time::timeout(Duration::from_secs(15), engine.shutdown()).await;
+    // shutdown：task 此刻在 retry 的退避 sleep 中（30s 长 sleep）
+    // retry.rs 的 sleep 用 select! 监听 shutdown_token，收到信号立即冒泡 Cancelled；
+    // turn.rs 流式 select! 的 shutdown 分支（biased 优先）接管，落库退出。
+    // 断言 2s 内完成——证明不依赖退避 sleep 走完、也不依赖 10s abort 兜底。
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(2), engine.shutdown()).await;
     assert!(
         shutdown_done.is_ok(),
-        "shutdown 应在 15 秒内完成（即便 task 卡在 retry 退避 sleep 中，token cancelled 也能让 select! 胜出）"
+        "shutdown 应在 2 秒内完成（retry sleep 监听 shutdown_token 立即冒泡 Cancelled，turn.rs shutdown 分支接管退出）"
     );
+}
+
+/// 多 session 并发活跃时 shutdown 是**并发**等待退出，而非串行
+///
+/// 场景：5 个 session 同时进入 retry 退避 sleep（retry_after_ms=30000，远超 SHUTDOWN_TASK_TIMEOUT）。
+/// 修复前（串行 await）：每个 task 独立 10s 超时，总耗时 ≈ 5 × 10s = 50s
+/// 修复后（JoinSet 并发 + 总 10s 超时）：所有 task 共享 10s 预算，sleep 同时被 shutdown_token 取消，
+/// 总耗时应远小于 10s（通常毫秒级）。
+///
+/// 断言阈值 5 秒——既验证并发（远小于串行的 50s），又留足 CI 抖动余量。
+#[tokio::test]
+async fn shutdown_terminates_concurrent_sessions_in_parallel() {
+    /// 始终返回 RateLimit 错误流的 Provider（每次 stream_chat 都失败）
+    /// ——用于让任意数量的 session 都持续进入 retry 退避（共享 Provider 实例也能并发触发）
+    struct AlwaysRateLimitProvider;
+    #[async_trait::async_trait]
+    impl fuyao_provider::Provider for AlwaysRateLimitProvider {
+        fn stream_chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+            _options: StreamOptions,
+        ) -> BoxStream<Result<StreamEvent, StreamError>> {
+            // 每次调用都返回 RateLimit（retry_after_ms=30s 远超 shutdown 预算）
+            let item: Result<StreamEvent, StreamError> = Err(StreamError::RateLimit {
+                retry_after_ms: Some(30000),
+                retry_after_secs: None,
+            });
+            Box::pin(futures_util::stream::iter(std::iter::once(item)))
+        }
+        async fn chat(
+            &self,
+            _request: ChatRequest,
+            _model: &str,
+        ) -> Result<ChatResponse, StreamError> {
+            Err(StreamError::ApiError("mock: chat 不支持".into()))
+        }
+    }
+
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(AlwaysRateLimitProvider),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    // 创建 5 个并发 session，每个发一条消息触发 retry 退避
+    const N: usize = 5;
+    let mut session_ids = Vec::with_capacity(N);
+    for i in 0..N {
+        let id = engine
+            .create_session(SessionParams::default())
+            .await
+            .expect("创建 session 失败");
+        let (event, params) = guide_user_message(&format!("触发重试 #{i}"), "test/model");
+        engine.send(&id, event, params).await.expect("发消息失败");
+        session_ids.push(id);
+    }
+
+    // 等 5 个 session 都至少收到一个 Retry 事件，确认都进入退避 sleep
+    // （retry_after_ms=30s，sleep 中 task 不会自然退出）
+    let mut entered_backoff_count = 0;
+    for _ in 0..200 {
+        if let Ok(Some(OutputEvent::Retry(_))) =
+            tokio::time::timeout(Duration::from_millis(200), engine.recv()).await
+        {
+            entered_backoff_count += 1;
+            if entered_backoff_count >= N {
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        entered_backoff_count, N,
+        "应有 {N} 个 session 都进入 retry 退避"
+    );
+
+    // shutdown：5 个 task 都在 retry 30s sleep 中
+    // 串行模式（旧）会退化到 ≈ N × 30s（实际被 abort 在 N × SHUTDOWN_TASK_TIMEOUT）
+    // 并发模式（新）应远小于 SHUTDOWN_TASK_TIMEOUT（10s）——所有 sleep 同时被 cancel
+    let start = std::time::Instant::now();
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(5), engine.shutdown()).await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        shutdown_done.is_ok(),
+        "shutdown 应在 5 秒内完成（5 个 task 并发退出，远小于串行的 N × 30s），实际未完成"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "shutdown 耗时应 < 5s（并发退出），实际: {elapsed:?}"
+    );
+
+    // 验证 5 个 session 的元数据都落库了（即使被中断，session 元数据仍应有记录）
+    let db_path = agent_paths.sessions_db_path();
+    let store = fuyao_session::SessionStore::new(db_path)
+        .await
+        .expect("重新打开 store 失败");
+    for id in &session_ids {
+        let session = store.get(id).await.expect("DB 查询失败");
+        assert!(session.is_some(), "session {id} 应在 DB 中存在");
+    }
 }
