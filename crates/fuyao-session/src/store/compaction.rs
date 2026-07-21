@@ -201,6 +201,61 @@ impl super::SessionStore {
         Ok(())
     }
 
+    /// 标记会话结束（填 ended_at + end_reason）
+    ///
+    /// 单字段 UPDATE，不动其他字段、不动 messages 表。由 `Engine::end_session` 在
+    /// session task 退出**之后**调用——确保 `ended_at` / `end_reason` 是最终值，
+    /// 不被 task 退出时的全量 `update(&session)` 覆盖。
+    ///
+    /// 设计上与 `update_title` / `update_system_prompt` 对称：都是单字段更新方法，
+    /// 走独立 SQL 路径而非全量 `update(session)`，避免并发更新间的字段覆盖。
+    ///
+    /// # 参数
+    /// - `session_id`：被结束的会话
+    /// - `end_reason`：结束原因（如 `"session_ended"` / `"engine_shutdown"`）
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]：session_id 在数据库中不存在
+    pub async fn end_session(
+        &self,
+        session_id: &str,
+        end_reason: &str,
+    ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        // 校验 session 存在（与 update_title 一致，避免给不存在的 session 写脏数据）
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(SessionError::NotFound(session_id.to_string()));
+        }
+
+        // 秒级 f64 时间戳，与 started_at / ended_at 字段类型对齐
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        sqlx::query("UPDATE sessions SET ended_at = ?2, end_reason = ?3 WHERE id = ?1")
+            .bind(session_id)
+            .bind(now)
+            .bind(end_reason)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            session_id = session_id,
+            end_reason = end_reason,
+            "会话已标记结束"
+        );
+        Ok(())
+    }
+
     /// 加载模型可见窗口消息
     ///
     /// 返回「最近一条 compaction 消息（若有）及之后的所有消息」。

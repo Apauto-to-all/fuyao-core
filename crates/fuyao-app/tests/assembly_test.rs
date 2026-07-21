@@ -795,3 +795,191 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
         assert!(session.is_some(), "session {id} 应在 DB 中存在");
     }
 }
+
+// ============================================================================
+// Engine::end_session：单 session 销毁（与 shutdown 对称但只动一个 child_token）
+// ============================================================================
+
+/// end_session 后该 session 从调度表移除——后续 send 返回 `Err(SessionNotFound)`
+#[tokio::test]
+async fn end_session_removes_from_schedule() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    // end_session 应正常返回 Ok（task 在 idle 状态，cancel 立即响应退出）
+    let done = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.end_session(&session_id, "session_ended"),
+    )
+    .await;
+    assert!(done.is_ok(), "end_session 应在 3 秒内完成");
+    done.expect("end_session 未在 3s 内完成")
+        .expect("end_session 返回错误");
+
+    // end_session 后再 send 应返回 SessionNotFound（session 已从调度表移除）
+    let (event, params) = guide_user_message("end 后的发送", "test/model");
+    let result = engine.send(&session_id, event, params).await;
+    assert!(
+        matches!(result, Err(fuyao_core::EngineError::SessionNotFound(_))),
+        "end_session 后 send 应返回 Err(SessionNotFound)，实际: {result:?}"
+    );
+
+    // 引擎本身仍未 shutdown，可继续创建新 session
+    let new_id = engine.create_session(SessionParams::default()).await;
+    assert!(new_id.is_ok(), "end_session 后引擎应仍可创建新 session");
+
+    engine.shutdown().await;
+}
+
+/// end_session 把 ended_at / end_reason 写进 DB（task 退出后单字段 UPDATE 落最终值）
+#[tokio::test]
+async fn end_session_persists_ended_at_and_reason() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(MockProvider {
+            events: text_events("对话已结束"),
+        }),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_id = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session 失败");
+
+    // end_session 前在 DB 中 ended_at / end_reason 都为 None
+    let db_path = agent_paths.sessions_db_path();
+    {
+        let store = fuyao_session::SessionStore::new(db_path.clone())
+            .await
+            .expect("打开 store 失败");
+        let before = store.get(&session_id).await.unwrap().unwrap();
+        assert!(before.ended_at.is_none());
+        assert!(before.end_reason.is_none());
+    }
+
+    // end_session 应在合理时间内完成
+    let done = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.end_session(&session_id, "session_ended"),
+    )
+    .await;
+    assert!(done.is_ok(), "end_session 应在 3 秒内完成");
+    done.unwrap().expect("end_session 返回错误");
+
+    // DB 验证：ended_at 已落库，end_reason == 传入值
+    let store = fuyao_session::SessionStore::new(db_path)
+        .await
+        .expect("重新打开 store 失败");
+    let loaded = store
+        .get(&session_id)
+        .await
+        .expect("DB 查询失败")
+        .expect("session 应存在");
+    assert!(loaded.ended_at.is_some(), "ended_at 应已落库");
+    assert_eq!(
+        loaded.end_reason.as_deref(),
+        Some("session_ended"),
+        "end_reason 应为传入值"
+    );
+
+    engine.shutdown().await;
+}
+
+/// end_session 只销毁指定 session——其他 session 不受影响，仍可正常 send + recv
+///
+/// 核心验证：end_session 只 cancel 该 session 的 child_token，不动引擎 root token，
+/// 故其他 session 的 task 不会被波及。这是 end_session 与 shutdown 的本质区别。
+#[tokio::test]
+async fn end_session_does_not_affect_other_sessions() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let (registry, _mcp_manager) = build_tool_registry().await;
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(MockProvider {
+            events: text_events("B 的回复"),
+        }),
+        registry,
+        PluginHost::new(),
+    )
+    .await;
+
+    let session_a = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session A 失败");
+    let session_b = engine
+        .create_session(SessionParams::default())
+        .await
+        .expect("创建 session B 失败");
+
+    // 销毁 A
+    let done = tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.end_session(&session_a, "session_ended"),
+    )
+    .await;
+    assert!(done.is_ok(), "end_session(A) 应在 3 秒内完成");
+    done.unwrap().expect("end_session(A) 返回错误");
+
+    // A 已销毁，再 send A 返回 SessionNotFound
+    let (event_a, params_a) = guide_user_message("A 已死", "test/model");
+    let result_a = engine.send(&session_a, event_a, params_a).await;
+    assert!(
+        matches!(result_a, Err(fuyao_core::EngineError::SessionNotFound(_))),
+        "A 销毁后 send A 应返回 SessionNotFound，实际: {result_a:?}"
+    );
+
+    // B 仍正常工作：发消息 + 收到 Chunk / Assistant
+    let (event_b, params_b) = guide_user_message("B 还活着", "test/model");
+    engine
+        .send(&session_b, event_b, params_b)
+        .await
+        .expect("B 的 send 不应失败");
+
+    let mut got_assistant = false;
+    for _ in 0..50 {
+        if let Ok(Some(OutputEvent::Assistant(a))) =
+            tokio::time::timeout(Duration::from_millis(500), engine.recv()).await
+        {
+            assert!(
+                a.payload
+                    .content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("B 的回复"),
+                "B 的 Assistant 应含「B 的回复」"
+            );
+            got_assistant = true;
+            break;
+        }
+    }
+    assert!(got_assistant, "B 应仍能正常完成 ReAct（end A 不影响 B）");
+
+    engine.shutdown().await;
+}

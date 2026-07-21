@@ -270,6 +270,38 @@ async fn update_title_errors_on_missing_session() {
     assert!(matches!(result, Err(SessionError::NotFound(_))));
 }
 
+// ===== end_session 测试组 =====
+
+#[tokio::test]
+async fn end_session_updates_db_row() {
+    let store = temp_store().await;
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+    // 新建 session 未结束
+    let before = store.get(&session.id).await.unwrap().unwrap();
+    assert!(before.ended_at.is_none());
+    assert!(before.end_reason.is_none());
+
+    store
+        .end_session(&session.id, "session_ended")
+        .await
+        .unwrap();
+
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert!(loaded.ended_at.is_some(), "ended_at 应已落库");
+    assert_eq!(loaded.end_reason.as_deref(), Some("session_ended"));
+    // 其他字段不动
+    assert_eq!(loaded.compression_count, 0);
+    assert!(loaded.last_compacted_seq.is_none());
+}
+
+#[tokio::test]
+async fn end_session_errors_on_missing_session() {
+    let store = temp_store().await;
+    let result = store.end_session("nonexistent", "session_ended").await;
+    assert!(matches!(result, Err(SessionError::NotFound(_))));
+}
+
 // ===== load_visible_messages 测试组 =====
 
 #[tokio::test]
