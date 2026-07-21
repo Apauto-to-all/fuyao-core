@@ -508,7 +508,7 @@ impl Engine {
     /// 引擎关闭是危险操作，不混入对话级的事件流（不走 send），
     /// 由独立的关闭方法触发。
     ///
-    /// 关闭流程（学 opencode 优雅停机 + 对齐设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障）：
+    /// 关闭流程（「显式关闭 + 等待退出 + 强制中止兜底」三层保障）：
     /// 1. shutdown flag 置位（`AtomicBool::store(true)`）→ 后续 `send` 立即返回 `Err(Shutdown)`，
     ///    `recv` 先 drain 残余事件再返回 None（不丢 shutdown 前最后几条产出）
     /// 2. cancel 引擎级 shutdown_token → 所有 session task 的 select! 同时收到 cancelled 信号
@@ -524,7 +524,7 @@ impl Engine {
     /// `max(各 task 退出时间)`。
     ///
     /// **fire-and-forget task**（如 title 生成等 spawn 的独立 task）：**不显式 abort**，
-    /// 靠 runtime 关闭自然终止（对齐 opencode + 文档 01.1:935 已记录决策）。
+    /// 靠 runtime 关闭自然终止（已记录决策：fire-and-forget task 不显式 abort）。
     pub async fn shutdown(&self) {
         // 1. flag 置位：后续 send / recv 立即走快路径拒绝
         self.shutdown.store(true, Ordering::Release);

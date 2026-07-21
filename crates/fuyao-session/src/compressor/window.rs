@@ -5,7 +5,7 @@
 
 use fuyao_api::{Message, MessageKind};
 
-/// 4 字符 ≈ 1 token 的粗估（对齐 zeroclaw + opencode V2）
+/// 4 字符 ≈ 1 token 的粗估
 const CHARS_PER_TOKEN: usize = 4;
 
 /// 窗口切分结果
@@ -21,7 +21,7 @@ pub struct Window<'a> {
 fn estimate_message_tokens(msg: &Message) -> usize {
     let text_len =
         msg.content.as_deref().unwrap_or("").len() + msg.reasoning.as_deref().unwrap_or("").len();
-    // ponytail: 不解析 tool_calls JSON 深度估算——保留粗估，压缩触发偏保守没问题
+    // 不解析 tool_calls JSON 深度估算——保留粗估，压缩触发偏保守没问题
     let tool_len = msg
         .tool_calls
         .as_ref()
@@ -109,7 +109,7 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
         if msg.role == "assistant" {
             if let Some(ref tool_calls) = msg.tool_calls {
                 // 检查这个 assistant 的所有 tool_call_id 是否在后续消息中都有 result
-                // ponytail: 解析出 owned id 列表避免借用冲突
+                // 解析出 owned id 列表避免借用冲突
                 let call_ids: Vec<String> =
                     serde_json::from_value::<Vec<serde_json::Value>>(tool_calls.clone())
                         .map(|calls| {

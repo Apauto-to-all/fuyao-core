@@ -12,7 +12,7 @@
 //! - **不污染 stream 模块**：stream.rs 只做流式解码（错误冒泡），本模块在更外层协调
 //! - **不污染 interrupt 模块**：不引入 phase / Backoff 字段
 //!
-//! ## 策略（对齐 opencode 高层 session retry 语义）
+//! ## 策略（高层 session retry 语义）
 //!
 //! | 错误类别 | 处理 |
 //! |---------|------|
@@ -21,7 +21,7 @@
 //! | 可恢复错误（RateLimit / Timeout / Connection / 5xx）| 退避后重试，次数上限 `RetryConfig.max_retries` |
 //!
 //! 首 chunk 判定：流式开始后 `TurnState.text` 或 `reasoning` 非空即视为已吐首 chunk
-//! （对齐 opencode V2 runner 的 `hasAssistantStarted` 语义）。
+//! （即助手已开始输出的判定语义）。
 //!
 //! ## 退避
 //!

@@ -1,9 +1,8 @@
 //! LLM 重试事件
 //!
 //! 引擎在 LLM 调用失败后判定可重试时，进入退避等待并发出本事件，前端据此渲染
-//! 「重试中…N 秒后重试，错误：xxx」提示（对齐 opencode `[retrying in 5s attempt #2]`
-//! 的 UI 反馈模式）。事件经统一消息处理管道（dispatch）发送：可被 output_intercept
-//! 钩子拦截改写，也会触发 output_observe 钩子（如审计日志）。
+//! 「重试中…N 秒后重试，错误：xxx」提示。事件经统一消息处理管道（dispatch）发送：
+//! 可被 output_intercept 钩子拦截改写，也会触发 output_observe 钩子（如审计日志）。
 //!
 //! 事件触发点：`fuyao-core/src/react/retry.rs::RetryRunner`（per-session，每次重试前发一条）。
 //!
@@ -27,7 +26,7 @@ pub struct RetryMessage {
 /// 重试载荷
 ///
 /// 每个字段都对应 UI 渲染所需的 1 条信息：
-/// - `attempt`：第几次重试（1 = 第一次重试，对应 opencode 的 attempt #N）
+/// - `attempt`：第几次重试（1-based，1 = 第一次重试）
 /// - `max_retries`：配置的最大重试次数（UI 可显示「2/5」；u32::MAX 时 UI 应渲染为「无限」）
 /// - `wait_ms`：本次退避等待毫秒数（UI 用它显示「N 秒后重试」倒计时）
 /// - `cause`：错误的人类可读描述（UI 显示错误原因）

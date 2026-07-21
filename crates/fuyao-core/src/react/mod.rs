@@ -221,7 +221,7 @@ pub(crate) async fn run_session(
 /// 触发条件满足时：调一次独立 LLM（`tools=[]`）拿摘要 → `mark_compaction` 落库 →
 /// 复制 keep_recent 为新 seq（下次 `load_visible_messages` 自然看到 compaction 边界 + keep_recent）。
 ///
-/// 失败处理（对齐 opencode "失败保持边界" + hermes 分级）：
+/// 失败处理（失败保持边界 + 错误分级）：
 /// - 摘要为空 / 无可压缩内容：log warn 跳过
 /// - LLM 调用失败：log warn 跳过（不进 cooldown，下次还会触发判定）
 /// - 落库失败：log warn 跳过

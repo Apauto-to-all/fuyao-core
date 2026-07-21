@@ -1,6 +1,6 @@
 //! 触发层：阈值检测 + 反抖动
 //!
-//! 触发公式（对齐 opencode V2 + hermes 共识）：
+//! 触发公式：
 //! ```text
 //! prompt_tokens >= threshold × (context_length - summary_max_tokens)
 //! ```
@@ -12,7 +12,7 @@ use fuyao_api::CompressionConfig;
 
 /// 压缩运行时状态（per-session，反抖动用）
 ///
-/// 反抖动策略（对齐 hermes + zeroclaw 共识）：记录上次压缩的节省比例，
+/// 反抖动策略：记录上次压缩的节省比例，
 /// 连续两次低于 `min_savings_pct` 时停压缩——避免无效循环。
 #[derive(Debug, Default, Clone)]
 pub struct CompressionState {

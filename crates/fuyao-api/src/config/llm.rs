@@ -16,7 +16,7 @@ pub struct RetryConfig {
     pub max_delay_with_headers_ms: u64,
     /// 可恢复错误的最大重试次数
     ///
-    /// 默认 `u32::MAX`（无限重试）——对齐 opencode 高层 session 重试语义：
+    /// 默认 `u32::MAX`（无限重试）——可恢复错误的 session 级重试语义：
     /// 可恢复错误（RateLimit / Timeout / Connection / 5xx）说明供应商侧短时不可用，
     /// 引擎应持续重试直到恢复。用户嫌激进可在 TOML 里配小。
     ///
@@ -70,7 +70,7 @@ mod tests {
         assert_eq!(c.initial_delay_ms, 2000);
         assert_eq!(c.max_delay_ms, 30000);
         assert_eq!(c.max_delay_with_headers_ms, 2_147_483_647);
-        // 默认无限重试（对齐 opencode 高层语义）
+        // 默认无限重试（session 级重试语义）
         assert_eq!(c.max_retries, u32::MAX);
     }
 

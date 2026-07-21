@@ -144,7 +144,7 @@ retry.rs:
 - **退避**：指数退避，起始 2000ms（可配）
 - **响应头优先**：服务器返回 `Retry-After` 时尊重它
 - **可重试判定**：429 / 5xx / Timeout / Connection 可重试，4xx / AuthError / StreamParseError / ContextOverflow / Cancelled 不重试
-- **max_retries 默认 `u32::MAX`**（无限重试）——对齐 opencode 高层语义，可配小
+- **max_retries 默认 `u32::MAX`**（无限重试）——可恢复错误说明供应商侧短时不可用，引擎应持续重试直到恢复；嫌激进可在 TOML 里配小
 
 **重试位置**：react 层 `fuyao-core/src/react/retry.rs::run_stream_with_retry`（不在 provider 层）——因为发 Retry 事件需要 session_id（详见 [引擎内核设计](引擎内核设计.md)）。
 

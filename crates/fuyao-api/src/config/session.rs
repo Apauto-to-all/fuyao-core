@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 /// 上下文压缩配置（`[session.compression]`）
 ///
-/// 触发公式（对齐 opencode V2 + hermes 共识）：
+/// 触发公式：
 /// ```text
 /// prompt_tokens >= threshold × (context_length - summary_max_tokens)
 /// ```
@@ -23,7 +23,7 @@ use serde::Deserialize;
 /// - 大上下文模型（如 200K+）受 `keep_tokens_max` 上限保护，避免保留过多
 ///
 /// 反抖动：连续两次压缩的 token 节省比例低于 `min_savings_pct` 时停压缩，
-/// 避免无效循环（对齐 hermes + zeroclaw 共识）。
+/// 避免无效循环。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CompressionConfig {
