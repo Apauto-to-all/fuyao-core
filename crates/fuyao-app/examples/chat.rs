@@ -18,7 +18,7 @@ use std::io::Write;
 
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{AgentPaths, MessageParams, ModelConfig, SessionParams};
+use fuyao_api::{AgentPaths, EngineParams, MessageParams, ModelConfig, SessionParams};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// 默认模型（provider/model 形式，按项目约定）
@@ -47,9 +47,11 @@ async fn main() {
 
     // 1. 一键装配：init（配置 / 日志 / Provider）→ 工具收集 → 启动引擎
     //    from_cwd：以当前工作目录为 workspace，使 .fuyao/skills 等项目级资源生效
-    let (engine, ctx) = fuyao_app::start(AgentPaths::from_cwd())
-        .await
-        .expect("引擎启动失败，请检查配置与 API Key");
+    let (engine, ctx) = fuyao_app::start(EngineParams {
+        agent_paths: AgentPaths::from_cwd(),
+    })
+    .await
+    .expect("引擎启动失败，请检查配置与 API Key");
 
     // 单一 reader 贯穿全程：先读模式选择，再读交互输入
     let stdin = tokio::io::stdin();

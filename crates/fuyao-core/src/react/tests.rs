@@ -337,7 +337,7 @@ async fn make_harness_with_hooks(
         tools,
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
-        agent_config: fuyao_api::AgentConfig::default(),
+        session_params: fuyao_api::SessionParams::default(),
         emitter: Emitter::new(tx_event, "test_session".to_string()),
         guide: empty_queue(),
         pending: empty_queue(),
@@ -638,7 +638,7 @@ async fn pending_consumed_when_task_idle() {
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
-        fuyao_api::AgentConfig::default(),
+        fuyao_api::SessionParams::default(),
         tx_event,
     ));
 
@@ -723,7 +723,7 @@ async fn plugin_message_routes_through_dispatch() {
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
-        fuyao_api::AgentConfig::default(),
+        fuyao_api::SessionParams::default(),
         tx_event,
     ));
 
@@ -1496,7 +1496,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         tools: Arc::new(ToolRegistry::builder().build()),
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
-        agent_config: fuyao_api::AgentConfig::default(),
+        session_params: fuyao_api::SessionParams::default(),
         emitter,
         guide: empty_queue(),
         pending: empty_queue(),
@@ -1552,7 +1552,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         tools: Arc::new(ToolRegistry::builder().build()),
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
-        agent_config: fuyao_api::AgentConfig::default(),
+        session_params: fuyao_api::SessionParams::default(),
         emitter,
         guide: empty_queue(),
         pending: empty_queue(),

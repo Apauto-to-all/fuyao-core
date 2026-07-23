@@ -1,6 +1,6 @@
 //! 引擎初始化 —— 应用层装配入口（配置 / 日志 / Provider 准备）
 //!
-//! 负责从 [`AgentPaths`] 出发完成引擎装配前的所有准备：
+//! 负责从 [`EngineParams`](fuyao_api::EngineParams) 出发完成引擎装配前的所有准备：
 //! 1. 加载 `.env` 环境变量（三层目录）
 //! 2. 加载三层 TOML 配置
 //! 3. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
@@ -13,14 +13,14 @@
 //!
 //! 典型用法（推荐用 [`crate::start`] 一行启动）：
 //! ```ignore
-//! use fuyao_api::AgentPaths;
+//! use fuyao_api::{AgentPaths, EngineParams};
 //!
-//! let agent_paths = AgentPaths::default();
-//! let (registry, _log_guard) = fuyao_app::init_engine(agent_paths).await?;
+//! let params = EngineParams { agent_paths: AgentPaths::default() };
+//! let fuyao_app::InitResult { provider, log_guard } = fuyao_app::init_engine(&params).await?;
 //! ```
 
 use crate::logging::LogGuard;
-use fuyao_api::{AgentPaths, FuyaoConfig, load_config, load_env, set_config};
+use fuyao_api::{AgentPaths, EngineParams, FuyaoConfig, load_config, load_env, set_config};
 use fuyao_provider::ProviderRegistry;
 use fuyao_provider::{agent_paths_cache_key, register_model, register_provider};
 use std::sync::Arc;
@@ -53,27 +53,33 @@ pub struct InitResult {
 
 /// 引擎装配准备 —— 应用层装配入口
 ///
-/// 从 [`AgentPaths`] 出发，一气呵成完成：环境变量加载 → 配置注册 →
+/// 从 [`EngineParams`] 出发，一气呵成完成：环境变量加载 → 配置注册 →
 /// 日志初始化 → Provider 实例批量构造，
 /// 返回可直接喂给 `Engine::new` 的 `(ProviderRegistry, 日志 guard)`。
+///
+/// 内部取出 `agent_paths` 字段传给下游路径定位子流程——这些子函数只关心路径，
+/// 与引擎级扩展字段无关，传裸 [`AgentPaths`] 即可。
 ///
 /// **Provider 创建容错**：批量构造时单个 Provider 实例失败（如 API Key 未配）只记 WARN 跳过，
 /// 其他成功的照常注册——支持渐进配置（部分 provider 配错也能启动引擎）。
 /// 但若**所有** Provider 都失败，返回 [`InitError::NoProviderAvailable`]。
 ///
 /// # 参数
-/// - `agent_paths`：Agent 三层目录身份证明，决定配置与数据路径。
+/// - `params`：引擎启动参数，内含 Agent 三层目录身份证明，决定配置与数据路径。
 ///
 /// # 错误
 /// - [`InitError::NoProviderAvailable`]：所有 Provider 实例创建失败
 /// - [`InitError::ConfigError`]：配置文件加载失败
-pub async fn init_engine(agent_paths: AgentPaths) -> Result<InitResult, InitError> {
+pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError> {
+    // 内部工具函数只需要路径身份证明，直接取裸 &AgentPaths 复用
+    let agent_paths = &params.agent_paths;
+
     // 1. 加载 .env 环境变量
-    load_env(&agent_paths);
+    load_env(agent_paths);
 
     // 2. 加载配置（一次）：注入全局只读句柄，供所有模块 get_config 读取；
     //    同时复用于 Provider/Model 注册，避免重复加载。
-    let config = load_config(&agent_paths).map_err(|e| InitError::ConfigError(e.to_string()))?;
+    let config = load_config(agent_paths).map_err(|e| InitError::ConfigError(e.to_string()))?;
     if let Some(ref cfg) = config {
         set_config(Arc::new(cfg.clone()));
     }
@@ -84,13 +90,13 @@ pub async fn init_engine(agent_paths: AgentPaths) -> Result<InitResult, InitErro
         .as_ref()
         .map(|c| c.logging.clone())
         .unwrap_or_default();
-    let log_guard = crate::logging::init_logging(&logging_config, &agent_paths);
+    let log_guard = crate::logging::init_logging(&logging_config, agent_paths);
 
     // 4. 注册 Provider/Model 配置到注册表（带缓存，重复调用幂等）
-    ensure_registered(&agent_paths, config.as_ref())?;
+    ensure_registered(agent_paths, config.as_ref())?;
 
     // 5. 批量构造所有已注册 Provider 的实例（单个失败仅 WARN 跳过）
-    let provider = ProviderRegistry::from_registered(&agent_paths);
+    let provider = ProviderRegistry::from_registered(agent_paths);
     if provider.is_empty() {
         return Err(InitError::NoProviderAvailable);
     }

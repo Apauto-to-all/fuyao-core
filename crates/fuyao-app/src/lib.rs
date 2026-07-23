@@ -16,7 +16,7 @@ mod tools;
 
 use std::sync::Arc;
 
-use fuyao_api::{AgentPaths, EngineParams};
+use fuyao_api::EngineParams;
 use fuyao_core::{Engine, PluginHost, ToolRegistry, ToolRegistryBuilder};
 use fuyao_mcp::MCPManager;
 
@@ -46,12 +46,12 @@ pub enum SetupError {
 ///
 /// 需要在中间介入（如动态追加工具）时，改用 [`init_engine`] + [`build_tool_registry`]
 /// 分步装配，再自行调 `Engine::new`。
-pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), SetupError> {
-    // 1. 配置 / 日志 / Provider 准备
+pub async fn start(params: EngineParams) -> Result<(Engine, AppContext), SetupError> {
+    // 1. 配置 / 日志 / Provider 准备（init_engine 内部取出 agent_paths 供子流程定位路径）
     let init::InitResult {
         provider,
         log_guard,
-    } = init_engine(agent_paths.clone()).await.map_err(|e| {
+    } = init_engine(&params).await.map_err(|e| {
         tracing::error!(cause = %e, "引擎装配准备失败");
         e
     })?;
@@ -67,7 +67,7 @@ pub async fn start(agent_paths: AgentPaths) -> Result<(Engine, AppContext), Setu
 
     // 4. 启动引擎（工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
-    let engine = Engine::new(EngineParams { agent_paths }, provider, tools, plugin_host).await;
+    let engine = Engine::new(params, provider, tools, plugin_host).await;
 
     tracing::info!("引擎启动完成");
 

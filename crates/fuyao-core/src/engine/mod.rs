@@ -13,9 +13,7 @@ use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
-use fuyao_api::{
-    AgentConfig, EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams,
-};
+use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_provider::ProviderRegistry;
@@ -170,8 +168,10 @@ impl Engine {
         let session_id = session.id.clone();
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
+        // SessionParams 整体传下去，不在入口拆包——压缩重建 prompt 等运行时场景
+        // 仍需 agent_config，贯穿到 SessionCtx 留存，将来加字段只动 SessionCtx 一处
         let handle = self
-            .assemble_session(session_id.clone(), session, params.agent_config)
+            .assemble_session(session_id.clone(), session, params)
             .await;
         self.sessions
             .lock()
@@ -205,9 +205,8 @@ impl Engine {
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
-        let handle = self
-            .assemble_session(id.clone(), session, params.agent_config)
-            .await;
+        // SessionParams 整体传下去（与 create_session 对称）
+        let handle = self.assemble_session(id.clone(), session, params).await;
         self.sessions.lock().await.insert(id.clone(), handle);
 
         tracing::info!(session_id = %id, "恢复对话");
@@ -226,7 +225,7 @@ impl Engine {
         &self,
         session_id: SessionId,
         session: Session,
-        agent_config: AgentConfig,
+        session_params: SessionParams,
     ) -> SessionHandle {
         // 双队列
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
@@ -267,7 +266,7 @@ impl Engine {
             Arc::clone(&self.tools),
             hooks,
             self.params.agent_paths.clone(),
-            agent_config,
+            session_params,
             self.tx_event.clone(),
         ));
 

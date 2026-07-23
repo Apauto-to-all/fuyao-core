@@ -63,8 +63,11 @@ pub(crate) struct SessionCtx {
     /// 钩子注册表（引擎级共享，透传给本 session 的 dispatch 管道）
     pub hooks: SharedHooks,
     pub agent_paths: fuyao_api::AgentPaths,
-    /// Agent 配置（创建时定死的会话级配置，压缩后重建 system_prompt 用）
-    pub agent_config: fuyao_api::AgentConfig,
+    /// 对话级参数（创建时定死且不可变，压缩后重建 system_prompt 用其中的 agent_config）
+    ///
+    /// 贯穿整个 session 生命周期：将来 SessionParams 加字段（如 temperature）时，
+    /// 只在此处多存一个值，中间函数签名不动。
+    pub session_params: fuyao_api::SessionParams,
     pub emitter: Emitter,
     /// 引导队列（直接消费）
     pub guide: SharedQueue,
@@ -96,13 +99,12 @@ pub(crate) struct SessionCtx {
 /// 过完整管道（拦截 → 处理[入 guide/pending 队列] → 发送[回显 User] → 观察）。
 /// 入队是 session 层管道的 process 职责，不在引擎层直接操作队列。
 ///
-/// 关于 SessionParams 的简化（有意决策）：`SessionParams` 在 `Engine::create_session`
-/// 里被消费——只取出 `agent_config` 构建 system_prompt 存进 `Session.system_prompt`，
-/// 之后 SessionParams 本身不再传入 task。task 运行时需要的配置走两条路：
-/// - 工具配置：引擎级 `ToolRegistry` 共享（`tools` 参数），启动时装配。
-/// - session 级配置（system_prompt）：已构建进 `Session`，task 直接读。
+/// 关于 SessionParams 的贯穿：`SessionParams` 从 `Engine::create_session` 整体传入，
+/// 不在入口拆成 `AgentConfig`——压缩重建 system_prompt 等运行时场景仍需其中字段，
+/// 故整体留存进 `SessionCtx.session_params`。将来 SessionParams 加字段时，
+/// 只需在 `SessionCtx` 多存一个值，中间函数签名不动。
 ///
-/// 这样多 session 并发时工具共享、人格隔离，互不干扰。
+/// 多 session 并发时工具共享（引擎级 `ToolRegistry`）、人格隔离（各自 SessionParams），互不干扰。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_session(
     session_id: String,
@@ -118,7 +120,7 @@ pub(crate) async fn run_session(
     tools: Arc<ToolRegistry>,
     hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
-    agent_config: fuyao_api::AgentConfig,
+    session_params: fuyao_api::SessionParams,
     tx_event: Sender<OutputEvent>,
 ) {
     tracing::info!(session_id = %session_id, "session 执行流启动");
@@ -129,7 +131,7 @@ pub(crate) async fn run_session(
         tools,
         hooks,
         agent_paths,
-        agent_config,
+        session_params,
         emitter: Emitter::new(tx_event, session_id.clone()),
         guide,
         pending,
@@ -434,7 +436,10 @@ async fn run_pre_turn_compression(
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
             // X 已被压进摘要后不再误导模型
-            let new_prompt = fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.agent_config);
+            let new_prompt = fuyao_prompt::build_system_prompt(
+                &ctx.agent_paths,
+                &ctx.session_params.agent_config,
+            );
 
             // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
             // keep_recent 已复制，system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，
