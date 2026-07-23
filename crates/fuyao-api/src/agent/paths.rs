@@ -44,6 +44,24 @@ impl Default for AgentPaths {
 }
 
 impl AgentPaths {
+    /// 以当前工作目录为 workspace 构造
+    ///
+    /// 应用层入口（cli / tui / example）最常用的初始化方式：把进程当前目录
+    /// 作为 workspace 层，使其 `.fuyao/` 下的 skills、agents 定义、instructions、
+    /// 项目级 `fuyao.toml` 等资源都能被分层路径体系解析到。
+    ///
+    /// 与 [`Default`] 的区别：`Default` 的 `workspace` 为 `None`，workspace 层被
+    /// 完全跳过，仅能看到 global 层；`from_cwd` 保证 workspace 层生效。
+    /// 当前目录不可读时回退为 [`Default`]（仅 global 层），避免启动直接失败。
+    pub fn from_cwd() -> Self {
+        match std::env::current_dir() {
+            Ok(ws) => Self {
+                workspace: Some(ws),
+                ..Self::default()
+            },
+            Err(_) => Self::default(),
+        }
+    }
     /// 配置文件分层路径（fuyao.toml）
     pub fn config_paths(&self) -> LayeredPaths {
         LayeredPaths {
@@ -253,6 +271,15 @@ mod tests {
         let paths = AgentPaths::default();
         assert!(paths.agent_id.is_none());
         assert!(paths.workspace.is_none());
+    }
+
+    #[test]
+    fn from_cwd_sets_workspace_to_current_dir() {
+        // from_cwd：workspace 应等于 std::env::current_dir，使 workspace 层生效
+        let paths = AgentPaths::from_cwd();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(paths.workspace.as_ref(), Some(&cwd));
+        assert!(paths.agent_id.is_none());
     }
 
     #[test]

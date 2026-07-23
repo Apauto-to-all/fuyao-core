@@ -46,7 +46,8 @@ async fn main() {
     println!("=== fuyao 引擎端到端冒烟测试 ===\n");
 
     // 1. 一键装配：init（配置 / 日志 / Provider）→ 工具收集 → 启动引擎
-    let (engine, ctx) = fuyao_app::start(AgentPaths::default())
+    //    from_cwd：以当前工作目录为 workspace，使 .fuyao/skills 等项目级资源生效
+    let (engine, ctx) = fuyao_app::start(AgentPaths::from_cwd())
         .await
         .expect("引擎启动失败，请检查配置与 API Key");
 
