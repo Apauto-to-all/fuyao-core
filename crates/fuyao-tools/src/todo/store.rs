@@ -8,7 +8,7 @@
 //! schema 耦合（todos 表属工具层职责，session 层不维护它）。
 
 use fuyao_api::TodoItem;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,10 +49,13 @@ impl TodoStore {
 
         let storage = fuyao_api::get_config().session.storage.clone();
 
+        // synchronous=Normal：与 SessionStore 保持一致，WAL 下 commit 不强制 fsync，
+        // 避免与 SessionStore 的事务在 fsync 期间互相阻塞触发 database is locked。
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(storage.busy_timeout_secs));
 

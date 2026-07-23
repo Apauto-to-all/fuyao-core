@@ -20,7 +20,7 @@ mod tests;
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -44,11 +44,14 @@ impl SessionStore {
 
         let storage = fuyao_api::get_config().session.storage.clone();
 
-        // 连接选项：启用 WAL、外键、忙等待
+        // 连接选项：WAL + 同步 Normal + 外键 + 忙等待
+        // synchronous=Normal：WAL 模式下的推荐搭配，commit 不强制 fsync，
+        // 写锁持有时间从 FULL 的几十毫秒降到亚毫秒级，从根上消除多连接并发写时的锁竞争。
         let options = SqliteConnectOptions::new()
             .filename(&db_path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(storage.busy_timeout_secs));
 
