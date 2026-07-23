@@ -15,8 +15,12 @@
 //! - **Delete**: 删除文件
 //! - **Move**: 移动/重命名文件
 
+use crate::file::edit::filelock::with_file_lock;
 use crate::file::edit::fuzzy::fuzzy_find_and_replace;
 use crate::file::edit::patch::{OperationType, PatchOperation, parse_v4a_patch};
+use crate::file::edit::textutil::{
+    detect_line_ending, join_bom, normalize_line_endings, split_bom, trim_common_indent,
+};
 use crate::file::safety::check_sensitive_path;
 use crate::file::tracker::{check_file_staleness, update_read_timestamp};
 use similar::TextDiff;
@@ -90,23 +94,56 @@ pub fn apply_replace(
 
     let stale_warning = check_file_staleness(path_display, task_id);
 
-    let content = match std::fs::read_to_string(file_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return EditReplaceResult {
-                success: false,
-                path: path_display.to_string(),
-                matches: 0,
-                strategy: None,
-                diff: String::new(),
-                warning: None,
-                error: Some(format!("无权限访问文件: {e}")),
+    // 「读-改-写」整段包进 per-path 文件锁，防止同一文件并发编辑覆盖
+    let (new_content, original_content, match_count, strategy, error) =
+        with_file_lock(file_path, || {
+            // 读取时分离 BOM（原文件可能带 \u{FEFF}，需记录并写回时还原）
+            let raw = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        String::new(),
+                        String::new(),
+                        0,
+                        None,
+                        Some(format!("无权限访问文件: {e}")),
+                    );
+                }
             };
-        }
-    };
 
-    let (new_content, match_count, strategy, error) =
-        fuzzy_find_and_replace(&content, old_string, new_string, replace_all);
+            let (content, has_bom) = split_bom(&raw);
+            // 检测原文件行尾风格，用于写入前把 new_content 转回该风格（保真）
+            let ending = detect_line_ending(content);
+
+            let (new_content, match_count, strategy, error) =
+                fuzzy_find_and_replace(content, old_string, new_string, replace_all);
+
+            if error.is_some() {
+                return (String::new(), String::new(), 0, None, error);
+            }
+
+            // 写入前保真：把 fuzzy 替换后的内容转回原文件行尾风格，并还原 BOM
+            let to_write = ending.apply(&new_content);
+            let to_write = join_bom(&to_write, has_bom);
+
+            if let Err(e) = std::fs::write(file_path, to_write.as_bytes()) {
+                return (
+                    String::new(),
+                    String::new(),
+                    0,
+                    None,
+                    Some(format!("写入文件失败: {e}")),
+                );
+            }
+
+            (
+                new_content,
+                content.to_string(),
+                match_count,
+                strategy,
+                None,
+            )
+        });
 
     if let Some(err) = error {
         return EditReplaceResult {
@@ -120,19 +157,7 @@ pub fn apply_replace(
         };
     }
 
-    if let Err(e) = std::fs::write(file_path, &new_content) {
-        return EditReplaceResult {
-            success: false,
-            path: path_display.to_string(),
-            matches: 0,
-            strategy: None,
-            diff: String::new(),
-            warning: None,
-            error: Some(format!("写入文件失败: {e}")),
-        };
-    }
-
-    let diff = generate_unified_diff(&content, &new_content, path_display, path_display);
+    let diff = generate_unified_diff(&original_content, &new_content, path_display, path_display);
 
     update_read_timestamp(path_display, task_id);
 
@@ -502,8 +527,17 @@ fn apply_update(op: &PatchOperation, workspace: &Path, task_id: &str) -> Result<
 }
 
 /// 生成 unified diff 格式的差异文本
+///
+/// 两步处理：
+/// 1. 生成前把换行符归一化为 LF——`similar` 的 `from_lines` 会把 `\r` 当作行内容保留，
+///    导致 CRLF 文件的 diff 每行末尾残留 `\r`，给 LLM 展示时显得杂乱。
+/// 2. 生成后压缩公共前导缩进——深嵌套代码的 diff 保留大量公共缩进会浪费 token。
+///
+/// diff 仅用于展示改动，不影响磁盘文件（磁盘写入走行尾保真 + BOM 还原）。
 fn generate_unified_diff(old: &str, new: &str, from_file: &str, to_file: &str) -> String {
-    let diff = TextDiff::from_lines(old, new);
+    let old_norm = normalize_line_endings(old);
+    let new_norm = normalize_line_endings(new);
+    let diff = TextDiff::from_lines(&old_norm, &new_norm);
     let mut output = String::new();
 
     for hunk in diff
@@ -514,7 +548,7 @@ fn generate_unified_diff(old: &str, new: &str, from_file: &str, to_file: &str) -
         output.push_str(&hunk.to_string());
     }
 
-    output
+    trim_common_indent(&output)
 }
 
 /// 检查编辑操作的物理安全（敏感路径检查）
@@ -606,5 +640,18 @@ mod tests {
     fn apply_v4a_patch_empty() {
         let result = apply_v4a_patch("", Path::new("/tmp"), "test_task");
         assert!(!result.success);
+    }
+
+    #[test]
+    fn diff_crlf_stripped() {
+        // CRLF 文件生成的 diff 不应残留 \r（避免给 LLM 展示杂乱的 \r）
+        let old = "enabled = false\r\nurl = \"x\"\r\n";
+        let new = "enabled = true\r\nurl = \"x\"\r\n";
+        let diff = generate_unified_diff(old, new, "f.toml", "f.toml");
+        assert!(
+            !diff.contains('\r'),
+            "diff 输出不应包含 \\r，实际：{diff:?}"
+        );
+        assert!(diff.contains("enabled = true"));
     }
 }

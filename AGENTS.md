@@ -15,13 +15,33 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 ## 项目导航
 
-所有源码在 `crates/` 下，11 个 crate 按依赖层次组织（L0→L4），依赖严格单向，禁止反向依赖：
+所有源码在 `crates/` 下，11 个 crate 依赖严格单向，禁止反向依赖。按职责分五类：
 
-- **L0** `fuyao-api`：公共类型 + 配置 + 路径（零内部依赖）
-- **L1** `fuyao-provider` / `fuyao-mcp` / `fuyao-skills` / `fuyao-hooks`：能力层（各自独立）
-- **L2** `fuyao-prompt` / `fuyao-guard`：构建层
-- **L3** `fuyao-core` / `fuyao-session` / `fuyao-tools`：内核层
-- **L4** `fuyao-app`：装配入口（依赖几乎所有下层）
+**基座**（公共类型）：
+
+- `fuyao-api`：公共类型（trait / 配置 / 路径 / 消息 / 事件协议），零内部依赖，所有 crate 的地基
+
+**引擎内核**（ReAct 循环 + session 管理）：
+
+- `fuyao-core`：ReAct 循环 + dispatch 统一消息管道 + 多 session 调度，对外暴露四个动作（启动 / 创建 / 恢复 / 收发）。session 化双层架构的「能力共享层」，持有 provider / DB 句柄 / 出口通道
+
+**内核协作者**（core 的直接依赖，构成内核但不参与 ReAct 编排）：
+
+- `fuyao-session`：会话持久化（SQLite CRUD）+ 上下文压缩 + 费用计算 + 标题生成
+- `fuyao-prompt`：系统提示词分层构建（覆盖区 + 补充区）+ Agent 定义加载与注册表
+- `fuyao-hooks`：钩子系统（拦截 + 观察）+ 插件两层模型（Plugin 工厂 / PluginInstance 实例）
+
+**能力实现**（引擎装配的能力，彼此独立、可增删替换）：
+
+- `fuyao-provider`：LLM 客户端（自建 HTTP，OpenAI 兼容）+ ProviderRegistry 多路由
+- `fuyao-mcp`：MCP Server 连接管理 + 工具发现 / 注册 / 调用
+- `fuyao-skills`：Agent Skills 协议（发现 / 加载 / 解析）
+- `fuyao-tools`：内置工具实现集合（file / terminal / web / todo / skill）
+- `fuyao-guard`：内置防护插件（循环检测，防重复执行 / 输出），基于 hooks 插件机制接入
+
+**装配入口**（项目唯一的组装点，把下层能力装配成可用的引擎）：
+
+- `fuyao-app`：一键装配入口（init → 收集工具 → 启动引擎），应用层（cli / tui）的唯一依赖
 
 ### 文档导航
 

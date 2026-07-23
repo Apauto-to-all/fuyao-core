@@ -14,9 +14,11 @@
 //! - 编辑后更新追踪器时间戳
 
 pub mod backend;
+pub mod filelock;
 pub mod fuzzy;
 mod handler;
 pub mod patch;
+pub mod textutil;
 pub mod types;
 
 use crate::registry::ToolEntry;
