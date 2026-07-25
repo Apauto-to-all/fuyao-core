@@ -9,7 +9,7 @@
 //! - [`accumulate_session_total`]：累积 Session.total_*（cost 用 Decimal 精确累加，
 //!   避免 f64 直接相加的精度误差）
 
-use fuyao_api::{AgentPaths, Message, PriceTier, Session};
+use fuyao_api::{AgentPaths, Message, MessageRole, PriceTier, Session};
 use fuyao_provider::{StreamUsage, get_model};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -187,7 +187,7 @@ pub fn fill_message_cost(
 ///
 /// 落库走 `SessionStore::update`，全量 UPDATE 把 session.total_* 和 messages.cost 写入 DB。
 pub fn accumulate_session_total(session: &mut Session, msg: &Message) {
-    if msg.role != "assistant" {
+    if !matches!(msg.role, MessageRole::Assistant) {
         return;
     }
 

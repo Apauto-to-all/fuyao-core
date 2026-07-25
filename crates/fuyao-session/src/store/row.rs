@@ -1,6 +1,6 @@
 //! 数据库行映射：sessions / messages 表 ↔ 领域类型（Session / Message）
 
-use fuyao_api::{Message, MessageKind, Session};
+use fuyao_api::{Message, MessageKind, MessageRole, Session};
 use sqlx::FromRow;
 
 /// 会话行（数据库列映射，字段顺序与 sessions 表一致）
@@ -77,11 +77,15 @@ impl From<MessageRow> for Message {
                 None
             }
         });
+        // 未知 role 兜底为 User 并记可观测日志（DB 历史脏数据：首字母大写、旧版本残留等）
+        if !MessageRole::is_known(&r.role) {
+            tracing::warn!(role = %r.role, "未知消息角色，兜底为 User");
+        }
         Message {
             id: r.id,
             session_id: r.session_id,
             model_id: r.model_id,
-            role: r.role,
+            role: MessageRole::parse(&r.role),
             content: r.content,
             reasoning: r.reasoning,
             tool_call_id: r.tool_call_id,

@@ -109,6 +109,63 @@ impl MessageKind {
     }
 }
 
+/// 消息角色（对话语义类型）
+///
+/// 四种变体覆盖所有主流 LLM 协议（OpenAI / Anthropic / Gemini / Bedrock）的角色语义：
+/// - `User` / `Assistant` 是对话骨架
+/// - `System` 表达操作者高权限指令
+/// - `Tool` 表达工具执行结果
+///
+/// 序列化为小写字符串，与 DB 现有 TEXT 列数据、wire format 完全兼容——零迁移。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    /// 用户消息
+    #[default]
+    User,
+    /// 助手消息
+    Assistant,
+    /// 工具结果消息
+    Tool,
+    /// 系统消息（含压缩边界消息，后者靠 `kind=Compaction` 区分）
+    System,
+}
+
+impl MessageRole {
+    /// 序列化为数据库存储 / wire format 的小写字符串
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::System => "system",
+        }
+    }
+
+    /// 从数据库字符串反序列化，未知值兜底为 `User`
+    ///
+    /// DB 里可能存在历史脏数据（手动改库、旧版本残留、首字母大写的 `"Assistant"` 等），
+    /// 反序列化遇到未知字符串时兜底为 `User`（不阻断流程）。可观测日志由调用方在
+    /// 持有 DB 上下文的层（如 `fuyao_session::store::row`）记录——本函数保持纯函数，
+    /// 与 `MessageKind::parse` 一致，避免给地基 crate 引入日志依赖。
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "tool" => Self::Tool,
+            "system" => Self::System,
+            _ => Self::User,
+        }
+    }
+
+    /// 判断是否为已知角色（非兜底值）
+    ///
+    /// 供调用方在 `parse` 后判断是否命中兜底，以便记录可观测日志。
+    pub fn is_known(s: &str) -> bool {
+        matches!(s, "user" | "assistant" | "tool" | "system")
+    }
+}
+
 /// 消息（持久化单元）
 #[derive(Debug, Clone, Default)]
 pub struct Message {
@@ -118,8 +175,8 @@ pub struct Message {
     pub session_id: String,
     /// 模型 ID
     pub model_id: Option<String>,
-    /// 角色：user / assistant / system / tool / developer
-    pub role: String,
+    /// 角色：user / assistant / system / tool
+    pub role: MessageRole,
     /// 消息内容
     pub content: Option<String>,
     /// 推理内容
@@ -154,7 +211,7 @@ impl Message {
     /// 创建用户消息
     pub fn user(content: String) -> Self {
         Self {
-            role: "user".to_string(),
+            role: MessageRole::User,
             content: Some(content),
             timestamp: current_timestamp(),
             ..Self::default()
@@ -164,7 +221,7 @@ impl Message {
     /// 创建 assistant 消息
     pub fn assistant(content: Option<String>) -> Self {
         Self {
-            role: "assistant".to_string(),
+            role: MessageRole::Assistant,
             content,
             timestamp: current_timestamp(),
             ..Self::default()
@@ -174,7 +231,7 @@ impl Message {
     /// 创建工具结果消息
     pub fn tool_result(tool_call_id: String, content: String) -> Self {
         Self {
-            role: "tool".to_string(),
+            role: MessageRole::Tool,
             tool_call_id: Some(tool_call_id),
             content: Some(content),
             timestamp: current_timestamp(),
@@ -185,7 +242,7 @@ impl Message {
     /// 创建系统消息
     pub fn system(content: String) -> Self {
         Self {
-            role: "system".to_string(),
+            role: MessageRole::System,
             content: Some(content),
             timestamp: current_timestamp(),
             ..Self::default()
@@ -194,11 +251,11 @@ impl Message {
 
     /// 创建压缩边界消息（上下文压缩专用）
     ///
-    /// `content` = 摘要正文（Markdown）；`role='system'` 避免与 user/assistant
+    /// `content` = 摘要正文（Markdown）；`role=System` 避免与 user/assistant
     /// 流混淆，`kind=Compaction` 是真正的类型标记（DB 列 + 业务识别都靠它）。
     pub fn compaction(summary: String) -> Self {
         Self {
-            role: "system".to_string(),
+            role: MessageRole::System,
             content: Some(summary),
             timestamp: current_timestamp(),
             kind: MessageKind::Compaction,
@@ -209,10 +266,10 @@ impl Message {
     /// 转换为 OpenAI API 格式的 JSON Value
     pub fn to_openai(&self) -> serde_json::Value {
         let mut msg = serde_json::Map::new();
-        msg.insert("role".to_string(), serde_json::json!(&self.role));
+        msg.insert("role".to_string(), serde_json::json!(self.role.as_str()));
 
-        match self.role.as_str() {
-            "assistant" => {
+        match self.role {
+            MessageRole::Assistant => {
                 // Qwen 不接受 tool_calls + content=""，有工具调用且无内容时不设置 content
                 if self.tool_calls.is_some() && self.content.is_none() {
                     // 不设置 content
@@ -232,7 +289,7 @@ impl Message {
                     );
                 }
             }
-            "tool" => {
+            MessageRole::Tool => {
                 if let Some(tool_call_id) = &self.tool_call_id {
                     msg.insert("tool_call_id".to_string(), serde_json::json!(tool_call_id));
                 }
@@ -241,7 +298,7 @@ impl Message {
                     serde_json::json!(self.content.as_deref().unwrap_or("")),
                 );
             }
-            _ => {
+            MessageRole::User | MessageRole::System => {
                 msg.insert(
                     "content".to_string(),
                     serde_json::json!(self.content.as_deref().unwrap_or("")),
@@ -295,28 +352,28 @@ mod tests {
     #[test]
     fn message_user_creates_user_role() {
         let msg = Message::user("你好".to_string());
-        assert_eq!(msg.role, "user");
+        assert_eq!(msg.role, MessageRole::User);
         assert_eq!(msg.content, Some("你好".to_string()));
     }
 
     #[test]
     fn message_assistant_creates_assistant_role() {
         let msg = Message::assistant(Some("回复内容".to_string()));
-        assert_eq!(msg.role, "assistant");
+        assert_eq!(msg.role, MessageRole::Assistant);
         assert_eq!(msg.content, Some("回复内容".to_string()));
     }
 
     #[test]
     fn message_tool_result_creates_tool_role() {
         let msg = Message::tool_result("call_123".to_string(), "结果".to_string());
-        assert_eq!(msg.role, "tool");
+        assert_eq!(msg.role, MessageRole::Tool);
         assert_eq!(msg.tool_call_id, Some("call_123".to_string()));
     }
 
     #[test]
     fn message_system_creates_system_role() {
         let msg = Message::system("系统提示".to_string());
-        assert_eq!(msg.role, "system");
+        assert_eq!(msg.role, MessageRole::System);
     }
 
     #[test]
@@ -335,7 +392,7 @@ mod tests {
             "function": { "name": "bash", "arguments": "{}" }
         }]);
         let msg = Message {
-            role: "assistant".to_string(),
+            role: MessageRole::Assistant,
             content: None,
             tool_calls: Some(tool_calls),
             ..Message::default()
@@ -357,7 +414,7 @@ mod tests {
     #[test]
     fn message_to_openai_assistant_with_reasoning() {
         let msg = Message {
-            role: "assistant".to_string(),
+            role: MessageRole::Assistant,
             content: Some("回复".to_string()),
             reasoning: Some("思考过程".to_string()),
             ..Message::default()
@@ -369,7 +426,7 @@ mod tests {
     #[test]
     fn message_default_role_is_user() {
         let msg = Message::default();
-        assert_eq!(msg.role, "");
+        assert_eq!(msg.role, MessageRole::User);
     }
 
     #[test]
@@ -399,7 +456,49 @@ mod tests {
     fn message_compaction_marks_kind() {
         let msg = Message::compaction("## 目标\n- 测试".to_string());
         assert_eq!(msg.kind, MessageKind::Compaction);
-        assert_eq!(msg.role, "system");
+        assert_eq!(msg.role, MessageRole::System);
         assert_eq!(msg.content.as_deref(), Some("## 目标\n- 测试"));
+    }
+
+    #[test]
+    fn message_role_roundtrip() {
+        // as_str 输出小写，与 DB 存量数据 / wire format 一致
+        assert_eq!(MessageRole::User.as_str(), "user");
+        assert_eq!(MessageRole::Assistant.as_str(), "assistant");
+        assert_eq!(MessageRole::Tool.as_str(), "tool");
+        assert_eq!(MessageRole::System.as_str(), "system");
+
+        // parse 正向解析
+        assert_eq!(MessageRole::parse("user"), MessageRole::User);
+        assert_eq!(MessageRole::parse("assistant"), MessageRole::Assistant);
+        assert_eq!(MessageRole::parse("tool"), MessageRole::Tool);
+        assert_eq!(MessageRole::parse("system"), MessageRole::System);
+
+        // 未知值（首字母大写 / 脏数据）兜底为 User
+        assert_eq!(MessageRole::parse("Assistant"), MessageRole::User);
+        assert_eq!(MessageRole::parse("developer"), MessageRole::User);
+        assert_eq!(MessageRole::parse("unknown"), MessageRole::User);
+
+        // is_known 区分已知 / 未知
+        assert!(MessageRole::is_known("user"));
+        assert!(MessageRole::is_known("assistant"));
+        assert!(MessageRole::is_known("tool"));
+        assert!(MessageRole::is_known("system"));
+        assert!(!MessageRole::is_known("Assistant"));
+        assert!(!MessageRole::is_known("developer"));
+    }
+
+    #[test]
+    fn message_role_default_is_user() {
+        assert_eq!(MessageRole::default(), MessageRole::User);
+    }
+
+    #[test]
+    fn message_role_serializes_lowercase() {
+        // wire format：序列化输出小写字符串
+        let json = serde_json::to_string(&MessageRole::Assistant).unwrap();
+        assert_eq!(json, "\"assistant\"");
+        let json = serde_json::to_string(&MessageRole::Tool).unwrap();
+        assert_eq!(json, "\"tool\"");
     }
 }

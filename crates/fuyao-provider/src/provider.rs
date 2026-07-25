@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::Stream;
-use fuyao_api::ThinkingType;
+use fuyao_api::{MessageRole, ThinkingType};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
@@ -82,7 +82,7 @@ pub struct ChatRequest {
 /// 对话消息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,
+    pub role: MessageRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,7 +98,7 @@ pub struct ChatMessage {
 impl Default for ChatMessage {
     fn default() -> Self {
         Self {
-            role: "user".to_string(),
+            role: MessageRole::User,
             content: None,
             reasoning: None,
             tool_calls: None,
@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn chat_message_default_role_is_user() {
         let msg = ChatMessage::default();
-        assert_eq!(msg.role, "user");
+        assert_eq!(msg.role, MessageRole::User);
     }
 
     #[test]

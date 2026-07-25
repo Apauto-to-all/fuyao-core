@@ -13,7 +13,7 @@
 use crate::compressor::prompt::COMPRESSION_SYSTEM_PROMPT;
 use crate::compressor::window::{estimate_tokens, select_recent};
 use futures_util::StreamExt;
-use fuyao_api::{CompressionConfig, Message};
+use fuyao_api::{CompressionConfig, Message, MessageRole};
 use fuyao_provider::{
     BoxStream, ChatMessage, ChatRequest, Provider, StreamError, StreamEvent, StreamOptions,
 };
@@ -49,7 +49,7 @@ pub struct SummaryResult {
 /// 不做任何序列化或重构——这是前缀缓存的生命线。
 fn to_chat_message(m: &Message) -> ChatMessage {
     ChatMessage {
-        role: m.role.clone(),
+        role: m.role,
         content: m.content.clone(),
         reasoning: m.reasoning.clone(),
         tool_calls: m.tool_calls.as_ref().and_then(|tc| tc.as_array().cloned()),
@@ -95,7 +95,7 @@ pub async fn generate_summary(
     // system 保持 session 原值不变 —— 前缀缓存的生命线
     let mut chat_messages: Vec<ChatMessage> = messages.iter().map(to_chat_message).collect();
     chat_messages.push(ChatMessage {
-        role: "user".to_string(),
+        role: MessageRole::User,
         content: Some(COMPRESSION_SYSTEM_PROMPT.to_string()),
         ..Default::default()
     });
@@ -319,7 +319,7 @@ mod tests {
         msg.tool_name = Some("bash".to_string());
 
         let cm = to_chat_message(&msg);
-        assert_eq!(cm.role, "assistant");
+        assert_eq!(cm.role, MessageRole::Assistant);
         assert_eq!(cm.content.as_deref(), Some("回复"));
         assert_eq!(cm.reasoning.as_deref(), Some("思考"));
         assert!(cm.tool_calls.is_some());

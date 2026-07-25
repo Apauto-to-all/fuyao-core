@@ -6,6 +6,7 @@
 use super::*;
 use async_trait::async_trait;
 use futures_util::stream;
+use fuyao_api::MessageRole;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::{
@@ -430,8 +431,8 @@ async fn single_turn_no_tools() {
     // user + assistant（事件级落库，从 DB 查询验证）
     let msgs = visible_messages(&h).await;
     assert_eq!(msgs.len(), 2);
-    assert_eq!(msgs[0].role, "user");
-    assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(msgs[0].role, MessageRole::User);
+    assert_eq!(msgs[1].role, MessageRole::Assistant);
 }
 
 /// 有工具循环：先工具调用 → 执行 echo → 再最终回复
@@ -454,7 +455,7 @@ async fn react_loop_with_tool() {
     let msgs = visible_messages(&h).await;
     assert!(msgs.len() >= 3, "应含 user/assistant/tool 至少 3 条");
     let last = msgs.last().unwrap();
-    assert_eq!(last.role, "assistant");
+    assert_eq!(last.role, MessageRole::Assistant);
 }
 
 /// 工具结果进 messages（tool_call_id 回填）
@@ -472,7 +473,7 @@ async fn tool_result_in_messages() {
     let msgs = visible_messages(&h).await;
     let tool_msg = msgs
         .iter()
-        .find(|m| m.role == "tool")
+        .find(|m| matches!(m.role, MessageRole::Tool))
         .expect("应有 tool 角色消息");
     assert_eq!(tool_msg.tool_call_id.as_deref(), Some("tc_42"));
     assert!(tool_msg.content.as_ref().unwrap().contains("echo"));
@@ -520,7 +521,7 @@ async fn guide_all_consumed_on_tool_complete() {
     let user_msgs: Vec<_> = visible_messages(&h)
         .await
         .iter()
-        .filter(|m| m.role == "user")
+        .filter(|m| matches!(m.role, MessageRole::User))
         .map(|m| m.content.clone().unwrap_or_default())
         .collect();
     assert!(user_msgs.contains(&"原始问题".to_string()));
@@ -565,7 +566,7 @@ async fn pending_before_guide_on_final_reply() {
     let user_msgs: Vec<_> = visible_messages(&h)
         .await
         .iter()
-        .filter(|m| m.role == "user")
+        .filter(|m| matches!(m.role, MessageRole::User))
         .map(|m| m.content.clone().unwrap_or_default())
         .collect();
     assert!(
@@ -1130,7 +1131,7 @@ async fn messages_persisted_to_db() {
     // 验证 tool 消息的 tool_call_id 回填正确
     let tool_msg = reloaded
         .iter()
-        .find(|m| m.role == "tool")
+        .find(|m| matches!(m.role, MessageRole::Tool))
         .expect("应有 tool 消息");
     assert_eq!(
         tool_msg.tool_call_id.as_deref(),
@@ -1296,7 +1297,7 @@ async fn cost_accumulated_per_assistant_message() {
     let assistant_msgs: Vec<_> = visible_messages(&h)
         .await
         .iter()
-        .filter(|m| m.role == "assistant")
+        .filter(|m| matches!(m.role, MessageRole::Assistant))
         .cloned()
         .collect();
     assert_eq!(
@@ -1388,7 +1389,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     // 1. DB 最后一条是修改后的内容
     let msgs = visible_messages(&h).await;
     let last_msg = msgs.last().expect("应有 assistant 消息进 DB");
-    assert_eq!(last_msg.role, "assistant");
+    assert_eq!(last_msg.role, MessageRole::Assistant);
     assert_eq!(
         last_msg.content.as_deref(),
         Some("[脱敏]原始内容"),
@@ -1405,7 +1406,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     let assistant_in_request = request
         .messages
         .iter()
-        .rfind(|m| m.role == "assistant")
+        .rfind(|m| matches!(m.role, MessageRole::Assistant))
         .expect("ChatRequest 应包含 assistant 消息");
     assert_eq!(
         assistant_in_request.content.as_deref(),
@@ -1445,7 +1446,9 @@ async fn intercept_block_skips_final_assistant_in_history() {
 
     // Block：不应有任何 assistant 消息进 DB（只有 preload 的 user）
     let msgs = visible_messages(&h).await;
-    let has_assistant = msgs.iter().any(|m| m.role == "assistant");
+    let has_assistant = msgs
+        .iter()
+        .any(|m| matches!(m.role, MessageRole::Assistant));
     assert!(!has_assistant, "Block 时 assistant 消息不应进 DB");
     // total_cost 也应为 0（拦截 Block 的消息不计费）
     assert_eq!(h.session.total_cost, 0.0, "Block 时不应累积任何费用");

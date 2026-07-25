@@ -3,7 +3,7 @@
 //! 仅用于决定 apply 时「保留多少近账」（keep_recent），不再参与摘要请求构造——
 //! 摘要请求把全部消息原样发给 LLM，不切窗口、不序列化，前缀缓存完整命中。
 
-use fuyao_api::{Message, MessageKind};
+use fuyao_api::{Message, MessageKind, MessageRole};
 
 /// 4 字符 ≈ 1 token 的粗估
 const CHARS_PER_TOKEN: usize = 4;
@@ -83,11 +83,11 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
 
     // 切分点处是安全消息（user/system/普通 assistant）：无需扩大
     let first = &messages[cut];
-    if first.role != "tool" && first.role != "assistant" {
+    if !matches!(first.role, MessageRole::Tool | MessageRole::Assistant) {
         return cut;
     }
     // 普通文本 assistant（无 tool_calls）：本身是安全边界
-    if first.role == "assistant" && first.tool_calls.is_none() {
+    if matches!(first.role, MessageRole::Assistant) && first.tool_calls.is_none() {
         return cut;
     }
     // 压缩边界消息：安全边界
@@ -100,13 +100,13 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
     while scan > 0 {
         let msg = &messages[scan];
 
-        if msg.role == "tool" {
+        if matches!(msg.role, MessageRole::Tool) {
             // tool 消息被切断了，需要向前找对应的 assistant
             scan -= 1;
             continue;
         }
 
-        if msg.role == "assistant" {
+        if matches!(msg.role, MessageRole::Assistant) {
             if let Some(ref tool_calls) = msg.tool_calls {
                 // 检查这个 assistant 的所有 tool_call_id 是否在后续消息中都有 result
                 // 解析出 owned id 列表避免借用冲突
@@ -128,7 +128,7 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
                 // 收集 cut 之后的 tool result id
                 let result_ids: std::collections::HashSet<&str> = messages[scan + 1..total]
                     .iter()
-                    .filter(|m| m.role == "tool")
+                    .filter(|m| matches!(m.role, MessageRole::Tool))
                     .filter_map(|m| m.tool_call_id.as_deref())
                     .collect();
 

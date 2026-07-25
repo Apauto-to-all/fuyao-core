@@ -26,7 +26,7 @@ mod intercept;
 
 use crate::emit::Emitter;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::{Message, Session};
+use fuyao_api::{Message, MessageRole, Session};
 use fuyao_hooks::SharedHooks;
 use fuyao_session::SessionStore;
 use std::future::Future;
@@ -110,7 +110,7 @@ pub(crate) async fn emit_to_history(
     if let Some(mut msg) = msg_from_event(&intercepted) {
         // 自动累积 session.total_*（仅 assistant 角色；cost 用 Decimal 精确累加，
         // 避免 f64 加法误差——累积逻辑统一在 fuyao_session::accumulate_session_total）
-        let is_assistant = msg.role == "assistant";
+        let is_assistant = matches!(msg.role, MessageRole::Assistant);
         let msg_cost = msg.cost;
         fuyao_session::accumulate_session_total(session, &msg);
         if is_assistant {

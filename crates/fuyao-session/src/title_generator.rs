@@ -85,7 +85,7 @@ async fn generate_title(
     let request = ChatRequest {
         system: Some(TITLE_PROMPT.to_string()),
         messages: vec![ChatMessage {
-            role: "user".to_string(),
+            role: fuyao_api::MessageRole::User,
             content: Some(format!("用户: {user_snippet}\n\n助手: {assistant_snippet}")),
             ..ChatMessage::default()
         }],

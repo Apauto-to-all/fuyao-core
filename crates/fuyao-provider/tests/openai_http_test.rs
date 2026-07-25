@@ -9,6 +9,7 @@
 //! 用 from_parts 注入 mockito server URL，绕开全局 config 与真实网络。
 
 use futures_util::StreamExt;
+use fuyao_api::MessageRole;
 use fuyao_provider::{
     ChatMessage, ChatRequest, FinishReason, OpenAIProvider, Provider, StreamError, StreamEvent,
     StreamOptions,
@@ -28,7 +29,7 @@ fn mock_provider(server: &Server) -> OpenAIProvider {
 fn simple_request(content: &str) -> ChatRequest {
     ChatRequest {
         messages: vec![ChatMessage {
-            role: "user".to_string(),
+            role: MessageRole::User,
             content: Some(content.to_string()),
             ..Default::default()
         }],

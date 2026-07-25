@@ -3,7 +3,7 @@
 use super::SessionStore;
 use super::compaction::CompressionReason;
 use crate::error::SessionError;
-use fuyao_api::{Message, MessageKind, Session};
+use fuyao_api::{Message, MessageKind, MessageRole, Session};
 use tempfile::tempdir;
 
 /// 构造临时存储（隔离的临时目录，测试结束自动清理）
@@ -182,7 +182,7 @@ async fn mark_compaction_inserts_boundary_message() {
     let boundary = &full[2];
     assert_eq!(boundary.seq, 3);
     assert_eq!(boundary.kind, MessageKind::Compaction);
-    assert_eq!(boundary.role, "system");
+    assert_eq!(boundary.role, MessageRole::System);
     assert_eq!(boundary.content.as_deref(), Some("## 目标\n- 测试"));
 }
 

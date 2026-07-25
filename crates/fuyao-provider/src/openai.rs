@@ -110,7 +110,7 @@ impl OpenAIProvider {
         // 对话消息
         for msg in request.messages {
             let mut msg_value = serde_json::json!({
-                "role": msg.role,
+                "role": msg.role.as_str(),
             });
 
             // 内容
@@ -764,7 +764,7 @@ impl Provider for OpenAIProvider {
 mod tests {
     use super::*;
     use crate::provider::{ChatMessage, ChatRequest, StreamOptions as ProviderStreamOptions};
-    use fuyao_api::ThinkingType;
+    use fuyao_api::{MessageRole, ThinkingType};
 
     #[test]
     fn chat_url_appends_path() {
@@ -798,7 +798,7 @@ mod tests {
         let provider = test_provider();
         let request = ChatRequest {
             messages: vec![ChatMessage {
-                role: "user".to_string(),
+                role: MessageRole::User,
                 content: Some("hello".to_string()),
                 ..Default::default()
             }],
@@ -837,7 +837,7 @@ mod tests {
         let provider = test_provider();
         let request = ChatRequest {
             messages: vec![ChatMessage {
-                role: "user".to_string(),
+                role: MessageRole::User,
                 content: Some("hi".to_string()),
                 ..Default::default()
             }],

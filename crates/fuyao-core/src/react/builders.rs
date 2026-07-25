@@ -12,9 +12,9 @@
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::ModelConfig;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
+use fuyao_api::{MessageRole, ModelConfig};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 use fuyao_session::SessionStore;
 
@@ -64,7 +64,7 @@ pub(crate) async fn build_chat_request(
     // 先收集所有已有 tool 结果的 tool_call_id（用于配对检查）
     let mut answered_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for m in &history {
-        if m.role == "tool"
+        if matches!(m.role, MessageRole::Tool)
             && let Some(id) = &m.tool_call_id
         {
             answered_ids.insert(id.as_str());
@@ -74,7 +74,7 @@ pub(crate) async fn build_chat_request(
     let mut messages = Vec::with_capacity(history.len());
     for m in &history {
         messages.push(ChatMessage {
-            role: m.role.clone(),
+            role: m.role,
             content: m.content.clone(),
             reasoning: m.reasoning.clone(),
             tool_calls: m.tool_calls.as_ref().and_then(|tc| tc.as_array().cloned()),
@@ -83,7 +83,7 @@ pub(crate) async fn build_chat_request(
         });
 
         // assistant 消息后：为缺结果的 tool_call 补 error tool_result
-        if m.role == "assistant"
+        if matches!(m.role, MessageRole::Assistant)
             && let Some(tool_calls) = m.tool_calls.as_ref().and_then(|tc| tc.as_array())
         {
             for tc in tool_calls {
@@ -91,7 +91,7 @@ pub(crate) async fn build_chat_request(
                 if !id.is_empty() && !answered_ids.contains(id) {
                     // 缺结果：补 error tool_result
                     messages.push(ChatMessage {
-                        role: "tool".to_string(),
+                        role: MessageRole::Tool,
                         content: Some("[工具执行被拦截或中断]".to_string()),
                         reasoning: None,
                         tool_calls: None,
@@ -351,7 +351,7 @@ mod tests {
         let tool_msgs: Vec<_> = request
             .messages
             .iter()
-            .filter(|m| m.role == "tool")
+            .filter(|m| matches!(m.role, MessageRole::Tool))
             .collect();
         assert_eq!(tool_msgs.len(), 3, "应有 3 条 tool 消息（1真实+2补充）");
 
@@ -388,7 +388,11 @@ mod tests {
 
         let request =
             build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
-        let tool_count = request.messages.iter().filter(|m| m.role == "tool").count();
+        let tool_count = request
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .count();
         assert_eq!(tool_count, 2, "全部有结果时不补充");
     }
 

@@ -36,7 +36,7 @@ use fuyao_api::message::output::{
     AssistantMessage, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, TitleMessage, TitlePayload,
 };
-use fuyao_api::{Message, ModelConfig, Session};
+use fuyao_api::{Message, MessageRole, ModelConfig, Session};
 use fuyao_provider::Provider;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -301,7 +301,10 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult) {
     };
 
     // 计数法判定首轮
-    let user_count = visible.iter().filter(|m| m.role == "user").count();
+    let user_count = visible
+        .iter()
+        .filter(|m| matches!(m.role, MessageRole::User))
+        .count();
     if user_count != 1 {
         return;
     }
@@ -309,7 +312,7 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult) {
     // 取首条 user content + 本轮 assistant 文本（StreamResult.text 是本轮流式累积全文）
     let user_content = visible
         .iter()
-        .find(|m| m.role == "user")
+        .find(|m| matches!(m.role, MessageRole::User))
         .and_then(|m| m.content.clone())
         .unwrap_or_default();
     let assistant_content = result.text.clone();
@@ -319,7 +322,7 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult) {
     let main_model_id = visible
         .iter()
         .rev()
-        .find(|m| m.role == "assistant")
+        .find(|m| matches!(m.role, MessageRole::Assistant))
         .and_then(|m| m.model_id.clone())
         .unwrap_or_default();
 
@@ -631,7 +634,7 @@ async fn emit_interrupt_and_complete_tool_results(
     {
         Ok(msgs) => msgs
             .iter()
-            .filter(|m| m.role == "tool")
+            .filter(|m| matches!(m.role, MessageRole::Tool))
             .filter_map(|m| m.tool_call_id.clone())
             .collect(),
         Err(e) => {
