@@ -29,10 +29,13 @@ use crate::interrupt::{
 use crate::react::queue;
 use crate::stream::StreamResult;
 use crate::tool_exec;
+use fuyao_api::InterruptSource;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::input::{InterruptMessage, InterruptPayload, InterruptSource};
-use fuyao_api::message::output::{AssistantMessage, TitleMessage, TitlePayload};
+use fuyao_api::message::output::{
+    AssistantMessage, InterruptMessage as OutputInterruptMessage,
+    InterruptPayload as OutputInterruptPayload, TitleMessage, TitlePayload,
+};
 use fuyao_api::{Message, ModelConfig, Session};
 use fuyao_provider::Provider;
 use std::sync::Arc;
@@ -43,11 +46,10 @@ use tokio::sync::mpsc::Receiver;
 /// shutdown 中断语义：source=Shutdown / reason="引擎关闭"。
 /// 走与用户中断完全相同的 emit_interrupt_event + handle_interrupt 路径，
 /// 让 UI 收到标准 Interrupt 事件，DB 记录能区分「引擎关闭中断」vs「用户主动中断」。
-fn shutdown_interrupt_payload() -> InterruptPayload {
-    InterruptPayload {
-        reason: "引擎关闭".to_string(),
-        source: InterruptSource::Shutdown,
-    }
+///
+/// 内核内部产生的中断载荷本就是 output 侧类型，直接构造。
+fn shutdown_interrupt_payload() -> OutputInterruptPayload {
+    OutputInterruptPayload::new("引擎关闭", InterruptSource::Shutdown)
 }
 
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环注入 session.messages）
@@ -57,7 +59,7 @@ fn shutdown_interrupt_payload() -> InterruptPayload {
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     session: &mut Session,
-    rx_interrupt: &mut Receiver<InterruptMessage>,
+    rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     model_config: ModelConfig,
 ) {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
@@ -377,7 +379,7 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult) {
 async fn handle_tool_calls(
     ctx: &SessionCtx,
     session: &mut Session,
-    rx_interrupt: &mut Receiver<InterruptMessage>,
+    rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
 ) {
@@ -617,7 +619,7 @@ async fn emit_interrupt_and_complete_tool_results(
     ctx: &SessionCtx,
     session: &mut Session,
     effective_tool_calls: &[fuyao_provider::ToolCallData],
-    payload: &InterruptPayload,
+    payload: &OutputInterruptPayload,
 ) {
     emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 

@@ -29,6 +29,29 @@ pub struct InterruptPayload {
     pub source: InterruptSource,
 }
 
+impl InterruptPayload {
+    /// 构造中断载荷
+    ///
+    /// 内核链路只认 output 侧类型，入口（Engine::send 转化、SessionSender 直产）
+    /// 统一用此方法构造，避免散落的字段照搬样板。
+    pub fn new(reason: impl Into<String>, source: InterruptSource) -> Self {
+        Self {
+            reason: reason.into(),
+            source,
+        }
+    }
+}
+
+impl InterruptMessage {
+    /// 构造中断事件（base 取默认值，自动生成 id/timestamp）
+    pub fn new(reason: impl Into<String>, source: InterruptSource) -> Self {
+        Self {
+            base: EventBase::default(),
+            payload: InterruptPayload::new(reason, source),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

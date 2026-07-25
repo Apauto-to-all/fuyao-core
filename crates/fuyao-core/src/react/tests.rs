@@ -9,6 +9,7 @@ use futures_util::stream;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::{
+    InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
     UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
 };
 use fuyao_provider::{
@@ -304,9 +305,9 @@ fn empty_hooks() -> fuyao_hooks::SharedHooks {
 struct TestHarness {
     ctx: SessionCtx,
     session: Session,
-    rx_interrupt: Receiver<InterruptMessage>,
+    rx_interrupt: Receiver<OutputInterruptMessage>,
     #[allow(dead_code)]
-    tx_interrupt: mpsc::Sender<InterruptMessage>,
+    tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
     rx_event: mpsc::Receiver<OutputEvent>,
 }
 
@@ -615,11 +616,11 @@ async fn pending_consumed_when_task_idle() {
     // 入站通道（User 消息经此送进 session task 过管道入队）
     let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
     // tx 必须随测试存活以保持中断通道打开（rx_interrupt.recv() 不提前返回 None）
-    let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
-    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
+    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
+    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
     // Plugin 通道（保持打开，避免 rx_plugin.recv() 提前返回 None）
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<fuyao_api::message::input::PluginMessage>(16);
+    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
     let (tx_event, mut rx_event) = mpsc::channel(128);
 
     // 启动 session 执行流（两队列都空，task 进入 select! 等待）
@@ -679,16 +680,16 @@ async fn pending_consumed_when_task_idle() {
     assert!(guide.lock().unwrap().is_empty(), "guide 应保持空");
 }
 
-/// Plugin 消息路由：经 tx_plugin 通道发 InputEvent::Plugin 携带的 PluginMessage →
-/// 从 rx_event 流出 OutputEvent::Plugin（session_id 标签正确）。
+/// Plugin 消息路由：经 tx_plugin 通道发 output 侧 PluginMessage（Engine::send
+/// 已在入口转化） → 从 rx_event 流出 OutputEvent::Plugin（session_id 标签正确）。
 ///
-/// 验证阶段 2 新链路：
-/// - InputEvent::Plugin 不再在 Engine 层直发 OutputEvent::Plugin
-/// - 改为送进 session 的 tx_plugin 通道，由 session task 过 dispatch 管道
-/// - 经 Emitter 自动盖 session_id 标签
+/// 验证链路：
+/// - tx_plugin 通道承载 output 侧 PluginMessage（入口转化后内核只认 output 侧）
+/// - session task 过 dispatch 管道，经 Emitter 自动盖 session_id 标签
 #[tokio::test]
 async fn plugin_message_routes_through_dispatch() {
-    use fuyao_api::message::input::{PluginEventSource, PluginMessage, PluginPayload};
+    use fuyao_api::PluginEventSource;
+    use fuyao_api::message::output::{PluginMessage, PluginPayload};
 
     // 不会被调用（Plugin 消息不触发 ReAct），随便给个空响应占位
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
@@ -701,11 +702,11 @@ async fn plugin_message_routes_through_dispatch() {
     let guide = empty_queue();
     let pending = empty_queue();
     let (_tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
-    let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
-    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
+    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
+    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
     // tx_plugin 需要保留以发送消息
-    let (tx_plugin, rx_plugin) = mpsc::channel::<fuyao_api::message::input::PluginMessage>(16);
+    let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
     let (tx_event, mut rx_event) = mpsc::channel(128);
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -729,7 +730,7 @@ async fn plugin_message_routes_through_dispatch() {
         tx_event,
     ));
 
-    // 模拟 Engine::send 的 Plugin 分支：发一条 Plugin 消息到 tx_plugin 通道
+    // 模拟 Engine::send 入口转化后送入 tx_plugin 通道的 output 侧 PluginMessage
     tx_plugin
         .send(PluginMessage {
             base: fuyao_api::message::EventBase::default(),
@@ -784,8 +785,8 @@ async fn plugin_message_routes_through_dispatch() {
 /// handle_interrupt 读 TurnState 已累积的"你好"发部分 AssistantMessage。
 #[tokio::test]
 async fn interrupt_during_streaming() {
-    use fuyao_api::message::input::InterruptSource;
-    use fuyao_api::message::input::{InterruptMessage, InterruptPayload};
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
 
     // 准备 1 轮事件流（中断发生在首轮流式期间）
     let (provider, txs) = ControllableProvider::with_batches(1);
@@ -815,13 +816,7 @@ async fn interrupt_during_streaming() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         tx_interrupt
-            .send(InterruptMessage {
-                base: fuyao_api::message::EventBase::default(),
-                payload: InterruptPayload {
-                    reason: "用户取消".into(),
-                    source: InterruptSource::User,
-                },
-            })
+            .send(InterruptMessage::new("用户取消", InterruptSource::User))
             .await
             .unwrap();
     };
@@ -862,8 +857,8 @@ async fn interrupt_during_streaming() {
 /// 阻塞式工具 handler 卡住 → 发中断信号 → exec_fut 被 drop，统一补发中断式 ToolResult。
 #[tokio::test]
 async fn interrupt_during_tool_execution() {
-    use fuyao_api::message::input::InterruptSource;
-    use fuyao_api::message::input::{InterruptMessage, InterruptPayload};
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
 
     let provider = Arc::new(MockProvider::new(vec![MockProvider::tool_call_response(
         "tc_block",
@@ -900,13 +895,7 @@ async fn interrupt_during_tool_execution() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         tx_interrupt
-            .send(InterruptMessage {
-                base: fuyao_api::message::EventBase::default(),
-                payload: InterruptPayload {
-                    reason: "用户取消".into(),
-                    source: InterruptSource::User,
-                },
-            })
+            .send(InterruptMessage::new("用户取消", InterruptSource::User))
             .await
             .unwrap();
     };

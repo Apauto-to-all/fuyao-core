@@ -265,14 +265,14 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuyao_api::PluginEventSource;
     use fuyao_api::UserMessageMode;
     use fuyao_api::message::EventBase;
-    use fuyao_api::message::input::{
-        InterruptMessage, PluginEventSource, PluginMessage, PluginSource,
-    };
+    use fuyao_api::message::input::PluginSource;
     use fuyao_api::message::output::{
-        ChunkPayload, ToolCallPayload, ToolResultPayload, UserMessage as OutputUserMessage,
-        UserPayload as OutputUserPayload,
+        ChunkPayload, InterruptMessage as OutputInterruptMessage,
+        PluginMessage as OutputPluginMessage, ToolCallPayload, ToolResultPayload,
+        UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
     };
     use fuyao_hooks::SessionSender;
     use tokio::sync::mpsc;
@@ -283,8 +283,8 @@ mod tests {
     /// 测试按需解构对应 rx 验证消息流向。
     fn make_sender() -> (
         SessionSender,
-        mpsc::Receiver<PluginMessage>,
-        mpsc::Receiver<InterruptMessage>,
+        mpsc::Receiver<OutputPluginMessage>,
+        mpsc::Receiver<OutputInterruptMessage>,
         mpsc::Receiver<OutputUserMessage>,
     ) {
         let (tx_plugin, rx_plugin) = mpsc::channel(16);

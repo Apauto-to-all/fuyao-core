@@ -31,6 +31,44 @@ pub struct PluginPayload {
     pub message: Option<String>,
 }
 
+impl PluginPayload {
+    /// 构造插件事件载荷
+    ///
+    /// 内核链路只认 output 侧类型，入口（Engine::send 转化、SessionSender 直产）
+    /// 统一用此方法构造，避免散落的字段照搬样板。
+    pub fn new(
+        source: PluginEventSource,
+        event_type: impl Into<String>,
+        data: Option<serde_json::Value>,
+        error: Option<String>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            source,
+            event_type: event_type.into(),
+            data,
+            error,
+            message,
+        }
+    }
+}
+
+impl PluginMessage {
+    /// 构造插件事件（base 取默认值，自动生成 id/timestamp）
+    pub fn new(
+        source: PluginEventSource,
+        event_type: impl Into<String>,
+        data: Option<serde_json::Value>,
+        error: Option<String>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            base: EventBase::default(),
+            payload: PluginPayload::new(source, event_type, data, error, message),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,8 +3,10 @@
 //! 集中放引擎模块间共享的类型别名、状态类型。
 
 use fuyao_api::SessionParams;
-use fuyao_api::message::input::{InterruptMessage, PluginMessage};
-use fuyao_api::message::output::UserMessage as OutputUserMessage;
+use fuyao_api::message::output::{
+    InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
+    UserMessage as OutputUserMessage,
+};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -21,8 +23,8 @@ pub type SessionId = String;
 
 /// 共享队列（guide / pending 对等，同类型，可互倒）
 ///
-/// 队列载荷直接复用 output 侧 `OutputUserMessage`——内核统一处理输出侧消息
-///（见 AGENTS.md「消息处理原则」），入站载荷与队列载荷类型完全一致，
+/// 队列载荷直接复用 output 侧 `OutputUserMessage`——内核统一处理输出侧消息，
+/// 入站载荷与队列载荷类型完全一致，
 /// 复用同一类型避免无意义的拆解/重组（也消除字段丢失风险）。
 pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<OutputUserMessage>>>;
 
@@ -46,10 +48,10 @@ pub(crate) struct SessionHandle {
     pub pending: SharedQueue,
     /// 入站通道发送端（User 消息，output 侧 OutputUserMessage）
     pub tx_inbound: Sender<OutputUserMessage>,
-    /// 中断通道发送端（Interrupt）
-    pub tx_interrupt: Sender<InterruptMessage>,
-    /// Plugin 通道发送端（Plugin 通知，过 dispatch 管道发外部）
-    pub tx_plugin: Sender<PluginMessage>,
+    /// 中断通道发送端（output 侧 InterruptMessage，入口转化后承载）
+    pub tx_interrupt: Sender<OutputInterruptMessage>,
+    /// Plugin 通道发送端（output 侧 PluginMessage，入口转化后承载）
+    pub tx_plugin: Sender<OutputPluginMessage>,
     /// 对话级参数共享句柄（与 SessionCtx.session_params 指向同一份）
     ///
     /// Engine 的 update_session_params 经此写回；task 内的消费点（跑 turn、压缩）

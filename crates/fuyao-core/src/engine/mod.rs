@@ -12,7 +12,10 @@ use crate::engine::types::{SessionHandle, SharedQueue};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
+use fuyao_api::PluginEventSource;
+use fuyao_api::message::output::{
+    InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
+};
 use fuyao_api::{EngineParams, InputEvent, OutputEvent, Session, SessionParams};
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
@@ -236,10 +239,10 @@ impl Engine {
         // 用 tokio::Mutex：Engine 写与 task 读均跨 async 上下文（与 SessionCtx.session_params 同型）。
         let session_params = Arc::new(Mutex::new(session_params));
 
-        // 三条 session 级通道
+        // 三条 session 级通道（载荷统一为 output 侧类型——入口转化后内核只认 output 侧）
         let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::message::output::UserMessage>(16);
-        let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
-        let (tx_plugin, rx_plugin) = mpsc::channel::<PluginMessage>(16);
+        let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+        let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
 
         // 该 session 的关闭信号（引擎级 shutdown_token 的 child_token）
         //   Engine::shutdown 调 root.cancel → 所有 child 同时 cancel
@@ -301,8 +304,8 @@ impl Engine {
         &self,
         session_id: &SessionId,
         tx_inbound: mpsc::Sender<fuyao_api::message::output::UserMessage>,
-        tx_interrupt: mpsc::Sender<InterruptMessage>,
-        tx_plugin: mpsc::Sender<PluginMessage>,
+        tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
+        tx_plugin: mpsc::Sender<OutputPluginMessage>,
     ) -> SharedHooks {
         let mut registry = HooksRegistry::new();
 
@@ -401,20 +404,34 @@ impl Engine {
                     .map_err(|_| EngineError::Shutdown)?;
             }
             InputEvent::Interrupt(interrupt_msg) => {
-                // 中断走独立通道（select! 中断点监听）
+                // 入口转化：input 侧 InterruptMessage → output 侧 InterruptMessage。
+                // input 侧消息的唯一职责就是在此被转化，之后内核链路（通道、select!、
+                // emit_interrupt_event）全程只认 output 侧类型。
+                let outbound = OutputInterruptMessage::new(
+                    interrupt_msg.payload.reason,
+                    interrupt_msg.payload.source,
+                );
                 handle
                     .tx_interrupt
-                    .send(interrupt_msg)
+                    .send(outbound)
                     .await
                     .map_err(|_| EngineError::Shutdown)?;
             }
             InputEvent::Plugin(plugin_msg) => {
-                // 插件通知送进 session 的 Plugin 通道，由 session task 过 dispatch 管道：
-                // 拦截 → 发送（盖 session_id 标签发外部） → 观察
-                // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道
+                // 入口转化：input 侧 PluginMessage → output 侧 PluginMessage。
+                // 转化后送 session 的 Plugin 通道，由 session task 过 dispatch 管道：
+                // 拦截 → 发送（盖 session_id 标签发外部） → 观察。
+                // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道。
+                let outbound = OutputPluginMessage::new(
+                    plugin_msg.payload.source,
+                    plugin_msg.payload.event_type,
+                    plugin_msg.payload.data,
+                    plugin_msg.payload.error,
+                    plugin_msg.payload.message,
+                );
                 handle
                     .tx_plugin
-                    .send(plugin_msg)
+                    .send(outbound)
                     .await
                     .map_err(|_| EngineError::Shutdown)?;
             }

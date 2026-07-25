@@ -11,10 +11,11 @@ use super::host::{PluginHost, PluginInstallError};
 use super::instance::PluginInstance;
 use super::sender::SessionSender;
 use crate::HooksRegistry;
+use fuyao_api::InterruptSource;
+use fuyao_api::PluginEventSource;
 use fuyao_api::UserMessageMode;
-use fuyao_api::message::input::{
-    InterruptMessage, InterruptSource, PluginEventSource, PluginMessage,
-};
+use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
+use fuyao_api::message::output::PluginMessage as OutputPluginMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -374,8 +375,8 @@ fn plugin_instance_default_dispose_noop() {
 fn make_sender() -> (
     SessionSender,
     tokio::sync::mpsc::Receiver<OutputUserMessage>,
-    tokio::sync::mpsc::Receiver<InterruptMessage>,
-    tokio::sync::mpsc::Receiver<PluginMessage>,
+    tokio::sync::mpsc::Receiver<OutputInterruptMessage>,
+    tokio::sync::mpsc::Receiver<OutputPluginMessage>,
 ) {
     let (tx_user, rx_user) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);

@@ -12,11 +12,12 @@
 //! 这是"真·主动"模式：插件自主决定何时发送，引擎只负责消费。
 //! 所有发送方法用 `try_send`（非阻塞），失败记 warn（不阻塞 hook 执行）。
 
+use fuyao_api::InterruptSource;
+use fuyao_api::PluginEventSource;
 use fuyao_api::message::EventBase;
-use fuyao_api::message::input::{
-    InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource, PluginMessage,
-    PluginPayload, PluginSource, UserMessageMode, UserMessageSource,
-};
+use fuyao_api::message::input::{PluginSource, UserMessageMode, UserMessageSource};
+use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
+use fuyao_api::message::output::PluginMessage as OutputPluginMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::output::UserPayload as OutputUserPayload;
 use tokio::sync::mpsc::Sender;
@@ -29,8 +30,8 @@ use tokio::sync::mpsc::Sender;
 ///
 /// 所有方法用 `try_send`（非阻塞）：通道满或关闭时静默忽略，仅记 warn 日志。
 ///
-/// User 消息直接发送 output 侧 `OutputUserMessage`——内核统一处理输出侧消息，
-/// 入站通道与队列载荷类型均为 `OutputUserMessage`（见 AGENTS.md「消息处理原则」）。
+/// 三条通道载荷统一为 output 侧类型——插件是内核内组件，直接产出 output 侧消息，
+/// 不经 input 中间态（与外部 `InputEvent` 经 `Engine::send` 入口转化的路径在地基上统一）。
 #[derive(Clone)]
 pub struct SessionSender {
     /// 绑定的插件身份（自动填 Plugin 消息的 source 字段）
@@ -38,9 +39,9 @@ pub struct SessionSender {
     /// User 消息发送端（送进 session 入站通道）
     tx_user: Sender<OutputUserMessage>,
     /// Interrupt 消息发送端（送进 session 中断通道）
-    tx_interrupt: Sender<InterruptMessage>,
+    tx_interrupt: Sender<OutputInterruptMessage>,
     /// Plugin 消息发送端（送进 session Plugin 通道）
-    tx_plugin: Sender<PluginMessage>,
+    tx_plugin: Sender<OutputPluginMessage>,
 }
 
 impl SessionSender {
@@ -48,8 +49,8 @@ impl SessionSender {
     pub fn new(
         identity: PluginEventSource,
         tx_user: Sender<OutputUserMessage>,
-        tx_interrupt: Sender<InterruptMessage>,
-        tx_plugin: Sender<PluginMessage>,
+        tx_interrupt: Sender<OutputInterruptMessage>,
+        tx_plugin: Sender<OutputPluginMessage>,
     ) -> Self {
         Self {
             identity,
@@ -102,14 +103,11 @@ impl SessionSender {
     /// 发送 Interrupt 消息（中断当前 session 的执行）
     ///
     /// source 自动标记为 `Hook`，与用户主动中断区分。
+    /// 直接产出 output 侧 InterruptMessage（内核内组件不经 input 中间态）。
     pub fn send_interrupt(&self, reason: impl Into<String>) {
-        let result = self.tx_interrupt.try_send(InterruptMessage {
-            base: EventBase::default(),
-            payload: InterruptPayload {
-                reason: reason.into(),
-                source: InterruptSource::Hook,
-            },
-        });
+        let result = self
+            .tx_interrupt
+            .try_send(OutputInterruptMessage::new(reason, InterruptSource::Hook));
         if let Err(e) = result {
             tracing::warn!(
                 plugin = %self.identity.name,
@@ -135,6 +133,7 @@ impl SessionSender {
     /// 发送完整 Plugin 消息（自动填 source = identity, base = default）
     ///
     /// source 字段自动绑定构造时的 identity，无需调用方手填，杜绝命名漂移。
+    /// 直接产出 output 侧 PluginMessage（内核内组件不经 input 中间态）。
     pub fn send_plugin_full(
         &self,
         event_type: &str,
@@ -142,16 +141,13 @@ impl SessionSender {
         error: Option<String>,
         message: Option<String>,
     ) {
-        let result = self.tx_plugin.try_send(PluginMessage {
-            base: EventBase::default(),
-            payload: PluginPayload {
-                source: self.identity.clone(),
-                event_type: event_type.to_string(),
-                data,
-                error,
-                message,
-            },
-        });
+        let result = self.tx_plugin.try_send(OutputPluginMessage::new(
+            self.identity.clone(),
+            event_type,
+            data,
+            error,
+            message,
+        ));
         if let Err(e) = result {
             tracing::warn!(
                 plugin = %self.identity.name,

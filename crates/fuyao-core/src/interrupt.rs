@@ -19,9 +19,9 @@
 
 use crate::dispatch;
 use crate::emit::Emitter;
+use fuyao_api::InterruptSource;
 use fuyao_api::Message;
 use fuyao_api::Session;
-use fuyao_api::message::input::{InterruptPayload, InterruptSource};
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, ToolResultMessage, ToolResultPayload,
@@ -103,7 +103,7 @@ pub(crate) fn classify(state: &TurnState) -> InterruptKind {
 pub(crate) async fn handle_interrupt(
     state: &SharedTurnState,
     kind: InterruptKind,
-    interrupt: &InterruptPayload,
+    interrupt: &OutputInterruptPayload,
     emitter: &Emitter,
     hooks: &SharedHooks,
     store: &SessionStore,
@@ -288,25 +288,19 @@ fn make_interrupt_tool_result(
 
 /// 发送中断通知事件（用户可见的停止信号）
 ///
-/// 由 react 在 select! 命中中断命令时调用，转 input Interrupt 为 output Interrupt 事件。
+/// 入参已是 output 侧 InterruptPayload（内核链路只认 output 侧），
+/// 包成 OutputEvent::Interrupt 过 dispatch 管道发出。由 react 在 select! 命中
+/// 中断命令时调用。
 pub(crate) async fn emit_interrupt_event(
-    interrupt: &InterruptPayload,
+    interrupt: &OutputInterruptPayload,
     emitter: &Emitter,
     hooks: &SharedHooks,
 ) {
-    dispatch::dispatch(
-        emitter,
-        hooks,
-        OutputEvent::Interrupt(OutputInterruptMessage {
-            base: EventBase::default(),
-            payload: OutputInterruptPayload {
-                reason: interrupt.reason.clone(),
-                source: interrupt.source.clone(),
-            },
-        }),
-        None,
-    )
-    .await;
+    let event = OutputEvent::Interrupt(OutputInterruptMessage {
+        base: EventBase::default(),
+        payload: interrupt.clone(),
+    });
+    dispatch::dispatch(emitter, hooks, event, None).await;
 }
 
 #[cfg(test)]
@@ -345,10 +339,7 @@ mod tests {
         let hooks: SharedHooks = Arc::new(tokio::sync::Mutex::new(
             fuyao_hooks::HooksRegistry::default(),
         ));
-        let interrupt = InterruptPayload {
-            reason: "用户取消".into(),
-            source: InterruptSource::User,
-        };
+        let interrupt = OutputInterruptPayload::new("用户取消", InterruptSource::User);
 
         // 构造临时 store + session（消息进 DB）
         let dir =

@@ -34,12 +34,11 @@ use crate::interrupt::emit_interrupt_event;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::input::{InterruptMessage, PluginMessage};
+use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::output::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
-    PluginPayload as OutputPluginPayload,
 };
 use fuyao_api::{CompressionConfig, EventBase, Session, SessionParams};
 use fuyao_hooks::SharedHooks;
@@ -114,8 +113,8 @@ pub(crate) async fn run_session(
     guide: SharedQueue,
     pending: SharedQueue,
     mut rx_inbound: Receiver<OutputUserMessage>,
-    mut rx_interrupt: Receiver<InterruptMessage>,
-    mut rx_plugin: Receiver<PluginMessage>,
+    mut rx_interrupt: Receiver<OutputInterruptMessage>,
+    mut rx_plugin: Receiver<OutputPluginMessage>,
     shutdown_token: CancellationToken,
     mut session: Session,
     store: Arc<fuyao_session::SessionStore>,
@@ -524,26 +523,22 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
     }
 }
 
-/// 处理入站 Plugin 消息：把 input 侧 PluginMessage 转 output 侧 OutputEvent::Plugin，
-/// 过完整 dispatch 管道（拦截 → 发送 → 观察）。
+/// 处理入站 Plugin 消息：通道承载的就是 output 侧 PluginMessage，
+/// 直接包成 `OutputEvent::Plugin` 过完整 dispatch 管道（拦截 → 发送 → 观察）。
 ///
 /// process 段传 None——Plugin 消息无需特殊处理（不像 User 要入队），纯通知透传。
 /// 发送时 Emitter 自动盖 session_id 标签。
 fn handle_inbound_plugin(
     ctx: &SessionCtx,
-    plugin_msg: PluginMessage,
+    plugin_msg: OutputPluginMessage,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
     Box::pin(async move {
-        let output_event = OutputEvent::Plugin(OutputPluginMessage {
-            base: plugin_msg.base,
-            payload: OutputPluginPayload {
-                source: plugin_msg.payload.source,
-                event_type: plugin_msg.payload.event_type,
-                data: plugin_msg.payload.data,
-                error: plugin_msg.payload.error,
-                message: plugin_msg.payload.message,
-            },
-        });
-        dispatch::dispatch(&ctx.emitter, &ctx.hooks, output_event, None).await;
+        dispatch::dispatch(
+            &ctx.emitter,
+            &ctx.hooks,
+            OutputEvent::Plugin(plugin_msg),
+            None,
+        )
+        .await;
     })
 }

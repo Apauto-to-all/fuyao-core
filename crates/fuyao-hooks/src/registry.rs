@@ -172,7 +172,9 @@ impl HooksRegistry {
 mod tests {
     use super::*;
     use crate::plugin::SessionSender;
-    use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
+    use fuyao_api::PluginEventSource;
+    use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
+    use fuyao_api::message::output::PluginMessage as OutputPluginMessage;
     use fuyao_api::message::output::UserMessage as OutputUserMessage;
     use std::sync::Arc;
 
@@ -180,8 +182,8 @@ mod tests {
     fn make_sender() -> (
         SessionSender,
         tokio::sync::mpsc::Receiver<OutputUserMessage>,
-        tokio::sync::mpsc::Receiver<InterruptMessage>,
-        tokio::sync::mpsc::Receiver<PluginMessage>,
+        tokio::sync::mpsc::Receiver<OutputInterruptMessage>,
+        tokio::sync::mpsc::Receiver<OutputPluginMessage>,
     ) {
         let (tx_user, rx_user) = tokio::sync::mpsc::channel(16);
         let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);
