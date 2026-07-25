@@ -11,11 +11,11 @@ use super::host::{PluginHost, PluginInstallError};
 use super::instance::PluginInstance;
 use super::sender::SessionSender;
 use crate::HooksRegistry;
-use fuyao_api::InboundUser;
 use fuyao_api::UserMessageMode;
 use fuyao_api::message::input::{
     InterruptMessage, InterruptSource, PluginEventSource, PluginMessage,
 };
+use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -373,7 +373,7 @@ fn plugin_instance_default_dispose_noop() {
 /// 构造测试用 SessionSender + 三条接收端
 fn make_sender() -> (
     SessionSender,
-    tokio::sync::mpsc::Receiver<InboundUser>,
+    tokio::sync::mpsc::Receiver<OutputUserMessage>,
     tokio::sync::mpsc::Receiver<InterruptMessage>,
     tokio::sync::mpsc::Receiver<PluginMessage>,
 ) {
@@ -397,8 +397,8 @@ async fn sender_send_user_uses_guide_mode_by_default() {
     let (sender, mut rx_user, _rx_int, _rx_plug) = make_sender();
     sender.send_user("hello");
     let received = rx_user.recv().await.expect("应收到 User 消息");
-    assert_eq!(received.message.payload.content, "hello");
-    assert_eq!(received.message.payload.mode, UserMessageMode::Guide);
+    assert_eq!(received.payload.content, "hello");
+    assert_eq!(received.payload.mode, UserMessageMode::Guide);
 }
 
 /// send_user_with_mode 指定 Pending 模式
@@ -407,8 +407,8 @@ async fn sender_send_user_with_mode_pending() {
     let (sender, mut rx_user, _rx_int, _rx_plug) = make_sender();
     sender.send_user_with_mode("排队", UserMessageMode::Pending);
     let received = rx_user.recv().await.expect("应收到 User 消息");
-    assert_eq!(received.message.payload.content, "排队");
-    assert_eq!(received.message.payload.mode, UserMessageMode::Pending);
+    assert_eq!(received.payload.content, "排队");
+    assert_eq!(received.payload.mode, UserMessageMode::Pending);
 }
 
 /// send_interrupt 投递到 Interrupt 通道，source = Hook
@@ -473,7 +473,7 @@ async fn sender_three_channels_are_independent() {
     assert!(rx_plug.try_recv().is_err(), "Plugin 通道不应有消息");
     // User 通道有消息
     let received = rx_user.recv().await.expect("User 通道应有消息");
-    assert_eq!(received.message.payload.content, "只发 User");
+    assert_eq!(received.payload.content, "只发 User");
 }
 
 /// identity() 只读访问

@@ -265,7 +265,6 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::InboundUser;
     use fuyao_api::UserMessageMode;
     use fuyao_api::message::EventBase;
     use fuyao_api::message::input::{
@@ -286,7 +285,7 @@ mod tests {
         SessionSender,
         mpsc::Receiver<PluginMessage>,
         mpsc::Receiver<InterruptMessage>,
-        mpsc::Receiver<InboundUser>,
+        mpsc::Receiver<OutputUserMessage>,
     ) {
         let (tx_plugin, rx_plugin) = mpsc::channel(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel(16);

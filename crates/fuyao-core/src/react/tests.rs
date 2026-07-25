@@ -6,7 +6,6 @@
 use super::*;
 use async_trait::async_trait;
 use futures_util::stream;
-use fuyao_api::MessageParams;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::{
@@ -233,49 +232,52 @@ fn echo_registry() -> Arc<ToolRegistry> {
     Arc::new(ToolRegistry::builder().register(entry).build())
 }
 
-/// 测试用 MessageParams：携带 `test/...` 形式的 model_id
+/// 测试用 ModelConfig：携带 `test/...` 形式的 model_id
 ///
 /// 必须带 model_id——否则 turn.rs::resolve_model 在 None + 无 [models.default] 时
 /// 返回 Err，走配置错误分支结束 turn，测试 ReAct 行为就跑不起来。所有测试的
 /// ProviderRegistry 都用 `with_instance("test", ...)` 构造，model_id 拆出的
 /// provider_id = "test" 能匹配到。
-fn test_params() -> MessageParams {
-    MessageParams {
-        model_config: fuyao_api::ModelConfig {
-            model_id: Some("test/test-model".to_string()),
-            thinking_type: None,
-            reasoning_effort: None,
+fn test_params() -> fuyao_api::ModelConfig {
+    fuyao_api::ModelConfig {
+        model_id: Some("test/test-model".to_string()),
+        thinking_type: None,
+        reasoning_effort: None,
+    }
+}
+
+/// 测试用 SessionParams（model_id 同 test_params，供 SessionCtx 构造用）
+fn test_session_params() -> fuyao_api::SessionParams {
+    fuyao_api::SessionParams {
+        agent_config: fuyao_api::AgentConfig::default(),
+        model_config: test_params(),
+    }
+}
+
+/// 构造测试用入站消息（默认 Guide 模式 + User 来源）
+///
+/// 返回 output 侧 `OutputUserMessage`——内核统一处理输出侧消息，入站通道与队列
+/// 载荷均为此类型。模型配置不再随消息携带，由 session 的 SessionParams 提供。
+fn make_inbound(content: &str) -> OutputUserMessage {
+    OutputUserMessage {
+        base: EventBase::default(),
+        payload: OutputUserPayload {
+            content: content.to_string(),
+            mode: UserMessageMode::Guide,
+            source: UserMessageSource::User,
         },
     }
 }
 
-/// 构造测试用 InboundUser（默认 Guide 模式 + User 来源）
-fn make_inbound(content: &str) -> fuyao_api::InboundUser {
-    fuyao_api::InboundUser {
-        message: OutputUserMessage {
-            base: EventBase::default(),
-            payload: OutputUserPayload {
-                content: content.to_string(),
-                mode: UserMessageMode::Guide,
-                source: UserMessageSource::User,
-            },
+/// 构造测试用入站消息（指定 mode）
+fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> OutputUserMessage {
+    OutputUserMessage {
+        base: EventBase::default(),
+        payload: OutputUserPayload {
+            content: content.to_string(),
+            mode,
+            source: UserMessageSource::User,
         },
-        params: test_params(),
-    }
-}
-
-/// 构造测试用 InboundUser（指定 mode）
-fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> fuyao_api::InboundUser {
-    fuyao_api::InboundUser {
-        message: OutputUserMessage {
-            base: EventBase::default(),
-            payload: OutputUserPayload {
-                content: content.to_string(),
-                mode,
-                source: UserMessageSource::User,
-            },
-        },
-        params: test_params(),
     }
 }
 
@@ -337,7 +339,7 @@ async fn make_harness_with_hooks(
         tools,
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
-        session_params: fuyao_api::SessionParams::default(),
+        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
         emitter: Emitter::new(tx_event, "test_session".to_string()),
         guide: empty_queue(),
         pending: empty_queue(),
@@ -611,7 +613,7 @@ async fn pending_consumed_when_task_idle() {
     let guide = empty_queue();
     let pending = empty_queue();
     // 入站通道（User 消息经此送进 session task 过管道入队）
-    let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
+    let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
     // tx 必须随测试存活以保持中断通道打开（rx_interrupt.recv() 不提前返回 None）
     let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
@@ -638,7 +640,7 @@ async fn pending_consumed_when_task_idle() {
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
-        fuyao_api::SessionParams::default(),
+        Arc::new(tokio::sync::Mutex::new(test_session_params())),
         tx_event,
     ));
 
@@ -698,7 +700,7 @@ async fn plugin_message_routes_through_dispatch() {
 
     let guide = empty_queue();
     let pending = empty_queue();
-    let (_tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
+    let (_tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
     let _tx_interrupt = mpsc::channel::<InterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
@@ -723,7 +725,7 @@ async fn plugin_message_routes_through_dispatch() {
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         fuyao_api::AgentPaths::default(),
-        fuyao_api::SessionParams::default(),
+        Arc::new(tokio::sync::Mutex::new(test_session_params())),
         tx_event,
     ));
 
@@ -1267,9 +1269,9 @@ async fn cost_accumulated_per_assistant_message() {
     let mut h = make_harness(provider, echo_registry()).await;
     preload_user(&mut h, "测费用累积").await;
 
-    // 用带 model_id 的 params，让累积逻辑能查到价格表
+    // 用带 model_id 的 model_config，让累积逻辑能查到价格表
     let mut params = test_params();
-    params.model_config.model_id = Some("test/cost-model".to_string());
+    params.model_id = Some("test/cost-model".to_string());
 
     turn::run_turn(&h.ctx, &mut h.session, &mut h.rx_interrupt, params).await;
 
@@ -1496,7 +1498,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         tools: Arc::new(ToolRegistry::builder().build()),
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
-        session_params: fuyao_api::SessionParams::default(),
+        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
         emitter,
         guide: empty_queue(),
         pending: empty_queue(),
@@ -1552,7 +1554,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         tools: Arc::new(ToolRegistry::builder().build()),
         hooks,
         agent_paths: fuyao_api::AgentPaths::default(),
-        session_params: fuyao_api::SessionParams::default(),
+        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
         emitter,
         guide: empty_queue(),
         pending: empty_queue(),
@@ -1570,18 +1572,15 @@ async fn inject_messages_preserves_plugin_source_in_event() {
     ctx.store.create(&session).await.unwrap();
 
     // 构造一条 Plugin 来源消息（模拟 SessionSender.send_user 注入）
-    let inbound = fuyao_api::InboundUser {
-        message: OutputUserMessage {
-            base: EventBase::default(),
-            payload: OutputUserPayload {
-                content: "循环检测提醒".into(),
-                mode: UserMessageMode::Guide,
-                source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
-                    name: "loop_guard".into(),
-                }),
-            },
+    let inbound = OutputUserMessage {
+        base: EventBase::default(),
+        payload: OutputUserPayload {
+            content: "循环检测提醒".into(),
+            mode: UserMessageMode::Guide,
+            source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
+                name: "loop_guard".into(),
+            }),
         },
-        params: test_params(),
     };
     queue::inject_messages(&ctx, &mut session, vec![inbound]).await;
 

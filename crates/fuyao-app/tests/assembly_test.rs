@@ -16,30 +16,34 @@ use std::time::Duration;
 use common::{MockProvider, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{EngineParams, MessageParams, ModelConfig, SessionParams};
+use fuyao_api::{EngineParams, ModelConfig, SessionParams};
 use fuyao_app::build_tool_registry;
 use fuyao_core::{Engine, PluginHost};
 use fuyao_provider::{
     BoxStream, ChatRequest, ChatResponse, StreamError, StreamEvent, StreamOptions,
 };
 
-/// 构造 Guide 模式的用户消息
-fn guide_user_message(content: &str, model_id: &str) -> (InputEvent, MessageParams) {
-    let event = InputEvent::User(UserMessage {
+/// 构造 Guide 模式的用户消息（模型配置由 session 的 SessionParams 决定，不随消息走）
+fn guide_user_message(content: &str) -> InputEvent {
+    InputEvent::User(UserMessage {
         base: EventBase::default(),
         payload: UserPayload {
             content: content.to_string(),
             mode: Default::default(),
             source: Default::default(),
         },
-    });
-    let params = MessageParams {
+    })
+}
+
+/// 测试用 SessionParams：携带 `test/model` 形式的 model_id（与各测试的 ProviderRegistry 匹配）
+fn test_session_params() -> SessionParams {
+    SessionParams {
         model_config: ModelConfig {
-            model_id: Some(model_id.to_string()),
+            model_id: Some("test/model".to_string()),
             ..Default::default()
         },
-    };
-    (event, params)
+        ..Default::default()
+    }
 }
 
 // ============================================================================
@@ -102,16 +106,13 @@ async fn assembled_engine_runs_react_loop() {
 
     // 创建 session
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     // 发一条 guide 消息（触发一轮 ReAct）
-    let (event, params) = guide_user_message("装配后测试", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("装配后测试");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     // 收事件，验证装配后引擎可产出 Chunk + Assistant
     let mut got_chunk = false;
@@ -215,15 +216,12 @@ async fn retry_runner_emits_retry_event_then_succeeds() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
-    let (event, params) = guide_user_message("测试重试", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("测试重试");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     // 收事件：期望顺序 Retry(attempt=1) → Chunk → Assistant
     let mut got_retry = false;
@@ -289,15 +287,12 @@ async fn retry_runner_no_retry_on_auth_error() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
-    let (event, params) = guide_user_message("测试严重错误", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("测试严重错误");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     // 收事件：应有 Error，不应有 Retry
     let mut got_error = false;
@@ -368,15 +363,12 @@ async fn retry_runner_no_retry_after_first_chunk() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
-    let (event, params) = guide_user_message("测试首 chunk", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("测试首 chunk");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     let mut got_error = false;
     let mut got_retry = false;
@@ -448,15 +440,12 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
-    let (event, params) = guide_user_message("测试持续重试", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("测试持续重试");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     // 2 秒内应至少看到 2 条 Retry 事件（attempt 递增）
     let mut retry_attempts = Vec::new();
@@ -507,15 +496,15 @@ async fn shutdown_blocks_send_with_shutdown_error() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     engine.shutdown().await;
 
     // shutdown 后 send 应立即返回 Shutdown 错误
-    let (event, params) = guide_user_message("shutdown 后的发送", "test/model");
-    let result = engine.send(&session_id, event, params).await;
+    let event = guide_user_message("shutdown 后的发送");
+    let result = engine.send(&session_id, event).await;
     assert!(
         matches!(result, Err(fuyao_core::EngineError::Shutdown)),
         "shutdown 后 send 应返回 Err(Shutdown)，实际: {result:?}"
@@ -539,7 +528,7 @@ async fn shutdown_returns_none_for_recv() {
     .await;
 
     let _session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
@@ -575,15 +564,12 @@ async fn shutdown_terminates_active_session_and_persists() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
-    let (event, params) = guide_user_message("你好", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("你好");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     // 收到 Assistant 事件（证明 ReAct 跑完了）
     let mut got_assistant = false;
@@ -655,15 +641,12 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
-    let (event, params) = guide_user_message("触发持续重试", "test/model");
-    engine
-        .send(&session_id, event, params)
-        .await
-        .expect("发消息失败");
+    let event = guide_user_message("触发持续重试");
+    engine.send(&session_id, event).await.expect("发消息失败");
 
     // 等收到一个 Retry 事件，确认进入退避 sleep
     let mut entered_backoff = false;
@@ -743,11 +726,11 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
     let mut session_ids = Vec::with_capacity(N);
     for i in 0..N {
         let id = engine
-            .create_session(SessionParams::default())
+            .create_session(test_session_params())
             .await
             .expect("创建 session 失败");
-        let (event, params) = guide_user_message(&format!("触发重试 #{i}"), "test/model");
-        engine.send(&id, event, params).await.expect("发消息失败");
+        let event = guide_user_message(&format!("触发重试 #{i}"));
+        engine.send(&id, event).await.expect("发消息失败");
         session_ids.push(id);
     }
 
@@ -817,7 +800,7 @@ async fn end_session_removes_from_schedule() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
@@ -832,15 +815,15 @@ async fn end_session_removes_from_schedule() {
         .expect("end_session 返回错误");
 
     // end_session 后再 send 应返回 SessionNotFound（session 已从调度表移除）
-    let (event, params) = guide_user_message("end 后的发送", "test/model");
-    let result = engine.send(&session_id, event, params).await;
+    let event = guide_user_message("end 后的发送");
+    let result = engine.send(&session_id, event).await;
     assert!(
         matches!(result, Err(fuyao_core::EngineError::SessionNotFound(_))),
         "end_session 后 send 应返回 Err(SessionNotFound)，实际: {result:?}"
     );
 
     // 引擎本身仍未 shutdown，可继续创建新 session
-    let new_id = engine.create_session(SessionParams::default()).await;
+    let new_id = engine.create_session(test_session_params()).await;
     assert!(new_id.is_ok(), "end_session 后引擎应仍可创建新 session");
 
     engine.shutdown().await;
@@ -865,7 +848,7 @@ async fn end_session_persists_ended_at_and_reason() {
     .await;
 
     let session_id = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
@@ -930,11 +913,11 @@ async fn end_session_does_not_affect_other_sessions() {
     .await;
 
     let session_a = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session A 失败");
     let session_b = engine
-        .create_session(SessionParams::default())
+        .create_session(test_session_params())
         .await
         .expect("创建 session B 失败");
 
@@ -948,17 +931,17 @@ async fn end_session_does_not_affect_other_sessions() {
     done.unwrap().expect("end_session(A) 返回错误");
 
     // A 已销毁，再 send A 返回 SessionNotFound
-    let (event_a, params_a) = guide_user_message("A 已死", "test/model");
-    let result_a = engine.send(&session_a, event_a, params_a).await;
+    let event_a = guide_user_message("A 已死");
+    let result_a = engine.send(&session_a, event_a).await;
     assert!(
         matches!(result_a, Err(fuyao_core::EngineError::SessionNotFound(_))),
         "A 销毁后 send A 应返回 SessionNotFound，实际: {result_a:?}"
     );
 
     // B 仍正常工作：发消息 + 收到 Chunk / Assistant
-    let (event_b, params_b) = guide_user_message("B 还活着", "test/model");
+    let event_b = guide_user_message("B 还活着");
     engine
-        .send(&session_b, event_b, params_b)
+        .send(&session_b, event_b)
         .await
         .expect("B 的 send 不应失败");
 

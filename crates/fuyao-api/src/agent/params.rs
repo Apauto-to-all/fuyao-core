@@ -2,24 +2,27 @@
 //!
 //! 按归属层把引擎交互参数拆解成三个 Params：
 //! - [`EngineParams`]：引擎级，启动时定死
-//! - [`SessionParams`]：对话级，创建对话时定死且不可变（前缀缓存红线）
-//! - [`MessageParams`]：消息级，每条消息自带
+//! - [`SessionParams`]：对话级，创建对话时提供，运行时可通过引擎接口更新（见下）
+//! - [`ModelConfig`]：模型运行配置，归属 [`SessionParams`]，整 session 共享一份
 //!
 //! 三者都是拓展容器：目前装的字段后续可按需增加，不改函数签名、不动调用方。
 //!
-//! 内层 struct [`ModelConfig`] / [`AgentConfig`] 字段不变，只是外层容器从单一
-//! AgentContext 拆成各自归属的 Params。
+//! 关于 [`SessionParams`] 的更新：整 session 全程只有一份，存在 `SessionCtx`（共享可变）。
+//! 要用就读最新，要改就调 [`Engine::update_session_params`](../../../fuyao_core/struct.Engine.html)
+//! 写最新——没有"生效时机"概念，消费点（跑 turn、压缩）每次现读现用。
+//! 注意 `agent_config` 一旦定死就不应改（改了会重建 system_prompt 冲掉前缀缓存），
+//! 目前该字段更新未实现（见 `update_session_params` 的 TODO）。
 
 use crate::agent::AgentPaths;
 use crate::provider::ThinkingType;
 
-/// 模型运行配置（消息级参数的内层结构）
+/// 模型运行配置（session 级共享一份）
 ///
 /// 聚合「用哪个模型」+「怎么思考」三个运行时模型参数。
 /// 三字段默认 `None`，请求体不发对应字段，走模型自身默认行为。
 ///
-/// 归属：装入 [`MessageParams`]，跟着每条消息走——同一对话里上一条用 A 模型、
-/// 这一条用 B 模型完全自由，因为模型选择是消息的属性，不是对话的属性。
+/// 归属：装入 [`SessionParams`]，整 session 共享一份——消费点（跑 turn、压缩）
+/// 每次现读 `SessionParams` 取值，更新即通过引擎接口写回去，不存在"生效时机"问题。
 #[derive(Debug, Clone, Default)]
 pub struct ModelConfig {
     /// 模型 ID，如 aliyun/qwen3.6-plus。None 时自动使用默认模型
@@ -59,27 +62,22 @@ pub struct EngineParams {
     pub agent_paths: AgentPaths,
 }
 
-/// 创建对话时的参数（对话级，创建时定死，不可变）
+/// 创建对话时的参数（对话级，整 session 共享一份，可更新）
 ///
-/// 创建对话时提供，目前装 [`AgentConfig`]（系统提示词等）。
+/// 创建对话时提供，装 [`AgentConfig`]（人格/系统提示词）+ [`ModelConfig`]（模型运行配置）。
 /// 后续要加新字段直接往里塞，不改函数签名、不动调用方。
 ///
-/// Agent 配置创建时定死，不可变——改了会冲掉前缀缓存，代价大。
+/// **整 session 全程只有一份**，存在 `SessionCtx`（共享可变）。消费点（跑 turn、压缩）
+/// 每次现读现用；要改就调引擎的 `update_session_params` 写回——没有"生效时机"概念。
+///
+/// 边界（前缀缓存红线）：
+/// - `agent_config`：创建时定死不应改——改了要重建 system_prompt，冲掉前缀缓存。
+/// - `model_config`：可随时更新（切模型不破坏前缀缓存语义，下一轮自然用新模型）。
 #[derive(Debug, Clone, Default)]
 pub struct SessionParams {
-    /// Agent 运行配置（definition 选择 + 未来扩展）
+    /// Agent 运行配置（definition 选择 + 未来扩展，创建时定死不应改）
     pub agent_config: AgentConfig,
-}
-
-/// 发送消息时的配置（消息级，每条消息自带）
-///
-/// 每发一条消息都带一个 [`MessageParams`]，决定**这一轮**用哪个模型跑、怎么思考。
-/// 后续要加新字段直接往里塞，不改函数签名、不动调用方。
-///
-/// model id 是消息的属性，不是对话的属性——同一对话里每条消息能换模型，互不干扰。
-#[derive(Debug, Clone, Default)]
-pub struct MessageParams {
-    /// 模型运行配置（聚合模型选择 + 思考控制）
+    /// 模型运行配置（整 session 共享一份，可随时更新）
     pub model_config: ModelConfig,
 }
 
@@ -110,16 +108,18 @@ mod tests {
     }
 
     #[test]
-    fn message_params_default_uses_default_model_config() {
-        let params = MessageParams::default();
+    fn session_params_default_all_none() {
+        let params = SessionParams::default();
+        assert!(params.agent_config.definition.is_none());
         assert!(params.model_config.model_id.is_none());
         assert!(params.model_config.thinking_type.is_none());
         assert!(params.model_config.reasoning_effort.is_none());
     }
 
     #[test]
-    fn message_params_model_id_set() {
-        let params = MessageParams {
+    fn session_params_model_id_set() {
+        let params = SessionParams {
+            agent_config: AgentConfig::default(),
             model_config: ModelConfig {
                 model_id: Some("deepseek/deepseek-v4-flash".to_string()),
                 ..Default::default()
@@ -132,17 +132,12 @@ mod tests {
     }
 
     #[test]
-    fn session_params_default_uses_default_agent_config() {
-        let params = SessionParams::default();
-        assert!(params.agent_config.definition.is_none());
-    }
-
-    #[test]
     fn session_params_definition_set() {
         let params = SessionParams {
             agent_config: AgentConfig {
                 definition: Some("coder".to_string()),
             },
+            model_config: ModelConfig::default(),
         };
         assert_eq!(params.agent_config.definition.as_deref(), Some("coder"));
     }

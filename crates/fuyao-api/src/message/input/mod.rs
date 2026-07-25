@@ -8,13 +8,11 @@
 //! - `Plugin`: 插件通知（envelope {base, payload}）
 
 // 子模块：每种事件类型独立文件
-mod inbound;
 mod interrupt;
 mod plugin;
 mod user;
 
 // envelope / payload 在 input 层导出（外部通过 input::UserMessage 等路径访问）
-pub use inbound::InboundUser;
 pub use interrupt::{InterruptMessage, InterruptPayload, InterruptSource};
 pub use plugin::{PluginEventSource, PluginMessage, PluginPayload};
 pub use user::{

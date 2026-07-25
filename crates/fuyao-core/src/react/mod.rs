@@ -35,12 +35,13 @@ use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{InterruptMessage, PluginMessage};
+use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::output::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
     PluginPayload as OutputPluginPayload,
 };
-use fuyao_api::{CompressionConfig, EventBase, InboundUser, Session};
+use fuyao_api::{CompressionConfig, EventBase, Session, SessionParams};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{ProviderRegistry, StreamUsage};
 use fuyao_session::CompressionRuntimeState;
@@ -63,11 +64,13 @@ pub(crate) struct SessionCtx {
     /// 钩子注册表（引擎级共享，透传给本 session 的 dispatch 管道）
     pub hooks: SharedHooks,
     pub agent_paths: fuyao_api::AgentPaths,
-    /// 对话级参数（创建时定死且不可变，压缩后重建 system_prompt 用其中的 agent_config）
+    /// 对话级参数（共享句柄，Engine 写 / task 现读现用）
     ///
-    /// 贯穿整个 session 生命周期：将来 SessionParams 加字段（如 temperature）时，
-    /// 只在此处多存一个值，中间函数签名不动。
-    pub session_params: fuyao_api::SessionParams,
+    /// 整 session 全程只有一份：`Engine::update_session_params` 经 SessionHandle 写回，
+    /// 本 ctx 现读现用（跑 turn 取 model_config、压缩取 agent_config 重建 prompt）。
+    /// 用 Mutex 是因为 Engine 写与 task 读跨线程——读时持锁拷一份快照即用。
+    /// agent_config 创建时定死不应改（前缀缓存红线），model_config 可随时更新。
+    pub session_params: Arc<Mutex<SessionParams>>,
     pub emitter: Emitter,
     /// 引导队列（直接消费）
     pub guide: SharedQueue,
@@ -110,7 +113,7 @@ pub(crate) async fn run_session(
     session_id: String,
     guide: SharedQueue,
     pending: SharedQueue,
-    mut rx_inbound: Receiver<InboundUser>,
+    mut rx_inbound: Receiver<OutputUserMessage>,
     mut rx_interrupt: Receiver<InterruptMessage>,
     mut rx_plugin: Receiver<PluginMessage>,
     shutdown_token: CancellationToken,
@@ -120,7 +123,7 @@ pub(crate) async fn run_session(
     tools: Arc<ToolRegistry>,
     hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
-    session_params: fuyao_api::SessionParams,
+    session_params: Arc<Mutex<SessionParams>>,
     tx_event: Sender<OutputEvent>,
 ) {
     tracing::info!(session_id = %session_id, "session 执行流启动");
@@ -155,7 +158,7 @@ pub(crate) async fn run_session(
             // === 上下文压缩检查（pre-turn）===
             // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库 → 复制 keep_recent 为新 seq
             // 失败 log warn 跳过本次压缩，主流程继续
-            run_pre_turn_compression(&ctx, &mut session, &msgs).await;
+            run_pre_turn_compression(&ctx, &mut session).await;
 
             // shutdown 检查（pre-turn 后）：避免压缩后又开新 turn
             // shutdown_token 在 run_pre_turn_compression 期间被 cancel 的情况下，
@@ -169,13 +172,15 @@ pub(crate) async fn run_session(
                 break;
             }
 
-            // 取第一条消息的 params（决定本轮 model/options）
-            // ReAct 多轮复用同一份 model（一个 turn 一个模型）
-            // TODO: 多条 guide 消息 params 不一致时如何取——当前取第一条
-            let first_params = msgs.first().map(|m| m.params.clone()).unwrap_or_default();
+            // 取本轮模型配置：从 session 的 SessionParams 现读快照（整 session 共享一份，
+            // Engine::update_session_params 写回，这里读最新）。ReAct 多轮复用同一份模型。
+            let model_config = {
+                let p = ctx.session_params.lock().await;
+                p.model_config.clone()
+            };
             // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
             queue::inject_messages(&ctx, &mut session, msgs).await;
-            turn::run_turn(&ctx, &mut session, &mut rx_interrupt, first_params).await;
+            turn::run_turn(&ctx, &mut session, &mut rx_interrupt, model_config).await;
         } else {
             // guide 空：等入站消息（过管道入队）/ 中断 / Plugin 通知 / shutdown
             tokio::select! {
@@ -229,11 +234,7 @@ pub(crate) async fn run_session(
 /// - 落库失败：log warn 跳过
 ///
 /// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
-async fn run_pre_turn_compression(
-    ctx: &SessionCtx,
-    session: &mut Session,
-    incoming: &[InboundUser],
-) {
+async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
     // 读取上一轮真实 usage（首轮无 usage 跳过——还没跑过没法判定）
     let usage = {
         let guard = ctx.last_usage.lock().await;
@@ -248,14 +249,15 @@ async fn run_pre_turn_compression(
     // **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，
     // 否则原样发的请求会因为 endpoint 切换导致前缀缓存失效。
     // model_id 解析顺序与 turn.rs::resolve_model 一致：
-    //   1. incoming[0].params.model_id = Some(...) → 用它
+    //   1. SessionParams.model_config.model_id = Some(...) → 用它（整 session 共享一份，现读）
     //   2. None → 读 [models.default] 兜底
     //   3. 都没有 → 无法确定主模型，跳过本次压缩（warn 记录原因）
-    let model_id: String = match incoming
-        .first()
-        .and_then(|m| m.params.model_config.model_id.as_deref())
-    {
-        Some(id) => id.to_string(),
+    let explicit_id: Option<String> = {
+        let p = ctx.session_params.lock().await;
+        p.model_config.model_id.as_deref().map(|id| id.to_string())
+    };
+    let model_id: String = match explicit_id {
+        Some(id) => id,
         None => match fuyao_api::get_config()
             .models
             .default
@@ -436,10 +438,12 @@ async fn run_pre_turn_compression(
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
             // X 已被压进摘要后不再误导模型
-            let new_prompt = fuyao_prompt::build_system_prompt(
-                &ctx.agent_paths,
-                &ctx.session_params.agent_config,
-            );
+            // agent_config 创建时定死不应变（前缀缓存红线），此处锁取快照即用
+            let agent_config = {
+                let p = ctx.session_params.lock().await;
+                p.agent_config.clone()
+            };
+            let new_prompt = fuyao_prompt::build_system_prompt(&ctx.agent_paths, &agent_config);
 
             // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
             // keep_recent 已复制，system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，
@@ -504,8 +508,8 @@ async fn run_pre_turn_compression(
 ///
 /// 这样保证 user 消息的拦截/push/发送三个时机**对齐**（都在消费时刻），
 /// 修复"以输入消息为核心组织"导致的三时机错位（拦截提前、发送提前、push 延迟）。
-async fn handle_inbound_user(ctx: &SessionCtx, inbound: InboundUser) {
-    let mode = inbound.message.payload.mode;
+async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
+    let mode = inbound.payload.mode;
     match mode {
         UserMessageMode::Guide => ctx
             .guide

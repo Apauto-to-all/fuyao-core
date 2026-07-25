@@ -13,7 +13,7 @@ use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
-use fuyao_api::{EngineParams, InputEvent, MessageParams, OutputEvent, Session, SessionParams};
+use fuyao_api::{EngineParams, InputEvent, OutputEvent, Session, SessionParams};
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_provider::ProviderRegistry;
@@ -231,8 +231,13 @@ impl Engine {
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
 
+        // SessionParams 共享句柄：整 session 全程只有一份，Engine 可写（update_session_params）、
+        // task 现读现用（跑 turn、压缩取 model_config）。一份 clone 给 SessionCtx，一份留 Handle。
+        // 用 tokio::Mutex：Engine 写与 task 读均跨 async 上下文（与 SessionCtx.session_params 同型）。
+        let session_params = Arc::new(Mutex::new(session_params));
+
         // 三条 session 级通道
-        let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::InboundUser>(16);
+        let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::message::output::UserMessage>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<InterruptMessage>(8);
         let (tx_plugin, rx_plugin) = mpsc::channel::<PluginMessage>(16);
 
@@ -266,7 +271,7 @@ impl Engine {
             Arc::clone(&self.tools),
             hooks,
             self.params.agent_paths.clone(),
-            session_params,
+            Arc::clone(&session_params),
             self.tx_event.clone(),
         ));
 
@@ -278,6 +283,7 @@ impl Engine {
             tx_plugin,
             task,
             shutdown_token,
+            session_params,
         }
     }
 
@@ -294,7 +300,7 @@ impl Engine {
     async fn assemble_session_hooks(
         &self,
         session_id: &SessionId,
-        tx_inbound: mpsc::Sender<fuyao_api::InboundUser>,
+        tx_inbound: mpsc::Sender<fuyao_api::message::output::UserMessage>,
         tx_interrupt: mpsc::Sender<InterruptMessage>,
         tx_plugin: mpsc::Sender<PluginMessage>,
     ) -> SharedHooks {
@@ -354,7 +360,7 @@ impl Engine {
     /// 入事件（单一入口）
     ///
     /// 所有对话级输入事件从一个口进，靠 session id 区分对话，按事件类型分流：
-    /// - `User`：入队，触发 ReAct 循环。`MessageParams` 决定本轮用哪个模型
+    /// - `User`：入队，触发 ReAct 循环。模型配置从 session 的 `SessionParams` 现读（见 [`update_session_params`](Self::update_session_params)）
     /// - `Interrupt`：发出中断信号，打断对应对话的当前执行
     /// - `Plugin`：插件发给某对话的通知，转发为 OutputEvent::Plugin 送出
     ///
@@ -362,15 +368,7 @@ impl Engine {
     /// 后续产出从 [`recv`](Self::recv) 流出。
     ///
     /// session id 不在调度表 → 同步返回 `Err(SessionNotFound)`（要恢复走恢复动作）。
-    ///
-    /// `MessageParams` 决定本轮用哪个模型、怎么思考——model id 跟着消息走。
-    /// 仅 `User` 变体使用，其他变体忽略此参数。
-    pub async fn send(
-        &self,
-        id: &SessionId,
-        event: InputEvent,
-        params: MessageParams,
-    ) -> Result<(), EngineError> {
+    pub async fn send(&self, id: &SessionId, event: InputEvent) -> Result<(), EngineError> {
         // shutdown 同步快路径检查：已关闭立即拒绝（区分于 SessionNotFound）
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::Shutdown);
@@ -384,7 +382,9 @@ impl Engine {
         match event {
             InputEvent::User(user_msg) => {
                 // 立即把 input 侧 UserMessage 字段照搬转化为 output 侧 UserMessage
-                // （base + payload 完整保留，含 source），与 params 一起送进 session task。
+                // （base + payload 完整保留，含 source），直接送进 session task。
+                // 模型/思考等运行时配置挂在 session 级（SessionParams.model_config），
+                // 消费点（跑 turn、压缩）现读现用，不随消息携带。
                 // 后续 handle_inbound_user 纯入队，inject_messages 消费时统一过管道。
                 let outbound = fuyao_api::message::output::UserMessage {
                     base: user_msg.base,
@@ -394,13 +394,9 @@ impl Engine {
                         source: user_msg.payload.source,
                     },
                 };
-                let inbound = fuyao_api::InboundUser {
-                    message: outbound,
-                    params,
-                };
                 handle
                     .tx_inbound
-                    .send(inbound)
+                    .send(outbound)
                     .await
                     .map_err(|_| EngineError::Shutdown)?;
             }
@@ -424,6 +420,39 @@ impl Engine {
             }
         }
 
+        Ok(())
+    }
+
+    /// 更新对话级参数（运行时调整 session 配置）
+    ///
+    /// 整 session 全程只有一份 `SessionParams`（存在 `SessionCtx` 的共享句柄），
+    /// 本方法直接覆盖该句柄，消费点（跑 turn、压缩）下次现读即用新值——
+    /// 不存在"生效时机"概念，普通"改一个可变变量"。
+    ///
+    /// 无论传入什么 `SessionParams`，整个直接替代当前值——agent_config / model_config
+    /// 一视同仁全量覆盖，调用方给什么就用什么。
+    ///
+    /// TODO: agent_config 运行时切换的前缀缓存问题。system_prompt 在 create_session 时
+    ///   已烘进 Session.system_prompt，此处改 agent_config.definition 后，新定义要到
+    ///   下次压缩重建 system_prompt 时才会反映进提示词（react/mod.rs 的压缩分支）。
+    ///   即 agent_config 切换不会立即重建提示词——「不破坏前缀缓存的提示词立即重建」
+    ///   方案待设计（可能的方向：预热新前缀后切 / 增量提示词注入 / 强制开新 session）。
+    ///   在那之前：model_config 立即生效无副作用；agent_config 切换的延迟生效行为见上。
+    ///
+    /// session id 不在调度表 → 同步返回 `Err(SessionNotFound)`。
+    pub async fn update_session_params(
+        &self,
+        id: &SessionId,
+        params: SessionParams,
+    ) -> Result<(), EngineError> {
+        let sessions = self.sessions.lock().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+        // 全量直接替代：调用方给什么 SessionParams 就用什么，不做任何字段拦截。
+        let mut current = handle.session_params.lock().await;
+        *current = params;
+        tracing::info!(session_id = %id, "对话参数已更新");
         Ok(())
     }
 

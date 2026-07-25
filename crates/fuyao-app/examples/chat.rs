@@ -18,7 +18,7 @@ use std::io::Write;
 
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{AgentPaths, EngineParams, MessageParams, ModelConfig, SessionParams};
+use fuyao_api::{AgentPaths, EngineParams, ModelConfig, SessionParams};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// 默认模型（provider/model 形式，按项目约定）
@@ -62,7 +62,13 @@ async fn main() {
     let mut lanes = Vec::new();
 
     let session_a = engine
-        .create_session(SessionParams::default())
+        .create_session(SessionParams {
+            model_config: ModelConfig {
+                model_id: Some(DEFAULT_MODEL.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
         .await
         .expect("创建 session A 失败");
     lanes.push(Lane {
@@ -74,7 +80,13 @@ async fn main() {
 
     if two {
         let session_b = engine
-            .create_session(SessionParams::default())
+            .create_session(SessionParams {
+                model_config: ModelConfig {
+                    model_id: Some(DEFAULT_MODEL.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
             .await
             .expect("创建 session B 失败");
         lanes.push(Lane {
@@ -141,7 +153,7 @@ where
     buf.trim() == "2"
 }
 
-/// 把一条用户消息发给指定 session（model_id 跟着消息走）
+/// 把一条用户消息发给指定 session（模型由 session 的 SessionParams 决定，创建时定）
 async fn send_to(engine: &fuyao_core::Engine, session_id: &str, content: &str) {
     let session_id = session_id.to_string();
     let event = InputEvent::User(UserMessage {
@@ -152,13 +164,7 @@ async fn send_to(engine: &fuyao_core::Engine, session_id: &str, content: &str) {
             source: UserMessageSource::User,
         },
     });
-    let params = MessageParams {
-        model_config: ModelConfig {
-            model_id: Some(DEFAULT_MODEL.to_string()),
-            ..Default::default()
-        },
-    };
-    if let Err(e) = engine.send(&session_id, event, params).await {
+    if let Err(e) = engine.send(&session_id, event).await {
         eprintln!("[发送失败：{e}]");
     }
 }

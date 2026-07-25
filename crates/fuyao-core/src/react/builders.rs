@@ -2,7 +2,7 @@
 //!
 //! 从 ReAct 循环抽出的纯构造逻辑：
 //! - [`build_chat_request`]：从 DB 加载可见消息凑 ChatRequest（async，走 store 查询）
-//! - [`resolve_model`]：从 MessageParams 解析 model + provider_id + StreamOptions
+//! - [`resolve_model`]：从 ModelConfig 解析 model + provider_id + StreamOptions
 //! - 各类 Assistant Payload 构造器（事件用）
 //! - 工具调用拦截回灌用的双向转换函数
 //! - [`fill_assistant_message_usage_and_cost`]：填 assistant Message 的 token + cost 字段
@@ -12,7 +12,7 @@
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::MessageParams;
+use fuyao_api::ModelConfig;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
@@ -21,7 +21,7 @@ use fuyao_session::SessionStore;
 /// 解析后的模型信息（一轮 ReAct 用）
 ///
 /// `provider_id` 用于从 `ProviderRegistry` 查 Provider 实例；`model` 是裸模型名，
-/// 喂给 `provider.stream_chat`。两者从 `MessageParams.model_id`（形如
+/// 喂给 `provider.stream_chat`。两者从 `ModelConfig.model_id`（形如
 /// `"provider_id/model_id"`）拆分而来——model_id=None 时回退 `[models.default]`。
 #[derive(Debug)]
 pub(crate) struct ResolvedModel {
@@ -113,11 +113,11 @@ pub(crate) async fn build_chat_request(
     }
 }
 
-/// 从 MessageParams 解析本轮模型信息
+/// 从 ModelConfig 解析本轮模型信息
 ///
 /// model_id 解析顺序：
-/// 1. **`MessageParams.model_id = Some("provider_id/model_id")`**：直接拆分
-/// 2. **`MessageParams.model_id = None`**：读全局 `[models.default]` 配置兜底
+/// 1. **`ModelConfig.model_id = Some("provider_id/model_id")`**：直接拆分
+/// 2. **`ModelConfig.model_id = None`**：读全局 `[models.default]` 配置兜底
 ///    - 配了 `[models.default]` → 用它的 `model` 字段（同样是 `"provider_id/model_id"` 格式）
 ///    - 没配 → 返回 `Err`（fail-loud：用户必须显式指定或配 default，引擎不猜）
 ///
@@ -130,11 +130,11 @@ pub(crate) async fn build_chat_request(
 /// 返回的 `ResolvedModel` 由调用方（turn.rs）继续从 `ctx.providers.get(provider_id)`
 /// 查 Provider 实例——本函数不查 registry（保持纯构造器职责，与 IO 解耦）。
 pub(crate) fn resolve_model(
-    params: &MessageParams,
+    model_config: &ModelConfig,
     tools: &ToolRegistry,
 ) -> Result<ResolvedModel, String> {
     // 1. 确定 model_id 字符串：显式指定 → 用它；None → 读 [models.default]
-    let model_id: String = match params.model_config.model_id.as_deref() {
+    let model_id: String = match model_config.model_id.as_deref() {
         Some(id) => id.to_string(),
         None => {
             // 读全局配置（已由 init 阶段加载进 get_config）
@@ -148,7 +148,7 @@ pub(crate) fn resolve_model(
                 Some(id) => id,
                 None => {
                     return Err(
-                        "未指定模型：MessageParams.model_id 为空且未配置 [models.default]"
+                        "未指定模型：ModelConfig.model_id 为空且未配置 [models.default]"
                             .to_string(),
                     );
                 }
@@ -176,8 +176,8 @@ pub(crate) fn resolve_model(
             Some(tool_defs)
         },
         tool_choice: None,
-        thinking_type: params.model_config.thinking_type.clone(),
-        reasoning_effort: params.model_config.reasoning_effort.clone(),
+        thinking_type: model_config.thinking_type.clone(),
+        reasoning_effort: model_config.reasoning_effort.clone(),
     };
 
     Ok(ResolvedModel {
@@ -420,13 +420,11 @@ mod tests {
         ToolRegistryBuilder::default().build()
     }
 
-    fn params_with_model(model_id: Option<&str>) -> MessageParams {
-        MessageParams {
-            model_config: fuyao_api::ModelConfig {
-                model_id: model_id.map(String::from),
-                thinking_type: None,
-                reasoning_effort: None,
-            },
+    fn params_with_model(model_id: Option<&str>) -> ModelConfig {
+        ModelConfig {
+            model_id: model_id.map(String::from),
+            thinking_type: None,
+            reasoning_effort: None,
         }
     }
 

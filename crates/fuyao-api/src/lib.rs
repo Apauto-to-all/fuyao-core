@@ -23,7 +23,7 @@ mod skill_types;
 mod tool;
 
 // 导出常用类型
-pub use agent::{AgentConfig, AgentPaths, EngineParams, MessageParams, ModelConfig, SessionParams};
+pub use agent::{AgentConfig, AgentPaths, EngineParams, ModelConfig, SessionParams};
 pub use config::{
     CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig, LlmConfig,
     LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef, ModelSelection,
@@ -34,8 +34,8 @@ pub use config::{
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
-    EventBase, InboundUser, InputEvent, InterruptSource, OutputEvent, PluginEventSource,
-    PluginSource, SystemSource, UserMessageMode, UserMessageSource,
+    EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginSource,
+    SystemSource, UserMessageMode, UserMessageSource,
 };
 pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,

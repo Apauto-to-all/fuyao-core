@@ -12,8 +12,6 @@
 //! 这是"真·主动"模式：插件自主决定何时发送，引擎只负责消费。
 //! 所有发送方法用 `try_send`（非阻塞），失败记 warn（不阻塞 hook 执行）。
 
-use fuyao_api::InboundUser;
-use fuyao_api::MessageParams;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{
     InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource, PluginMessage,
@@ -30,12 +28,15 @@ use tokio::sync::mpsc::Sender;
 /// 传给插件。插件 clone 后保存（[`Clone`] 已实现）。
 ///
 /// 所有方法用 `try_send`（非阻塞）：通道满或关闭时静默忽略，仅记 warn 日志。
+///
+/// User 消息直接发送 output 侧 `OutputUserMessage`——内核统一处理输出侧消息，
+/// 入站通道与队列载荷类型均为 `OutputUserMessage`（见 AGENTS.md「消息处理原则」）。
 #[derive(Clone)]
 pub struct SessionSender {
     /// 绑定的插件身份（自动填 Plugin 消息的 source 字段）
     identity: PluginEventSource,
     /// User 消息发送端（送进 session 入站通道）
-    tx_user: Sender<InboundUser>,
+    tx_user: Sender<OutputUserMessage>,
     /// Interrupt 消息发送端（送进 session 中断通道）
     tx_interrupt: Sender<InterruptMessage>,
     /// Plugin 消息发送端（送进 session Plugin 通道）
@@ -46,7 +47,7 @@ impl SessionSender {
     /// 构造（引擎在 session 装配时调用，传入该 session 的三条通道 sender）
     pub fn new(
         identity: PluginEventSource,
-        tx_user: Sender<InboundUser>,
+        tx_user: Sender<OutputUserMessage>,
         tx_interrupt: Sender<InterruptMessage>,
         tx_plugin: Sender<PluginMessage>,
     ) -> Self {
@@ -78,18 +79,15 @@ impl SessionSender {
     ///
     /// source 字段自动标记为 `Plugin`，携带本插件的 identity 名称——保证来源可追溯。
     pub fn send_user_with_mode(&self, content: impl Into<String>, mode: UserMessageMode) {
-        let result = self.tx_user.try_send(InboundUser {
-            message: OutputUserMessage {
-                base: EventBase::default(),
-                payload: OutputUserPayload {
-                    content: content.into(),
-                    mode,
-                    source: UserMessageSource::Plugin(PluginSource {
-                        name: self.identity.name.clone(),
-                    }),
-                },
+        let result = self.tx_user.try_send(OutputUserMessage {
+            base: EventBase::default(),
+            payload: OutputUserPayload {
+                content: content.into(),
+                mode,
+                source: UserMessageSource::Plugin(PluginSource {
+                    name: self.identity.name.clone(),
+                }),
             },
-            params: MessageParams::default(),
         });
         if let Err(e) = result {
             tracing::warn!(

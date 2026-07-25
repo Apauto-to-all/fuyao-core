@@ -14,11 +14,11 @@
 use super::SessionCtx;
 use crate::dispatch;
 use crate::engine::types::SharedQueue;
-use fuyao_api::InboundUser;
+use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::{Message, OutputEvent, Session};
 
 /// 一次性取出 guide 全部消息（非阻塞，drain 清空队列）
-pub(crate) fn consume_all_guide(guide: &SharedQueue) -> Vec<InboundUser> {
+pub(crate) fn consume_all_guide(guide: &SharedQueue) -> Vec<OutputUserMessage> {
     let mut q = guide.lock().unwrap_or_else(|e| e.into_inner());
     q.drain(..).collect()
 }
@@ -39,9 +39,8 @@ pub(crate) fn drain_pending_to_guide(guide: &SharedQueue, pending: &SharedQueue)
 
 /// 把一批队列消息经 `emit_to_history` 单条落 DB
 ///
-/// 每条 `InboundUser` 的 `message`（output 侧 UserMessage）取出包成
-/// `OutputEvent::User`，经统一管道：拦截 → 构造 `Message::user` 调
-/// `store.insert_message` 单条落 DB → 发送事件给 UI → 观察钩子。
+/// 每条 output 侧 `OutputUserMessage` 直接包成 `OutputEvent::User`，经统一管道：
+/// 拦截 → 构造 `Message::user` 调 `store.insert_message` 单条落 DB → 发送事件给 UI → 观察钩子。
 ///
 /// 与 assistant / tool_result 完全对称——拦截/存储/发送三者同源，插件可在消费时刻
 /// 改写或阻断 user 消息（修复"拦截裂缝在 user 消息上重现"的结构性缺陷）。
@@ -50,10 +49,10 @@ pub(crate) fn drain_pending_to_guide(guide: &SharedQueue, pending: &SharedQueue)
 pub(crate) async fn inject_messages(
     ctx: &SessionCtx,
     session: &mut Session,
-    msgs: Vec<InboundUser>,
+    msgs: Vec<OutputUserMessage>,
 ) {
     for m in msgs {
-        let event = OutputEvent::User(m.message);
+        let event = OutputEvent::User(m);
         let _ = dispatch::emit_to_history(
             &ctx.emitter,
             &ctx.hooks,

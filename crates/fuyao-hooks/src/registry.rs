@@ -172,14 +172,14 @@ impl HooksRegistry {
 mod tests {
     use super::*;
     use crate::plugin::SessionSender;
-    use fuyao_api::InboundUser;
     use fuyao_api::message::input::{InterruptMessage, PluginEventSource, PluginMessage};
+    use fuyao_api::message::output::UserMessage as OutputUserMessage;
     use std::sync::Arc;
 
     /// 构造测试用 SessionSender + 三条接收端（identity="test_plugin"）
     fn make_sender() -> (
         SessionSender,
-        tokio::sync::mpsc::Receiver<InboundUser>,
+        tokio::sync::mpsc::Receiver<OutputUserMessage>,
         tokio::sync::mpsc::Receiver<InterruptMessage>,
         tokio::sync::mpsc::Receiver<PluginMessage>,
     ) {
@@ -217,7 +217,7 @@ mod tests {
         reg.init_send_inputs(sender).await;
         assert!(*called.lock().unwrap(), "hook 应被调用");
         let received = rx_user.recv().await.expect("应收到 User 消息");
-        assert_eq!(received.message.payload.content, "引导消息");
+        assert_eq!(received.payload.content, "引导消息");
     }
 
     /// 空 send_input 列表时 init_send_inputs 不 panic
@@ -247,7 +247,7 @@ mod tests {
         );
         reg.init_send_inputs(sender).await;
         let received = rx_user.recv().await.expect("panic 后正常 hook 仍应执行");
-        assert_eq!(received.message.payload.content, "降级消息");
+        assert_eq!(received.payload.content, "降级消息");
     }
 
     /// 观察钩子按注册顺序串行执行

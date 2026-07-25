@@ -33,7 +33,7 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{InterruptMessage, InterruptPayload, InterruptSource};
 use fuyao_api::message::output::{AssistantMessage, TitleMessage, TitlePayload};
-use fuyao_api::{Message, MessageParams, Session};
+use fuyao_api::{Message, ModelConfig, Session};
 use fuyao_provider::Provider;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -52,17 +52,17 @@ fn shutdown_interrupt_payload() -> InterruptPayload {
 
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环注入 session.messages）
 ///
-/// `params` 取自本轮 guide 第一条消息（决定 model/options），turn 内多轮复用。
+/// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     session: &mut Session,
     rx_interrupt: &mut Receiver<InterruptMessage>,
-    params: MessageParams,
+    model_config: ModelConfig,
 ) {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
     // 任一失败：发 Error 事件 + 落库 + 结束本轮（配置错误，永久不可恢复）
-    let resolved: ResolvedModel = match resolve_model(&params, &ctx.tools) {
+    let resolved: ResolvedModel = match resolve_model(&model_config, &ctx.tools) {
         Ok(r) => r,
         Err(msg) => {
             tracing::warn!(
@@ -156,11 +156,11 @@ pub(crate) async fn run_turn(
             Ok(result) => {
                 if result.tool_calls.is_empty() {
                     // 无工具调用：最终回复
-                    handle_final_reply(ctx, session, &result, &params).await;
+                    handle_final_reply(ctx, session, &result, &model_config).await;
                     return;
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
-                    handle_tool_calls(ctx, session, rx_interrupt, &result, &params).await;
+                    handle_tool_calls(ctx, session, rx_interrupt, &result, &model_config).await;
                     // execute_tools 内部若被中断会直接 return（见下方），此处 assume 已完成
                 }
             }
@@ -210,14 +210,14 @@ async fn handle_final_reply(
     ctx: &SessionCtx,
     session: &mut Session,
     result: &StreamResult,
-    params: &MessageParams,
+    model_config: &ModelConfig,
 ) {
     // 回传本轮真实 usage 给主循环（pre-turn 压缩触发判定用）
     *ctx.last_usage.lock().await = Some(result.usage.clone());
 
     // 经 emit_to_history：拦截 → 闭包构造 Message（填 token + cost）→ 自动累积 session.total_* → 落 DB → 发送事件
     // 拦截不改 usage（token 是模型给的客观值），计费用原始 result.usage。
-    let model_id = params.model_config.model_id.as_deref();
+    let model_id = model_config.model_id.as_deref();
     let usage = result.usage.clone();
     let agent_paths = ctx.agent_paths.clone();
     let event = OutputEvent::Assistant(AssistantMessage {
@@ -379,7 +379,7 @@ async fn handle_tool_calls(
     session: &mut Session,
     rx_interrupt: &mut Receiver<InterruptMessage>,
     result: &StreamResult,
-    params: &MessageParams,
+    model_config: &ModelConfig,
 ) {
     // 步骤1：逐个拦截 ToolCall 事件，构造 effective_tool_calls
     // 整批 tool_calls 拆成单个 ToolCall 事件各自拦截；Block 的跳过。
@@ -407,7 +407,7 @@ async fn handle_tool_calls(
         tool_calls: effective_tool_calls,
         usage: result.usage.clone(),
     };
-    let model_id = params.model_config.model_id.as_deref();
+    let model_id = model_config.model_id.as_deref();
     let usage = result.usage.clone();
     let agent_paths = ctx.agent_paths.clone();
     let event = OutputEvent::Assistant(AssistantMessage {
