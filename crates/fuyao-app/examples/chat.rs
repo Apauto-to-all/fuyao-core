@@ -1,6 +1,6 @@
 //! fuyao 引擎端到端冒烟测试
 //!
-//! 通过 `fuyao-app::start` 一键装配启动引擎，验证项目完整可用。
+//! 通过 `fuyao_app::start` 一键装配启动引擎，验证项目完整可用。
 //! 启动时选择 session 数量：
 //! - 单对话：默认 deepseek 模型，事件以 JSON 原样打印（无颜色）
 //! - 双对话：同一条消息同时发给两个 session，流式输出交错到达，
@@ -19,6 +19,7 @@ use std::io::Write;
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{AgentPaths, EngineParams, ModelConfig, SessionParams};
+use fuyao_app::App;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// 默认模型（provider/model 形式，按项目约定）
@@ -45,9 +46,9 @@ struct Lane {
 async fn main() {
     println!("=== fuyao 引擎端到端冒烟测试 ===\n");
 
-    // 1. 一键装配：init（配置 / 日志 / Provider）→ 工具收集 → 启动引擎
+    // 1. 一键装配：init（配置 / 日志 / Provider）→ 工具收集 → 启动引擎 → App fan-in 装配
     //    from_cwd：以当前工作目录为 workspace，使 .fuyao/skills 等项目级资源生效
-    let (engine, ctx) = fuyao_app::start(EngineParams {
+    let app = fuyao_app::start(EngineParams {
         agent_paths: AgentPaths::from_cwd(),
     })
     .await
@@ -60,11 +61,8 @@ async fn main() {
     // 2. 选择 session 数量，据此创建对话
     let two = read_two_sessions(&mut reader).await;
     let mut lanes = Vec::new();
-    // per-session rx 收集：Phase 1 出站已 per-session 化，本例内联 spawn forwarder
-    // 把所有 session 的 rx 汇聚到一根 fan_rx（Phase 2 后由 App::recv 提供）
-    let (fan_tx, mut fan_rx) = tokio::sync::mpsc::channel::<OutputEvent>(64);
 
-    let (session_a, rx_a) = engine
+    let session_a = app
         .create_session(SessionParams {
             model_config: ModelConfig {
                 model_id: Some(DEFAULT_MODEL.to_string()),
@@ -74,7 +72,6 @@ async fn main() {
         })
         .await
         .expect("创建 session A 失败");
-    spawn_forwarder(rx_a, fan_tx.clone());
     lanes.push(Lane {
         label: if two { "A" } else { "" },
         session_id: session_a,
@@ -83,7 +80,7 @@ async fn main() {
     });
 
     if two {
-        let (session_b, rx_b) = engine
+        let session_b = app
             .create_session(SessionParams {
                 model_config: ModelConfig {
                     model_id: Some(DEFAULT_MODEL.to_string()),
@@ -93,7 +90,6 @@ async fn main() {
             })
             .await
             .expect("创建 session B 失败");
-        spawn_forwarder(rx_b, fan_tx.clone());
         lanes.push(Lane {
             label: "B",
             session_id: session_b,
@@ -109,8 +105,6 @@ async fn main() {
     } else {
         println!("\n已创建单个对话（模型 {DEFAULT_MODEL}）\n");
     }
-    // drop 主线程持的 fan_tx 副本：所有 forwarder 退出后 fan_rx 返 None（与引擎 shutdown 同步）
-    drop(fan_tx);
 
     // 3. 交互循环：读取输入 → 发给所有 session → 消费本轮事件
     loop {
@@ -135,33 +129,17 @@ async fn main() {
 
         // 同一条消息发给所有 session（各自带 DEFAULT_MODEL）
         for lane in &lanes {
-            send_to(&engine, &lane.session_id, input).await;
+            send_to(&app, &lane.session_id, input).await;
         }
 
-        // 消费本轮：fan_rx 流出事件，按 session_id 路由到对应 lane 染色打印，
+        // 消费本轮：App::recv 流出事件，按 session_id 路由到对应 lane 染色打印，
         // 直到所有 lane 收到终态事件（Assistant 非 tool_calls / Error / Interrupt）
-        consume_turn(&mut fan_rx, &mut lanes).await;
+        consume_turn(&app, &mut lanes).await;
         println!();
     }
 
-    fuyao_app::shutdown(engine, ctx).await;
+    app.shutdown().await;
     println!("已退出。");
-}
-
-/// per-session 出站 forwarder：把一个 session 的 rx 转到共享 fan_tx（fan-in）
-///
-/// Phase 1 占位实现——Phase 2 后由装配层（fuyao-app）的 App::recv 统一提供。
-fn spawn_forwarder(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<OutputEvent>,
-    fan_tx: tokio::sync::mpsc::Sender<OutputEvent>,
-) {
-    tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if fan_tx.send(ev).await.is_err() {
-                break;
-            }
-        }
-    });
 }
 
 /// 读取是否双 session 模式（输入 2 为双对话，其余默认单对话）
@@ -177,7 +155,7 @@ where
 }
 
 /// 把一条用户消息发给指定 session（模型由 session 的 SessionParams 决定，创建时定）
-async fn send_to(engine: &fuyao_core::Engine, session_id: &str, content: &str) {
+async fn send_to(app: &App, session_id: &str, content: &str) {
     let session_id = session_id.to_string();
     let event = InputEvent::User(UserMessage {
         base: EventBase::default(),
@@ -187,15 +165,15 @@ async fn send_to(engine: &fuyao_core::Engine, session_id: &str, content: &str) {
             source: UserMessageSource::User,
         },
     });
-    if let Err(e) = engine.send(&session_id, event).await {
+    if let Err(e) = app.send(&session_id, event).await {
         eprintln!("[发送失败：{e}]");
     }
 }
 
 /// 消费一轮所有事件，按 session_id 路由到对应 lane 染色打印，直到所有 lane 完成
-async fn consume_turn(fan_rx: &mut tokio::sync::mpsc::Receiver<OutputEvent>, lanes: &mut [Lane]) {
+async fn consume_turn(app: &App, lanes: &mut [Lane]) {
     loop {
-        let Some(event) = fan_rx.recv().await else {
+        let Some(event) = app.recv().await else {
             println!("[引擎已关闭]");
             return;
         };

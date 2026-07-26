@@ -17,7 +17,7 @@ use common::{MockProvider, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{EngineParams, ModelConfig, SessionParams};
-use fuyao_app::build_tool_registry;
+use fuyao_app::{App, LogGuard, build_tool_registry};
 use fuyao_core::{Engine, PluginHost};
 use fuyao_provider::{
     BoxStream, ChatRequest, ChatResponse, StreamError, StreamEvent, StreamOptions,
@@ -103,22 +103,23 @@ async fn assembled_engine_runs_react_loop() {
         plugin_host,
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    // 创建 session
-    let (session_id, mut rx_event) = engine
+    // 创建 session（App 内部 spawn forwarder 把 rx 转到 fan_out）
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     // 发一条 guide 消息（触发一轮 ReAct）
     let event = guide_user_message("装配后测试");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
-    // 收事件，验证装配后引擎可产出 Chunk + Assistant
+    // 收事件（App::recv 是 fan-in 单一出口），验证装配后引擎可产出 Chunk + Assistant
     let mut got_chunk = false;
     let mut got_assistant = false;
     for _ in 0..20 {
-        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), app.recv()).await {
             Ok(Some(e)) => match e {
                 OutputEvent::Chunk(_) => got_chunk = true,
                 OutputEvent::Assistant(a) => {
@@ -141,7 +142,7 @@ async fn assembled_engine_runs_react_loop() {
         }
     }
 
-    engine.shutdown().await;
+    app.shutdown().await;
 
     assert!(got_chunk, "装配后应产出 Chunk 事件");
     assert!(got_assistant, "装配后应产出 Assistant 事件");
@@ -151,7 +152,7 @@ async fn assembled_engine_runs_react_loop() {
 // shutdown：优雅停机串联（engine + MCP）
 // ============================================================================
 
-/// shutdown 对空 AppContext（无 MCP manager）不 panic，且消费 ctx drop log_guard
+/// App::shutdown 对无 MCP manager 的 App 不 panic，且消费 self drop log_guard
 #[tokio::test]
 async fn shutdown_with_no_mcp_manager_does_not_panic() {
     let (_, _home) = temp_agent_paths();
@@ -167,13 +168,10 @@ async fn shutdown_with_no_mcp_manager_does_not_panic() {
     )
     .await;
 
-    let ctx = fuyao_app::AppContext {
-        mcp_manager: None,
-        log_guard: fuyao_app::LogGuard::default(),
-    };
+    let app = App::new(engine, None, LogGuard::default());
 
-    // 不应 panic：engine.shutdown() + mcp_manager=None（跳过 stop_all）+ ctx drop
-    fuyao_app::shutdown(engine, ctx).await;
+    // 不应 panic：engine.shutdown() + 无 MCP（跳过 stop_all）+ forwarder 收尾 + self drop
+    app.shutdown().await;
 }
 
 // ============================================================================
@@ -214,20 +212,21 @@ async fn retry_runner_emits_retry_event_then_succeeds() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, mut rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     let event = guide_user_message("测试重试");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
     // 收事件：期望顺序 Retry(attempt=1) → Chunk → Assistant
     let mut got_retry = false;
     let mut got_assistant = false;
     for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), app.recv()).await {
             Ok(Some(OutputEvent::Retry(r))) => {
                 got_retry = true;
                 assert_eq!(r.payload.attempt, 1, "首次重试 attempt 应为 1");
@@ -258,7 +257,7 @@ async fn retry_runner_emits_retry_event_then_succeeds() {
         }
     }
 
-    engine.shutdown().await;
+    app.shutdown().await;
     assert!(got_retry, "应发出 OutputEvent::Retry 事件");
     assert!(got_assistant, "重试后应产出 Assistant 事件");
 }
@@ -285,20 +284,21 @@ async fn retry_runner_no_retry_on_auth_error() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, mut rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     let event = guide_user_message("测试严重错误");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
     // 收事件：应有 Error，不应有 Retry
     let mut got_error = false;
     let mut got_retry = false;
     for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), app.recv()).await {
             Ok(Some(OutputEvent::Error(_))) => {
                 got_error = true;
                 break;
@@ -310,7 +310,7 @@ async fn retry_runner_no_retry_on_auth_error() {
         }
     }
 
-    engine.shutdown().await;
+    app.shutdown().await;
     assert!(!got_retry, "严重错误不应触发 Retry 事件");
     assert!(got_error, "严重错误应冒泡为 OutputEvent::Error");
 }
@@ -361,19 +361,20 @@ async fn retry_runner_no_retry_after_first_chunk() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, mut rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     let event = guide_user_message("测试首 chunk");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
     let mut got_error = false;
     let mut got_retry = false;
     for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), app.recv()).await {
             Ok(Some(OutputEvent::Error(_))) => {
                 got_error = true;
                 break;
@@ -385,7 +386,7 @@ async fn retry_runner_no_retry_after_first_chunk() {
         }
     }
 
-    engine.shutdown().await;
+    app.shutdown().await;
     assert!(
         !got_retry,
         "首 chunk 后错误不应触发 Retry（避免 UI 重复输出）"
@@ -438,14 +439,15 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, mut rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     let event = guide_user_message("测试持续重试");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
     // 2 秒内应至少看到 2 条 Retry 事件（attempt 递增）
     let mut retry_attempts = Vec::new();
@@ -455,13 +457,13 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
             break;
         }
         if let Ok(Some(OutputEvent::Retry(r))) =
-            tokio::time::timeout(Duration::from_millis(200), rx_event.recv()).await
+            tokio::time::timeout(Duration::from_millis(200), app.recv()).await
         {
             retry_attempts.push(r.payload.attempt);
         }
     }
 
-    engine.shutdown().await;
+    app.shutdown().await;
     assert!(
         retry_attempts.len() >= 2,
         "持续错误应至少触发 2 次 Retry 事件（实际: {} 次）",
@@ -562,20 +564,21 @@ async fn shutdown_terminates_active_session_and_persists() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, mut rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     let event = guide_user_message("你好");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
     // 收到 Assistant 事件（证明 ReAct 跑完了）
     let mut got_assistant = false;
     for _ in 0..50 {
         if let Ok(Some(OutputEvent::Assistant(a))) =
-            tokio::time::timeout(Duration::from_millis(500), rx_event.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), app.recv()).await
         {
             assert!(
                 a.payload
@@ -592,7 +595,7 @@ async fn shutdown_terminates_active_session_and_persists() {
     assert!(got_assistant, "应收到 Assistant 事件");
 
     // shutdown：此时 task 应在 idle（turn 跑完后），select! 立即响应 cancelled 退出
-    let shutdown_done = tokio::time::timeout(Duration::from_secs(3), engine.shutdown()).await;
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(3), app.shutdown()).await;
     assert!(
         shutdown_done.is_ok(),
         "shutdown 应在 3 秒内完成（task 应立即响应 cancelled 退出）"
@@ -639,20 +642,21 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, mut rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
 
     let event = guide_user_message("触发持续重试");
-    engine.send(&session_id, event).await.expect("发消息失败");
+    app.send(&session_id, event).await.expect("发消息失败");
 
     // 等收到一个 Retry 事件，确认进入退避 sleep
     let mut entered_backoff = false;
     for _ in 0..20 {
         if let Ok(Some(OutputEvent::Retry(_))) =
-            tokio::time::timeout(Duration::from_millis(500), rx_event.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), app.recv()).await
         {
             entered_backoff = true;
             break;
@@ -664,7 +668,7 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
     // retry.rs 的 sleep 用 select! 监听 shutdown_token，收到信号立即冒泡 Cancelled；
     // turn.rs 流式 select! 的 shutdown 分支（biased 优先）接管，落库退出。
     // 断言 2s 内完成——证明不依赖退避 sleep 走完、也不依赖 10s abort 兜底。
-    let shutdown_done = tokio::time::timeout(Duration::from_secs(2), engine.shutdown()).await;
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(2), app.shutdown()).await;
     assert!(
         shutdown_done.is_ok(),
         "shutdown 应在 2 秒内完成（retry sleep 监听 shutdown_token 立即冒泡 Cancelled，turn.rs shutdown 分支接管退出）"
@@ -720,40 +724,28 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
     // 创建 5 个并发 session，每个发一条消息触发 retry 退避
-    // Phase 1 per-session rx：装配层 fan-in 暂未就绪，本测试内联 spawn forwarder
-    // 把 5 个 session 的 rx 汇聚到一根 fan_rx（Phase 2 后由 App::recv 提供）
+    // App 内部 spawn forwarder 把每个 session 的 rx 汇聚到 fan_out（App::recv 消费）
     const N: usize = 5;
     let mut session_ids = Vec::with_capacity(N);
-    let (fan_tx, mut fan_rx) = tokio::sync::mpsc::channel::<OutputEvent>(64);
     for i in 0..N {
-        let (id, rx) = engine
+        let id = app
             .create_session(test_session_params())
             .await
             .expect("创建 session 失败");
         let event = guide_user_message(&format!("触发重试 #{i}"));
-        engine.send(&id, event).await.expect("发消息失败");
-        // per-session forwarder：把该 session 的 rx 转到共享 fan_rx
-        let fan_tx = fan_tx.clone();
-        tokio::spawn(async move {
-            let mut rx = rx;
-            while let Some(ev) = rx.recv().await {
-                if fan_tx.send(ev).await.is_err() {
-                    break;
-                }
-            }
-        });
+        app.send(&id, event).await.expect("发消息失败");
         session_ids.push(id);
     }
-    drop(fan_tx);
 
     // 等 5 个 session 都至少收到一个 Retry 事件，确认都进入退避 sleep
     // （retry_after_ms=30s，sleep 中 task 不会自然退出）
     let mut entered_backoff_count = 0;
     for _ in 0..200 {
         if let Ok(Some(OutputEvent::Retry(_))) =
-            tokio::time::timeout(Duration::from_millis(200), fan_rx.recv()).await
+            tokio::time::timeout(Duration::from_millis(200), app.recv()).await
         {
             entered_backoff_count += 1;
             if entered_backoff_count >= N {
@@ -770,7 +762,7 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
     // 串行模式（旧）会退化到 ≈ N × 30s（实际被 abort 在 N × SHUTDOWN_TASK_TIMEOUT）
     // 并发模式（新）应远小于 SHUTDOWN_TASK_TIMEOUT（10s）——所有 sleep 同时被 cancel
     let start = std::time::Instant::now();
-    let shutdown_done = tokio::time::timeout(Duration::from_secs(5), engine.shutdown()).await;
+    let shutdown_done = tokio::time::timeout(Duration::from_secs(5), app.shutdown()).await;
     let elapsed = start.elapsed();
 
     assert!(
@@ -812,8 +804,9 @@ async fn end_session_removes_from_schedule() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, _rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -821,7 +814,7 @@ async fn end_session_removes_from_schedule() {
     // end_session 应正常返回 Ok（task 在 idle 状态，cancel 立即响应退出）
     let done = tokio::time::timeout(
         Duration::from_secs(3),
-        engine.end_session(&session_id, "session_ended"),
+        app.end_session(&session_id, "session_ended"),
     )
     .await;
     assert!(done.is_ok(), "end_session 应在 3 秒内完成");
@@ -830,17 +823,17 @@ async fn end_session_removes_from_schedule() {
 
     // end_session 后再 send 应返回 SessionNotFound（session 已从调度表移除）
     let event = guide_user_message("end 后的发送");
-    let result = engine.send(&session_id, event).await;
+    let result = app.send(&session_id, event).await;
     assert!(
         matches!(result, Err(fuyao_core::EngineError::SessionNotFound(_))),
         "end_session 后 send 应返回 Err(SessionNotFound)，实际: {result:?}"
     );
 
     // 引擎本身仍未 shutdown，可继续创建新 session
-    let new_id = engine.create_session(test_session_params()).await;
+    let new_id = app.create_session(test_session_params()).await;
     assert!(new_id.is_ok(), "end_session 后引擎应仍可创建新 session");
 
-    engine.shutdown().await;
+    app.shutdown().await;
 }
 
 /// end_session 把 ended_at / end_reason 写进 DB（task 退出后单字段 UPDATE 落最终值）
@@ -860,8 +853,9 @@ async fn end_session_persists_ended_at_and_reason() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_id, _rx_event) = engine
+    let session_id = app
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -880,7 +874,7 @@ async fn end_session_persists_ended_at_and_reason() {
     // end_session 应在合理时间内完成
     let done = tokio::time::timeout(
         Duration::from_secs(3),
-        engine.end_session(&session_id, "session_ended"),
+        app.end_session(&session_id, "session_ended"),
     )
     .await;
     assert!(done.is_ok(), "end_session 应在 3 秒内完成");
@@ -902,7 +896,7 @@ async fn end_session_persists_ended_at_and_reason() {
         "end_reason 应为传入值"
     );
 
-    engine.shutdown().await;
+    app.shutdown().await;
 }
 
 /// end_session 只销毁指定 session——其他 session 不受影响，仍可正常 send + recv
@@ -925,12 +919,13 @@ async fn end_session_does_not_affect_other_sessions() {
         PluginHost::new(),
     )
     .await;
+    let app = App::new(engine, None, LogGuard::default());
 
-    let (session_a, _rx_a) = engine
+    let session_a = app
         .create_session(test_session_params())
         .await
         .expect("创建 session A 失败");
-    let (session_b, mut rx_event) = engine
+    let session_b = app
         .create_session(test_session_params())
         .await
         .expect("创建 session B 失败");
@@ -938,7 +933,7 @@ async fn end_session_does_not_affect_other_sessions() {
     // 销毁 A
     let done = tokio::time::timeout(
         Duration::from_secs(3),
-        engine.end_session(&session_a, "session_ended"),
+        app.end_session(&session_a, "session_ended"),
     )
     .await;
     assert!(done.is_ok(), "end_session(A) 应在 3 秒内完成");
@@ -946,23 +941,22 @@ async fn end_session_does_not_affect_other_sessions() {
 
     // A 已销毁，再 send A 返回 SessionNotFound
     let event_a = guide_user_message("A 已死");
-    let result_a = engine.send(&session_a, event_a).await;
+    let result_a = app.send(&session_a, event_a).await;
     assert!(
         matches!(result_a, Err(fuyao_core::EngineError::SessionNotFound(_))),
         "A 销毁后 send A 应返回 SessionNotFound，实际: {result_a:?}"
     );
 
-    // B 仍正常工作：发消息 + 收到 Chunk / Assistant
+    // B 仍正常工作：发消息 + 收到 Chunk / Assistant（App::recv fan-in 单一出口消费 B 的事件）
     let event_b = guide_user_message("B 还活着");
-    engine
-        .send(&session_b, event_b)
+    app.send(&session_b, event_b)
         .await
         .expect("B 的 send 不应失败");
 
     let mut got_assistant = false;
     for _ in 0..50 {
         if let Ok(Some(OutputEvent::Assistant(a))) =
-            tokio::time::timeout(Duration::from_millis(500), rx_event.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), app.recv()).await
         {
             assert!(
                 a.payload
@@ -978,5 +972,5 @@ async fn end_session_does_not_affect_other_sessions() {
     }
     assert!(got_assistant, "B 应仍能正常完成 ReAct（end A 不影响 B）");
 
-    engine.shutdown().await;
+    app.shutdown().await;
 }

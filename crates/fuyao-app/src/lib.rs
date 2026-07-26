@@ -2,13 +2,15 @@
 //!
 //! 一键装配：初始化（配置 / 日志 / Provider）+ 收集工具（内置 + MCP）+ 启动引擎。
 //! 应用层（fuyao-cli / fuyao-tui）只需依赖 fuyao-app：
-//! - [`start`]：一行启动，串联 `init_engine` → `build_tool_registry` → `Engine::new`，
-//!   返回可直接使用的 `(Engine, AppContext)`。
+//! - [`start`]：一行启动，串联 `init_engine` → `build_tool_registry` → `Engine::new` →
+//!   [`App`] 装配（fan-in 单一出口），返回可直接使用的 [`App`]。
+//! - [`App`]：装配产物，包装 [`Engine`] + fan-in 出口（[`App::recv`]）。
 //! - [`init_engine`] + [`build_tool_registry`]：分步装配，供需要介入中间过程的场景使用。
 //!
 //! 工具注入时机：新架构无事后注册的 EngineHandle，工具必须在 `Engine::new` 前收集成
 //! `ToolRegistry` 一次性注入（见设计文档「动作一·启动引擎」）。
 
+mod app;
 mod init;
 mod logging;
 mod mcp;
@@ -20,16 +22,9 @@ use fuyao_api::EngineParams;
 use fuyao_core::{Engine, PluginHost, ToolRegistry, ToolRegistryBuilder};
 use fuyao_mcp::MCPManager;
 
+pub use app::App;
 pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
-
-/// 装配产物：调用方持有，用于管理生命周期
-pub struct AppContext {
-    /// MCP 管理器（无配置 server 时为 None）。调用方须持有保活，否则 MCP 工具失效。
-    pub mcp_manager: Option<Arc<MCPManager>>,
-    /// 日志 guard：drop 时 flush 文件缓冲，须存活到引擎结束。
-    pub log_guard: LogGuard,
-}
 
 /// 装配错误
 #[derive(Debug, thiserror::Error)]
@@ -39,14 +34,14 @@ pub enum SetupError {
     Init(#[from] InitError),
 }
 
-/// 一键启动：init_engine → build_tool_registry → Engine::new
+/// 一键启动：init_engine → build_tool_registry → Engine::new → App 装配
 ///
 /// 这是绝大多数应用推荐的入口：一行完成配置/日志/Provider 准备 +
-/// 工具收集（内置 + MCP）+ 引擎启动，返回可直接使用的 `(Engine, AppContext)`。
+/// 工具收集（内置 + MCP）+ 引擎启动 + fan-in 装配，返回可直接使用的 [`App`]。
 ///
 /// 需要在中间介入（如动态追加工具）时，改用 [`init_engine`] + [`build_tool_registry`]
-/// 分步装配，再自行调 `Engine::new`。
-pub async fn start(params: EngineParams) -> Result<(Engine, AppContext), SetupError> {
+/// 分步装配，再自行调 `Engine::new` + [`App::new`]。
+pub async fn start(params: EngineParams) -> Result<App, SetupError> {
     // 1. 配置 / 日志 / Provider 准备（init_engine 内部取出 agent_paths 供子流程定位路径）
     let init::InitResult {
         provider,
@@ -71,31 +66,8 @@ pub async fn start(params: EngineParams) -> Result<(Engine, AppContext), SetupEr
 
     tracing::info!("引擎启动完成");
 
-    Ok((
-        engine,
-        AppContext {
-            mcp_manager,
-            log_guard,
-        },
-    ))
-}
-
-/// 优雅关闭：先停引擎，再关 MCP（有序停机）
-///
-/// 应用退出时调用，实现「先关 MCP 再退出」的有序清理：
-/// 1. `engine.shutdown()`：清空 session 调度表，停止接收新对话。
-/// 2. `mcp_manager.stop_all()`：对每个 MCP 连接执行 rmcp 的 `close_with_timeout`
-///    优雅关闭（先关 transport 让 server 退出、超时 kill 子进程）。
-///
-/// 消费 `ctx` 使 `log_guard` 随之 drop，flush 文件日志缓冲。
-/// 单个 MCP server 关闭失败不影响其他（错误隔离在 `stop_all` 内部）。
-pub async fn shutdown(engine: Engine, ctx: AppContext) {
-    engine.shutdown().await;
-    if let Some(mcp_manager) = ctx.mcp_manager {
-        mcp_manager.stop_all().await;
-    }
-    tracing::info!("应用已优雅关闭（引擎 + MCP 已停）");
-    // ctx 在此 drop，log_guard flush 日志
+    // 5. 装配 App（fan-in 单一出口）
+    Ok(App::new(engine, mcp_manager, log_guard))
 }
 
 /// 收集工具（内置 + MCP），汇总成引擎可注入的 `ToolRegistry`
