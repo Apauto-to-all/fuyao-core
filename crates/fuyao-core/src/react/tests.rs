@@ -223,7 +223,7 @@ async fn temp_store() -> Arc<fuyao_session::SessionStore> {
 
 /// 构造一个注册了 echo 工具的 ToolRegistry
 fn echo_registry() -> Arc<ToolRegistry> {
-    let handler: fuyao_api::ToolFn = Arc::new(|args, _ctx| {
+    let handler: fuyao_api::ToolFn = Arc::new(|args, _ctx, _cancel| {
         let s = args.to_string();
         Box::pin(async move { format!("echo:{s}") })
     });
@@ -868,7 +868,7 @@ async fn interrupt_during_tool_execution() {
     )]));
 
     // 注册阻塞工具：handler 等一个永不到来的信号，确保中断前不会完成
-    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx| {
+    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx, _cancel| {
         Box::pin(async {
             // 永不完成：sleep 30 秒，足够测试发中断
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1022,7 +1022,7 @@ async fn shutdown_during_tool_execution() {
     )]));
 
     // 注册阻塞工具：handler 等一个永不到来的信号，确保 shutdown 前不会完成
-    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx| {
+    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx, _cancel| {
         Box::pin(async {
             // 永不完成：sleep 30 秒，足够测试发 shutdown 信号
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;

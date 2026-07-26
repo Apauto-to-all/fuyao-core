@@ -6,7 +6,7 @@
 // 跨测试二进制共享：未用部分不报 dead_code
 #![allow(dead_code)]
 
-use fuyao_api::{AgentPaths, ToolCallContext, ToolFn};
+use fuyao_api::{AgentPaths, CancellationToken, ToolCallContext, ToolFn};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +31,7 @@ pub fn make_ctx(workspace: PathBuf) -> ToolCallContext {
 
 /// 调用工具 handler，返回解析后的 JSON
 pub async fn call_tool(handler: &ToolFn, args: Value, ctx: &ToolCallContext) -> Value {
-    let result = handler(args, ctx.clone()).await;
+    let result = handler(args, ctx.clone(), CancellationToken::new()).await;
     serde_json::from_str(&result).unwrap_or_else(|_| {
         Value::Object(serde_json::Map::from_iter([(
             "raw".to_string(),

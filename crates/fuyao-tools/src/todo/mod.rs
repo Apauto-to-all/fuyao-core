@@ -15,8 +15,9 @@ use std::collections::HashMap;
 
 /// 注册 todowrite 工具
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
-    let handler: ToolFn =
-        std::sync::Arc::new(|args, ctx| Box::pin(async move { todo_handler(args, &ctx).await }));
+    let handler: ToolFn = std::sync::Arc::new(|args, ctx, _cancel| {
+        Box::pin(async move { todo_handler(args, &ctx).await })
+    });
 
     let mut todo_item_properties = HashMap::new();
     todo_item_properties.insert(

@@ -474,12 +474,16 @@ async fn handle_tool_calls(
     let tool_calls_for_exec = effective_result.tool_calls.clone();
     let (result_tx, mut result_rx) =
         tokio::sync::mpsc::channel::<tool_exec::ToolExecResult>(tool_calls_for_exec.len());
+    // 派生 child_token：shutdown 时 parent→child 自动传播；interrupt 分支显式 cancel。
+    // handler 据此优雅收尾长任务（杀子进程等），不监听的靠 abort 兜底（双保险）
+    let cancel = ctx.shutdown_token.child_token();
     let exec_fut = tool_exec::execute_tools(
         &tool_calls_for_exec,
         &ctx.tools,
         &ctx.agent_paths,
         &ctx.emitter,
         &result_tx,
+        &cancel,
     );
     tokio::pin!(exec_fut);
 
@@ -501,6 +505,9 @@ async fn handle_tool_calls(
                 return;
             }
             cmd = rx_interrupt.recv() => {
+                // interrupt 命中：显式 cancel 工具批 child_token（shutdown 靠 parent 传播，无需此处 cancel）
+                // 让监听 token 的长任务 handler 后台优雅收尾；无宽限期，立即清空 + 补发
+                cancel.cancel();
                 // 收到 Interrupt 或通道关闭（None）：清空 channel 把已完成的 push 进 messages
                 // 用 try_recv 非阻塞清空（exec_fut 可能还在跑，recv 会阻塞）
                 while let Ok(r) = result_rx.try_recv() {

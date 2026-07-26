@@ -21,8 +21,9 @@ use std::collections::HashMap;
 
 /// 注册 webfetch 工具
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
-    let handler: ToolFn =
-        std::sync::Arc::new(|args, _ctx| Box::pin(async move { webfetch_handler(args).await }));
+    let handler: ToolFn = std::sync::Arc::new(|args, _ctx, _cancel| {
+        Box::pin(async move { webfetch_handler(args).await })
+    });
 
     // 超时/限制默认值从全局配置读取，反映到工具参数描述
     let limits = fuyao_api::get_config().tools.limits.clone();

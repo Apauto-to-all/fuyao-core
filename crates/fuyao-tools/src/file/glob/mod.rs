@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 /// 注册 glob 工具
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
-    let handler: ToolFn = std::sync::Arc::new(|args: Value, ctx| {
+    let handler: ToolFn = std::sync::Arc::new(|args: Value, ctx, _cancel| {
         Box::pin(async move { glob_impl(args, &ctx).await })
     });
 

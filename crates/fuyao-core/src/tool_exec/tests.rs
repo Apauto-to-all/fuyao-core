@@ -8,7 +8,7 @@
 
 use super::*;
 use crate::tool_registry::{ToolEntry, ToolRegistryBuilder};
-use fuyao_api::{AgentPaths, ToolDefinition, ToolFn};
+use fuyao_api::{AgentPaths, CancellationToken, ToolDefinition, ToolFn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -20,7 +20,7 @@ fn test_paths() -> AgentPaths {
 /// 构造一个 handler 恒返回固定串的工具条目
 fn fixed_result_tool(name: &str, result: &str) -> ToolEntry {
     let result = result.to_string();
-    let handler: ToolFn = Arc::new(move |_args, _ctx| {
+    let handler: ToolFn = Arc::new(move |_args, _ctx, _cancel| {
         let result = result.clone();
         Box::pin(async move { result })
     });
@@ -32,7 +32,7 @@ fn fixed_result_tool(name: &str, result: &str) -> ToolEntry {
 
 /// 构造一个按 args.name 返回 result_{name} 的工具条目
 fn echo_name_tool(name: &str) -> ToolEntry {
-    let handler: ToolFn = Arc::new(|args, _ctx| {
+    let handler: ToolFn = Arc::new(|args, _ctx, _cancel| {
         let n = args
             .get("name")
             .and_then(|v| v.as_str())
@@ -84,7 +84,7 @@ async fn collect_results(
 async fn execute_single_unknown_tool() {
     let tools = Arc::new(ToolRegistryBuilder::default().build());
     let tc = make_tool_call("1", "unknown_tool", "{}");
-    let result = execute_single(&tc, &tools, &test_paths(), "s1").await;
+    let result = execute_single(&tc, &tools, &test_paths(), "s1", &CancellationToken::new()).await;
     assert_eq!(result.tool_name, "unknown_tool");
     assert!(result.content.contains("未知工具"));
 }
@@ -97,7 +97,7 @@ async fn execute_single_known_tool() {
             .build(),
     );
     let tc = make_tool_call("1", "test_tool", r#"{"key":"value"}"#);
-    let result = execute_single(&tc, &tools, &test_paths(), "s1").await;
+    let result = execute_single(&tc, &tools, &test_paths(), "s1", &CancellationToken::new()).await;
     assert_eq!(result.content, "tool result");
 }
 
@@ -115,7 +115,15 @@ async fn single_call_goes_sequential() {
     let calls = vec![make_tool_call("1", "read", r#"{"name":"a"}"#)];
     let (tx, mut rx) = mpsc::channel(8);
 
-    execute_tools(&calls, &tools, &test_paths(), &emitter, &tx).await;
+    execute_tools(
+        &calls,
+        &tools,
+        &test_paths(),
+        &emitter,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     assert_eq!(results.len(), 1);
@@ -137,7 +145,15 @@ async fn never_parallel_tool_goes_sequential() {
     ];
     let (tx, mut rx) = mpsc::channel(8);
 
-    execute_tools(&calls, &tools, &test_paths(), &emitter, &tx).await;
+    execute_tools(
+        &calls,
+        &tools,
+        &test_paths(),
+        &emitter,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     // 串行：结果按提交序
@@ -165,7 +181,15 @@ async fn parallel_executes_all() {
     ];
     let (tx, mut rx) = mpsc::channel(16);
 
-    execute_tools(&calls, &tools, &test_paths(), &emitter, &tx).await;
+    execute_tools(
+        &calls,
+        &tools,
+        &test_paths(),
+        &emitter,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     assert_eq!(results.len(), 3);
@@ -193,7 +217,16 @@ async fn parallel_respects_max_concurrent() {
         max_concurrent: 1,
         ..Default::default()
     };
-    execute_parallel(&calls, &tools, &test_paths(), &emitter, &tx, &config).await;
+    execute_parallel(
+        &calls,
+        &tools,
+        &test_paths(),
+        &emitter,
+        &tx,
+        &config,
+        &CancellationToken::new(),
+    )
+    .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     assert_eq!(results.len(), 10);
@@ -216,7 +249,15 @@ async fn parallel_notify_count_matches_calls() {
     let expected = calls.len();
     let (tx, mut rx) = mpsc::channel(expected);
 
-    execute_tools(&calls, &tools, &test_paths(), &emitter, &tx).await;
+    execute_tools(
+        &calls,
+        &tools,
+        &test_paths(),
+        &emitter,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await;
     let results = collect_results(&tx, &mut rx, expected).await;
 
     assert_eq!(results.len(), expected, "通知次数应等于工具调用数");

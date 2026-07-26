@@ -35,8 +35,9 @@ use std::collections::HashMap;
 
 /// 注册 bash 工具
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
-    let handler: ToolFn =
-        std::sync::Arc::new(|args, ctx| Box::pin(async move { bash_impl(args, &ctx).await }));
+    let handler: ToolFn = std::sync::Arc::new(|args, ctx, cancel| {
+        Box::pin(async move { bash_impl(args, &ctx, cancel).await })
+    });
 
     // 超时默认/上限从全局配置读取，反映到工具参数描述
     let limits = fuyao_api::get_config().tools.limits.clone();

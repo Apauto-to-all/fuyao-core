@@ -17,6 +17,9 @@ pub struct BashToolResult {
     /// 是否超时
     #[serde(skip_serializing_if = "is_false")]
     pub timed_out: bool,
+    /// 是否被取消（中断 / shutdown 触发，与超时正交）
+    #[serde(skip_serializing_if = "is_false")]
+    pub cancelled: bool,
     /// 命令执行时的工作目录
     #[serde(skip_serializing_if = "Option::is_none")]
     pub working_dir: Option<String>,

@@ -6,13 +6,17 @@ use crate::redact::redact_sensitive_text;
 use crate::terminal::execute::{execute_command, format_result};
 use crate::terminal::safety::{check_command_safety, validate_workdir};
 use crate::terminal::shell::find_shell;
-use fuyao_api::ToolCallContext;
+use fuyao_api::{CancellationToken, ToolCallContext};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// bash 工具实现
-pub(crate) async fn bash_impl(args: Value, ctx: &ToolCallContext) -> String {
+pub(crate) async fn bash_impl(
+    args: Value,
+    ctx: &ToolCallContext,
+    cancel: CancellationToken,
+) -> String {
     // 1. 参数校验
     let raw_command = match args.get("command").and_then(|v| v.as_str()) {
         Some(cmd) => cmd.trim().to_string(),
@@ -59,8 +63,14 @@ pub(crate) async fn bash_impl(args: Value, ctx: &ToolCallContext) -> String {
 
     // 7. 执行命令
     let workdir_path = workdir.map(PathBuf::from);
-    let mut result =
-        execute_command(&raw_command, workdir_path.as_deref(), timeout, shell_info).await;
+    let mut result = execute_command(
+        &raw_command,
+        workdir_path.as_deref(),
+        timeout,
+        shell_info,
+        cancel,
+    )
+    .await;
 
     // 8. 输出脱敏（防止 env/printenv 等命令泄漏 API key）
     if !result.output.is_empty() {
@@ -79,7 +89,7 @@ mod tests {
     async fn bash_impl_missing_command() {
         let args = serde_json::json!({});
         let ctx = ToolCallContext::default();
-        let result = bash_impl(args, &ctx).await;
+        let result = bash_impl(args, &ctx, CancellationToken::new()).await;
         assert!(result.contains("缺少 command 参数"));
     }
 
@@ -87,7 +97,7 @@ mod tests {
     async fn bash_impl_empty_command() {
         let args = serde_json::json!({"command": ""});
         let ctx = ToolCallContext::default();
-        let result = bash_impl(args, &ctx).await;
+        let result = bash_impl(args, &ctx, CancellationToken::new()).await;
         assert!(result.contains("命令不能为空"));
     }
 
@@ -95,7 +105,7 @@ mod tests {
     async fn bash_impl_blocked_command() {
         let args = serde_json::json!({"command": "mkfs.ext4 /dev/sda1"});
         let ctx = ToolCallContext::default();
-        let result = bash_impl(args, &ctx).await;
+        let result = bash_impl(args, &ctx, CancellationToken::new()).await;
         assert!(result.contains("被阻止"));
     }
 
@@ -103,7 +113,7 @@ mod tests {
     async fn bash_impl_echo_command() {
         let args = serde_json::json!({"command": "echo hello_world_test"});
         let ctx = ToolCallContext::default();
-        let result = bash_impl(args, &ctx).await;
+        let result = bash_impl(args, &ctx, CancellationToken::new()).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(
             parsed["output"]
@@ -121,7 +131,7 @@ mod tests {
             "workdir": if cfg!(windows) { "C:\\" } else { "/tmp" }
         });
         let ctx = ToolCallContext::default();
-        let result = bash_impl(args, &ctx).await;
+        let result = bash_impl(args, &ctx, CancellationToken::new()).await;
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["output"].as_str().unwrap().contains("test_workdir"));
     }

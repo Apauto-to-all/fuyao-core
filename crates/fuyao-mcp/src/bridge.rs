@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuyao_api::{ToolCallContext, ToolFn};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolFn};
 use serde_json::Value;
 
 use crate::circuit_breaker::{bump_error, check_breaker, reset_error};
@@ -45,119 +45,121 @@ pub fn make_tool_call_handler(
     server_name: String,
     tool_timeout: u32,
 ) -> ToolFn {
-    Arc::new(move |args: Value, _ctx: ToolCallContext| {
-        let tool_name = tool_name.clone();
-        let server_name = server_name.clone();
-        let timeout_secs = tool_timeout;
-        let conn = connection.clone();
+    Arc::new(
+        move |args: Value, _ctx: ToolCallContext, _cancel: CancellationToken| {
+            let tool_name = tool_name.clone();
+            let server_name = server_name.clone();
+            let timeout_secs = tool_timeout;
+            let conn = connection.clone();
 
-        Box::pin(async move {
-            // 检查熔断器
-            if let Some(msg) = check_breaker(&server_name) {
-                return serde_json::json!({"error": msg}).to_string();
-            }
-
-            // 执行 MCP 调用
-            let started = std::time::Instant::now();
-            let call_result = tokio::time::timeout(
-                Duration::from_secs(timeout_secs as u64),
-                do_call(&conn, &tool_name, args.clone()),
-            )
-            .await;
-
-            let result = match call_result {
-                Ok(Ok(result)) => {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(&result) {
-                        if parsed.get("error").is_some() {
-                            bump_error(&server_name);
-                        } else {
-                            reset_error(&server_name);
-                        }
-                    }
-                    result
+            Box::pin(async move {
+                // 检查熔断器
+                if let Some(msg) = check_breaker(&server_name) {
+                    return serde_json::json!({"error": msg}).to_string();
                 }
-                Ok(Err(err_msg)) => {
-                    // 检测 Auth 错误并尝试恢复
-                    if crate::recovery::is_auth_error_str(&err_msg) {
-                        tracing::warn!(
-                            server = %server_name,
-                            tool = %tool_name,
-                            kind = "auth",
-                            attempt = 1u8,
-                            recovered = false,
-                            cause = %err_msg,
-                            "MCP 调用遇到可恢复错误，触发重连"
-                        );
-                        notify_reconnect(&conn);
-                        let retry_result =
-                            wait_and_retry(&conn, &server_name, &tool_name, &args).await;
-                        if let Some(result) = retry_result {
-                            reset_error(&server_name);
-                            tracing::info!(
-                                name = %server_name,
-                                tool = %tool_name,
-                                ok = !result.contains("\"error\""),
-                                recovered = true,
-                                elapsed_ms = started.elapsed().as_millis() as u64,
-                                "MCP 工具调用完成"
-                            );
-                            return result;
-                        }
-                    }
 
-                    // 检测 Session 过期并尝试恢复
-                    if crate::recovery::is_session_expired_error_str(&err_msg) {
-                        tracing::warn!(
-                            server = %server_name,
-                            tool = %tool_name,
-                            kind = "session",
-                            attempt = 1u8,
-                            recovered = false,
-                            cause = %err_msg,
-                            "MCP 调用遇到可恢复错误，触发重连"
-                        );
-                        notify_reconnect(&conn);
-                        let retry_result =
-                            wait_and_retry(&conn, &server_name, &tool_name, &args).await;
-                        if let Some(result) = retry_result {
-                            reset_error(&server_name);
-                            tracing::info!(
-                                name = %server_name,
-                                tool = %tool_name,
-                                ok = !result.contains("\"error\""),
-                                recovered = true,
-                                elapsed_ms = started.elapsed().as_millis() as u64,
-                                "MCP 工具调用完成"
-                            );
-                            return result;
-                        }
-                    }
+                // 执行 MCP 调用
+                let started = std::time::Instant::now();
+                let call_result = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs as u64),
+                    do_call(&conn, &tool_name, args.clone()),
+                )
+                .await;
 
-                    bump_error(&server_name);
-                    serde_json::json!({
-                        "error": sanitize_error(&format!("MCP 调用失败: {err_msg}"))
-                    })
-                    .to_string()
-                }
-                Err(_) => {
-                    bump_error(&server_name);
-                    serde_json::json!({
+                let result = match call_result {
+                    Ok(Ok(result)) => {
+                        if let Ok(parsed) = serde_json::from_str::<Value>(&result) {
+                            if parsed.get("error").is_some() {
+                                bump_error(&server_name);
+                            } else {
+                                reset_error(&server_name);
+                            }
+                        }
+                        result
+                    }
+                    Ok(Err(err_msg)) => {
+                        // 检测 Auth 错误并尝试恢复
+                        if crate::recovery::is_auth_error_str(&err_msg) {
+                            tracing::warn!(
+                                server = %server_name,
+                                tool = %tool_name,
+                                kind = "auth",
+                                attempt = 1u8,
+                                recovered = false,
+                                cause = %err_msg,
+                                "MCP 调用遇到可恢复错误，触发重连"
+                            );
+                            notify_reconnect(&conn);
+                            let retry_result =
+                                wait_and_retry(&conn, &server_name, &tool_name, &args).await;
+                            if let Some(result) = retry_result {
+                                reset_error(&server_name);
+                                tracing::info!(
+                                    name = %server_name,
+                                    tool = %tool_name,
+                                    ok = !result.contains("\"error\""),
+                                    recovered = true,
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    "MCP 工具调用完成"
+                                );
+                                return result;
+                            }
+                        }
+
+                        // 检测 Session 过期并尝试恢复
+                        if crate::recovery::is_session_expired_error_str(&err_msg) {
+                            tracing::warn!(
+                                server = %server_name,
+                                tool = %tool_name,
+                                kind = "session",
+                                attempt = 1u8,
+                                recovered = false,
+                                cause = %err_msg,
+                                "MCP 调用遇到可恢复错误，触发重连"
+                            );
+                            notify_reconnect(&conn);
+                            let retry_result =
+                                wait_and_retry(&conn, &server_name, &tool_name, &args).await;
+                            if let Some(result) = retry_result {
+                                reset_error(&server_name);
+                                tracing::info!(
+                                    name = %server_name,
+                                    tool = %tool_name,
+                                    ok = !result.contains("\"error\""),
+                                    recovered = true,
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    "MCP 工具调用完成"
+                                );
+                                return result;
+                            }
+                        }
+
+                        bump_error(&server_name);
+                        serde_json::json!({
+                            "error": sanitize_error(&format!("MCP 调用失败: {err_msg}"))
+                        })
+                        .to_string()
+                    }
+                    Err(_) => {
+                        bump_error(&server_name);
+                        serde_json::json!({
                         "error": format!("MCP tool '{tool_name}' timed out after {timeout_secs}s")
                     })
                     .to_string()
-                }
-            };
+                    }
+                };
 
-            tracing::info!(
-                name = %server_name,
-                tool = %tool_name,
-                ok = !result.contains("\"error\""),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "MCP 工具调用完成"
-            );
-            result
-        })
-    })
+                tracing::info!(
+                    name = %server_name,
+                    tool = %tool_name,
+                    ok = !result.contains("\"error\""),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "MCP 工具调用完成"
+                );
+                result
+            })
+        },
+    )
 }
 
 /// 执行单次 MCP 工具调用，返回格式化的 JSON 字符串

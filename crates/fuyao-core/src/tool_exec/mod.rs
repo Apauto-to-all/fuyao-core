@@ -28,7 +28,7 @@ mod parallel;
 
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::ToolCallContext;
+use fuyao_api::{CancellationToken, ToolCallContext};
 use fuyao_provider::ToolCallData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -59,6 +59,7 @@ pub(crate) async fn execute_tools(
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
+    cancel: &CancellationToken,
 ) {
     if tool_calls.is_empty() {
         return;
@@ -83,9 +84,18 @@ pub(crate) async fn execute_tools(
             max_concurrent = config.max_concurrent,
             "工具批次并行执行"
         );
-        execute_parallel(tool_calls, tools, agent_paths, emitter, result_tx, &config).await
+        execute_parallel(
+            tool_calls,
+            tools,
+            agent_paths,
+            emitter,
+            result_tx,
+            &config,
+            cancel,
+        )
+        .await
     } else {
-        execute_sequential(tool_calls, tools, agent_paths, emitter, result_tx).await
+        execute_sequential(tool_calls, tools, agent_paths, emitter, result_tx, cancel).await
     }
 }
 
@@ -99,11 +109,12 @@ async fn execute_sequential(
     agent_paths: &fuyao_api::AgentPaths,
     emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
+    cancel: &CancellationToken,
 ) {
     let session_id = emitter.session_id().to_string();
 
     for tc in tool_calls {
-        let result = execute_single(tc, tools, agent_paths, &session_id).await;
+        let result = execute_single(tc, tools, agent_paths, &session_id, cancel).await;
         // 完成一个通知一个：调用方据此立即走 emit_to_history
         if result_tx.send(result).await.is_err() {
             tracing::warn!(
@@ -129,6 +140,7 @@ async fn execute_parallel(
     emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
     config: &fuyao_api::ToolRunnerConfig,
+    cancel: &CancellationToken,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
     let session_id = emitter.session_id().to_string();
@@ -140,11 +152,12 @@ async fn execute_parallel(
         let agent_paths = agent_paths.clone(); // AgentPaths 已 Clone
         let session_id = session_id.clone();
         let semaphore = semaphore.clone();
+        let cancel = cancel.clone(); // CancellationToken clone 廉价（Arc 共享），进 task 供 handler 监听
 
         join_set.spawn(async move {
             // 获取许可：限制同一批次内同时运行的工具数（session 局部，不影响其他 session）
             let _permit = semaphore.acquire().await;
-            execute_single(&tc, &tools, &agent_paths, &session_id).await
+            execute_single(&tc, &tools, &agent_paths, &session_id, &cancel).await
         });
     }
 
@@ -178,11 +191,13 @@ async fn execute_parallel(
 /// 容错：未知工具返回提示字符串；参数解析失败用 `Value::Null`。
 ///
 /// 串行与并行共用本函数。`tools` 收 `&Arc<ToolRegistry>` 便于并行 task clone Arc。
+/// `cancel` 是本次工具批次的中断信号，调 handler 时 clone 传入供其监听。
 async fn execute_single(
     tc: &ToolCallData,
     tools: &Arc<ToolRegistry>,
     agent_paths: &fuyao_api::AgentPaths,
     session_id: &str,
+    cancel: &CancellationToken,
 ) -> ToolExecResult {
     let tool_name = tc.name.clone();
     let tool_call_id = tc.id.clone();
@@ -210,7 +225,7 @@ async fn execute_single(
     };
 
     let started = std::time::Instant::now();
-    let content = (entry.handler)(args, ctx).await;
+    let content = (entry.handler)(args, ctx, cancel.clone()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     tracing::info!(tool_name = %tool_name, elapsed_ms, "工具执行完成");

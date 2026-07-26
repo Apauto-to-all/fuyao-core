@@ -7,6 +7,7 @@ use super::output::{decode_output, strip_ansi, truncate_output};
 use super::safety::build_safe_env;
 use super::shell::ShellInfo;
 use super::types::BashToolResult;
+use fuyao_api::CancellationToken;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -44,6 +45,8 @@ pub struct TerminalResult {
     pub error: Option<String>,
     /// 是否超时
     pub timed_out: bool,
+    /// 是否被取消（中断 / shutdown 触发，与超时正交）
+    pub cancelled: bool,
     /// 命令执行时的工作目录
     pub working_dir: Option<String>,
     /// 执行耗时（毫秒）
@@ -58,19 +61,21 @@ pub struct TerminalResult {
 
 /// 执行 shell 命令
 ///
-/// 在指定目录下执行命令，带超时控制、环境变量屏蔽和进程组杀死。
+/// 在指定目录下执行命令，带取消监听、超时控制、环境变量屏蔽和进程组杀死。
 /// stderr 通过 shell 重定向合并到 stdout（2>&1），保持输出交错顺序。
+///
+/// 三态等待（cancel 优先）：取消 → 杀进程组 + forget；超时 → 杀进程组 + forget；正常 → 读输出。
 pub async fn execute_command(
     command: &str,
     working_dir: Option<&Path>,
     timeout: Duration,
     shell_info: &ShellInfo,
+    cancel: CancellationToken,
 ) -> TerminalResult {
     let start = Instant::now();
     let safe_env = build_safe_env();
 
     // 在 shell 层面合并 stderr 到 stdout，保持输出交错顺序
-    // 与 Python 的 stderr=STDOUT 行为一致
     let merged_command = format!("{command} 2>&1");
 
     let mut cmd = tokio::process::Command::new(&shell_info.path);
@@ -81,7 +86,7 @@ pub async fn execute_command(
         .env_clear()
         .envs(&safe_env);
 
-    // Unix: 创建新进程组，超时可杀整组
+    // Unix: 创建新进程组，超时 / 取消时可杀整组
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -102,6 +107,7 @@ pub async fn execute_command(
                 exit_code: -1,
                 error: Some(format!("命令执行失败: {e}")),
                 timed_out: false,
+                cancelled: false,
                 working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                 execution_time_ms: Some(elapsed_ms),
                 exit_code_meaning: None,
@@ -110,80 +116,105 @@ pub async fn execute_command(
         }
     };
 
-    // 带超时等待
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => {
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            let exit_code = status.code().unwrap_or(-1);
-
-            // 读取 stdout（stderr 已通过 2>&1 合并到 stdout）
-            let stdout_bytes = match child.stdout.take() {
-                Some(mut s) => {
-                    let mut buf = Vec::new();
-                    let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-                    buf
-                }
-                None => Vec::new(),
-            };
-
-            // 解码输出
-            let mut combined = decode_output(&stdout_bytes);
-
-            // 清理 ANSI 转义
-            combined = strip_ansi(&combined);
-
-            // 截断过长输出
-            combined = truncate_output(combined.trim());
-
-            // 解读退出码
-            let exit_code_meaning = interpret_exit_code(command, exit_code);
-
-            TerminalResult {
-                success: exit_code == 0,
-                output: combined,
-                exit_code,
-                error: None,
-                timed_out: false,
-                working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
-                execution_time_ms: Some(elapsed_ms),
-                exit_code_meaning,
-                shell_type: shell_info.shell_type,
-            }
-        }
-        Ok(Err(e)) => {
-            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-            TerminalResult {
-                success: false,
-                output: String::new(),
-                exit_code: -1,
-                error: Some(format!("命令执行错误: {e}")),
-                timed_out: false,
-                working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
-                execution_time_ms: Some(elapsed_ms),
-                exit_code_meaning: None,
-                shell_type: shell_info.shell_type,
-            }
-        }
-        Err(_) => {
-            // 超时，杀死进程组
+    // 三态等待：cancel 优先（biased），命中后杀进程组 + forget 回收
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // 取消：杀进程组（Unix）或主进程（Windows），forget 让 OS 回收
             kill_process(&mut child);
-            // Windows 上 Child::drop 会调用 wait()，而 kill 后 wait 可能 panic（Rust 标准库 bug）
-            // 使用 forget 避免 drop，让 OS 回收进程资源
             std::mem::forget(child);
 
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             TerminalResult {
                 success: false,
                 output: String::new(),
-                exit_code: 124,
-                error: Some(format!("命令在 {} 秒后超时", timeout.as_secs())),
-                timed_out: true,
+                exit_code: -1,
+                error: Some("命令被取消".to_string()),
+                timed_out: false,
+                cancelled: true,
                 working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                 execution_time_ms: Some(elapsed_ms),
                 exit_code_meaning: None,
                 shell_type: shell_info.shell_type,
             }
         }
+        wait_res = tokio::time::timeout(timeout, child.wait()) => match wait_res {
+            Ok(Ok(status)) => {
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let exit_code = status.code().unwrap_or(-1);
+
+                // 读取 stdout（stderr 已通过 2>&1 合并到 stdout）
+                let stdout_bytes = match child.stdout.take() {
+                    Some(mut s) => {
+                        let mut buf = Vec::new();
+                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
+                        buf
+                    }
+                    None => Vec::new(),
+                };
+
+                // 解码输出
+                let mut combined = decode_output(&stdout_bytes);
+
+                // 清理 ANSI 转义
+                combined = strip_ansi(&combined);
+
+                // 截断过长输出
+                combined = truncate_output(combined.trim());
+
+                // 解读退出码
+                let exit_code_meaning = interpret_exit_code(command, exit_code);
+
+                TerminalResult {
+                    success: exit_code == 0,
+                    output: combined,
+                    exit_code,
+                    error: None,
+                    timed_out: false,
+                    cancelled: false,
+                    working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
+                    execution_time_ms: Some(elapsed_ms),
+                    exit_code_meaning,
+                    shell_type: shell_info.shell_type,
+                }
+            }
+            Ok(Err(e)) => {
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                TerminalResult {
+                    success: false,
+                    output: String::new(),
+                    exit_code: -1,
+                    error: Some(format!("命令执行错误: {e}")),
+                    timed_out: false,
+                    cancelled: false,
+                    working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
+                    execution_time_ms: Some(elapsed_ms),
+                    exit_code_meaning: None,
+                    shell_type: shell_info.shell_type,
+                }
+            }
+            Err(_) => {
+                // 超时，杀死进程组
+                kill_process(&mut child);
+                // Windows 上 Child::drop 会调用 wait()，而 kill 后 wait 可能 panic（Rust 标准库 bug）
+                // 使用 forget 避免 drop，让 OS 回收进程资源
+                std::mem::forget(child);
+
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                TerminalResult {
+                    success: false,
+                    output: String::new(),
+                    exit_code: 124,
+                    error: Some(format!("命令在 {} 秒后超时", timeout.as_secs())),
+                    timed_out: true,
+                    cancelled: false,
+                    working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
+                    execution_time_ms: Some(elapsed_ms),
+                    exit_code_meaning: None,
+                    shell_type: shell_info.shell_type,
+                }
+            }
+        },
     }
 }
 
@@ -204,6 +235,7 @@ pub fn format_result(result: TerminalResult) -> String {
         exit_code: result.exit_code,
         error: result.error,
         timed_out: result.timed_out,
+        cancelled: result.cancelled,
         working_dir: result.working_dir,
         execution_time_ms: result
             .execution_time_ms
@@ -226,6 +258,7 @@ mod tests {
             exit_code: 0,
             error: None,
             timed_out: false,
+            cancelled: false,
             working_dir: Some("/tmp".to_string()),
             execution_time_ms: Some(100.0),
             exit_code_meaning: None,
@@ -247,6 +280,7 @@ mod tests {
             exit_code: 124,
             error: Some("命令在 1 秒后超时".to_string()),
             timed_out: true,
+            cancelled: false,
             working_dir: None,
             execution_time_ms: Some(1000.0),
             exit_code_meaning: None,
@@ -267,6 +301,7 @@ mod tests {
             exit_code: 0,
             error: None,
             timed_out: false,
+            cancelled: false,
             working_dir: None,
             execution_time_ms: Some(50.0),
             exit_code_meaning: None,
@@ -286,6 +321,7 @@ mod tests {
             exit_code: 1,
             error: Some("命令执行失败".to_string()),
             timed_out: false,
+            cancelled: false,
             working_dir: None,
             execution_time_ms: Some(50.0),
             exit_code_meaning: None,
@@ -304,8 +340,38 @@ mod tests {
         } else {
             "sleep 5"
         };
-        let result = execute_command(command, None, Duration::from_secs(1), shell_info).await;
+        let result = execute_command(
+            command,
+            None,
+            Duration::from_secs(1),
+            shell_info,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.timed_out);
         assert_eq!(result.exit_code, 124);
+    }
+
+    #[tokio::test]
+    async fn execute_command_cancelled() {
+        // cancel 命中：杀子进程 + forget，返回 cancelled 标记（与超时正交）
+        let shell_info = super::super::shell::find_shell();
+        let command = if cfg!(windows) {
+            "ping -n 6 127.0.0.1 > NUL"
+        } else {
+            "sleep 5"
+        };
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        // 短延迟后取消，确保子进程已 spawn
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_clone.cancel();
+        });
+        let result =
+            execute_command(command, None, Duration::from_secs(10), shell_info, cancel).await;
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        assert_eq!(result.error.as_deref(), Some("命令被取消"));
     }
 }

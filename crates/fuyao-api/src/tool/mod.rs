@@ -15,3 +15,6 @@ pub use context::ToolCallContext;
 pub use definition::{ToolDefinition, ToolParameterProperty, ToolParameters, ToolSchema};
 pub use func::ToolFn;
 pub use result::ToolResult;
+
+// 取消令牌：工具 handler 据此响应中断 / shutdown，优雅收尾长任务
+pub use tokio_util::sync::CancellationToken;

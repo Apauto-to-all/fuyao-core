@@ -15,8 +15,9 @@ use std::collections::HashMap;
 
 /// 注册 skill 工具
 pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
-    let handler: ToolFn =
-        std::sync::Arc::new(|args, ctx| Box::pin(async move { skill_handler(args, &ctx) }));
+    let handler: ToolFn = std::sync::Arc::new(|args, ctx, _cancel| {
+        Box::pin(async move { skill_handler(args, &ctx) })
+    });
 
     let mut properties = HashMap::new();
     properties.insert(

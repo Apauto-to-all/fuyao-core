@@ -99,7 +99,7 @@ mod tests {
     use std::sync::Arc;
 
     fn dummy_handler() -> ToolFn {
-        Arc::new(|_args, _ctx| Box::pin(async { "ok".to_string() }))
+        Arc::new(|_args, _ctx, _cancel| Box::pin(async { "ok".to_string() }))
     }
 
     fn make_entry(name: &str) -> ToolEntry {
