@@ -975,6 +975,7 @@ dependencies = [
  "fuyao-session",
  "rust_decimal",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

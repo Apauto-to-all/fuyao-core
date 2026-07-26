@@ -17,8 +17,8 @@ impl super::SessionStore {
             "INSERT INTO sessions (id, started_at, ended_at, end_reason,
                 message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                 total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                compression_count, last_compacted_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                compression_count, last_compacted_seq, parent_session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )
         .bind(session.id.as_str())
         .bind(session.started_at)
@@ -35,6 +35,7 @@ impl super::SessionStore {
         .bind(session.system_prompt.as_deref())
         .bind(session.compression_count)
         .bind(session.last_compacted_seq)
+        .bind(session.parent_session_id.as_deref())
         .execute(&self.pool)
         .await?;
 
@@ -50,7 +51,7 @@ impl super::SessionStore {
             "SELECT id, started_at, ended_at, end_reason,
                     message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                     total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                    compression_count, last_compacted_seq
+                    compression_count, last_compacted_seq, parent_session_id
              FROM sessions WHERE id = ?1",
         )
         .bind(session_id)
@@ -72,7 +73,7 @@ impl super::SessionStore {
                 total_prompt_tokens = ?6, total_completion_tokens = ?7,
                 total_reasoning_tokens = ?8, total_cached_tokens = ?9,
                 total_cost = ?10, title = ?11, system_prompt = ?12,
-                compression_count = ?13, last_compacted_seq = ?14
+                compression_count = ?13, last_compacted_seq = ?14, parent_session_id = ?15
              WHERE id = ?1",
         )
         .bind(session.id.as_str())
@@ -89,6 +90,7 @@ impl super::SessionStore {
         .bind(session.system_prompt.as_deref())
         .bind(session.compression_count)
         .bind(session.last_compacted_seq)
+        .bind(session.parent_session_id.as_deref())
         .execute(&self.pool)
         .await?;
 
@@ -114,7 +116,7 @@ impl super::SessionStore {
             "SELECT id, started_at, ended_at, end_reason,
                     message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                     total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                    compression_count, last_compacted_seq
+                    compression_count, last_compacted_seq, parent_session_id
              FROM sessions ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
         )
         .bind(limit)

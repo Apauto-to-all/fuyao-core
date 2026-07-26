@@ -21,6 +21,7 @@ pub(super) struct SessionRow {
     pub(super) system_prompt: Option<String>,
     pub(super) compression_count: i32,
     pub(super) last_compacted_seq: Option<i64>,
+    pub(super) parent_session_id: Option<String>,
 }
 
 impl From<SessionRow> for Session {
@@ -41,6 +42,7 @@ impl From<SessionRow> for Session {
             end_reason: r.end_reason,
             compression_count: r.compression_count,
             last_compacted_seq: r.last_compacted_seq,
+            parent_session_id: r.parent_session_id,
         }
     }
 }

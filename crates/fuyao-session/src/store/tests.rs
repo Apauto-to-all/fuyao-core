@@ -87,6 +87,122 @@ async fn store_update_syncs_metadata() {
     assert_eq!(loaded.compression_count, 2);
 }
 
+// ===== parent_session_id（通用子任务标记）测试组 =====
+
+#[tokio::test]
+async fn parent_session_id_defaults_none_on_create() {
+    // 主 session（create_session / resume_session 产出）：parent_session_id 应为 None
+    let store = temp_store().await;
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert!(loaded.parent_session_id.is_none());
+}
+
+#[tokio::test]
+async fn parent_session_id_persists_and_roundtrips() {
+    // 子任务 session：parent_session_id 应为父 id，且 create/get/update 全程保持
+    let store = temp_store().await;
+    let parent = Session::new(Some("父会话".to_string()), None);
+    store.create(&parent).await.unwrap();
+
+    let mut child = Session::new(None, None);
+    child.parent_session_id = Some(parent.id.clone());
+    store.create(&child).await.unwrap();
+
+    // get 读回
+    let loaded = store.get(&child.id).await.unwrap().unwrap();
+    assert_eq!(
+        loaded.parent_session_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+
+    // update 不丢字段（全量 UPDATE 应保持 parent_session_id）
+    let mut modified = loaded;
+    modified.message_count = 5;
+    store.update(&modified).await.unwrap();
+    let reloaded = store.get(&child.id).await.unwrap().unwrap();
+    assert_eq!(
+        reloaded.parent_session_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(reloaded.message_count, 5);
+}
+
+#[tokio::test]
+async fn fork_copy_visible_messages_to_child() {
+    // 模拟 Engine 的 fork 拷贝数据层机制（build_forked_session，fork_session 与
+    // create_child_session 的 Fork 模式共用）：
+    // 源 session 有可见消息 → 新建子 session → 逐条 insert_message 复制 →
+    // 子 session 的可见窗口应与源一致（含 compaction 边界，若有）
+    let store = temp_store().await;
+
+    // 源 session：2 条普通消息
+    let parent = Session::new(None, Some("父系统提示词".to_string()));
+    store.create(&parent).await.unwrap();
+    let mut m1 = Message::user("父消息1".to_string());
+    store.insert_message(&parent.id, &mut m1).await.unwrap();
+    let mut m2 = Message::assistant(Some("父回复".to_string()));
+    store.insert_message(&parent.id, &mut m2).await.unwrap();
+
+    // 加一次压缩，让源 session 的可见窗口含 compaction 边界
+    store
+        .mark_compaction(&parent.id, "父摘要".to_string(), CompressionReason::Auto)
+        .await
+        .unwrap();
+    let mut m3 = Message::user("压缩后消息".to_string());
+    store.insert_message(&parent.id, &mut m3).await.unwrap();
+
+    let source_visible = store.load_visible_messages(&parent.id).await.unwrap();
+    // 源可见 = [compaction 边界, 压缩后消息]
+    assert_eq!(source_visible.len(), 2);
+
+    // 构造子 session（复制源系统提示词 + 标记 parent_session_id）
+    // message_count 只计普通消息（排除 compaction 边界，与 count_messages 语义一致）
+    let non_compaction_count = source_visible
+        .iter()
+        .filter(|m| matches!(m.kind, MessageKind::Message))
+        .count();
+    let mut child = Session::new(None, parent.system_prompt.clone());
+    child.parent_session_id = Some(parent.id.clone());
+    child.message_count = non_compaction_count as i64;
+    store.create(&child).await.unwrap();
+
+    // 逐条复制可见消息（与 fork_session / apply 的 copy-to-new-seq 模式一致）
+    for msg in &source_visible {
+        let mut clone = msg.clone();
+        clone.seq = 0;
+        store.insert_message(&child.id, &mut clone).await.unwrap();
+    }
+
+    // 子 session 的可见窗口应与源一致（compaction 边界 + 压缩后消息）
+    let child_visible = store.load_visible_messages(&child.id).await.unwrap();
+    assert_eq!(child_visible.len(), source_visible.len());
+    assert_eq!(child_visible[0].kind, MessageKind::Compaction);
+    assert_eq!(child_visible[0].content.as_deref(), Some("父摘要"));
+    assert_eq!(child_visible[1].content.as_deref(), Some("压缩后消息"));
+
+    // 子 session 自身统计从 0 起算（费用 / token 不继承源），仅 message_count 对齐复制条数
+    let child_meta = store.get(&child.id).await.unwrap().unwrap();
+    assert_eq!(
+        child_meta.parent_session_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    // message_count 只计普通消息（1 条），不含 compaction 边界
+    assert_eq!(child_meta.message_count, 1);
+    assert_eq!(child_meta.total_prompt_tokens, 0);
+    assert_eq!(child_meta.total_cost, 0.0);
+    // 子 session 从未压缩过：自己的压缩指针为空（源的压缩边界只是被复制成普通行）
+    assert!(child_meta.last_compacted_seq.is_none());
+
+    // count_messages 排除 compaction 边界，与 message_count 语义一致
+    assert_eq!(
+        store.count_messages(&child.id).await.unwrap(),
+        non_compaction_count as i64
+    );
+}
+
 // ===== insert_message / count_messages 测试（事件级落库） =====
 
 #[tokio::test]

@@ -1,0 +1,140 @@
+//! 会话运行时操作（入站分发 / 出站拉取 / 参数更新）
+//!
+//! 本模块集中 [`Engine`] 的「运行」相关动作：
+//! - [`Engine::send`]：入站事件单一入口（User / Interrupt / Plugin 分流）
+//! - [`Engine::recv`]：出站事件单一出口
+//! - [`Engine::update_session_params`]：运行时调整 session 参数
+
+use super::*;
+
+impl Engine {
+    /// 入事件（单一入口）
+    ///
+    /// 所有对话级输入事件从一个口进，靠 session id 区分对话，按事件类型分流：
+    /// - `User`：入队，触发 ReAct 循环。模型配置从 session 的 `SessionParams` 现读（见 [`update_session_params`](Self::update_session_params)）
+    /// - `Interrupt`：发出中断信号，打断对应对话的当前执行
+    /// - `Plugin`：插件发给某对话的通知，转发为 OutputEvent::Plugin 送出
+    ///
+    /// 入队即返回，不阻塞——不等大模型想完。
+    /// 后续产出从 [`recv`](Self::recv) 流出。
+    ///
+    /// session id 不在调度表 → 同步返回 `Err(SessionNotFound)`（要恢复走恢复动作）。
+    pub async fn send(&self, id: &SessionId, event: InputEvent) -> Result<(), EngineError> {
+        // shutdown 同步快路径检查：已关闭立即拒绝（区分于 SessionNotFound）
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(EngineError::Shutdown);
+        }
+
+        let sessions = self.sessions.lock().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+
+        match event {
+            InputEvent::User(user_msg) => {
+                // 立即把 input 侧 UserMessage 字段照搬转化为 output 侧 UserMessage
+                // （base + payload 完整保留，含 source），直接送进 session task。
+                // 模型/思考等运行时配置挂在 session 级（SessionParams.model_config），
+                // 消费点（跑 turn、压缩）现读现用，不随消息携带。
+                // 后续 handle_inbound_user 纯入队，inject_messages 消费时统一过管道。
+                let outbound = fuyao_api::message::output::UserMessage {
+                    base: user_msg.base,
+                    payload: fuyao_api::message::output::UserPayload {
+                        content: user_msg.payload.content,
+                        mode: user_msg.payload.mode,
+                        source: user_msg.payload.source,
+                    },
+                };
+                handle
+                    .tx_inbound
+                    .send(outbound)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
+            }
+            InputEvent::Interrupt(interrupt_msg) => {
+                // 入口转化：input 侧 InterruptMessage → output 侧 InterruptMessage。
+                // input 侧消息的唯一职责就是在此被转化，之后内核链路（通道、select!、
+                // emit_interrupt_event）全程只认 output 侧类型。
+                let outbound = OutputInterruptMessage::new(
+                    interrupt_msg.payload.reason,
+                    interrupt_msg.payload.source,
+                );
+                handle
+                    .tx_interrupt
+                    .send(outbound)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
+            }
+            InputEvent::Plugin(plugin_msg) => {
+                // 入口转化：input 侧 PluginMessage → output 侧 PluginMessage。
+                // 转化后送 session 的 Plugin 通道，由 session task 过 dispatch 管道：
+                // 拦截 → 发送（盖 session_id 标签发外部） → 观察。
+                // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道。
+                let outbound = OutputPluginMessage::new(
+                    plugin_msg.payload.source,
+                    plugin_msg.payload.event_type,
+                    plugin_msg.payload.data,
+                    plugin_msg.payload.error,
+                    plugin_msg.payload.message,
+                );
+                handle
+                    .tx_plugin
+                    .send(outbound)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 更新对话级参数（运行时调整 session 配置）
+    ///
+    /// 整 session 全程只有一份 `SessionParams`（存在 `SessionCtx` 的共享句柄），
+    /// 本方法直接覆盖该句柄，消费点（跑 turn、压缩）下次现读即用新值——
+    /// 不存在"生效时机"概念，普通"改一个可变变量"。
+    ///
+    /// 无论传入什么 `SessionParams`，整个直接替代当前值——agent_config / model_config
+    /// 一视同仁全量覆盖，调用方给什么就用什么。
+    ///
+    /// TODO: agent_config 运行时切换的前缀缓存问题。system_prompt 在 create_session 时
+    ///   已烘进 Session.system_prompt，此处改 agent_config.definition 后，新定义要到
+    ///   下次压缩重建 system_prompt 时才会反映进提示词（react/mod.rs 的压缩分支）。
+    ///   即 agent_config 切换不会立即重建提示词——「不破坏前缀缓存的提示词立即重建」
+    ///   方案待设计（可能的方向：预热新前缀后切 / 增量提示词注入 / 强制开新 session）。
+    ///   在那之前：model_config 立即生效无副作用；agent_config 切换的延迟生效行为见上。
+    ///
+    /// session id 不在调度表 → 同步返回 `Err(SessionNotFound)`。
+    pub async fn update_session_params(
+        &self,
+        id: &SessionId,
+        params: SessionParams,
+    ) -> Result<(), EngineError> {
+        let sessions = self.sessions.lock().await;
+        let handle = sessions
+            .get(id)
+            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+        // 全量直接替代：调用方给什么 SessionParams 就用什么，不做任何字段拦截。
+        let mut current = handle.session_params.lock().await;
+        *current = params;
+        tracing::info!(session_id = %id, "对话参数已更新");
+        Ok(())
+    }
+
+    /// 出事件（单一出口）
+    ///
+    /// 从统一出口取下一条产出事件，按 session_id 归类到对应对话。
+    /// 所有对话的产出都从此口流出，没有第二个出口。
+    ///
+    /// 返回 `None` 表示引擎已关闭、通道已断。
+    ///
+    /// shutdown 后调用：先 drain 残余事件（不丢 shutdown 前最后几条产出），
+    /// 队列空了再返回 None——让消费者能完整收完 shutdown 前的事件流后优雅退出。
+    pub async fn recv(&self) -> Option<OutputEvent> {
+        // shutdown 后走快路径：drain 残余事件，再返回 None
+        if self.shutdown.load(Ordering::Acquire) {
+            return self.rx_event.lock().await.try_recv().ok();
+        }
+        self.rx_event.lock().await.recv().await
+    }
+}

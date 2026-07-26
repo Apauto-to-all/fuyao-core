@@ -21,7 +21,7 @@ mod stream;
 mod tool_exec;
 mod tool_registry;
 
-pub use engine::{Engine, SessionId};
+pub use engine::{ChildSessionSource, Engine, SessionId};
 pub use error::EngineError;
 pub use tool_registry::{ToolEntry, ToolRegistry, ToolRegistryBuilder};
 

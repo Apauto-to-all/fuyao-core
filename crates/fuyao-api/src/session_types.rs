@@ -44,6 +44,15 @@ pub struct Session {
     pub compression_count: i32,
     /// 最近一次压缩边界消息的 seq（NULL = 从未压缩）
     pub last_compacted_seq: Option<i64>,
+    /// 通用子任务标记（非 fork 专属）：
+    /// - `None` = 主 session（用户对话，`create_session` / `resume_session` 产出）
+    /// - `Some(父 session id)` = 子任务 session（后台任务 / 子代理），值表示这个子任务隶属于哪个主 session
+    ///
+    /// 用途：前端区分主对话 vs 子任务，按父 id 分组/过滤。无论子任务是「全新创建」还是
+    /// 「fork 旧的」来的，只要它是子任务就带 `parent_session_id`。
+    ///
+    /// 与历史「链式分裂压缩方案」的同名字段无任何关系——该方案已废弃，此处仅作通用子任务标记。
+    pub parent_session_id: Option<String>,
     // 注：消息列表（messages）已从内存移除——每条消息产生即落 DB，
     // 需要时按 session_id 从数据库查询（见 SessionStore::load_visible_messages）。
     // 这样单个 session 内存占用恒定（不随历史增长），多 session 并发无内存压力。
@@ -74,6 +83,7 @@ impl Session {
             end_reason: None,
             compression_count: 0,
             last_compacted_seq: None,
+            parent_session_id: None,
         }
     }
 }
@@ -340,6 +350,13 @@ mod tests {
         let session = Session::new(None, None);
         assert_eq!(session.id.len(), 8);
         assert_eq!(session.title, Some("新会话".to_string()));
+    }
+
+    #[test]
+    fn session_new_parent_session_id_defaults_none() {
+        // 用户会话（非派生）：parent_session_id 应为 None
+        let session = Session::new(None, None);
+        assert!(session.parent_session_id.is_none());
     }
 
     #[test]
