@@ -2,34 +2,36 @@
 //!
 //! 引擎内部发出 OutputEvent 的统一入口。
 //! 核心职责：给事件的 base 盖上 session_id 标签（全程标签原则），
-//! 然后发到出口通道。
+//! 然后发到该 session 的 per-session 出站通道（无界，见设计文档 04）。
 
 use fuyao_api::message::OutputEvent;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::UnboundedSender;
 
-/// 事件发射器（session 级，聚合出口通道 + session_id）
+/// 事件发射器（session 级，聚合 per-session 出站通道 + session_id）
 ///
 /// 把 `tx_event` + `session_id` 打包成 owned 结构体，避免在每个调用点
 /// 重复传这两个参数。所有 task 内部发事件都经它——保证 session_id 标签不丢。
 #[derive(Clone)]
 pub(crate) struct Emitter {
-    tx: Sender<OutputEvent>,
+    tx: UnboundedSender<OutputEvent>,
     session_id: String,
 }
 
 impl Emitter {
-    pub fn new(tx: Sender<OutputEvent>, session_id: String) -> Self {
+    pub fn new(tx: UnboundedSender<OutputEvent>, session_id: String) -> Self {
         Self { tx, session_id }
     }
 
-    /// 发出一个事件，盖上 session_id 标签后送入出口通道
+    /// 发出一个事件，盖上 session_id 标签后送入 per-session 出站通道
     ///
     /// 设计文档「session id 全程标签」原则：事件一产生就带编号，
     /// 消费者拿任意一条事件都能取到 session_id 分流。
-    pub async fn emit(&self, event: OutputEvent) {
-        let mut event = event;
+    ///
+    /// 出站通道**无界**——本方法同步返回，不阻塞调用方（事件入 channel 前已落库，
+    /// 不让 emit 反压到 ReAct turn 推进，见设计文档 04）。
+    pub fn emit(&self, mut event: OutputEvent) {
         stamp_session_id(&mut event, &self.session_id);
-        if self.tx.send(event).await.is_err() {
+        if self.tx.send(event).is_err() {
             tracing::warn!(session_id = %self.session_id, "事件出口通道已关闭，事件丢弃");
         }
     }

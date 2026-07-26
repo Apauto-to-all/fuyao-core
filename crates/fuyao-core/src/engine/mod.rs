@@ -1,10 +1,14 @@
 //! 引擎核心
 //!
-//! 两层分离的引擎层：启动一次，装配能力（provider / store / 出口通道）；
+//! 两层分离的引擎层：启动一次，装配能力（provider / store / 工具 / 插件）；
 //! 多个对话按需创建，各自独立跑交互。
 //!
 //! 并发模型：每 session 一个独立 tokio task（异步并发）。
 //! Engine 持调度表，各 task 并发跑，同 session 内单 task 串行。
+//!
+//! 出站架构：**per-session 独立通道**——每个 session 持有自己的 `(tx, rx)` 通道对，
+//! session task 的所有 emit 都进自己的 tx；rx 由调用方（装配层）取走消费。
+//! Engine **不做 fan-in**——出站事件的汇聚是装配层的职责（见设计文档 04）。
 
 pub(crate) mod types;
 
@@ -58,16 +62,18 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 引擎
 ///
-/// 能力共享层：构造时装配一次，持有 DB 句柄、provider、出口通道等引擎级共享。
+/// 能力共享层：构造时装配一次，持有 DB 句柄、provider、工具等引擎级共享。
 /// 多个对话（Session）共享同一个 Engine 实例，靠 session id 区分。
 ///
 /// 公开 API 遵循设计文档的四个动作：
 /// - [`new`](Self::new)：启动引擎（构造即启动）
-/// - [`create_session`](Self::create_session)：创建对话
-/// - [`resume_session`](Self::resume_session)：恢复对话
+/// - [`create_session`](Self::create_session)：创建对话（返 `(id, rx)`，rx 由调用方消费）
+/// - [`resume_session`](Self::resume_session)：恢复对话（返 `(id, rx)`）
 /// - [`send`](Self::send)：入事件（单一入口）
-/// - [`recv`](Self::recv)：出事件（单一出口）
 /// - [`shutdown`](Self::shutdown)：关闭引擎（独立方法，不走消息流）
+///
+/// **没有 `recv` 方法**——出站事件靠每 session 自己的 rx 消费（per-session 通道化）。
+/// 装配层负责把多个 session 的 rx fan-in 成单一出口（见设计文档 04）。
 pub struct Engine {
     /// 会话存储层（Arc 共享给各 session task）
     store: Arc<SessionStore>,
@@ -97,22 +103,15 @@ pub struct Engine {
     /// 活跃 session 调度表（session_id → SessionHandle）
     sessions: Mutex<std::collections::HashMap<SessionId, SessionHandle>>,
 
-    /// 事件出口通道发送端（单一出口，各 task 往这发）
-    tx_event: mpsc::Sender<OutputEvent>,
-
-    /// 事件出口通道接收端（recv 用，Mutex 包裹因为 Engine 可跨 await 持有）
-    rx_event: Mutex<mpsc::Receiver<OutputEvent>>,
-
     /// 引擎启动参数（引擎级，含 agent_paths 等，后续可拓展）
     params: EngineParams,
 
     /// 引擎是否已 shutdown（AtomicBool 同步快路径）
     ///
-    /// shutdown 后置 true，作为 send / recv 的同步快路径检查：
+    /// shutdown 后置 true，作为 `send` 的同步快路径检查：
     /// - `send` 立即返回 `Err(EngineError::Shutdown)`（区分于 `SessionNotFound`）
-    /// - `recv` 先 drain 残余事件，再返回 None（不丢 shutdown 前最后几条事件）
     ///
-    /// 用 AtomicBool 而非 CancellationToken：send/recv 入口检查需同步、不 await，
+    /// 用 AtomicBool 而非 CancellationToken：send 入口检查需同步、不 await，
     /// AtomicBool 满足零开销同步语义；task 内的取消信号另用 `shutdown_token`。
     shutdown: Arc<AtomicBool>,
 
@@ -127,8 +126,8 @@ pub struct Engine {
 impl Engine {
     /// 启动引擎（动作一）
     ///
-    /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider 与工具注册表、
-    /// 建立出口通道。启动完成后才可创建/恢复对话。
+    /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider 与工具注册表。
+    /// 启动完成后才可创建/恢复对话。
     ///
     /// `tools` 由装配方注入（如从 `fuyao_tools::all_tools()` 转换），引擎持有后
     /// 所有 session task 共享同一份工具表。
@@ -140,6 +139,9 @@ impl Engine {
     /// `plugin_host` 是插件工厂集合，引擎级共享。每个 session 启动时调用
     /// [`PluginHost::create_instances`] 生成该 session 的独立实例，
     /// 各实例 register 到该 session 私有的 HooksRegistry。拦截/观察在 session task 内执行。
+    ///
+    /// **不建立出口通道**——per-session 出站通道在 [`Engine::assemble_session`]
+    /// 时按 session 独立创建，rx 随创建方法返回给调用方（见设计文档 04）。
     pub async fn new(
         params: EngineParams,
         providers: ProviderRegistry,
@@ -152,18 +154,12 @@ impl Engine {
             .await
             .expect("打开会话数据库失败");
 
-        // 建出口通道（单一出口）
-        // TODO: 通道容量从配置读取（第二步先用固定值）
-        let (tx_event, rx_event) = mpsc::channel(256);
-
         Self {
             store: Arc::new(store),
             providers: Arc::new(providers),
             tools: Arc::new(tools),
             plugin_host: Arc::new(plugin_host),
             sessions: Mutex::new(std::collections::HashMap::new()),
-            tx_event,
-            rx_event: Mutex::new(rx_event),
             params,
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_token: CancellationToken::new(),

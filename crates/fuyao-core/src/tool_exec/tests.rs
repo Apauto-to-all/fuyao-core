@@ -56,7 +56,7 @@ fn make_tool_call(id: &str, name: &str, args: &str) -> ToolCallData {
 
 /// 构造 Emitter（不需要验证事件，只用于 session_id 日志）
 fn test_emitter() -> Emitter {
-    let (tx, _rx) = mpsc::channel::<fuyao_api::message::OutputEvent>(8);
+    let (tx, _rx) = mpsc::unbounded_channel::<fuyao_api::message::OutputEvent>();
     Emitter::new(tx, "test-session".to_string())
 }
 

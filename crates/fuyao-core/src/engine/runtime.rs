@@ -1,9 +1,11 @@
-//! 会话运行时操作（入站分发 / 出站拉取 / 参数更新）
+//! 会话运行时操作（入站分发 / 参数更新）
 //!
 //! 本模块集中 [`Engine`] 的「运行」相关动作：
 //! - [`Engine::send`]：入站事件单一入口（User / Interrupt / Plugin 分流）
-//! - [`Engine::recv`]：出站事件单一出口
 //! - [`Engine::update_session_params`]：运行时调整 session 参数
+//!
+//! 出站事件不再走 Engine——每 session 持自己的 per-session 通道，rx 由创建方法
+//! 返调用方独占消费（见设计文档 04）。
 
 use super::*;
 
@@ -16,7 +18,7 @@ impl Engine {
     /// - `Plugin`：插件发给某对话的通知，转发为 OutputEvent::Plugin 送出
     ///
     /// 入队即返回，不阻塞——不等大模型想完。
-    /// 后续产出从 [`recv`](Self::recv) 流出。
+    /// 后续产出从该 session 的 per-session rx 流出（由 create_session 等返回）。
     ///
     /// session id 不在调度表 → 同步返回 `Err(SessionNotFound)`（要恢复走恢复动作）。
     pub async fn send(&self, id: &SessionId, event: InputEvent) -> Result<(), EngineError> {
@@ -119,22 +121,5 @@ impl Engine {
         *current = params;
         tracing::info!(session_id = %id, "对话参数已更新");
         Ok(())
-    }
-
-    /// 出事件（单一出口）
-    ///
-    /// 从统一出口取下一条产出事件，按 session_id 归类到对应对话。
-    /// 所有对话的产出都从此口流出，没有第二个出口。
-    ///
-    /// 返回 `None` 表示引擎已关闭、通道已断。
-    ///
-    /// shutdown 后调用：先 drain 残余事件（不丢 shutdown 前最后几条产出），
-    /// 队列空了再返回 None——让消费者能完整收完 shutdown 前的事件流后优雅退出。
-    pub async fn recv(&self) -> Option<OutputEvent> {
-        // shutdown 后走快路径：drain 残余事件，再返回 None
-        if self.shutdown.load(Ordering::Acquire) {
-            return self.rx_event.lock().await.try_recv().ok();
-        }
-        self.rx_event.lock().await.recv().await
     }
 }

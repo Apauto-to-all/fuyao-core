@@ -105,7 +105,7 @@ async fn assembled_engine_runs_react_loop() {
     .await;
 
     // 创建 session
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -118,7 +118,7 @@ async fn assembled_engine_runs_react_loop() {
     let mut got_chunk = false;
     let mut got_assistant = false;
     for _ in 0..20 {
-        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
             Ok(Some(e)) => match e {
                 OutputEvent::Chunk(_) => got_chunk = true,
                 OutputEvent::Assistant(a) => {
@@ -215,7 +215,7 @@ async fn retry_runner_emits_retry_event_then_succeeds() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -227,7 +227,7 @@ async fn retry_runner_emits_retry_event_then_succeeds() {
     let mut got_retry = false;
     let mut got_assistant = false;
     for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
             Ok(Some(OutputEvent::Retry(r))) => {
                 got_retry = true;
                 assert_eq!(r.payload.attempt, 1, "首次重试 attempt 应为 1");
@@ -286,7 +286,7 @@ async fn retry_runner_no_retry_on_auth_error() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -298,7 +298,7 @@ async fn retry_runner_no_retry_on_auth_error() {
     let mut got_error = false;
     let mut got_retry = false;
     for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
             Ok(Some(OutputEvent::Error(_))) => {
                 got_error = true;
                 break;
@@ -362,7 +362,7 @@ async fn retry_runner_no_retry_after_first_chunk() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -373,7 +373,7 @@ async fn retry_runner_no_retry_after_first_chunk() {
     let mut got_error = false;
     let mut got_retry = false;
     for _ in 0..50 {
-        match tokio::time::timeout(Duration::from_millis(2000), engine.recv()).await {
+        match tokio::time::timeout(Duration::from_millis(2000), rx_event.recv()).await {
             Ok(Some(OutputEvent::Error(_))) => {
                 got_error = true;
                 break;
@@ -439,7 +439,7 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -455,7 +455,7 @@ async fn retry_runner_emits_multiple_retry_events_under_persistent_error() {
             break;
         }
         if let Ok(Some(OutputEvent::Retry(r))) =
-            tokio::time::timeout(Duration::from_millis(200), engine.recv()).await
+            tokio::time::timeout(Duration::from_millis(200), rx_event.recv()).await
         {
             retry_attempts.push(r.payload.attempt);
         }
@@ -495,7 +495,7 @@ async fn shutdown_blocks_send_with_shutdown_error() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, _rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -527,7 +527,7 @@ async fn shutdown_returns_none_for_recv() {
     )
     .await;
 
-    let _session_id = engine
+    let (_session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -536,7 +536,7 @@ async fn shutdown_returns_none_for_recv() {
     engine.shutdown().await;
 
     // recv 应最终返回 None（shutdown 后通道 drain 完）
-    let result = tokio::time::timeout(Duration::from_secs(2), engine.recv()).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), rx_event.recv()).await;
     match result {
         Ok(None) => { /* 期望：返回 None */ }
         Ok(Some(ev)) => panic!("shutdown 后 recv 应返回 None，实际收到事件: {ev:?}"),
@@ -563,7 +563,7 @@ async fn shutdown_terminates_active_session_and_persists() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -575,7 +575,7 @@ async fn shutdown_terminates_active_session_and_persists() {
     let mut got_assistant = false;
     for _ in 0..50 {
         if let Ok(Some(OutputEvent::Assistant(a))) =
-            tokio::time::timeout(Duration::from_millis(500), engine.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), rx_event.recv()).await
         {
             assert!(
                 a.payload
@@ -640,7 +640,7 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -652,7 +652,7 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
     let mut entered_backoff = false;
     for _ in 0..20 {
         if let Ok(Some(OutputEvent::Retry(_))) =
-            tokio::time::timeout(Duration::from_millis(500), engine.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), rx_event.recv()).await
         {
             entered_backoff = true;
             break;
@@ -722,24 +722,38 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
     .await;
 
     // 创建 5 个并发 session，每个发一条消息触发 retry 退避
+    // Phase 1 per-session rx：装配层 fan-in 暂未就绪，本测试内联 spawn forwarder
+    // 把 5 个 session 的 rx 汇聚到一根 fan_rx（Phase 2 后由 App::recv 提供）
     const N: usize = 5;
     let mut session_ids = Vec::with_capacity(N);
+    let (fan_tx, mut fan_rx) = tokio::sync::mpsc::channel::<OutputEvent>(64);
     for i in 0..N {
-        let id = engine
+        let (id, rx) = engine
             .create_session(test_session_params())
             .await
             .expect("创建 session 失败");
         let event = guide_user_message(&format!("触发重试 #{i}"));
         engine.send(&id, event).await.expect("发消息失败");
+        // per-session forwarder：把该 session 的 rx 转到共享 fan_rx
+        let fan_tx = fan_tx.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(ev) = rx.recv().await {
+                if fan_tx.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        });
         session_ids.push(id);
     }
+    drop(fan_tx);
 
     // 等 5 个 session 都至少收到一个 Retry 事件，确认都进入退避 sleep
     // （retry_after_ms=30s，sleep 中 task 不会自然退出）
     let mut entered_backoff_count = 0;
     for _ in 0..200 {
         if let Ok(Some(OutputEvent::Retry(_))) =
-            tokio::time::timeout(Duration::from_millis(200), engine.recv()).await
+            tokio::time::timeout(Duration::from_millis(200), fan_rx.recv()).await
         {
             entered_backoff_count += 1;
             if entered_backoff_count >= N {
@@ -799,7 +813,7 @@ async fn end_session_removes_from_schedule() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, _rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -847,7 +861,7 @@ async fn end_session_persists_ended_at_and_reason() {
     )
     .await;
 
-    let session_id = engine
+    let (session_id, _rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session 失败");
@@ -912,11 +926,11 @@ async fn end_session_does_not_affect_other_sessions() {
     )
     .await;
 
-    let session_a = engine
+    let (session_a, _rx_a) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session A 失败");
-    let session_b = engine
+    let (session_b, mut rx_event) = engine
         .create_session(test_session_params())
         .await
         .expect("创建 session B 失败");
@@ -948,7 +962,7 @@ async fn end_session_does_not_affect_other_sessions() {
     let mut got_assistant = false;
     for _ in 0..50 {
         if let Ok(Some(OutputEvent::Assistant(a))) =
-            tokio::time::timeout(Duration::from_millis(500), engine.recv()).await
+            tokio::time::timeout(Duration::from_millis(500), rx_event.recv()).await
         {
             assert!(
                 a.payload

@@ -124,7 +124,7 @@ async fn create_child_session_fresh_sets_parent() {
     let (engine, _dir) = make_engine().await;
     let parent_id = "parent-main".to_string();
 
-    let child_id = engine
+    let (child_id, _rx) = engine
         .create_child_session(
             &parent_id,
             ChildSessionSource::Fresh,
@@ -150,5 +150,42 @@ async fn create_child_session_fresh_sets_parent() {
     );
 
     // 收尾：拆除 create_child_session spawn 出来的 idle session task
+    let _ = engine.end_session(&child_id, "测试结束").await;
+}
+
+#[tokio::test]
+async fn create_detached_child_session_fresh_sets_parent() {
+    // detached 入口与常规 create_child_session 在 Engine 层实现等价（仅语义差异），
+    // 验证返参类型与 parent 标记正确。
+    let (engine, _dir) = make_engine().await;
+    let parent_id = "parent-detached".to_string();
+
+    // detached 变体返参同型：(SessionId, UnboundedReceiver<OutputEvent>)
+    let (child_id, _rx) = engine
+        .create_detached_child_session(
+            &parent_id,
+            ChildSessionSource::Fresh,
+            SessionParams::default(),
+        )
+        .await
+        .unwrap();
+
+    // 落库后 parent_session_id 为父 id
+    let loaded = engine.store.get(&child_id).await.unwrap().unwrap();
+    assert_eq!(
+        loaded.parent_session_id.as_deref(),
+        Some(parent_id.as_str())
+    );
+    // 全新创建：空上下文 → message_count = 0
+    assert_eq!(loaded.message_count, 0);
+    // system_prompt 已从 agent_config 构建（非空，至少含环境 section）
+    assert!(
+        loaded
+            .system_prompt
+            .as_deref()
+            .is_some_and(|p| !p.is_empty())
+    );
+
+    // 收尾：拆除 detached 路径同样 spawn 出来的 idle session task
     let _ = engine.end_session(&child_id, "测试结束").await;
 }

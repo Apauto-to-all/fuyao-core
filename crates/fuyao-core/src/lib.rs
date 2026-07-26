@@ -1,15 +1,17 @@
 //! fuyao-core 引擎内核
 //!
-//! 能力共享层：启动一次，装配能力（provider / DB 句柄 / 出口通道）；
+//! 能力共享层：启动一次，装配能力（provider / DB / 工具 / 插件）；
 //! 多个对话按需创建，各自独立跑交互。
 //!
-//! 公开 API 遵循设计文档的四个动作：
+//! 公开 API：
 //! - 启动引擎（[`Engine::new`]）
-//! - 创建对话（[`Engine::create_session`]）
+//! - 创建对话（[`Engine::create_session`]，返 `(id, rx)`——rx 是 per-session 出站通道）
 //! - 恢复对话（[`Engine::resume_session`]）
 //! - 入事件（[`Engine::send`]，单一入口，对话级事件）
-//! - 出事件（[`Engine::recv`]，单一出口，出所有 OutputEvent）
 //! - 关闭引擎（[`Engine::shutdown`]，独立方法，不走消息流）
+//!
+//! **没有 Engine::recv**——出站靠每 session 自己的 rx 消费（per-session 通道化，
+//! 见设计文档 04）。装配层（fuyao-app）负责 fan-in 多个 session 的 rx 为单一出口。
 
 mod dispatch;
 mod emit;

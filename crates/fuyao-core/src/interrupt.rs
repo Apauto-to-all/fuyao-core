@@ -334,7 +334,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             s.text = "部分回复".into();
         }
-        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let emitter = Emitter::new(tx, "sess1".to_string());
         let hooks: SharedHooks = Arc::new(tokio::sync::Mutex::new(
             fuyao_hooks::HooksRegistry::default(),

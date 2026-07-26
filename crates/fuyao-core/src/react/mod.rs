@@ -46,7 +46,7 @@ use fuyao_provider::{ProviderRegistry, StreamUsage};
 use fuyao_session::CompressionRuntimeState;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
@@ -123,7 +123,7 @@ pub(crate) async fn run_session(
     hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
     session_params: Arc<Mutex<SessionParams>>,
-    tx_event: Sender<OutputEvent>,
+    tx_event: UnboundedSender<OutputEvent>,
 ) {
     tracing::info!(session_id = %session_id, "session 执行流启动");
 

@@ -60,8 +60,11 @@ async fn main() {
     // 2. 选择 session 数量，据此创建对话
     let two = read_two_sessions(&mut reader).await;
     let mut lanes = Vec::new();
+    // per-session rx 收集：Phase 1 出站已 per-session 化，本例内联 spawn forwarder
+    // 把所有 session 的 rx 汇聚到一根 fan_rx（Phase 2 后由 App::recv 提供）
+    let (fan_tx, mut fan_rx) = tokio::sync::mpsc::channel::<OutputEvent>(64);
 
-    let session_a = engine
+    let (session_a, rx_a) = engine
         .create_session(SessionParams {
             model_config: ModelConfig {
                 model_id: Some(DEFAULT_MODEL.to_string()),
@@ -71,6 +74,7 @@ async fn main() {
         })
         .await
         .expect("创建 session A 失败");
+    spawn_forwarder(rx_a, fan_tx.clone());
     lanes.push(Lane {
         label: if two { "A" } else { "" },
         session_id: session_a,
@@ -79,7 +83,7 @@ async fn main() {
     });
 
     if two {
-        let session_b = engine
+        let (session_b, rx_b) = engine
             .create_session(SessionParams {
                 model_config: ModelConfig {
                     model_id: Some(DEFAULT_MODEL.to_string()),
@@ -89,6 +93,7 @@ async fn main() {
             })
             .await
             .expect("创建 session B 失败");
+        spawn_forwarder(rx_b, fan_tx.clone());
         lanes.push(Lane {
             label: "B",
             session_id: session_b,
@@ -104,6 +109,8 @@ async fn main() {
     } else {
         println!("\n已创建单个对话（模型 {DEFAULT_MODEL}）\n");
     }
+    // drop 主线程持的 fan_tx 副本：所有 forwarder 退出后 fan_rx 返 None（与引擎 shutdown 同步）
+    drop(fan_tx);
 
     // 3. 交互循环：读取输入 → 发给所有 session → 消费本轮事件
     loop {
@@ -131,14 +138,30 @@ async fn main() {
             send_to(&engine, &lane.session_id, input).await;
         }
 
-        // 消费本轮：recv 流出事件，按 session_id 路由到对应 lane 染色打印，
+        // 消费本轮：fan_rx 流出事件，按 session_id 路由到对应 lane 染色打印，
         // 直到所有 lane 收到终态事件（Assistant 非 tool_calls / Error / Interrupt）
-        consume_turn(&engine, &mut lanes).await;
+        consume_turn(&mut fan_rx, &mut lanes).await;
         println!();
     }
 
     fuyao_app::shutdown(engine, ctx).await;
     println!("已退出。");
+}
+
+/// per-session 出站 forwarder：把一个 session 的 rx 转到共享 fan_tx（fan-in）
+///
+/// Phase 1 占位实现——Phase 2 后由装配层（fuyao-app）的 App::recv 统一提供。
+fn spawn_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<OutputEvent>,
+    fan_tx: tokio::sync::mpsc::Sender<OutputEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if fan_tx.send(ev).await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// 读取是否双 session 模式（输入 2 为双对话，其余默认单对话）
@@ -170,9 +193,9 @@ async fn send_to(engine: &fuyao_core::Engine, session_id: &str, content: &str) {
 }
 
 /// 消费一轮所有事件，按 session_id 路由到对应 lane 染色打印，直到所有 lane 完成
-async fn consume_turn(engine: &fuyao_core::Engine, lanes: &mut [Lane]) {
+async fn consume_turn(fan_rx: &mut tokio::sync::mpsc::Receiver<OutputEvent>, lanes: &mut [Lane]) {
     loop {
-        let Some(event) = engine.recv().await else {
+        let Some(event) = fan_rx.recv().await else {
             println!("[引擎已关闭]");
             return;
         };

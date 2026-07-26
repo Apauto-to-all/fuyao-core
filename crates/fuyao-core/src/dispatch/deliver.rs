@@ -29,7 +29,8 @@ pub(crate) async fn deliver(
     let observe_event = event.clone();
 
     // 先发送（Emitter 负责：盖 session_id 标签 + 推到出口通道）
-    emitter.emit(event).await;
+    // 出站通道无界，emit 同步返回——但本函数仍保留 async 因 observe hook 可能跨 await
+    emitter.emit(event);
 
     // 再观察（独立拿锁，不持锁跨 tx.send）
     let hooks = hooks.lock().await;

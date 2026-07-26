@@ -309,7 +309,7 @@ struct TestHarness {
     rx_interrupt: Receiver<OutputInterruptMessage>,
     #[allow(dead_code)]
     tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
-    rx_event: mpsc::Receiver<OutputEvent>,
+    rx_event: mpsc::UnboundedReceiver<OutputEvent>,
 }
 
 async fn make_harness(provider: Arc<dyn Provider>, tools: Arc<ToolRegistry>) -> TestHarness {
@@ -328,7 +328,7 @@ async fn make_harness_with_hooks(
     // （build_chat_request 用 emitter.session_id() 查 DB，必须匹配）
     session.id = "test_session".to_string();
     store.create(&session).await.unwrap();
-    let (tx_event, rx_event) = mpsc::channel(128);
+    let (tx_event, rx_event) = mpsc::unbounded_channel();
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
     // 包成 ProviderRegistry：测试里所有 model_id 都用 "test/..."，统一走 test provider。
     // turn.rs 从 ctx.providers.get(provider_id) 取实例，必须找到才能继续。
@@ -362,7 +362,7 @@ async fn make_harness_with_hooks(
 }
 
 /// 收集所有产出事件（直到通道暂时无数据）
-async fn collect_events(rx: &mut mpsc::Receiver<OutputEvent>) -> Vec<OutputEvent> {
+async fn collect_events(rx: &mut mpsc::UnboundedReceiver<OutputEvent>) -> Vec<OutputEvent> {
     let mut events = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         events.push(ev);
@@ -622,7 +622,7 @@ async fn pending_consumed_when_task_idle() {
     std::mem::forget(rx_interrupt_tx);
     // Plugin 通道（保持打开，避免 rx_plugin.recv() 提前返回 None）
     let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
-    let (tx_event, mut rx_event) = mpsc::channel(128);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     // 启动 session 执行流（两队列都空，task 进入 select! 等待）
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -708,7 +708,7 @@ async fn plugin_message_routes_through_dispatch() {
     std::mem::forget(rx_interrupt_tx);
     // tx_plugin 需要保留以发送消息
     let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
-    let (tx_event, mut rx_event) = mpsc::channel(128);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
@@ -1461,7 +1461,7 @@ async fn intercept_block_skips_final_assistant_in_history() {
 /// 无法在 user 消息进历史时介入（拦截裂缝）。
 #[tokio::test]
 async fn inject_messages_intercepts_user_at_consume_time() {
-    let (tx_event, _rx_event) = mpsc::channel::<OutputEvent>(128);
+    let (tx_event, _rx_event) = mpsc::unbounded_channel::<OutputEvent>();
     let emitter = Emitter::new(tx_event, "test_session".to_string());
     let hooks: fuyao_hooks::SharedHooks =
         Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
@@ -1532,7 +1532,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
 /// 发出的事件携带原始 source（含 Plugin 名称）。
 #[tokio::test]
 async fn inject_messages_preserves_plugin_source_in_event() {
-    let (tx_event, mut rx_event) = mpsc::channel::<OutputEvent>(128);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel::<OutputEvent>();
     let emitter = Emitter::new(tx_event, "test_session".to_string());
     let hooks: fuyao_hooks::SharedHooks =
         Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));

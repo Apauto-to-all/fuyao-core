@@ -5,10 +5,14 @@
 //! - [`Engine::resume_session`]：从数据库恢复老 session
 //! - [`Engine::fork_session`]：派生独立 session（复制源可见上下文）
 //! - [`Engine::create_child_session`]：创建带父标记的子任务 session
+//! - [`Engine::create_detached_child_session`]：创建 detached 子任务 session（rx 直接交调用方，不进 fan-in）
 //!
 //! 以及这些动作共用的内部装配逻辑（[`Engine::assemble_session`] /
 //! [`Engine::assemble_session_hooks`]）与 fork 拷贝核心
 //! （[`Engine::build_forked_session`]）。
+//!
+//! 所有创建方法都返 `(SessionId, Receiver<OutputEvent>)`——id 用于后续 send/end，
+//! rx 用于消费该 session 的产出事件（per-session 通道化，见设计文档 04）。
 
 use super::*;
 
@@ -18,8 +22,12 @@ impl Engine {
     /// 从零创建一个新 Session：构建系统提示词、生成编号、登记进调度表、落库。
     /// `SessionParams` 创建时定死且不可变（Agent 配置改了会冲掉前缀缓存）。
     ///
-    /// 返回新 session id。
-    pub async fn create_session(&self, params: SessionParams) -> Result<SessionId, EngineError> {
+    /// 返回 `(session_id, rx)`——rx 是该 session 的 per-session 出站通道接收端，
+    /// 调用方独占消费该 session 的所有 `OutputEvent`。
+    pub async fn create_session(
+        &self,
+        params: SessionParams,
+    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 构建系统提示词（Agent 配置决定人格）
         let system_prompt = build_system_prompt(&self.params.agent_paths, &params.agent_config);
 
@@ -34,7 +42,7 @@ impl Engine {
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去，不在入口拆包——压缩重建 prompt 等运行时场景
         // 仍需 agent_config，贯穿到 SessionCtx 留存，将来加字段只动 SessionCtx 一处
-        let handle = self
+        let (handle, rx_event) = self
             .assemble_session(session_id.clone(), session, params)
             .await;
         self.sessions
@@ -43,7 +51,7 @@ impl Engine {
             .insert(session_id.clone(), handle);
 
         tracing::info!(session_id = %session_id, "创建对话");
-        Ok(session_id)
+        Ok((session_id, rx_event))
     }
 
     /// 恢复对话（动作三）
@@ -55,12 +63,14 @@ impl Engine {
     /// （含 Agent 配置）——引擎核心不持久化 AgentConfig，恢复时由
     /// 调用方把创建时的那份配置原样再传一次。
     ///
+    /// 返回 `(session_id, rx)`——id 与传入相同，rx 是该 session 的 per-session 出站通道。
+    ///
     /// session id 不在数据库 → 同步返回 `Err(SessionNotFound)`。
     pub async fn resume_session(
         &self,
         id: &SessionId,
         params: SessionParams,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 从数据库加载
         let session = self
             .store
@@ -70,11 +80,11 @@ impl Engine {
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去（与 create_session 对称）
-        let handle = self.assemble_session(id.clone(), session, params).await;
+        let (handle, rx_event) = self.assemble_session(id.clone(), session, params).await;
         self.sessions.lock().await.insert(id.clone(), handle);
 
         tracing::info!(session_id = %id, "恢复对话");
-        Ok(())
+        Ok((id.clone(), rx_event))
     }
 
     /// 派生对话（fork：从源 session 复制可见上下文到新独立 session）
@@ -106,6 +116,9 @@ impl Engine {
     /// `message_count` 设为复制的**普通消息**条数（排除 compaction 边界，与 `emit_to_history` /
     /// `count_messages` 的计数语义一致——`mark_compaction` 不 bump 该计数）。
     ///
+    /// # 返回
+    /// `(new_session_id, rx)`——rx 是新 session 的 per-session 出站通道。
+    ///
     /// # 错误
     /// - [`EngineError::SessionNotFound`]：源 session id 在数据库中不存在
     /// - [`EngineError::Storage`]：复制消息或落库失败
@@ -113,14 +126,14 @@ impl Engine {
         &self,
         source_id: &SessionId,
         params: SessionParams,
-    ) -> Result<SessionId, EngineError> {
+    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 纯 fork：复制源可见上下文，parent=None（fork 出的是独立 session，非子任务）
         let new_session = self.build_forked_session(source_id, None).await?;
         let new_session_id = new_session.id.clone();
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表
         // SessionParams 整体传下去（与 create_session / resume_session 对称）
-        let handle = self
+        let (handle, rx_event) = self
             .assemble_session(new_session_id.clone(), new_session, params)
             .await;
         self.sessions
@@ -133,7 +146,7 @@ impl Engine {
             source_session_id = %source_id,
             "派生对话已创建（独立 session，parent=None）"
         );
-        Ok(new_session_id)
+        Ok((new_session_id, rx_event))
     }
 
     /// 创建子任务 session（后台任务 / 子代理地基）
@@ -156,6 +169,12 @@ impl Engine {
     /// Fresh 模式用 `agent_config` 构建初始 `system_prompt`；Fork 模式不重建（直接复制源的），
     /// `agent_config` 仅在子任务 session 后续压缩时参与重建。
     ///
+    /// # 返回
+    /// `(session_id, rx)`——rx 是子任务 session 的 per-session 出站通道。装配层通常 spawn
+    /// forwarder 把 rx 的事件汇聚到主 fan-out（fire-and-forget 后台任务用此路径）。
+    /// 若需调用方独占消费（如同步子代理 tool handler），改用
+    /// [`create_detached_child_session`](Self::create_detached_child_session)。
+    ///
     /// # 错误
     /// - [`EngineError::SessionNotFound`]：`Fork` 模式的源 session id 在数据库中不存在
     /// - [`EngineError::Storage`]：落库失败
@@ -164,7 +183,7 @@ impl Engine {
         parent_session_id: &SessionId,
         source: ChildSessionSource,
         params: SessionParams,
-    ) -> Result<SessionId, EngineError> {
+    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 先按模式构造 + 落库新 session（不带 assemble，assemble 在统一出口做）
         let new_session = match source {
             ChildSessionSource::Fresh => {
@@ -186,7 +205,7 @@ impl Engine {
         let new_session_id = new_session.id.clone();
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表（与 create_session 对称）
-        let handle = self
+        let (handle, rx_event) = self
             .assemble_session(new_session_id.clone(), new_session, params)
             .await;
         self.sessions
@@ -199,7 +218,39 @@ impl Engine {
             parent_session_id = %parent_session_id,
             "子任务 session 已创建"
         );
-        Ok(new_session_id)
+        Ok((new_session_id, rx_event))
+    }
+
+    /// 创建 detached 子任务 session（同步子代理专用）
+    ///
+    /// 与 [`create_child_session`](Self::create_child_session) 在 Engine 层实现完全一致
+    /// （都产出带 `parent_session_id` 的子任务 session 并返 `(id, rx)`），唯一差异是**语义**：
+    /// 本方法明确表达「调用方独占消费 rx」的意图——rx 不应被注册到装配层的 fan-in 集合
+    /// （不 spawn forwarder），而是直接交由 tool handler 等调用方持有。
+    ///
+    /// 同步子代理 tool handler 用本方法拿到子 session 的 rx 后：
+    /// - 透传 Chunk / ToolCall / ToolResult 到父 session 的出站通道（显示子代理进度）
+    /// - 收到 `Assistant(finish_reason=stop)` 即取内容作为工具结果回喂父 ReAct
+    ///
+    /// 见设计文档 03（子代理业务流程）+ 设计文档 04（detached API 与通道隔离）。
+    ///
+    /// # 返回
+    /// `(session_id, rx)`——rx **由调用方独占消费**，不进 fan-in。
+    ///
+    /// # 错误
+    /// - [`EngineError::SessionNotFound`]：`Fork` 模式的源 session id 在数据库中不存在
+    /// - [`EngineError::Storage`]：落库失败
+    pub async fn create_detached_child_session(
+        &self,
+        parent_session_id: &SessionId,
+        source: ChildSessionSource,
+        params: SessionParams,
+    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
+        // 当前实现与 create_child_session 等价（Engine 层无 fan-in 概念，rx 总是返调用方）。
+        // 独立方法的存在是为「detached 语义」留扩展点：未来若 detached session 需要
+        // 不同的 Engine 层处理（如递归深度追踪、shutdown 排除等）， divergence 在此发生。
+        self.create_child_session(parent_session_id, source, params)
+            .await
     }
 
     /// 从源 session 复制可见消息 + system_prompt，构造并落库新 session（fork 拷贝核心）
@@ -265,9 +316,10 @@ impl Engine {
 
     /// 装配 session（create_session / resume_session 公共方法）
     ///
-    /// 建该 session 专属的双队列 + 四条通道（inbound/interrupt/plugin + 事件出口），
+    /// 建该 session 专属的双队列 + 四条通道（inbound/interrupt/plugin + per-session 出站），
     /// 装配该 session 的 hooks（per-session 独立实例），spawn 执行流 task，
-    /// 返回 SessionHandle 由调用方登记进调度表。
+    /// 返回 `(SessionHandle, rx_event)`——rx_event 是该 session 的独立出站通道接收端，
+    /// 由调用方（装配层 / detached 调用方）独占消费。
     ///
     /// 关键：`assemble_session_hooks` 必须 async（`init_send_inputs` 是 async），
     /// 故本方法也是 async。
@@ -276,7 +328,7 @@ impl Engine {
         session_id: SessionId,
         session: Session,
         session_params: SessionParams,
-    ) -> SessionHandle {
+    ) -> (SessionHandle, mpsc::UnboundedReceiver<OutputEvent>) {
         // 双队列
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
         let pending: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
@@ -286,10 +338,14 @@ impl Engine {
         // 用 tokio::Mutex：Engine 写与 task 读均跨 async 上下文（与 SessionCtx.session_params 同型）。
         let session_params = Arc::new(Mutex::new(session_params));
 
-        // 三条 session 级通道（载荷统一为 output 侧类型——入口转化后内核只认 output 侧）
+        // 三条 session 级入站通道（载荷统一为 output 侧类型——入口转化后内核只认 output 侧）
         let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::message::output::UserMessage>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
         let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
+
+        // 该 session 的 per-session 出站通道（无界——事件入 channel 前已落库，
+        // 不让 emit 阻塞反压到 ReAct turn 推进，见设计文档 04）
+        let (tx_event, rx_event) = mpsc::unbounded_channel::<OutputEvent>();
 
         // 该 session 的关闭信号（引擎级 shutdown_token 的 child_token）
         //   Engine::shutdown 调 root.cancel → 所有 child 同时 cancel
@@ -306,7 +362,7 @@ impl Engine {
             )
             .await;
 
-        // spawn 执行流 task（多传 rx_plugin 参数）
+        // spawn 执行流 task（多传 tx_event 参数）
         let task = tokio::spawn(react::run_session(
             session_id.clone(),
             Arc::clone(&guide),
@@ -322,19 +378,22 @@ impl Engine {
             hooks,
             self.params.agent_paths.clone(),
             Arc::clone(&session_params),
-            self.tx_event.clone(),
+            tx_event,
         ));
 
-        SessionHandle {
-            guide,
-            pending,
-            tx_inbound,
-            tx_interrupt,
-            tx_plugin,
-            task,
-            shutdown_token,
-            session_params,
-        }
+        (
+            SessionHandle {
+                guide,
+                pending,
+                tx_inbound,
+                tx_interrupt,
+                tx_plugin,
+                task,
+                shutdown_token,
+                session_params,
+            },
+            rx_event,
+        )
     }
 
     /// 装配某 session 的 hooks（per-session，每 session 调用一次）

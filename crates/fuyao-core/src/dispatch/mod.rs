@@ -163,8 +163,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     /// 构造测试用 Emitter + 空 hooks
-    fn make_emitter_hooks() -> (Emitter, SharedHooks, mpsc::Receiver<OutputEvent>) {
-        let (tx, rx) = mpsc::channel(16);
+    fn make_emitter_hooks() -> (Emitter, SharedHooks, mpsc::UnboundedReceiver<OutputEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
         let emitter = Emitter::new(tx, "test-session".to_string());
         let hooks: SharedHooks =
             std::sync::Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
