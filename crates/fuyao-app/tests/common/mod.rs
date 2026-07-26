@@ -2,6 +2,11 @@
 //!
 //! MockProvider（复用 fuyao-core 的 stream::iter 模式）+ 临时 AgentPaths 构造
 //! （注入临时 fuyao_home，避免触碰真实 ~/.fuyao）。
+//!
+//! 文件级 `#![allow(dead_code)]`：本文件被多个测试二进制共享（每个测试文件独立编译），
+//! 不同二进制用到不同子集 fixture，未用部分会触发 dead_code 警告——属于共享 fixture 的正常现象。
+
+#![allow(dead_code)]
 
 use futures_util::stream;
 use fuyao_api::AgentPaths;
