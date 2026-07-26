@@ -93,7 +93,8 @@ L0  fuyao-api（零内部依赖）
 - **职责**：引擎内核（两层分离）：能力共享层（Engine）+ 对话执行层（session task）
 - **内部依赖**：api, provider, hooks, prompt, session
 - **公开 API**：
-  - **`Engine`**（五个动作 + shutdown）：`new(params, providers, tools, plugin_host)` / `create_session(SessionParams)` / `resume_session(id, SessionParams)` / `send(id, InputEvent, MessageParams)` / `recv()` / `end_session(id, reason)` / `shutdown()`
+  - **`Engine`**（五个交互 + 派生 + shutdown）：`new(params, providers, tools, plugin_host)` / `create_session(SessionParams)` / `resume_session(id, SessionParams)` / `fork_session(source_id, SessionParams)`（派生独立 session，`parent_session_id = None`）/ `create_child_session(parent_id, ChildSessionSource, SessionParams)`（创建子任务 session，`parent_session_id = Some(父 id)`）/ `send(id, InputEvent, MessageParams)` / `recv()` / `end_session(id, reason)` / `shutdown()`
+  - **`ChildSessionSource`**：`Fresh`（空上下文）/ `Fork(SessionId)`（复制源可见消息 + system_prompt）
   - **`SessionId`**：`String` 别名
   - **`EngineError`**：`SessionNotFound` / `Storage` / `Provider` / `Shutdown`
   - **工具注册**：`ToolRegistry` / `ToolRegistryBuilder` / `ToolEntry`

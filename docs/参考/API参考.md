@@ -33,7 +33,7 @@ cargo doc --workspace --no-deps --open
 
 ## 入口 API（最重要）
 
-应用层绝大多数场景只用 `fuyao-app` 的几个入口 + `fuyao-core::Engine` 的六个方法，其它类型只在装配或扩展时才接触：
+应用层绝大多数场景只用 `fuyao-app` 的几个入口 + `fuyao-core::Engine` 的方法，其它类型只在装配或扩展时才接触：
 
 ### 一行启动
 
@@ -44,7 +44,7 @@ let agent_paths = AgentPaths::default();
 let (engine, app_ctx) = fuyao_app::start(agent_paths).await?;
 ```
 
-### Engine 六个动作（五个交互 + shutdown）
+### Engine 动作清单（五个交互 + 派生 + shutdown）
 
 字段 / 签名细节见 rustdoc，核心动作清单如下（详见 [核心架构](../解释/核心架构.md)）：
 
@@ -56,6 +56,8 @@ let (engine, app_ctx) = fuyao_app::start(agent_paths).await?;
 | 入事件 | `engine.send` | `&SessionId` / `InputEvent` / `MessageParams` | `Result<(), EngineError>` |
 | 出事件 | `engine.recv` | — | `Option<OutputEvent>` |
 | 销毁单对话 | `engine.end_session` | `&SessionId` / `&str（end_reason）` | `Result<(), EngineError>` |
+| 派生对话（fork） | `engine.fork_session` | `&SessionId`（源）/ `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = None`） |
+| 创建子任务 session | `engine.create_child_session` | `&SessionId`（父）/ `ChildSessionSource` / `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = Some(父 id)`） |
 | 关闭引擎 | `engine.shutdown` | — | `()` |
 
 ## 手写参考聚焦什么

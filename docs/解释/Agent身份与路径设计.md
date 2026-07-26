@@ -41,6 +41,7 @@ UI 层只需在对应动作时提供对应 Params：
 
 - `start(agent_paths)` 或 `Engine::new(engine_params, ...)`：构造 `EngineParams`
 - `engine.create_session(SessionParams)` 或 `engine.resume_session(id, SessionParams)`：构造 `SessionParams`
+- `engine.fork_session(source_id, SessionParams)` 或 `engine.create_child_session(parent_id, ChildSessionSource, SessionParams)`：派生 / 子任务场景同样构造 `SessionParams`
 - `engine.send(id, InputEvent, MessageParams)`：构造 `MessageParams`
 
 ## agent_id 解析
