@@ -50,8 +50,8 @@ const SHUTDOWN_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// [`App::create_child_session`] 返 `(id, rx)`——rx 由调用方独占消费，不进 fan_in。
 /// 同步子代理 tool handler / fire-and-forget 后台任务均用此路径。
 pub struct App {
-    /// 引擎内核（装配层代理所有 engine 公共 API）
-    engine: Engine,
+    /// 引擎内核（`Arc` 共享：handler 闭包捕获弱引用注入工具 ctx；App 通过 Deref 代理 API）
+    engine: Arc<Engine>,
     /// MCP 管理器（无配置 server 时为 None）。shutdown 时调 stop_all 优雅关闭。
     mcp_manager: Option<Arc<MCPManager>>,
     /// 日志 guard：drop 时 flush 文件缓冲，须存活到 App 结束。
@@ -75,7 +75,11 @@ impl App {
     ///
     /// 调用方负责先把 `engine` / `mcp_manager` / `log_guard` 准备好。
     /// [`crate::start`] 内部也是调本方法（多走一遍 init + 工具收集）。
-    pub fn new(engine: Engine, mcp_manager: Option<Arc<MCPManager>>, log_guard: LogGuard) -> Self {
+    pub fn new(
+        engine: Arc<Engine>,
+        mcp_manager: Option<Arc<MCPManager>>,
+        log_guard: LogGuard,
+    ) -> Self {
         let (fan_out_tx, fan_out_rx) = mpsc::channel::<OutputEvent>(FAN_OUT_CAPACITY);
         Self {
             engine,

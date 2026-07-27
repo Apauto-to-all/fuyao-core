@@ -18,7 +18,7 @@ use fuyao_provider::ProviderRegistry;
 ///
 /// 返回 `(Engine, TempDir)`：TempDir 由调用方持有，存活到测试结束自动清理，
 /// 保证 SessionStore 的 db 路径在测试期间有效（无需 leak）。
-async fn make_engine() -> (Engine, tempfile::TempDir) {
+async fn make_engine() -> (Arc<Engine>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("创建临时目录失败");
     let fuyao_home = dir.path().to_path_buf();
     let agent_paths = AgentPaths {

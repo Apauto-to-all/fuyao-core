@@ -60,6 +60,7 @@ pub(crate) async fn execute_tools(
     emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
     cancel: &CancellationToken,
+    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 ) {
     if tool_calls.is_empty() {
         return;
@@ -92,10 +93,20 @@ pub(crate) async fn execute_tools(
             result_tx,
             &config,
             cancel,
+            subagent_ops,
         )
         .await
     } else {
-        execute_sequential(tool_calls, tools, agent_paths, emitter, result_tx, cancel).await
+        execute_sequential(
+            tool_calls,
+            tools,
+            agent_paths,
+            emitter,
+            result_tx,
+            cancel,
+            subagent_ops,
+        )
+        .await
     }
 }
 
@@ -110,11 +121,20 @@ async fn execute_sequential(
     emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
     cancel: &CancellationToken,
+    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 ) {
     let session_id = emitter.session_id().to_string();
 
     for tc in tool_calls {
-        let result = execute_single(tc, tools, agent_paths, &session_id, cancel).await;
+        let result = execute_single(
+            tc,
+            tools,
+            agent_paths,
+            &session_id,
+            cancel,
+            subagent_ops.clone(),
+        )
+        .await;
         // 完成一个通知一个：调用方据此立即走 emit_to_history
         if result_tx.send(result).await.is_err() {
             tracing::warn!(
@@ -133,6 +153,7 @@ async fn execute_sequential(
 ///   （UX 上调用方立即走 emit_to_history，UI 先看到先完成的工具结果）。
 /// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误日志，不连坐兄弟任务。
 ///   JoinSet drop 时自动 abort 所有未完成任务（中断取消语义由调用方的 select! drop 触发）。
+#[allow(clippy::too_many_arguments)]
 async fn execute_parallel(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
@@ -141,6 +162,7 @@ async fn execute_parallel(
     result_tx: &Sender<ToolExecResult>,
     config: &fuyao_api::ToolRunnerConfig,
     cancel: &CancellationToken,
+    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
     let session_id = emitter.session_id().to_string();
@@ -153,11 +175,20 @@ async fn execute_parallel(
         let session_id = session_id.clone();
         let semaphore = semaphore.clone();
         let cancel = cancel.clone(); // CancellationToken clone 廉价（Arc 共享），进 task 供 handler 监听
+        let subagent_ops = subagent_ops.clone(); // Option<Weak> clone 廉价
 
         join_set.spawn(async move {
             // 获取许可：限制同一批次内同时运行的工具数（session 局部，不影响其他 session）
             let _permit = semaphore.acquire().await;
-            execute_single(&tc, &tools, &agent_paths, &session_id, &cancel).await
+            execute_single(
+                &tc,
+                &tools,
+                &agent_paths,
+                &session_id,
+                &cancel,
+                subagent_ops,
+            )
+            .await
         });
     }
 
@@ -198,6 +229,7 @@ async fn execute_single(
     agent_paths: &fuyao_api::AgentPaths,
     session_id: &str,
     cancel: &CancellationToken,
+    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 ) -> ToolExecResult {
     let tool_name = tc.name.clone();
     let tool_call_id = tc.id.clone();
@@ -218,10 +250,12 @@ async fn execute_single(
         serde_json::Value::Null
     });
 
-    // 构建上下文：注入 session_id + agent_paths（工具据此访问路径、识别会话）
+    // 构建上下文：注入 session_id + agent_paths + subagent_ops（工具据此识别会话、
+    // 子代理类工具还据此 upgrade 拿引擎能力派生子 session）
     let ctx = ToolCallContext {
         session_id: Some(session_id.to_string()),
         agent_paths: Some(agent_paths.clone()),
+        subagent_ops,
     };
 
     let started = std::time::Instant::now();

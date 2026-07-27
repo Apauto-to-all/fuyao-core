@@ -23,7 +23,7 @@ pub fn collect_builtin_tools() -> Vec<ToolEntry> {
         entries.push(ToolEntry {
             definition: entry.definition.clone(),
             handler: entry.handler.clone(),
-            child_invisible: false,
+            child_invisible: entry.child_invisible,
         });
     }
     tracing::info!(tools = entries.len(), "内置工具收集完成");

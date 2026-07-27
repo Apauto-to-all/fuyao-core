@@ -213,6 +213,7 @@ mod tests {
         let ctx = ToolCallContext {
             session_id: Some("test".to_string()),
             agent_paths: None,
+            subagent_ops: None,
         };
         let result = todo_handler(serde_json::json!({}), &ctx).await;
         assert!(result.contains("agent_paths"));
@@ -223,6 +224,7 @@ mod tests {
         let ctx = ToolCallContext {
             session_id: Some("test".to_string()),
             agent_paths: Some(fuyao_api::AgentPaths::default()),
+            subagent_ops: None,
         };
         let result = todo_handler(serde_json::json!({ "todos": "not_array" }), &ctx).await;
         assert!(result.contains("todos 必须是数组"));

@@ -12,11 +12,19 @@ use fuyao_api::{ToolDefinition, ToolFn};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-/// 工具条目：schema + handler
+/// 工具条目：schema + handler + 可见性元数据
+///
+/// 与 `fuyao_core::ToolEntry` 字段对齐——`collect_builtin_tools` 转换时 1:1 映射。
+/// `child_invisible` 标记工具是否对子 session 隐藏（递归防护）。
 #[derive(Clone)]
 pub struct ToolEntry {
     pub definition: ToolDefinition,
     pub handler: ToolFn,
+    /// 是否对子 session 隐藏（递归防护）
+    ///
+    /// `true` 时该工具不出现在子任务 session 的工具列表里。子代理工具标 `true`，
+    /// 阻断子代理嵌套派生。
+    pub child_invisible: bool,
 }
 
 /// 通用工具注册表
@@ -24,6 +32,7 @@ static TOOL_REGISTRY: LazyLock<HashMap<&'static str, ToolEntry>> = LazyLock::new
     let mut map = HashMap::new();
     super::file::register(&mut map);
     super::skill::register(&mut map);
+    super::subagent::register(&mut map);
     super::terminal::register(&mut map);
     super::todo::register(&mut map);
     super::web::register(&mut map);

@@ -8,6 +8,7 @@ mod file;
 mod redact;
 mod registry;
 mod skill;
+mod subagent;
 mod terminal;
 mod todo;
 mod web;

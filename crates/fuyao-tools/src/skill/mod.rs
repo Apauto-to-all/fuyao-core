@@ -59,6 +59,7 @@ pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
         ToolEntry {
             definition,
             handler,
+            child_invisible: false,
         },
     );
 }

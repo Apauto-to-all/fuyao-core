@@ -2,23 +2,46 @@
 //!
 //! 工具执行时的上下文信息，由编排层注入。
 //! 不出现在工具 Schema 中，LLM 无法访问。
-//!
-//! 对应 Python 的 `fuyao.tools.types.ToolCallContext`。
 
 use crate::AgentPaths;
+use crate::tool::ops::SubagentOps;
 use std::path::{Path, PathBuf};
+use std::sync::Weak;
 
 /// 工具调用上下文
 ///
-/// 工具执行时的上下文信息，由编排层注入。
+/// 工具执行时的上下文信息，由编排层注入：
+/// - `session_id` / `agent_paths`：当前 session 的身份信息
+/// - `subagent_ops`：派生子 session 的引擎能力弱引用（仅子代理类工具用，
+///   handler upgrade 后调 [`SubagentOps`] 方法；普通工具忽略此字段）
+///
 /// 不出现在工具 Schema 中，LLM 无法访问。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ToolCallContext {
     /// 会话 ID
     pub session_id: Option<String>,
 
     /// Agent 三层目录身份证明
     pub agent_paths: Option<AgentPaths>,
+
+    /// 引擎派生子 session 的能力弱引用（运行期注入）
+    ///
+    /// 普通工具不读此字段；子代理类工具 upgrade 后调 [`SubagentOps`] 方法
+    /// 派生子任务 session 并消费其事件流。
+    pub subagent_ops: Option<Weak<dyn SubagentOps>>,
+}
+
+impl std::fmt::Debug for ToolCallContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallContext")
+            .field("session_id", &self.session_id)
+            .field("agent_paths", &self.agent_paths)
+            .field(
+                "subagent_ops",
+                &self.subagent_ops.as_ref().map(|_| "<SubagentOps>"),
+            )
+            .finish()
+    }
 }
 
 impl ToolCallContext {
@@ -53,6 +76,7 @@ impl ToolCallContext {
         Self {
             session_id,
             agent_paths,
+            subagent_ops: None,
         }
     }
 

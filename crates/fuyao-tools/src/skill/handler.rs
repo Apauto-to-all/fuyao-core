@@ -172,6 +172,7 @@ mod tests {
         ToolCallContext {
             session_id: Some("test_session".to_string()),
             agent_paths: Some(AgentPaths::default()),
+            subagent_ops: None,
         }
     }
 

@@ -14,6 +14,7 @@ pub(crate) mod types;
 
 mod lifecycle;
 mod runtime;
+mod subagent_ops;
 mod teardown;
 #[cfg(test)]
 mod tests;
@@ -26,30 +27,20 @@ use fuyao_api::PluginEventSource;
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
 };
-use fuyao_api::{EngineParams, InputEvent, MessageKind, OutputEvent, Session, SessionParams};
+use fuyao_api::{
+    ChildSessionSource, EngineParams, InputEvent, MessageKind, OutputEvent, Session, SessionParams,
+};
 use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_provider::ProviderRegistry;
 use fuyao_session::SessionStore;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 pub use types::SessionId;
-
-/// 子任务 session 的上下文来源
-///
-/// [`Engine::create_child_session`] 用：决定新子任务 session 是空上下文起步，
-/// 还是 fork 某个源 session 的可见上下文。两种模式产出的 session 都带 `parent_session_id`。
-#[derive(Debug, Clone)]
-pub enum ChildSessionSource {
-    /// 全新创建：空上下文，`system_prompt` 从 `agent_config` 构建（与 `create_session` 一致）
-    Fresh,
-    /// fork 旧 session：复制 `source_id` 的可见消息 + `system_prompt`（复用 fork_session 的拷贝逻辑）
-    Fork(SessionId),
-}
 
 /// shutdown 等待所有 session task 退出的总超时阈值
 ///
@@ -57,7 +48,7 @@ pub enum ChildSessionSource {
 /// break 前会走中断路径落库（保护 in-flight 状态）——通常毫秒级完成。
 /// 所有 task **并发退出**（用 JoinSet 同时 await），共享 10 秒总预算：
 /// 到点仍未退出的 task 统一 abort（JoinSet drop 自动 abort 所有未完成 task）。
-/// 这是「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
+/// 这是设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
 const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 引擎
@@ -121,6 +112,14 @@ pub struct Engine {
     /// 既支持引擎级一次 cancel 全部（Engine::shutdown 调 root.cancel），
     /// 也为未来「单 session 销毁」扩展点（cancel 单个 child）预留。
     shutdown_token: CancellationToken,
+
+    /// 引擎自身的弱引用（`Arc::new_cyclic` 构造时注入）
+    ///
+    /// 用于在不破坏构造顺序（ToolRegistry 先于 Engine 装配）的前提下，
+    /// 把引擎能力以弱引用形式注入工具调用上下文（[`crate::tool_exec`]），
+    /// 供子代理类工具派生子 session 时 upgrade 后调用。
+    /// 强引用循环避免：Engine → ToolRegistry → handler → ctx → Weak<Engine> 不成强环。
+    engine_weak: Weak<Engine>,
 }
 
 impl Engine {
@@ -128,6 +127,9 @@ impl Engine {
     ///
     /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider 与工具注册表。
     /// 启动完成后才可创建/恢复对话。
+    ///
+    /// 返回 `Arc<Engine>`——用 `Arc::new_cyclic` 构造，让引擎拿到自身的弱引用，
+    /// 存入 `engine_weak` 字段，供后续注入工具调用上下文（子代理工具派生子 session）。
     ///
     /// `tools` 由装配方注入（如从 `fuyao_tools::all_tools()` 转换），引擎持有后
     /// 所有 session task 共享同一份工具表。
@@ -147,14 +149,16 @@ impl Engine {
         providers: ProviderRegistry,
         tools: ToolRegistry,
         plugin_host: PluginHost,
-    ) -> Self {
+    ) -> Arc<Self> {
         // 用 agent_paths 解析 db_path，打开数据库
         let db_path = params.agent_paths.sessions_db_path();
         let store = SessionStore::new(db_path)
             .await
             .expect("打开会话数据库失败");
 
-        Self {
+        // Arc::new_cyclic：构造 Engine 时拿到自身的 Weak 引用，
+        // 存入 engine_weak 字段供后续注入工具 ctx（子代理工具用）
+        Arc::new_cyclic(|weak| Engine {
             store: Arc::new(store),
             providers: Arc::new(providers),
             tools: Arc::new(tools),
@@ -163,6 +167,17 @@ impl Engine {
             params,
             shutdown: Arc::new(AtomicBool::new(false)),
             shutdown_token: CancellationToken::new(),
-        }
+            engine_weak: weak.clone(),
+        })
+    }
+
+    /// 引擎自身的弱引用（trait object 形式，供工具调用上下文注入）
+    ///
+    /// 返回 `Weak<dyn SubagentOps>`——子代理类工具 handler upgrade 后调
+    /// [`SubagentOps`] 方法派生子 session。普通工具忽略此字段。
+    pub(crate) fn subagent_ops_weak(&self) -> Weak<dyn fuyao_api::SubagentOps> {
+        // unsized coerce: Weak<Engine> → Weak<dyn SubagentOps>
+        // （Engine impl SubagentOps 见 engine/subagent_ops.rs）
+        self.engine_weak.clone()
     }
 }

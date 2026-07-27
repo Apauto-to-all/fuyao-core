@@ -86,7 +86,15 @@ async fn collect_results(
 async fn execute_single_unknown_tool() {
     let tools = Arc::new(ToolRegistryBuilder::default().build());
     let tc = make_tool_call("1", "unknown_tool", "{}");
-    let result = execute_single(&tc, &tools, &test_paths(), "s1", &CancellationToken::new()).await;
+    let result = execute_single(
+        &tc,
+        &tools,
+        &test_paths(),
+        "s1",
+        &CancellationToken::new(),
+        None,
+    )
+    .await;
     assert_eq!(result.tool_name, "unknown_tool");
     assert!(result.content.contains("未知工具"));
 }
@@ -99,7 +107,15 @@ async fn execute_single_known_tool() {
             .build(),
     );
     let tc = make_tool_call("1", "test_tool", r#"{"key":"value"}"#);
-    let result = execute_single(&tc, &tools, &test_paths(), "s1", &CancellationToken::new()).await;
+    let result = execute_single(
+        &tc,
+        &tools,
+        &test_paths(),
+        "s1",
+        &CancellationToken::new(),
+        None,
+    )
+    .await;
     assert_eq!(result.content, "tool result");
 }
 
@@ -124,6 +140,7 @@ async fn single_call_goes_sequential() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
     )
     .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
@@ -154,6 +171,7 @@ async fn never_parallel_tool_goes_sequential() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
     )
     .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
@@ -190,6 +208,7 @@ async fn parallel_executes_all() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
     )
     .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
@@ -227,6 +246,7 @@ async fn parallel_respects_max_concurrent() {
         &tx,
         &config,
         &CancellationToken::new(),
+        None,
     )
     .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
@@ -258,6 +278,7 @@ async fn parallel_notify_count_matches_calls() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
     )
     .await;
     let results = collect_results(&tx, &mut rx, expected).await;

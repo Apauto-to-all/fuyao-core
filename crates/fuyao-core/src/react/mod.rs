@@ -90,6 +90,12 @@ pub(crate) struct SessionCtx {
     /// 目前只在主循环 idle select! 监听；未来若需 turn 中途响应，可在 turn.rs
     /// 的 select! 中段也加一路监听（行为同中断，但优先级更高）。
     pub shutdown_token: CancellationToken,
+    /// 引擎派生子 session 的能力弱引用（注入工具 ctx，子代理类工具用）
+    ///
+    /// 引擎级共享，跨 session 不变；放 SessionCtx 让 turn.rs 调 execute_tools 时
+    /// 便于透传到 [`crate::tool_exec::execute_single`] 构造的 ToolCallContext。
+    /// `Option` 让测试场景可传 `None`（避免 `Weak::<dyn Trait>::new()` 的 Sized 限制）。
+    pub subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 }
 
 /// session 的独立执行流
@@ -124,6 +130,7 @@ pub(crate) async fn run_session(
     agent_paths: fuyao_api::AgentPaths,
     session_params: Arc<Mutex<SessionParams>>,
     tx_event: UnboundedSender<OutputEvent>,
+    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 ) {
     tracing::info!(session_id = %session_id, "session 执行流启动");
 
@@ -141,6 +148,7 @@ pub(crate) async fn run_session(
         compression_state: Arc::new(std::sync::Mutex::new(CompressionRuntimeState::default())),
         compression_config: fuyao_api::get_config().session.compression.clone(),
         shutdown_token: shutdown_token.clone(),
+        subagent_ops,
     };
 
     // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断/shutdown

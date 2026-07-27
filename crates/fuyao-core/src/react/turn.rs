@@ -488,6 +488,7 @@ async fn handle_tool_calls(
         &ctx.emitter,
         &result_tx,
         &cancel,
+        ctx.subagent_ops.clone(),
     );
     tokio::pin!(exec_fut);
 

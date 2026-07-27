@@ -346,6 +346,7 @@ impl Engine {
             self.params.agent_paths.clone(),
             Arc::clone(&session_params),
             tx_event,
+            Some(self.subagent_ops_weak()),
         ));
 
         (

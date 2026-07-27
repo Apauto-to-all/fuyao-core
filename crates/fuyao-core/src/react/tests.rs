@@ -352,6 +352,7 @@ async fn make_harness_with_hooks(
         )),
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        subagent_ops: None,
     };
     TestHarness {
         ctx,
@@ -645,6 +646,7 @@ async fn pending_consumed_when_task_idle() {
         fuyao_api::AgentPaths::default(),
         Arc::new(tokio::sync::Mutex::new(test_session_params())),
         tx_event,
+        None,
     ));
 
     // 模拟 send：经入站通道发一条 Pending 消息（过管道入 pending 队列）
@@ -730,6 +732,7 @@ async fn plugin_message_routes_through_dispatch() {
         fuyao_api::AgentPaths::default(),
         Arc::new(tokio::sync::Mutex::new(test_session_params())),
         tx_event,
+        None,
     ));
 
     // 模拟 Engine::send 入口转化后送入 tx_plugin 通道的 output 侧 PluginMessage
@@ -1503,6 +1506,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         )),
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        subagent_ops: None,
     };
     let mut session = Session {
         id: "test_session".to_string(),
@@ -1559,6 +1563,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         )),
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
+        subagent_ops: None,
     };
     let mut session = Session {
         id: "test_session".to_string(),
