@@ -28,11 +28,12 @@ mod parallel;
 
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
+use fuyao_api::message::OutputEvent;
 use fuyao_api::{CancellationToken, ToolCallContext};
 use fuyao_provider::ToolCallData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::task::JoinSet;
 
 /// 单个工具执行的结果
@@ -66,6 +67,10 @@ pub(crate) async fn execute_tools(
         return;
     }
 
+    // 父 session 出站通道的直送克隆：供子代理类工具把子 session 的中间事件转发过来
+    // （绕过 emitter.emit 的 stamp_session_id——子事件已自带 child session_id 标签）
+    let event_forwarder = Some(emitter.tx_clone());
+
     // 工具并发策略从全局配置读取（`[tools.runner]`），运行期只读
     let config = fuyao_api::get_config().tools.runner.clone();
 
@@ -94,6 +99,7 @@ pub(crate) async fn execute_tools(
             &config,
             cancel,
             subagent_ops,
+            event_forwarder,
         )
         .await
     } else {
@@ -105,6 +111,7 @@ pub(crate) async fn execute_tools(
             result_tx,
             cancel,
             subagent_ops,
+            event_forwarder,
         )
         .await
     }
@@ -114,6 +121,7 @@ pub(crate) async fn execute_tools(
 ///
 /// 逐个查注册表 → 调 handler → 立即通过 `result_tx` 通知调用方。
 /// 完成一个通知一个，不等全部跑完。
+#[allow(clippy::too_many_arguments)]
 async fn execute_sequential(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
@@ -122,6 +130,7 @@ async fn execute_sequential(
     result_tx: &Sender<ToolExecResult>,
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
+    event_forwarder: Option<UnboundedSender<OutputEvent>>,
 ) {
     let session_id = emitter.session_id().to_string();
 
@@ -133,6 +142,7 @@ async fn execute_sequential(
             &session_id,
             cancel,
             subagent_ops.clone(),
+            event_forwarder.clone(),
         )
         .await;
         // 完成一个通知一个：调用方据此立即走 emit_to_history
@@ -163,6 +173,7 @@ async fn execute_parallel(
     config: &fuyao_api::ToolRunnerConfig,
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
+    event_forwarder: Option<UnboundedSender<OutputEvent>>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
     let session_id = emitter.session_id().to_string();
@@ -176,6 +187,7 @@ async fn execute_parallel(
         let semaphore = semaphore.clone();
         let cancel = cancel.clone(); // CancellationToken clone 廉价（Arc 共享），进 task 供 handler 监听
         let subagent_ops = subagent_ops.clone(); // Option<Weak> clone 廉价
+        let event_forwarder = event_forwarder.clone(); // Option<Sender> clone 廉价
 
         join_set.spawn(async move {
             // 获取许可：限制同一批次内同时运行的工具数（session 局部，不影响其他 session）
@@ -187,6 +199,7 @@ async fn execute_parallel(
                 &session_id,
                 &cancel,
                 subagent_ops,
+                event_forwarder,
             )
             .await
         });
@@ -230,6 +243,7 @@ async fn execute_single(
     session_id: &str,
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
+    event_forwarder: Option<UnboundedSender<OutputEvent>>,
 ) -> ToolExecResult {
     let tool_name = tc.name.clone();
     let tool_call_id = tc.id.clone();
@@ -250,12 +264,15 @@ async fn execute_single(
         serde_json::Value::Null
     });
 
-    // 构建上下文：注入 session_id + agent_paths + subagent_ops（工具据此识别会话、
-    // 子代理类工具还据此 upgrade 拿引擎能力派生子 session）
+    // 构建上下文：注入 session_id + agent_paths + tool_call_id + subagent_ops + event_forwarder
+    // （工具据此识别会话、子代理类工具还据此 upgrade 拿引擎能力派生子 session、
+    //  转发子 session 中间事件到父 session 出站通道）
     let ctx = ToolCallContext {
         session_id: Some(session_id.to_string()),
         agent_paths: Some(agent_paths.clone()),
+        tool_call_id: Some(tool_call_id.clone()),
         subagent_ops,
+        event_forwarder,
     };
 
     let started = std::time::Instant::now();

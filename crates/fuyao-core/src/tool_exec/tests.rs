@@ -93,6 +93,7 @@ async fn execute_single_unknown_tool() {
         "s1",
         &CancellationToken::new(),
         None,
+        None,
     )
     .await;
     assert_eq!(result.tool_name, "unknown_tool");
@@ -113,6 +114,7 @@ async fn execute_single_known_tool() {
         &test_paths(),
         "s1",
         &CancellationToken::new(),
+        None,
         None,
     )
     .await;
@@ -246,6 +248,7 @@ async fn parallel_respects_max_concurrent() {
         &tx,
         &config,
         &CancellationToken::new(),
+        None,
         None,
     )
     .await;

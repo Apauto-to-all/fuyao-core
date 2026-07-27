@@ -26,7 +26,9 @@ pub fn make_ctx(workspace: PathBuf) -> ToolCallContext {
             extra_dirs: Vec::new(),
             fuyao_home: std::env::temp_dir().join("fuyao_it_tools_home"),
         }),
+        tool_call_id: None,
         subagent_ops: None,
+        event_forwarder: None,
     }
 }
 

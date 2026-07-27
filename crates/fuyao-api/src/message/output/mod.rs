@@ -14,8 +14,10 @@
 //! - `compression`: 上下文压缩事件（Started/Delta/Ended 三阶段）
 //! - `title`: 会话标题更新（首轮对话后异步生成）
 //! - `retry`: LLM 重试事件（重试前发，前端据此渲染「N 秒后重试」提示）
+//! - `child_session`: 子任务 session 生命周期（子代理 / 后台任务派生时发出）
 
 mod assistant;
+mod child_session;
 mod chunk;
 mod compression;
 mod error;
@@ -29,6 +31,9 @@ mod user_message;
 
 // envelope / payload 在 output 层导出（外部通过 output::UserMessage 等路径访问）
 pub use assistant::{AssistantMessage, AssistantPayload};
+pub use child_session::{
+    ChildSessionMessage, ChildSessionOrigin, ChildSessionPayload, ChildSessionState,
+};
 pub use chunk::{ChunkMessage, ChunkPayload};
 pub use compression::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
@@ -71,6 +76,9 @@ pub enum OutputEvent {
     Title(TitleMessage),
     /// LLM 重试事件（重试前发，前端据此渲染「重试中…N 秒后重试，错误：xxx」提示）
     Retry(RetryMessage),
+    /// 子任务 session 生命周期（子代理 / 后台任务派生时发，前端据此追踪 child_session_id
+    /// 并把后续 session_id == child_session_id 的事件归到此任务的渲染区）
+    ChildSession(ChildSessionMessage),
 }
 
 #[cfg(test)]

@@ -224,6 +224,7 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Compression(m) => m.base.session_id.as_deref(),
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),
+        OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
     }
 }
 

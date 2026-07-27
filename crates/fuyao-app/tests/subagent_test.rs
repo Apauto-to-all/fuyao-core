@@ -3,11 +3,13 @@
 //! 验证完整流程：父 ReAct → LLM 调 subagent 工具 → handler 派生子 session →
 //! 子 session 跑完 ReAct → handler 取最终回复回喂 → 父收到 tool_result → 父继续到 stop。
 //!
+//! 同时验证子代理生命周期事件 + 中间事件透传：
+//! - `ChildSession(Started)` / `ChildSession(Ended)` 经父 session 出站通道进 fan_out
+//! - 子 session 的 Chunk 等中间事件经父 forwarder 进 fan_out（session_id 标 child）
+//!
 //! 仅覆盖端到端主干路径：
 //! - 递归防护（`definitions_json_for(true)` 排除 subagent）已有单测（`tool_registry.rs`）
 //! - 子 session 一次性（end_session 后 rx 返 None）已有单测（`child_session_test.rs`）
-//!
-//! 本测试聚焦「真实 Engine + 父子 session 联动」这一未覆盖维度。
 
 mod common;
 
@@ -19,6 +21,7 @@ use async_trait::async_trait;
 use common::{temp_agent_paths, text_events};
 use futures_util::stream;
 use fuyao_api::message::input::{UserMessage, UserPayload};
+use fuyao_api::message::output::{ChildSessionOrigin, ChildSessionState};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{EngineParams, FuyaoConfig, ModelConfig, ModelRef, SessionParams, set_config};
 use fuyao_app::{App, LogGuard, build_tool_registry};
@@ -138,9 +141,11 @@ fn as_providers<P: Provider + 'static>(p: P) -> fuyao_provider::ProviderRegistry
 ///
 /// 验证项：
 /// 1. 父 ReAct 产出含 `subagent` 的 ToolCall 事件
-/// 2. handler 派生子 session 跑完 ReAct，最终 content「子代理结果」回喂
-/// 3. 父 ReAct 收到含「子代理结果」的 ToolResult 事件
-/// 4. 父继续下一 turn 产出 finish_reason=stop 的最终 Assistant
+/// 2. handler 发 `ChildSession(Started)` 事件（携带 child_session_id + parent_session_id + tool_call_id）
+/// 3. 子 session 的 Chunk 中间事件被 forward 到 fan_out（session_id 标 child）
+/// 4. 父 ReAct 收到含「子代理结果」的 ToolResult 事件
+/// 5. handler 发 `ChildSession(Ended)` 事件
+/// 6. 父继续下一 turn 产出 finish_reason=stop 的最终 Assistant
 #[tokio::test]
 async fn parent_react_invokes_subagent_and_receives_tool_result() {
     ensure_test_config();
@@ -150,7 +155,7 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
 
     // 脚本按 stream_chat 调用顺序：
     // - [0] 父 turn1：返回 subagent tool_call
-    // - [1] 子 turn：返回「子代理结果」文本 + Stop
+    // - [1] 子 turn：返回「子代理结果」文本 + Stop（产生 Chunk 中间事件供 forward）
     // - [2] 父 turn2：收到 tool_result 后返回最终文本 + Stop
     let provider = ScriptedProvider {
         scripts: vec![
@@ -182,10 +187,14 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
 
     // 消费 fan_out：按事件类型断言关键节点
     let mut got_tool_call = false;
+    let mut got_child_started = false;
+    let mut got_child_chunk = false;
     let mut got_tool_result_with_child_content = false;
+    let mut got_child_ended = false;
     let mut got_final_assistant = false;
+    let mut child_session_id = String::new();
 
-    for _ in 0..300 {
+    for _ in 0..400 {
         // 单事件 5s 超时：脚本正确时毫秒级产出，5s 足够开发机抖动
         let Ok(Some(ev)) = timeout(Duration::from_secs(5), app.recv()).await else {
             break;
@@ -197,6 +206,35 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
                     "ToolCall 应是 subagent 工具"
                 );
                 got_tool_call = true;
+            }
+            OutputEvent::ChildSession(cs) => {
+                assert_eq!(
+                    cs.payload.parent_session_id, parent_id,
+                    "ChildSession 事件的 parent_session_id 应是父 session"
+                );
+                assert_eq!(
+                    cs.payload.origin,
+                    ChildSessionOrigin::Subagent,
+                    "origin 应是 Subagent"
+                );
+                assert_eq!(
+                    cs.payload.tool_call_id.as_deref(),
+                    Some("call_sub_1"),
+                    "tool_call_id 应是触发本次派生的 LLM tool_call id"
+                );
+                child_session_id = cs.payload.child_session_id.clone();
+                match cs.payload.state {
+                    ChildSessionState::Started => got_child_started = true,
+                    ChildSessionState::Ended => got_child_ended = true,
+                }
+            }
+            OutputEvent::Chunk(c) => {
+                // 子代理的 Chunk 经 forward 进 fan_out——session_id 应是 child
+                if c.base.session_id.as_deref() == Some(child_session_id.as_str())
+                    && !child_session_id.is_empty()
+                {
+                    got_child_chunk = true;
+                }
             }
             OutputEvent::ToolResult(tr) => {
                 assert_eq!(
@@ -226,9 +264,22 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
 
     assert!(got_tool_call, "父应产出 subagent 的 ToolCall 事件");
     assert!(
+        got_child_started,
+        "应收到 ChildSession(Started) 事件（携带 child_session_id）"
+    );
+    assert!(
+        !child_session_id.is_empty(),
+        "应从 ChildSession 事件提取 child_session_id"
+    );
+    assert!(
+        got_child_chunk,
+        "子代理的 Chunk 中间事件应被 forward 到 fan_out"
+    );
+    assert!(
         got_tool_result_with_child_content,
         "父应收到含子代理最终回复的 ToolResult"
     );
+    assert!(got_child_ended, "应收到 ChildSession(Ended) 事件");
     assert!(
         got_final_assistant,
         "父应在收到 tool_result 后继续 ReAct 产出最终 Assistant"

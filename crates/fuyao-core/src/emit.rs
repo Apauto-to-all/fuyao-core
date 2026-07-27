@@ -40,6 +40,15 @@ impl Emitter {
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
+
+    /// 出站通道 sender 的克隆（不盖 session_id 标签直送）
+    ///
+    /// 用于子代理 handler 把子 session 的事件转发到父 session 的出站通道：
+    /// 子事件已自带 child session_id 标签，不能再被本 emitter 的 session_id 覆盖。
+    /// 直接 `tx.send(ev)` 绕过 [`emit`](Self::emit) 的 stamp_session_id 步骤。
+    pub fn tx_clone(&self) -> UnboundedSender<OutputEvent> {
+        self.tx.clone()
+    }
 }
 
 /// 给事件的 base.session_id 盖标签（递归处理所有带 base 的变体）
@@ -57,5 +66,6 @@ fn stamp_session_id(event: &mut OutputEvent, session_id: &str) {
         OutputEvent::Compression(m) => m.base.session_id = id,
         OutputEvent::Title(m) => m.base.session_id = id,
         OutputEvent::Retry(m) => m.base.session_id = id,
+        OutputEvent::ChildSession(m) => m.base.session_id = id,
     }
 }
