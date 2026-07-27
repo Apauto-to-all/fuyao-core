@@ -4,15 +4,14 @@
 //! - [`Engine::create_session`]：从零创建新 session
 //! - [`Engine::resume_session`]：从数据库恢复老 session
 //! - [`Engine::fork_session`]：派生独立 session（复制源可见上下文）
-//! - [`Engine::create_child_session`]：创建带父标记的子任务 session
-//! - [`Engine::create_detached_child_session`]：创建 detached 子任务 session（rx 直接交调用方，不进 fan-in）
+//! - [`Engine::create_child_session`]：创建带父标记的子任务 session（rx 直接交调用方，不进 fan-in）
 //!
 //! 以及这些动作共用的内部装配逻辑（[`Engine::assemble_session`] /
 //! [`Engine::assemble_session_hooks`]）与 fork 拷贝核心
 //! （[`Engine::build_forked_session`]）。
 //!
 //! 所有创建方法都返 `(SessionId, Receiver<OutputEvent>)`——id 用于后续 send/end，
-//! rx 用于消费该 session 的产出事件（per-session 通道化，见设计文档 04）。
+//! rx 用于消费该 session 的产出事件（per-session 通道化）。
 
 use super::*;
 
@@ -170,10 +169,10 @@ impl Engine {
     /// `agent_config` 仅在子任务 session 后续压缩时参与重建。
     ///
     /// # 返回
-    /// `(session_id, rx)`——rx 是子任务 session 的 per-session 出站通道。装配层通常 spawn
-    /// forwarder 把 rx 的事件汇聚到主 fan-out（fire-and-forget 后台任务用此路径）。
-    /// 若需调用方独占消费（如同步子代理 tool handler），改用
-    /// [`create_detached_child_session`](Self::create_detached_child_session)。
+    /// `(session_id, rx)`——rx 是子任务 session 的 per-session 出站通道，由调用方独占消费。
+    /// 子 session 不进 fan-out（UI 出口只暴露主对话）；调用方按业务决定如何消费 rx：
+    /// - 同步子代理 tool handler：消费 rx 取 `finish_reason=stop` 的最终回复回喂父 ReAct
+    /// - fire-and-forget 后台任务：spawn 独立 task 消费 rx（写日志 / 丢弃均可——事件已落库）
     ///
     /// # 错误
     /// - [`EngineError::SessionNotFound`]：`Fork` 模式的源 session id 在数据库中不存在
@@ -219,38 +218,6 @@ impl Engine {
             "子任务 session 已创建"
         );
         Ok((new_session_id, rx_event))
-    }
-
-    /// 创建 detached 子任务 session（同步子代理专用）
-    ///
-    /// 与 [`create_child_session`](Self::create_child_session) 在 Engine 层实现完全一致
-    /// （都产出带 `parent_session_id` 的子任务 session 并返 `(id, rx)`），唯一差异是**语义**：
-    /// 本方法明确表达「调用方独占消费 rx」的意图——rx 不应被注册到装配层的 fan-in 集合
-    /// （不 spawn forwarder），而是直接交由 tool handler 等调用方持有。
-    ///
-    /// 同步子代理 tool handler 用本方法拿到子 session 的 rx 后：
-    /// - 透传 Chunk / ToolCall / ToolResult 到父 session 的出站通道（显示子代理进度）
-    /// - 收到 `Assistant(finish_reason=stop)` 即取内容作为工具结果回喂父 ReAct
-    ///
-    /// 见设计文档 03（子代理业务流程）+ 设计文档 04（detached API 与通道隔离）。
-    ///
-    /// # 返回
-    /// `(session_id, rx)`——rx **由调用方独占消费**，不进 fan-in。
-    ///
-    /// # 错误
-    /// - [`EngineError::SessionNotFound`]：`Fork` 模式的源 session id 在数据库中不存在
-    /// - [`EngineError::Storage`]：落库失败
-    pub async fn create_detached_child_session(
-        &self,
-        parent_session_id: &SessionId,
-        source: ChildSessionSource,
-        params: SessionParams,
-    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
-        // 当前实现与 create_child_session 等价（Engine 层无 fan-in 概念，rx 总是返调用方）。
-        // 独立方法的存在是为「detached 语义」留扩展点：未来若 detached session 需要
-        // 不同的 Engine 层处理（如递归深度追踪、shutdown 排除等）， divergence 在此发生。
-        self.create_child_session(parent_session_id, source, params)
-            .await
     }
 
     /// 从源 session 复制可见消息 + system_prompt，构造并落库新 session（fork 拷贝核心）
@@ -344,7 +311,7 @@ impl Engine {
         let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
 
         // 该 session 的 per-session 出站通道（无界——事件入 channel 前已落库，
-        // 不让 emit 阻塞反压到 ReAct turn 推进，见设计文档 04）
+        // 不让 emit 阻塞反压到 ReAct turn 推进）
         let (tx_event, rx_event) = mpsc::unbounded_channel::<OutputEvent>();
 
         // 该 session 的关闭信号（引擎级 shutdown_token 的 child_token）

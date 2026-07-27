@@ -1,13 +1,13 @@
-//! App 装配：fan-in 多个 session 的 per-session rx 为单一出口
+//! App 装配：fan-in 多个主 session 的 per-session rx 为单一出口
 //!
-//! 设计文档 04 第二步：装配层承担 fan-in 职责，重建单一出口。
+//! 装配层承担 fan-in 职责，重建单一出口。
 //! - [`App`] 持有 [`Engine`] + fan_out 通道（bounded）+ forward_tasks 表
-//! - 每个常规 session 创建时 spawn 一个 forwarder，把该 session 的 rx 转到 fan_out
+//! - 每个**主 session**（create_session / resume_session / fork_session）创建时 spawn 一个 forwarder
 //! - 暴露 [`App::recv`] 给上层消费者，语义等价于原 `Engine::recv`
 //! - [`App::shutdown`] 两段式：engine.shutdown 等 session task 退出 → forwarder 自然退出 → drop fan_out_tx
 //!
-//! detached 子代理 session（[`App::create_detached_child_session`]）跳过 forwarder 注册，
-//! rx 直接交调用方独占消费（设计文档 03/04）。
+//! **子 session**（create_child_session）不进 fan-out——rx 直接返调用方独占消费
+//! （子任务的事件不暴露给 UI 出口，由调用方按业务消费）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use crate::logging::LogGuard;
 /// fan_out 通道容量（app 层消费缓冲）
 ///
 /// per-session 出站无界已吸收瞬时突发；fan_out 是 app 消费缓冲，实测不够再调
-/// （设计文档 04 决策 2，沿用原 Engine 全局通道容量）。
+/// （沿用原 Engine 全局通道容量）。
 const FAN_OUT_CAPACITY: usize = 256;
 
 /// shutdown 等 forwarder task 退出的总超时阈值
@@ -46,9 +46,9 @@ const SHUTDOWN_FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// - [`App::recv`]：单一出口消费所有常规 session 的事件
 /// - [`App::shutdown`]：两段式收尾（engine.shutdown → forwarder 自然退出 → drop fan_out_tx）
 ///
-/// # detached 子代理
-/// [`App::create_detached_child_session`] 返 `(id, rx)`——rx 由调用方独占消费，
-/// 不进 fan_in（不 spawn forwarder）。设计文档 03 的同步子代理 tool handler 用此路径。
+/// # 子 session 不进 fan_out
+/// [`App::create_child_session`] 返 `(id, rx)`——rx 由调用方独占消费，不进 fan_in。
+/// 同步子代理 tool handler / fire-and-forget 后台任务均用此路径。
 pub struct App {
     /// 引擎内核（装配层代理所有 engine 公共 API）
     engine: Engine,
@@ -123,36 +123,13 @@ impl App {
         Ok(id)
     }
 
-    /// 创建子任务 session（rx 进 fan_out）
+    /// 创建子任务 session（rx **不进 fan_out**，直接返调用方独占消费）
     ///
-    /// 镜像 [`Engine::create_child_session`]——常规子任务（fire-and-forget 后台任务）
-    /// 的 rx 进 fan_in，与主对话事件流汇聚到 [`App::recv`]。
+    /// 镜像 [`Engine::create_child_session`]——子任务 session 的事件不暴露给 UI 出口，
+    /// rx 由调用方独占消费：
+    /// - 同步子代理 tool handler：消费 rx 取 `finish_reason=stop` 的最终回复
+    /// - fire-and-forget 后台任务：spawn 独立 task 消费 rx（写日志 / 丢弃均可——事件已落库）
     pub async fn create_child_session(
-        &self,
-        parent_session_id: &SessionId,
-        source: ChildSessionSource,
-        params: SessionParams,
-    ) -> Result<SessionId, EngineError> {
-        let (id, rx) = self
-            .engine
-            .create_child_session(parent_session_id, source, params)
-            .await?;
-        self.register_forwarder(id.clone(), rx).await;
-        Ok(id)
-    }
-
-    /// 创建 detached 子任务 session（rx **不进 fan_out**，直接返调用方独占消费）
-    ///
-    /// 镜像 [`Engine::create_detached_child_session`]——同步子代理 tool handler 用
-    /// 本方法拿到子 session 的 rx 独占消费：
-    /// - 透传 Chunk / ToolCall / ToolResult 到父 session 的出站通道（显示子代理进度）
-    /// - 收到 `Assistant(finish_reason=stop)` 即取内容作为工具结果回喂父 ReAct
-    ///
-    /// detached session 不在 `forward_tasks` 表中——shutdown / end_session 时不被
-    /// 装配层收尾，调用方独占消费完 rx 自然返 None（session task 退出 → tx_session drop）。
-    ///
-    /// 见设计文档 03（子代理业务流程）+ 设计文档 04（detached API 与通道隔离）。
-    pub async fn create_detached_child_session(
         &self,
         parent_session_id: &SessionId,
         source: ChildSessionSource,
@@ -160,7 +137,7 @@ impl App {
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 不 spawn forwarder，rx 直接返调用方独占消费
         self.engine
-            .create_detached_child_session(parent_session_id, source, params)
+            .create_child_session(parent_session_id, source, params)
             .await
     }
 
@@ -206,7 +183,7 @@ impl App {
 
     /// 关闭 App（两段式收尾 + MCP 停机 + drop log_guard）
     ///
-    /// 流程（设计文档 04「shutdown 时序」）：
+    /// 流程（shutdown 时序）：
     /// 1. `engine.shutdown()` → session task 全部退出 → tx_session drop → rx 返 None
     /// 2. 等 forward_tasks 全部退出（并发 JoinSet + 各自 `SHUTDOWN_FORWARD_TIMEOUT` 超时 abort 兜底）
     /// 3. 停 MCP（`mcp_manager.stop_all()` 优雅关闭所有 server 连接）

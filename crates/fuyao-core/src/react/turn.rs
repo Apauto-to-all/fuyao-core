@@ -64,7 +64,11 @@ pub(crate) async fn run_turn(
 ) {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
     // 任一失败：发 Error 事件 + 落库 + 结束本轮（配置错误，永久不可恢复）
-    let resolved: ResolvedModel = match resolve_model(&model_config, &ctx.tools) {
+    //
+    // is_child 按 session.parent_session_id 判定：子 session 的工具列表过滤掉
+    // child_invisible 的工具（递归防护——子 session 看不到派生类工具）
+    let is_child = session.parent_session_id.is_some();
+    let resolved: ResolvedModel = match resolve_model(&model_config, &ctx.tools, is_child) {
         Ok(r) => r,
         Err(msg) => {
             tracing::warn!(

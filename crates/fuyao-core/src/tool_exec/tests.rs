@@ -27,6 +27,7 @@ fn fixed_result_tool(name: &str, result: &str) -> ToolEntry {
     ToolEntry {
         definition: ToolDefinition::new(name, "测试工具"),
         handler,
+        child_invisible: false,
     }
 }
 
@@ -43,6 +44,7 @@ fn echo_name_tool(name: &str) -> ToolEntry {
     ToolEntry {
         definition: ToolDefinition::new(name, "测试工具"),
         handler,
+        child_invisible: false,
     }
 }
 

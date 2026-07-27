@@ -8,7 +8,7 @@
 //! - [`init_engine`] + [`build_tool_registry`]：分步装配，供需要介入中间过程的场景使用。
 //!
 //! 工具注入时机：新架构无事后注册的 EngineHandle，工具必须在 `Engine::new` 前收集成
-//! `ToolRegistry` 一次性注入（见设计文档「动作一·启动引擎」）。
+//! `ToolRegistry` 一次性注入（启动引擎时装配）。
 
 mod app;
 mod init;

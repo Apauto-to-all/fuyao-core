@@ -10,8 +10,8 @@
 //! - 入事件（[`Engine::send`]，单一入口，对话级事件）
 //! - 关闭引擎（[`Engine::shutdown`]，独立方法，不走消息流）
 //!
-//! **没有 Engine::recv**——出站靠每 session 自己的 rx 消费（per-session 通道化，
-//! 见设计文档 04）。装配层（fuyao-app）负责 fan-in 多个 session 的 rx 为单一出口。
+//! **没有 Engine::recv**——出站靠每 session 自己的 rx 消费（per-session 通道化）。
+//! 装配层（fuyao-app）负责 fan-in 多个 session 的 rx 为单一出口。
 
 mod dispatch;
 mod emit;

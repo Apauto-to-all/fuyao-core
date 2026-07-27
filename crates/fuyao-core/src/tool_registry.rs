@@ -10,7 +10,7 @@
 use fuyao_api::{ToolDefinition, ToolFn};
 use std::collections::HashMap;
 
-/// 工具条目：schema 定义 + 执行 handler
+/// 工具条目：schema 定义 + 执行 handler + 可见性元数据
 ///
 /// handler 是 `Arc`，clone 廉价，多 session 共享同一份函数指针。
 #[derive(Clone)]
@@ -19,6 +19,12 @@ pub struct ToolEntry {
     pub definition: ToolDefinition,
     /// 工具执行函数（接收 args + 上下文，返回结果字符串）
     pub handler: ToolFn,
+    /// 是否对子 session 隐藏（递归防护）
+    ///
+    /// `true` 时该工具不出现在子任务 session 的工具列表里——LLM 看不到就不会调，
+    /// 阻断子代理嵌套派生。默认 `false`（普通工具主子 session 都可见）；
+    /// 派生类工具（如子代理工具）标 `true`。
+    pub child_invisible: bool,
 }
 
 /// 工具注册表（引擎级共享）
@@ -50,13 +56,17 @@ impl ToolRegistry {
         self.inner.len()
     }
 
-    /// 序列化所有工具定义为 JSON Value 数组，填入 [`StreamOptions::tools`](fuyao_provider::StreamOptions::tools)
+    /// 序列化工具定义为 JSON Value 数组，按当前 session 是否子任务过滤
+    ///
+    /// `is_child=true` 时跳过 [`ToolEntry::child_invisible`] 为 `true` 的工具
+    /// （递归防护：子 session 看不到派生类工具，LLM 不会尝试调用，根本性阻断嵌套派生）。
     ///
     /// `ToolDefinition` 已实现 `Serialize`，直接 `to_value` 即可。
     /// 空注册表返回空 Vec（调用方据此决定是否带 tools 字段）。
-    pub fn definitions_json(&self) -> Vec<serde_json::Value> {
+    pub fn definitions_json_for(&self, is_child: bool) -> Vec<serde_json::Value> {
         self.inner
             .values()
+            .filter(|e| !is_child || !e.child_invisible)
             .filter_map(|e| serde_json::to_value(&e.definition).ok())
             .collect()
     }
@@ -106,6 +116,16 @@ mod tests {
         ToolEntry {
             definition: ToolDefinition::new(name, "测试工具"),
             handler: dummy_handler(),
+            child_invisible: false,
+        }
+    }
+
+    /// 构造标记为 child_invisible 的工具条目（递归防护测试用）
+    fn make_child_invisible_entry(name: &str) -> ToolEntry {
+        ToolEntry {
+            definition: ToolDefinition::new(name, "对子 session 隐藏的工具"),
+            handler: dummy_handler(),
+            child_invisible: true,
         }
     }
 
@@ -115,7 +135,8 @@ mod tests {
         assert!(reg.is_empty());
         assert_eq!(reg.len(), 0);
         assert!(reg.get("any").is_none());
-        assert!(reg.definitions_json().is_empty());
+        assert!(reg.definitions_json_for(false).is_empty());
+        assert!(reg.definitions_json_for(true).is_empty());
     }
 
     #[test]
@@ -139,17 +160,46 @@ mod tests {
     }
 
     #[test]
-    fn definitions_json_serializes_all() {
+    fn definitions_json_for_serializes_all_for_main_session() {
         let reg = ToolRegistry::builder()
             .register_all([make_entry("read"), make_entry("write")])
             .build();
-        let defs = reg.definitions_json();
+        // 主 session（is_child=false）看到全部工具
+        let defs = reg.definitions_json_for(false);
         assert_eq!(defs.len(), 2);
         // 每个都是 {type:"function", function:{name, description, parameters}}
         for d in &defs {
             assert_eq!(d["type"], "function");
             assert!(d["function"]["name"].is_string());
         }
+    }
+
+    #[test]
+    fn definitions_json_for_hides_child_invisible_for_child_session() {
+        // 注册 2 个普通工具 + 1 个对子 session 隐藏的工具
+        let reg = ToolRegistry::builder()
+            .register_all([
+                make_entry("read"),
+                make_entry("write"),
+                make_child_invisible_entry("subagent"),
+            ])
+            .build();
+        assert_eq!(reg.len(), 3);
+
+        // 主 session（is_child=false）：看到全部 3 个
+        let main_defs = reg.definitions_json_for(false);
+        assert_eq!(main_defs.len(), 3);
+
+        // 子 session（is_child=true）：只看到 2 个（subagent 被过滤）
+        let child_defs = reg.definitions_json_for(true);
+        assert_eq!(child_defs.len(), 2);
+        let child_names: Vec<&str> = child_defs
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(child_names.contains(&"read"));
+        assert!(child_names.contains(&"write"));
+        assert!(!child_names.contains(&"subagent"));
     }
 
     #[test]

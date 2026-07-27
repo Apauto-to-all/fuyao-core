@@ -5,7 +5,7 @@
 //! - [`Engine::update_session_params`]：运行时调整 session 参数
 //!
 //! 出站事件不再走 Engine——每 session 持自己的 per-session 通道，rx 由创建方法
-//! 返调用方独占消费（见设计文档 04）。
+//! 返调用方独占消费。
 
 use super::*;
 

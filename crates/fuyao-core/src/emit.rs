@@ -2,7 +2,7 @@
 //!
 //! 引擎内部发出 OutputEvent 的统一入口。
 //! 核心职责：给事件的 base 盖上 session_id 标签（全程标签原则），
-//! 然后发到该 session 的 per-session 出站通道（无界，见设计文档 04）。
+//! 然后发到该 session 的 per-session 出站通道（无界）。
 
 use fuyao_api::message::OutputEvent;
 use tokio::sync::mpsc::UnboundedSender;
@@ -24,11 +24,11 @@ impl Emitter {
 
     /// 发出一个事件，盖上 session_id 标签后送入 per-session 出站通道
     ///
-    /// 设计文档「session id 全程标签」原则：事件一产生就带编号，
+    /// 「session id 全程标签」原则：事件一产生就带编号，
     /// 消费者拿任意一条事件都能取到 session_id 分流。
     ///
     /// 出站通道**无界**——本方法同步返回，不阻塞调用方（事件入 channel 前已落库，
-    /// 不让 emit 反压到 ReAct turn 推进，见设计文档 04）。
+    /// 不让 emit 反压到 ReAct turn 推进）。
     pub fn emit(&self, mut event: OutputEvent) {
         stamp_session_id(&mut event, &self.session_id);
         if self.tx.send(event).is_err() {

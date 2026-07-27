@@ -53,6 +53,7 @@ pub async fn collect_mcp_tools() -> Option<(Arc<MCPManager>, Vec<ToolEntry>)> {
         entries.push(ToolEntry {
             definition,
             handler,
+            child_invisible: false,
         });
     }
 

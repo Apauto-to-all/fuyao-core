@@ -8,7 +8,7 @@
 //!
 //! 出站架构：**per-session 独立通道**——每个 session 持有自己的 `(tx, rx)` 通道对，
 //! session task 的所有 emit 都进自己的 tx；rx 由调用方（装配层）取走消费。
-//! Engine **不做 fan-in**——出站事件的汇聚是装配层的职责（见设计文档 04）。
+//! Engine **不做 fan-in**——出站事件的汇聚是装配层的职责。
 
 pub(crate) mod types;
 
@@ -57,7 +57,7 @@ pub enum ChildSessionSource {
 /// break 前会走中断路径落库（保护 in-flight 状态）——通常毫秒级完成。
 /// 所有 task **并发退出**（用 JoinSet 同时 await），共享 10 秒总预算：
 /// 到点仍未退出的 task 统一 abort（JoinSet drop 自动 abort 所有未完成 task）。
-/// 这是设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
+/// 这是「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
 const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 引擎
@@ -65,7 +65,7 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 /// 能力共享层：构造时装配一次，持有 DB 句柄、provider、工具等引擎级共享。
 /// 多个对话（Session）共享同一个 Engine 实例，靠 session id 区分。
 ///
-/// 公开 API 遵循设计文档的四个动作：
+/// 公开 API 遵循四个动作：
 /// - [`new`](Self::new)：启动引擎（构造即启动）
 /// - [`create_session`](Self::create_session)：创建对话（返 `(id, rx)`，rx 由调用方消费）
 /// - [`resume_session`](Self::resume_session)：恢复对话（返 `(id, rx)`）
@@ -73,7 +73,7 @@ const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 /// - [`shutdown`](Self::shutdown)：关闭引擎（独立方法，不走消息流）
 ///
 /// **没有 `recv` 方法**——出站事件靠每 session 自己的 rx 消费（per-session 通道化）。
-/// 装配层负责把多个 session 的 rx fan-in 成单一出口（见设计文档 04）。
+/// 装配层负责把多个 session 的 rx fan-in 成单一出口。
 pub struct Engine {
     /// 会话存储层（Arc 共享给各 session task）
     store: Arc<SessionStore>,
@@ -141,7 +141,7 @@ impl Engine {
     /// 各实例 register 到该 session 私有的 HooksRegistry。拦截/观察在 session task 内执行。
     ///
     /// **不建立出口通道**——per-session 出站通道在 [`Engine::assemble_session`]
-    /// 时按 session 独立创建，rx 随创建方法返回给调用方（见设计文档 04）。
+    /// 时按 session 独立创建，rx 随创建方法返回给调用方。
     pub async fn new(
         params: EngineParams,
         providers: ProviderRegistry,
