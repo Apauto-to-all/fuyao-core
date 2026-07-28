@@ -29,11 +29,12 @@ L0  fuyao-api（零内部依赖）
 - **职责**：公共类型 + 配置系统 + 路径系统
 - **内部依赖**：无
 - **公开 API**：
-  - **Params 三件套**：`EngineParams` / `SessionParams` / `MessageParams`（内层 `ModelConfig` / `AgentConfig`）；`AgentPaths`
+  - **Params 两件套**：`EngineParams` / `SessionParams`（内层 `ModelConfig` / `AgentConfig`）；`AgentPaths`
   - **配置**：`FuyaoConfig` 及全子配置（`CompressionConfig` / `SessionStorageConfig` / `TitleConfig` / `RetryConfig` / `LlmConfig` / `ToolsConfig` 等）；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`
-  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Plugin 三变体）/ `OutputEvent`（11 变体）及消息族（`InboundUser` / `InterruptSource` / `PluginEventSource` / `UserMessageMode` / `UserMessageSource` 等）
+  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Plugin 三变体）/ `OutputEvent`（12 变体）及消息族（`InboundUser` / `InterruptSource` / `PluginEventSource` / `UserMessageMode` / `UserMessageSource` / `ChildSessionOrigin` / `ChildSessionState` 等）
   - **Provider 类型**：`Provider` trait / `Model` / `ModelCost` / `ModelLimit` / `ThinkingType` 等
   - **会话类型**：`Session` / `Message` / `MessageKind` / `TodoItem`
+  - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）
   - **工具类型**：`ToolDefinition` / `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn` / `ToolResult` / `ToolCallContext`
   - **其他**：`AgentDefinition` / `AgentMode` / `SkillDefinition` / `SkillMeta` / `MCPServerConfig` / `ApiError` / `ConfigError`
 
@@ -93,7 +94,7 @@ L0  fuyao-api（零内部依赖）
 - **职责**：引擎内核（两层分离）：能力共享层（Engine）+ 对话执行层（session task）
 - **内部依赖**：api, provider, hooks, prompt, session
 - **公开 API**：
-  - **`Engine`**（五个交互 + 派生 + shutdown）：`new(params, providers, tools, plugin_host)` / `create_session(SessionParams)` / `resume_session(id, SessionParams)` / `fork_session(source_id, SessionParams)`（派生独立 session，`parent_session_id = None`）/ `create_child_session(parent_id, ChildSessionSource, SessionParams)`（创建子任务 session，`parent_session_id = Some(父 id)`）/ `send(id, InputEvent, MessageParams)` / `recv()` / `end_session(id, reason)` / `shutdown()`
+  - **`Engine`**（创建 / 恢复 / 派生 / 子任务 / send / end / shutdown，**无 recv**——出站走 per-session rx）：`new(params, providers, tools, plugin_host)` / `create_session(SessionParams)` → `(SessionId, rx)` / `resume_session(id, SessionParams)` → `(SessionId, rx)` / `fork_session(source_id, SessionParams)` → `(SessionId, rx)`（派生独立 session，`parent_session_id = None`）/ `create_child_session(parent_id, ChildSessionSource, SessionParams)` → `(SessionId, rx)`（创建子任务 session，`parent_session_id = Some(父 id)`；rx 不进 fan_out）/ `send(id, InputEvent)` / `end_session(id, reason)` / `shutdown()`
   - **`ChildSessionSource`**：`Fresh`（空上下文）/ `Fork(SessionId)`（复制源可见消息 + system_prompt）
   - **`SessionId`**：`String` 别名
   - **`EngineError`**：`SessionNotFound` / `Storage` / `Provider` / `Shutdown`
@@ -118,17 +119,16 @@ L0  fuyao-api（零内部依赖）
 - **职责**：内置工具集 + 安全防护 + todo 持久化（自建 TodoStore）
 - **内部依赖**：api, prompt, skills, sqlx
 - **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`
-- **内置工具**：read / write / edit / bash / grep / glob / webfetch / skill / todowrite
+- **内置工具**：read / write / edit / bash / grep / glob / webfetch / skill / todowrite / **subagent**（子代理工具，派生子 session 执行独立子任务，`child_invisible = true` 递归防护）
 
 ## fuyao-app（L4 装配）
 
-- **职责**：装配入口：`start` / `init_engine` / `build_tool_registry` / `shutdown`
+- **职责**：装配入口 + fan-in 单一出口：`start` / `init_engine` / `build_tool_registry` / `App`
 - **内部依赖**：api, core, guard, hooks, mcp, provider, prompt, session, tools
 - **公开 API**：
-  - **`start(agent_paths)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → `Engine::new`）
-  - **`init_engine(agent_paths)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`
+  - **`start(EngineParams)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → `Engine::new` → `App::new`），返回 `App`
+  - **`App`**（装配产物，持 `Engine` + fan-in 出口）：`new(engine, mcp_manager, log_guard)` / `create_session(SessionParams)` → `SessionId`（rx 由内部 forwarder 消费进 fan_out）/ `resume_session` / `fork_session` / `create_child_session(parent, source, params)` → `(SessionId, rx)`（**rx 不进 fan_out**，返调用方独占消费）/ `send` / `recv()` → `Option<OutputEvent>`（单一出口）/ `end_session` / `shutdown(self)`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop log_guard）
+  - **`init_engine(EngineParams)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`
   - **`build_tool_registry()`**：收集内置 + MCP 工具，返回 `(ToolRegistry, Option<Arc<MCPManager>>)`
-  - **`shutdown(engine, ctx)`**：有序停机（先 `engine.shutdown()` 再 `mcp_manager.stop_all()`）
-  - **`AppContext`**：`mcp_manager` / `log_guard`
   - **`LogGuard`**：drop 时 flush 文件日志
   - **错误**：`InitError`（`NoProviderAvailable` / `ConfigError`）/ `SetupError`（`Init`）

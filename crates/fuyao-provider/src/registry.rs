@@ -26,13 +26,14 @@ static MODEL_CACHE: LazyLock<Mutex<HashMap<String, HashMap<String, Model>>>> =
 /// 与上面的全局 PROVIDER_CACHE（Provider **配置**）不同：本结构持有
 /// 已构造好的 `Arc<dyn Provider>` **实例**，按 `provider_id` 查询。
 ///
-/// 引擎级共享（Engine 持有 `Arc<ProviderRegistry>`）。每条消息的
-/// `MessageParams.model_id` 形如 `"provider_id/model_id"`——拆出 `provider_id`
-/// 从本注册表取 Provider 实例，实现"不同 session / 不同消息用不同 Provider"。
+/// 引擎级共享（Engine 持有 `Arc<ProviderRegistry>`）。session 的
+/// `SessionParams.model_config.model_id` 形如 `"provider_id/model_id"`——拆出 `provider_id`
+/// 从本注册表取 Provider 实例，实现"不同 session 用不同 Provider"。
+/// model_config 整 session 共享一份，可经 `Engine::update_session_params` 随时切。
 ///
 /// 与旧"引擎持单个 `Arc<dyn Provider>`"模型的差异：
 /// - 旧：启动时按 default model_id 选一个 Provider 实例，所有调用都打到这里
-/// - 新：启动时把所有已注册 Provider 都建实例；每次调用按消息的 provider_id 路由
+/// - 新：启动时把所有已注册 Provider 都建实例；每次调用按 session 的 provider_id 路由
 ///
 /// 失败容错：单个 Provider 实例构造失败（如 API Key 缺失）不影响其他——
 /// `from_registered` 跳过失败的并记 WARN，调用方用到该 provider_id 时

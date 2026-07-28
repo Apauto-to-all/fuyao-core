@@ -22,13 +22,10 @@ EngineParams {                   // 引擎级，启动时定死
     agent_paths: AgentPaths       // 数据在哪（三层路径）
 }
 
-SessionParams {                  // 对话级，创建对话时定死且不可变（前缀缓存红线）
+SessionParams {                  // 对话级，创建对话时提供（agent_config 定死，model_config 可运行时切）
     agent_config: AgentConfig {
         definition: Option<String>  // 用哪个定义（加载 agents/{definition}.md，None 时用 default）
     }
-}
-
-MessageParams {                  // 消息级，每条消息自带
     model_config: ModelConfig {
         model_id: Option<String>        // 用哪个模型（provider_id/model_id，None 时用 [models.default]）
         thinking_type: Option<...>      // 思考开关
@@ -39,10 +36,10 @@ MessageParams {                  // 消息级，每条消息自带
 
 UI 层只需在对应动作时提供对应 Params：
 
-- `start(agent_paths)` 或 `Engine::new(engine_params, ...)`：构造 `EngineParams`
+- `fuyao_app::start(EngineParams)` 或 `Engine::new(engine_params, ...)`：构造 `EngineParams`
 - `engine.create_session(SessionParams)` 或 `engine.resume_session(id, SessionParams)`：构造 `SessionParams`
 - `engine.fork_session(source_id, SessionParams)` 或 `engine.create_child_session(parent_id, ChildSessionSource, SessionParams)`：派生 / 子任务场景同样构造 `SessionParams`
-- `engine.send(id, InputEvent, MessageParams)`：构造 `MessageParams`
+- `engine.send(id, InputEvent)`：无 Params——模型已在 session 的 `model_config` 定好；要切模型用 `engine.update_session_params(id, new_params)`，下一轮生效
 
 ## agent_id 解析
 

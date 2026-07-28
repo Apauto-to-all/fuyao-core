@@ -2,7 +2,7 @@
 
 > 本文解释 MCP 集成的生命周期管理、工具桥接、熔断恢复与安全防护。API 签名见 `cargo doc --workspace`；配置见 [配置 MCP 服务器](../指南/配置MCP服务器.md)。
 
-> **多 session 架构下的 MCP**：MCP 工具是**引擎级共享**——启动时由 `fuyao-app::build_tool_registry` 收集成 `ToolEntry` 注入 `ToolRegistry`，所有 session 共享同一份工具表（详见 [工具系统设计](工具系统设计.md)）。MCPManager 由 `AppContext` 持有保活，与 `Engine` 平级（不在 engine 内）。
+> **多 session 架构下的 MCP**：MCP 工具是**引擎级共享**——启动时由 `fuyao-app::build_tool_registry` 收集成 `ToolEntry` 注入 `ToolRegistry`，所有 session 共享同一份工具表（详见 [工具系统设计](工具系统设计.md)）。MCPManager 由 `App` 持有保活，与 `Engine` 平级（不在 engine 内）。
 
 ## 架构分层
 
@@ -44,7 +44,7 @@ build_tool_registry():
   4. 返回 (ToolRegistry, Option<Arc<MCPManager>>)
 ```
 
-`AppContext` 持有 `Option<Arc<MCPManager>>` 保活，应用退出时调 `fuyao_app::shutdown(engine, ctx)` 实现「先关 MCP 再退出」的有序停机。
+`App` 持有 `Option<Arc<MCPManager>>` 保活，应用退出时调 `App::shutdown()` 实现「先关 MCP 再退出」的有序停机。
 
 ## 双传输（stdio / HTTP）
 

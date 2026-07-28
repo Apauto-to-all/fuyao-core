@@ -76,7 +76,7 @@ HTTP 响应非 2xx 时 classify_http_error：
 
 ### 思考字段注入（thinking_type / reasoning_effort）
 
-`MessageParams.model_config` 携带 `thinking_type` 和 `reasoning_effort`，在构建请求体时条件注入：
+`SessionParams.model_config` 携带 `thinking_type` 和 `reasoning_effort`，在构建请求体时条件注入：
 
 | 条件 | 行为 |
 |------|------|
@@ -107,7 +107,7 @@ impl ProviderRegistry {
 
 ### 路由机制
 
-每条消息的 `MessageParams.model_id` 形如 `"provider_id/model_id"`——session task 在执行该轮 LLM 调用前：
+session 的 `SessionParams.model_config.model_id` 形如 `"provider_id/model_id"`——session task 在执行该轮 LLM 调用前：
 
 1. `resolve_model(params)` 拆 model_id（provider_id 小写、model 原样）；None 读 `[models.default]`，没配 fail-loud
 2. `ctx.providers.get(&resolved.provider_id)` 取 Provider 实例

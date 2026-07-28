@@ -33,32 +33,40 @@ cargo doc --workspace --no-deps --open
 
 ## 入口 API（最重要）
 
-应用层绝大多数场景只用 `fuyao-app` 的几个入口 + `fuyao-core::Engine` 的方法，其它类型只在装配或扩展时才接触：
+应用层绝大多数场景只用 `fuyao-app` 的几个入口 + `fuyao-app::App` 的方法。`fuyao-core::Engine` 主要给装配层 / 测试 / 不走 `App` 装配的场景直接使用。
 
 ### 一行启动
 
 ```rust
-use fuyao_api::AgentPaths;
+use fuyao_api::{AgentPaths, EngineParams};
 
-let agent_paths = AgentPaths::default();
-let (engine, app_ctx) = fuyao_app::start(agent_paths).await?;
+let app = fuyao_app::start(EngineParams {
+    agent_paths: AgentPaths::default(),
+}).await?;
+// app: fuyao_app::App —— 持 Engine + fan-in 出口
 ```
 
-### Engine 动作清单（五个交互 + 派生 + shutdown）
+`start` 串联 `init_engine`（配置 / 日志 / Provider）→ `build_tool_registry`（内置 + MCP 工具）→ 装配 `LoopGuardPlugin` → `Engine::new` → `App::new`，返回的 `App`（`fuyao_app::App`）即可直接用，签名见 rustdoc `fuyao_app` 首页。
 
-字段 / 签名细节见 rustdoc，核心动作清单如下（详见 [核心架构](../解释/核心架构.md)）：
+### App 动作清单（应用层主入口）
+
+`App` 包装 `Engine` 并承担 fan-in：每个**主 session**（`create_session` / `resume_session` / `fork_session`）创建时内部 spawn forwarder，把该 session 的 per-session 出站通道汇聚到单一 `fan_out` 通道，经 `App::recv` 对外暴露统一出口。签名细节见 rustdoc，动作清单如下（详见 [核心架构](../解释/核心架构.md)）：
 
 | 动作 | 方法 | 入参 | 返回 |
 |------|------|------|------|
-| 启动引擎 | `Engine::new` | `EngineParams` / `ProviderRegistry` / `ToolRegistry` / `PluginHost` | `Engine` |
-| 创建对话 | `engine.create_session` | `SessionParams` | `Result<SessionId, EngineError>` |
-| 恢复对话 | `engine.resume_session` | `&SessionId` / `SessionParams` | `Result<(), EngineError>` |
-| 入事件 | `engine.send` | `&SessionId` / `InputEvent` / `MessageParams` | `Result<(), EngineError>` |
-| 出事件 | `engine.recv` | — | `Option<OutputEvent>` |
-| 销毁单对话 | `engine.end_session` | `&SessionId` / `&str（end_reason）` | `Result<(), EngineError>` |
-| 派生对话（fork） | `engine.fork_session` | `&SessionId`（源）/ `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = None`） |
-| 创建子任务 session | `engine.create_child_session` | `&SessionId`（父）/ `ChildSessionSource` / `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = Some(父 id)`） |
-| 关闭引擎 | `engine.shutdown` | — | `()` |
+| 启动 | `fuyao_app::start` | `EngineParams` | `Result<App, SetupError>` |
+| 创建对话 | `app.create_session` | `SessionParams` | `Result<SessionId, EngineError>`（rx 由内部 forwarder 消费进 fan_out） |
+| 恢复对话 | `app.resume_session` | `&SessionId` / `SessionParams` | `Result<SessionId, EngineError>` |
+| 派生对话（fork） | `app.fork_session` | `&SessionId`（源）/ `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = None`，独立 session） |
+| 创建子任务 session | `app.create_child_session` | `&SessionId`（父）/ `ChildSessionSource` / `SessionParams` | `Result<(SessionId, UnboundedReceiver<OutputEvent>), EngineError>`（rx **不进 fan_out**，返调用方独占消费） |
+| 入事件 | `app.send` | `&SessionId` / `InputEvent` | `Result<(), EngineError>` |
+| 出事件 | `app.recv` | — | `Option<OutputEvent>`（单一出口，所有主 session 的事件汇聚于此） |
+| 销毁单对话 | `app.end_session` | `&SessionId` / `&str（end_reason）` | `Result<(), EngineError>` |
+| 关闭 | `app.shutdown` | 消费 `self` | `()`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop） |
+
+> **子 session 不进 fan_out**：子任务 session（`create_child_session` 产出）的 rx 直接返调用方独占消费——子代理 tool handler 用它取最终回复，fire-and-forget 后台任务 spawn 独立 task 消费。UI 出口只暴露主对话，避免子任务事件污染主对话流。
+
+需要绕过 `App` 直接用 `Engine`（如自定义 fan-in / 测试）时，`Engine` 的 `create_session` / `resume_session` / `fork_session` / `create_child_session` 均返 `(SessionId, rx)`——rx 由调用方自行消费，详见 rustdoc。
 
 ## 手写参考聚焦什么
 

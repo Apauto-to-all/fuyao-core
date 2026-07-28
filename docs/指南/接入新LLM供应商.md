@@ -33,7 +33,7 @@ DEEPSEEK_API_KEY=sk-xxxxxxxx
 
 ### 多 Provider 共存
 
-所有 `[providers.*]` 段都会被注册进 `ProviderRegistry`，按每条消息的 `MessageParams.model_id` 路由：
+所有 `[providers.*]` 段都会被注册进 `ProviderRegistry`，按 session 的 `SessionParams.model_config.model_id` 路由：
 
 ```toml
 [providers.deepseek]
@@ -51,7 +51,7 @@ base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 [providers.aliyun.models."qwen3.6-plus"]
 name = "qwen3.6-plus"
 
-# 默认模型（MessageParams.model_id = None 时用）
+# 默认模型（model_config.model_id = None 时用）
 [models.default]
 model = "deepseek/deepseek-v4-flash"
 
@@ -61,17 +61,19 @@ model = "aliyun/qwen3.6-plus"
 ```
 
 ```rust
-// 用默认模型
-engine.send(&id, InputEvent::User(msg), MessageParams::default()).await?;
+// 用默认模型（model_config.model_id = None 时走 [models.default]）
+let id = app.create_session(SessionParams::default()).await?;
 
-// 显式指定 aliyun 的模型
-let params = MessageParams {
+// 显式指定 aliyun 的模型（创建时在 model_config 定）
+let id = app.create_session(SessionParams {
     model_config: ModelConfig {
         model_id: Some("aliyun/qwen3.6-plus".to_string()),
         ..Default::default()
     },
-};
-engine.send(&id, InputEvent::User(msg), params).await?;
+    ..Default::default()
+}).await?;
+
+// 运行时切模型：调 Engine::update_session_params(&id, new_params)，下一轮生效（签名见 rustdoc）
 ```
 
 ## 方式二：实现 Provider trait
@@ -121,13 +123,13 @@ let engine = Engine::new(
 ## 验证
 
 ```rust
-let (engine, app_ctx) = fuyao_app::start(agent_paths).await?;
+let app = fuyao_app::start(EngineParams { agent_paths }).await?;
 
-let session_id = engine.create_session(SessionParams::default()).await?;
-engine.send(&session_id, InputEvent::User(msg), MessageParams::default()).await?;
+let session_id = app.create_session(SessionParams::default()).await?;
+app.send(&session_id, InputEvent::User(msg)).await?;
 
 // 观察 OutputEvent::Chunk 流式输出
-while let Some(event) = engine.recv().await {
+while let Some(event) = app.recv().await {
     if let OutputEvent::Assistant(_) = event { break; }
 }
 ```

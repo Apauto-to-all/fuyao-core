@@ -44,8 +44,8 @@ pub enum InitError {
 pub struct InitResult {
     /// Provider 实例注册表（多 Provider 路由，注入 `Engine::new`）
     ///
-    /// 启动时把所有已注册 Provider 都建实例装进 registry；每条消息按
-    /// `MessageParams.model_id` 拆出 provider_id 从 registry 取实例路由。
+    /// 启动时把所有已注册 Provider 都建实例装进 registry；每个 session 按
+    /// `SessionParams.model_config.model_id` 拆出 provider_id 从 registry 取实例路由。
     pub provider: ProviderRegistry,
     /// 日志 guard：drop 时 flush 文件缓冲，须存活到引擎结束
     pub log_guard: LogGuard,
