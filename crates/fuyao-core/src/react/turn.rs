@@ -259,7 +259,9 @@ async fn handle_final_reply(
         // guide 和 pending 都空：落库，turn 结束
         persist(ctx.emitter.session_id(), session, &ctx.store).await;
         // 首轮最终回复后异步生成标题（fire-and-forget，不阻塞主循环）
-        maybe_spawn_title_generation(ctx, result).await;
+        // 是否跳过子 session 由 [session.title] skip_child 控制（默认 true）
+        let is_child = session.parent_session_id.is_some();
+        maybe_spawn_title_generation(ctx, result, is_child).await;
     } else {
         // 有消息：全部注入（每条经 emit_to_history 拦截→落 DB→发送→观察），回 run_turn 顶部再调一轮 LLM
         queue::inject_messages(ctx, session, msgs).await;
@@ -270,6 +272,8 @@ async fn handle_final_reply(
 ///
 /// 触发条件（同时满足）：
 /// - `[session.title] enabled = true`
+/// - 非子 session 或 `[session.title] skip_child = false`：子任务 session 用
+///   `parent_session_id` 表达归属，重命名反而扰乱父/子分组与前端过滤
 /// - DB 可见消息中 `role=user` 的消息数严格等于 1（首轮判定：计数法比
 ///   `title=="新会话"` 更稳——用户可能改过 title）
 /// - 能取到首条 user content 与本轮 assistant 文本
@@ -281,9 +285,15 @@ async fn handle_final_reply(
 ///
 /// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
 /// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
-async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult) {
+async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, is_child: bool) {
     let title_cfg = &fuyao_api::get_config().session.title;
     if !title_cfg.enabled {
+        return;
+    }
+
+    // 子 session 跳过（可配置）：parent_session_id 已是归属标记，
+    // 默认 skip_child=true 避免重命名扰乱父/子分组
+    if is_child && title_cfg.skip_child {
         return;
     }
 
