@@ -5,6 +5,7 @@
 //! - 单对话：默认 deepseek 模型，事件以 JSON 原样打印（无颜色）
 //! - 双对话：同一条消息同时发给两个 session，流式输出交错到达，
 //!   用颜色区分来源（A 青色 / B 黄色），体现多 session 并发不阻塞
+//! - 子代理派生期间，子 session 事件用紫色与父 lane 区分，仍归父 lane 渲染
 //!
 //! 本例不做任何事件特化处理——每条 OutputEvent 直接序列化为 JSON 打印，
 //! 仅附加可选颜色，目标是「能跑起来」，后续再迭代展示层。
@@ -14,9 +15,11 @@
 //! cargo run --example chat -p fuyao-app
 //! ```
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
+use fuyao_api::message::output::ChildSessionState;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{AgentPaths, EngineParams, ModelConfig, SessionParams};
 use fuyao_app::App;
@@ -28,6 +31,8 @@ const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash";
 /// ANSI 颜色码：双对话时 A 用青色、B 用黄色，两路交错一眼区分归属
 const COLOR_A: &str = "\x1b[36m"; // 青色
 const COLOR_B: &str = "\x1b[33m"; // 黄色
+/// 子代理事件颜色：子 session 事件统一用紫色，与父 lane 颜色区分
+const COLOR_CHILD: &str = "\x1b[35m"; // 紫色
 const COLOR_RESET: &str = "\x1b[0m";
 
 /// 单路对话的展示状态
@@ -171,24 +176,56 @@ async fn send_to(app: &App, session_id: &str, content: &str) {
 }
 
 /// 消费一轮所有事件，按 session_id 路由到对应 lane 染色打印，直到所有 lane 完成
+///
+/// 子代理派生期间，子 session 的事件（Chunk / ToolCall / ...）经父 session 出站通道
+/// 流出，base.session_id 标的是 child。本函数维护 `child_session_id → 父 lane` 映射，
+/// 让子事件归父 lane 渲染（沿用父颜色），但不参与终态判断——子的 stop 不能误判
+/// 父本轮结束。映射由 ChildSession 生命周期事件（Started 建立 / Ended 拆除）维护。
 async fn consume_turn(app: &App, lanes: &mut [Lane]) {
+    // child_session_id → 父 lane idx：本轮动态建立 / 拆除
+    let mut child_to_parent: HashMap<String, usize> = HashMap::new();
+
     loop {
         let Some(event) = app.recv().await else {
             println!("[引擎已关闭]");
             return;
         };
-        // 路由：按 session_id 定位 lane，非本轮 session 的事件忽略
         let sid = event_session_id(&event).unwrap_or("");
-        let Some(idx) = lanes.iter().position(|l| l.session_id == sid) else {
+
+        // ChildSession 生命周期事件：base.session_id 是父（由父上下文发出），
+        // payload 标 child 生命周期——先据此维护映射，再走通用渲染
+        if let OutputEvent::ChildSession(m) = &event {
+            if let Some(parent_idx) = lanes
+                .iter()
+                .position(|l| l.session_id == m.payload.parent_session_id)
+            {
+                match m.payload.state {
+                    ChildSessionState::Started => {
+                        child_to_parent.insert(m.payload.child_session_id.clone(), parent_idx);
+                    }
+                    ChildSessionState::Ended => {
+                        child_to_parent.remove(&m.payload.child_session_id);
+                    }
+                }
+            }
+        }
+
+        // 路由：父 lane 直接匹配；否则查子 session 映射回父 lane；都不在则忽略
+        let Some(idx) = lanes
+            .iter()
+            .position(|l| l.session_id == sid)
+            .or_else(|| child_to_parent.get(sid).copied())
+        else {
             continue;
         };
 
-        // 序列化为 JSON 原样打印（带可选颜色），不做任何事件特化处理
+        // 序列化为 JSON 原样打印；子 session 事件（经 child 映射命中）用紫色区分父子
         let json = serde_json::to_string(&event).unwrap_or_else(|_| "<序列化失败>".into());
-        print_event(&json, &lanes[idx]);
+        let is_child = lanes[idx].session_id != sid;
+        print_event(&json, &lanes[idx], is_child);
 
-        // 终态事件标记本 lane 完成；全部完成则本轮结束
-        if is_terminal(&event) {
+        // 终态判断：只认父 session_id 自身的事件（子的 stop 不能误判父本轮结束）
+        if is_terminal(&event) && lanes[idx].session_id == sid {
             lanes[idx].finished = true;
             if lanes.iter().all(|l| l.finished) {
                 return;
@@ -198,13 +235,17 @@ async fn consume_turn(app: &App, lanes: &mut [Lane]) {
 }
 
 /// 按 lane 颜色打印一段 JSON（无颜色时为纯文本）
-fn print_event(json: &str, lane: &Lane) {
+///
+/// `child=true` 时改用子代理紫色，与父 lane 颜色区分；prefix 仍取父 lane 标签
+/// （标识归属），仅颜色切换父子。
+fn print_event(json: &str, lane: &Lane, child: bool) {
     let prefix = if lane.label.is_empty() {
         String::new()
     } else {
         format!("[{}] ", lane.label)
     };
-    match lane.color {
+    let color = if child { Some(COLOR_CHILD) } else { lane.color };
+    match color {
         Some(c) => println!("{c}{prefix}{json}{COLOR_RESET}"),
         None => println!("{prefix}{json}"),
     }
