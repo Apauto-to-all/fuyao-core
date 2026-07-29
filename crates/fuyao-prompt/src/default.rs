@@ -13,8 +13,8 @@ use std::sync::LazyLock;
 /// 内置主 Agent 默认定义（`defaults/primary/default.md`）
 const PRIMARY_DEFAULT_MD: &str = include_str!("defaults/primary/default.md");
 
-/// 内置探索子代理默认定义（`defaults/subagent/researcher.md`）
-const SUBAGENT_RESEARCHER_MD: &str = include_str!("defaults/subagent/researcher.md");
+/// 内置探索子代理默认定义（`defaults/subagent/explore.md`）
+const SUBAGENT_EXPLORE_MD: &str = include_str!("defaults/subagent/explore.md");
 
 /// 内置执行子代理默认定义（`defaults/subagent/executor.md`）
 const SUBAGENT_EXECUTOR_MD: &str = include_str!("defaults/subagent/executor.md");
@@ -29,7 +29,7 @@ const SUBAGENT_EXECUTOR_MD: &str = include_str!("defaults/subagent/executor.md")
 pub(crate) fn builtin_definition_md(name: &str) -> Option<&'static str> {
     match name {
         "" | "default" => Some(PRIMARY_DEFAULT_MD),
-        "researcher" => Some(SUBAGENT_RESEARCHER_MD),
+        "explore" => Some(SUBAGENT_EXPLORE_MD),
         "executor" => Some(SUBAGENT_EXECUTOR_MD),
         _ => None,
     }
@@ -71,7 +71,7 @@ mod tests {
     fn builtin_definition_md_known_names() {
         assert!(builtin_definition_md("default").is_some());
         assert!(builtin_definition_md("").is_some());
-        assert!(builtin_definition_md("researcher").is_some());
+        assert!(builtin_definition_md("explore").is_some());
         assert!(builtin_definition_md("executor").is_some());
     }
 

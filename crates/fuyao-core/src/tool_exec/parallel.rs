@@ -230,7 +230,7 @@ mod tests {
             make_tool_call(
                 "3",
                 "subagent",
-                r#"{"subagent_type":"researcher","description":"c","prompt":"z"}"#,
+                r#"{"subagent_type":"explore","description":"c","prompt":"z"}"#,
             ),
         ];
         assert!(should_parallelize(&calls, &config));

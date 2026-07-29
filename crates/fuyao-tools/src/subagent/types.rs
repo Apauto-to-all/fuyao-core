@@ -48,7 +48,7 @@ pub fn validate_subagent_type(subagent_type: &str, agent_paths: &AgentPaths) -> 
 ///
 /// 错误信息 + 可用列表（name + description），供 LLM 据此修正 `subagent_type`。
 /// 镜像 skill 工具的 `format_skill_not_found`，但额外带上描述——子代理列表通常很短
-/// （内置 researcher/executor + 少量用户定义），带描述更利于 LLM 选对子代理。
+/// （内置 explore/executor + 少量用户定义），带描述更利于 LLM 选对子代理。
 fn format_subagent_not_found(name: &str, available: &[SubagentMetaItem]) -> String {
     if available.is_empty() {
         format!("未找到子代理类型 '{name}'。当前没有可用的子代理")
@@ -75,10 +75,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_accepts_builtin_researcher() {
+    fn validate_accepts_builtin_explore() {
         let paths = AgentPaths::default();
-        // researcher 是内置子代理，永远可用
-        assert!(validate_subagent_type("researcher", &paths).is_ok());
+        // explore 是内置子代理，永远可用
+        assert!(validate_subagent_type("explore", &paths).is_ok());
     }
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
         let msg = result.unwrap_err();
         assert!(msg.contains("未找到子代理类型 'nonexistent'"));
         // 错误信息含可用列表（含描述），引导 LLM 修正
-        assert!(msg.contains("researcher"));
+        assert!(msg.contains("explore"));
         assert!(msg.contains("executor"));
         assert!(msg.contains("只读探索"));
     }

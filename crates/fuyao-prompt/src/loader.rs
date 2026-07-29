@@ -104,7 +104,7 @@ pub fn load_agent_definition_from_agent_paths(
         }
     }
 
-    // 用户文件未命中 → 查内置默认表（default/researcher/executor）
+    // 用户文件未命中 → 查内置默认表（default/explore/executor）
     if let Some(builtin) = load_builtin_definition(name) {
         return builtin;
     }
@@ -294,9 +294,9 @@ mod tests {
         assert_eq!(def.name, "fuyao");
         assert!(!def.system_prompt.is_empty());
 
-        let researcher = load_builtin_definition("researcher").unwrap();
-        assert_eq!(researcher.name, "researcher");
-        assert_eq!(researcher.mode, fuyao_api::AgentMode::Subagent);
+        let explore = load_builtin_definition("explore").unwrap();
+        assert_eq!(explore.name, "explore");
+        assert_eq!(explore.mode, fuyao_api::AgentMode::Subagent);
 
         let executor = load_builtin_definition("executor").unwrap();
         assert_eq!(executor.name, "executor");
@@ -310,22 +310,22 @@ mod tests {
 
     #[test]
     fn load_agent_definition_from_agent_paths_falls_back_to_builtin_subagent() {
-        // 用户无 agents/researcher.md → 回退内置 researcher（而非 DEFAULT_FUYAO_AGENT）
+        // 用户无 agents/explore.md → 回退内置 explore（而非 DEFAULT_FUYAO_AGENT）
         let ctx = AgentPaths::default();
-        let def = load_agent_definition_from_agent_paths(&ctx, "researcher");
-        assert_eq!(def.name, "researcher");
+        let def = load_agent_definition_from_agent_paths(&ctx, "explore");
+        assert_eq!(def.name, "explore");
         assert_eq!(def.mode, fuyao_api::AgentMode::Subagent);
     }
 
     #[test]
     fn load_agent_definition_from_agent_paths_user_overrides_builtin() {
-        // 用户 agents/researcher.md 覆盖内置
+        // 用户 agents/explore.md 覆盖内置
         let temp = std::env::temp_dir().join("fuyao_test_loader_override_builtin");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
         std::fs::write(
-            plugin.join("agents").join("researcher.md"),
-            "---\nname: my-researcher\ndescription: custom\nmode: subagent\n---\n自定义探索",
+            plugin.join("agents").join("explore.md"),
+            "---\nname: my-explore\ndescription: custom\nmode: subagent\n---\n自定义探索",
         )
         .unwrap();
 
@@ -333,8 +333,8 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let def = load_agent_definition_from_agent_paths(&ctx, "researcher");
-        assert_eq!(def.name, "my-researcher");
+        let def = load_agent_definition_from_agent_paths(&ctx, "explore");
+        assert_eq!(def.name, "my-explore");
 
         std::fs::remove_dir_all(&temp).ok();
     }

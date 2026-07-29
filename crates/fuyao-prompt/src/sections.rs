@@ -240,7 +240,7 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
 /// - 子代理工具 handler：校验 `subagent_type` 是否合法，不合法时返可用列表
 ///
 /// 来源合并（低 → 高优先级，后者覆盖前者）：
-/// 1. 内置默认子代理（researcher / executor）—— 编译期嵌入，永远存在
+/// 1. 内置默认子代理（explore / executor）—— 编译期嵌入，永远存在
 /// 2. 用户 `agents/*.md`（三层目录扫描，file stem 作为 name）—— mode 须 `is_usable_as_subagent`
 ///
 /// 用户同名文件覆盖内置：与 [`load_agent_definition_from_agent_paths`] 的加载链一致。
@@ -251,7 +251,7 @@ pub fn list_subagent_definitions(agent_paths: &AgentPaths) -> Vec<(String, Strin
     let mut by_name: HashMap<String, String> = HashMap::new();
 
     // 内置默认子代理（最低优先）
-    for builtin_name in ["researcher", "executor"] {
+    for builtin_name in ["explore", "executor"] {
         if let Some(def) = load_builtin_definition(builtin_name)
             && def.mode.is_usable_as_subagent()
         {
@@ -459,10 +459,10 @@ mod tests {
 
     #[test]
     fn build_subagent_index_section_lists_builtins() {
-        // 默认无用户 agents 目录 → 仅列内置 researcher / executor
+        // 默认无用户 agents 目录 → 仅列内置 explore / executor
         let ctx = AgentPaths::default();
         let section = build_subagent_index_section(&ctx);
-        assert!(section.contains("researcher"));
+        assert!(section.contains("explore"));
         assert!(section.contains("executor"));
         assert!(section.contains("只读探索"));
         assert!(section.contains("通用执行"));
@@ -470,13 +470,13 @@ mod tests {
 
     #[test]
     fn build_subagent_index_section_user_overrides_builtin() {
-        // 用户 agents/researcher.md 覆盖内置 researcher 的 description
+        // 用户 agents/explore.md 覆盖内置 explore 的 description
         let temp = std::env::temp_dir().join("fuyao_test_subagent_index_override");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
         std::fs::write(
-            plugin.join("agents").join("researcher.md"),
-            "---\nname: researcher\ndescription: 我的自定义探索\nmode: subagent\n---\n自定义",
+            plugin.join("agents").join("explore.md"),
+            "---\nname: explore\ndescription: 我的自定义探索\nmode: subagent\n---\n自定义",
         )
         .unwrap();
 

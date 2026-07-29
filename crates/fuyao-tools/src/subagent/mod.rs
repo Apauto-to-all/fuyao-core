@@ -27,7 +27,7 @@ pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
         ToolParameterProperty {
             kind: "string".to_string(),
             description:
-                "子代理定义名（系统提示词中「子代理」索引列出的 name，如 researcher / executor）"
+                "子代理定义名（系统提示词中「子代理」索引列出的 name，如 explore / executor）"
                     .to_string(),
             default: None,
             enum_values: None,
