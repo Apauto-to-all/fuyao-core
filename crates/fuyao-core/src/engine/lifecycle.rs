@@ -28,7 +28,11 @@ impl Engine {
         params: SessionParams,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 构建系统提示词（Agent 配置决定人格）
-        let system_prompt = build_system_prompt(&self.params.agent_paths, &params.agent_config);
+        let system_prompt = build_system_prompt(
+            &self.params.agent_paths,
+            &params.agent_config,
+            fuyao_prompt::PromptUsage::Primary,
+        );
 
         // 创建 Session（8 位 UUID）
         let session = Session::new(None, Some(system_prompt));
@@ -186,9 +190,12 @@ impl Engine {
         // 先按模式构造 + 落库新 session（不带 assemble，assemble 在统一出口做）
         let new_session = match source {
             ChildSessionSource::Fresh => {
-                // 全新子任务：空上下文，system_prompt 从 agent_config 构建（与 create_session 一致）
-                let system_prompt =
-                    build_system_prompt(&self.params.agent_paths, &params.agent_config);
+                // 全新子任务：空上下文，system_prompt 从 agent_config 构建（按子代理用途校验 mode）
+                let system_prompt = build_system_prompt(
+                    &self.params.agent_paths,
+                    &params.agent_config,
+                    fuyao_prompt::PromptUsage::Subagent,
+                );
                 let mut s = Session::new(None, Some(system_prompt));
                 s.parent_session_id = Some(parent_session_id.clone());
                 self.store.create(&s).await?;

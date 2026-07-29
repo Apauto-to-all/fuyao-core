@@ -23,7 +23,9 @@ use fuyao_api::message::output::{
     ChildSessionMessage, ChildSessionOrigin, ChildSessionPayload, ChildSessionState,
 };
 use fuyao_api::message::{EventBase, InputEvent};
-use fuyao_api::{CancellationToken, ChildSessionSource, SessionParams, ToolCallContext};
+use fuyao_api::{
+    AgentConfig, CancellationToken, ChildSessionSource, SessionParams, ToolCallContext,
+};
 
 /// 子代理执行超时兜底
 ///
@@ -33,14 +35,19 @@ const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 子代理工具执行入口
 ///
-/// 收 `(args, ctx, cancel)`：args 含 description + prompt，ctx 含引擎弱引用 + 父 session_id +
-/// tool_call_id + event_forwarder（父 session 出站通道的直送克隆）。
+/// 收 `(args, ctx, cancel)`：args 含 subagent_type + description + prompt，
+/// ctx 含引擎弱引用 + 父 session_id + tool_call_id + event_forwarder（父 session 出站通道的直送克隆）。
+/// `subagent_type` 透传为子 session 的 `AgentConfig.definition`（引擎按名加载 `agents/{type}.md`）。
 pub async fn subagent_handler(
     args: serde_json::Value,
     ctx: &ToolCallContext,
     cancel: CancellationToken,
 ) -> String {
     // 1. 解析参数
+    let subagent_type = match args.get("subagent_type").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return "❌ 子代理工具缺少 subagent_type 参数或为空".to_string(),
+    };
     let description = args
         .get("description")
         .and_then(|v| v.as_str())
@@ -59,13 +66,16 @@ pub async fn subagent_handler(
     };
 
     // 3. 派生子 session（Fresh 模式：空上下文，子代理不继承父会话历史）
+    //    subagent_type → definition，引擎按名加载 agents/{type}.md（含 mode 校验）
     let parent_id = ctx.session_id.as_deref().unwrap_or("");
+    let params = SessionParams {
+        agent_config: AgentConfig {
+            definition: Some(subagent_type.clone()),
+        },
+        ..Default::default()
+    };
     let (child_id, mut child_rx) = match ops
-        .create_child_session(
-            parent_id,
-            ChildSessionSource::Fresh,
-            SessionParams::default(),
-        )
+        .create_child_session(parent_id, ChildSessionSource::Fresh, params)
         .await
     {
         Ok(x) => x,
@@ -77,6 +87,7 @@ pub async fn subagent_handler(
     tracing::info!(
         parent_id,
         child_id = %child_id,
+        subagent_type,
         description,
         "子代理 session 已创建"
     );
@@ -216,9 +227,26 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn returns_error_when_subagent_type_missing() {
+        let ctx = ToolCallContext::default();
+        let result = subagent_handler(
+            serde_json::json!({"description": "测试", "prompt": "做某事"}),
+            &ctx,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.contains("缺少 subagent_type"), "实际：{result}");
+    }
+
+    #[tokio::test]
     async fn returns_error_when_prompt_missing() {
         let ctx = ToolCallContext::default();
-        let result = subagent_handler(serde_json::json!({}), &ctx, CancellationToken::new()).await;
+        let result = subagent_handler(
+            serde_json::json!({"subagent_type": "researcher", "description": "测试"}),
+            &ctx,
+            CancellationToken::new(),
+        )
+        .await;
         assert!(result.contains("缺少 prompt"), "实际：{result}");
     }
 
@@ -226,7 +254,11 @@ mod tests {
     async fn returns_error_when_subagent_ops_missing() {
         let ctx = ToolCallContext::default();
         let result = subagent_handler(
-            serde_json::json!({"description": "测试", "prompt": "做某事"}),
+            serde_json::json!({
+                "subagent_type": "researcher",
+                "description": "测试",
+                "prompt": "做某事"
+            }),
             &ctx,
             CancellationToken::new(),
         )

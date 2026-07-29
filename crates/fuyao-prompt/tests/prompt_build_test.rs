@@ -12,7 +12,10 @@ use common::{
     write_instruction,
 };
 use fuyao_api::{AgentConfig, AgentMode};
-use fuyao_prompt::{build_system_prompt, load_agent_definition_from_agent_paths};
+use fuyao_prompt::{PromptUsage, build_system_prompt, load_agent_definition_from_agent_paths};
+
+/// 测试默认用途（主 Agent）
+const PRIMARY: PromptUsage = PromptUsage::Primary;
 
 // ============================================================================
 // build_system_prompt：分层组装
@@ -24,7 +27,7 @@ fn build_system_prompt_empty_home_produces_default_sections() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     assert!(!prompt.is_empty());
     assert!(prompt.contains("# Agent 定义"), "应包含 Agent 定义 section");
@@ -42,7 +45,7 @@ fn build_system_prompt_custom_default_agent_overrides_builtin() {
     );
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     assert!(
         prompt.contains("自定义 Agent"),
@@ -65,7 +68,7 @@ fn build_system_prompt_named_definition_selected_by_config() {
     };
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_system_prompt(&paths, &config);
+    let prompt = build_system_prompt(&paths, &config, PRIMARY);
 
     assert!(prompt.contains("代码审查专家"), "应加载 reviewer 定义");
     assert!(!prompt.contains("默认内容"), "不应回退到 default.md 内容");
@@ -83,7 +86,7 @@ fn build_system_prompt_includes_project_context_from_workspace() {
         Vec::new(),
     );
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     assert!(prompt.contains("# 项目上下文"), "应含项目上下文 section");
     assert!(prompt.contains("禁止使用 unsafe"), "应含 AGENTS.md 正文");
@@ -101,7 +104,7 @@ fn build_system_prompt_includes_instructions_from_extra_dirs() {
         vec![plugin.path().to_path_buf()],
     );
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     assert!(prompt.contains("# 补充指令"), "应含补充指令 section");
     assert!(prompt.contains("测试补充规则"), "应含指令正文");
@@ -113,7 +116,7 @@ fn build_system_prompt_section_order_agent_before_env() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     let agent_idx = prompt.find("# Agent 定义").expect("应含 Agent 定义");
     let env_idx = prompt.find("# 环境").expect("应含环境");
@@ -126,7 +129,7 @@ fn build_system_prompt_datetime_is_non_deterministic_but_present() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     assert!(
         prompt.contains("当前时间："),
@@ -147,7 +150,7 @@ fn build_system_prompt_workspace_context_layered_subheaders() {
         Vec::new(),
     );
 
-    let prompt = build_system_prompt(&paths, &AgentConfig::default());
+    let prompt = build_system_prompt(&paths, &AgentConfig::default(), PRIMARY);
 
     assert!(prompt.contains("项目层上下文"), "应含项目层 AGENTS.md");
     assert!(prompt.contains("全局层上下文"), "应含全局层 AGENTS.md");

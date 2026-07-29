@@ -16,7 +16,24 @@ use std::path::Path;
 /// 返回 `None` 的情况：文件读取失败或解析失败。
 pub fn load_agent_definition(file_path: &Path) -> Option<AgentDefinition> {
     let content = std::fs::read_to_string(file_path).ok()?;
-    let (frontmatter, body) = parse_frontmatter(&content);
+    parse_definition_from_content(&content, Some(file_path.to_string_lossy().to_string()))
+}
+
+/// 从 Markdown 文本解析 Agent 定义
+///
+/// [`load_agent_definition`]（文件路径）与 [`default::DEFAULT_FUYAO_AGENT`] /
+/// [`load_builtin_definition`]（编译期嵌入文本）共用的解析核心。
+/// frontmatter 提取元数据，body 作为系统提示词。
+///
+/// - `content`：完整 Markdown 文本（可含 frontmatter）
+/// - `source_path`：来源文件路径，解析失败或无来源时传 `None`
+///
+/// 返回 `None` 的情况：解析失败（frontmatter 格式错误等）。
+pub(crate) fn parse_definition_from_content(
+    content: &str,
+    source_path: Option<String>,
+) -> Option<AgentDefinition> {
+    let (frontmatter, body) = parse_frontmatter(content);
 
     let name = frontmatter
         .get("name")
@@ -51,8 +68,19 @@ pub fn load_agent_definition(file_path: &Path) -> Option<AgentDefinition> {
         author,
         mode,
         system_prompt: body.trim().to_string(),
-        source_path: Some(file_path.to_string_lossy().to_string()),
+        source_path,
     })
+}
+
+/// 加载内置默认 Agent 定义
+///
+/// 按 name 查 [`default::builtin_definition_md`] 取编译期嵌入的 Markdown，再解析。
+/// 覆盖链：用户 `agents/{name}.md` → 内置默认（本函数）→ [`default::DEFAULT_FUYAO_AGENT`]。
+///
+/// 返回 `None`：name 不在内置默认表中（未知 name，由调用方决定是否回退到 DEFAULT_FUYAO_AGENT）。
+pub fn load_builtin_definition(name: &str) -> Option<AgentDefinition> {
+    let md = crate::default::builtin_definition_md(name)?;
+    parse_definition_from_content(md, None)
 }
 
 /// 从 AgentPaths 加载 Agent 定义
@@ -76,6 +104,12 @@ pub fn load_agent_definition_from_agent_paths(
         }
     }
 
+    // 用户文件未命中 → 查内置默认表（default/researcher/executor）
+    if let Some(builtin) = load_builtin_definition(name) {
+        return builtin;
+    }
+
+    // 内置也没有该 name → 回退主 Agent 默认定义
     DEFAULT_FUYAO_AGENT.clone()
 }
 
@@ -250,6 +284,57 @@ mod tests {
         std::fs::write(&md, "---\nname: any\n---\n任意").unwrap();
         let def = load_agent_definition(&md).unwrap();
         assert_eq!(def.mode, fuyao_api::AgentMode::All);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn load_builtin_definition_known_names() {
+        let def = load_builtin_definition("default").unwrap();
+        assert_eq!(def.name, "fuyao");
+        assert!(!def.system_prompt.is_empty());
+
+        let researcher = load_builtin_definition("researcher").unwrap();
+        assert_eq!(researcher.name, "researcher");
+        assert_eq!(researcher.mode, fuyao_api::AgentMode::Subagent);
+
+        let executor = load_builtin_definition("executor").unwrap();
+        assert_eq!(executor.name, "executor");
+        assert_eq!(executor.mode, fuyao_api::AgentMode::Subagent);
+    }
+
+    #[test]
+    fn load_builtin_definition_unknown_name() {
+        assert!(load_builtin_definition("nonexistent").is_none());
+    }
+
+    #[test]
+    fn load_agent_definition_from_agent_paths_falls_back_to_builtin_subagent() {
+        // 用户无 agents/researcher.md → 回退内置 researcher（而非 DEFAULT_FUYAO_AGENT）
+        let ctx = AgentPaths::default();
+        let def = load_agent_definition_from_agent_paths(&ctx, "researcher");
+        assert_eq!(def.name, "researcher");
+        assert_eq!(def.mode, fuyao_api::AgentMode::Subagent);
+    }
+
+    #[test]
+    fn load_agent_definition_from_agent_paths_user_overrides_builtin() {
+        // 用户 agents/researcher.md 覆盖内置
+        let temp = std::env::temp_dir().join("fuyao_test_loader_override_builtin");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("researcher.md"),
+            "---\nname: my-researcher\ndescription: custom\nmode: subagent\n---\n自定义探索",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let def = load_agent_definition_from_agent_paths(&ctx, "researcher");
+        assert_eq!(def.name, "my-researcher");
 
         std::fs::remove_dir_all(&temp).ok();
     }

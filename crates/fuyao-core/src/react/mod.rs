@@ -450,7 +450,15 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
                 let p = ctx.session_params.lock().await;
                 p.agent_config.clone()
             };
-            let new_prompt = fuyao_prompt::build_system_prompt(&ctx.agent_paths, &agent_config);
+            // 用途按 parent_session_id 推断：子 session（子代理）用 Subagent 校验，
+            // 主 session / fork 用 Primary。与创建时的用途保持一致。
+            let usage = if session.parent_session_id.is_some() {
+                fuyao_prompt::PromptUsage::Subagent
+            } else {
+                fuyao_prompt::PromptUsage::Primary
+            };
+            let new_prompt =
+                fuyao_prompt::build_system_prompt(&ctx.agent_paths, &agent_config, usage);
 
             // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
             // keep_recent 已复制，system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，

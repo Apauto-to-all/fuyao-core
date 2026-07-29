@@ -1,43 +1,49 @@
-//! 默认 Fuyao Agent 定义
+//! 默认 Agent 定义（内置，编译期嵌入）
 //!
-//! 框架内置的默认 Agent，硬编码确保框架稳定性。
-//! 用户可通过 `agents/default.md` 覆盖此定义。
+//! 框架内置的默认 Agent 定义，硬编码进二进制确保框架开箱即用。
+//! 用户可通过 `agents/{name}.md` 覆盖同名内置定义（加载链见 [`crate::loader`]）。
+//!
+//! 文件组织：默认提示词按用途分放在 `defaults/{primary,subagent}/*.md`，
+//! 通过 [`include_str!`] 在编译期整体嵌入二进制，运行时零读盘、零资产依赖。
+//! 文件本身仍是可语法高亮的 Markdown，修改后重新编译即生效。
 
-use fuyao_api::{AgentDefinition, AgentMode};
+use fuyao_api::AgentDefinition;
 use std::sync::LazyLock;
 
-/// 默认系统提示词
-const DEFAULT_SYSTEM_PROMPT: &str = r#"# Fuyao Agent
+/// 内置主 Agent 默认定义（`defaults/primary/default.md`）
+const PRIMARY_DEFAULT_MD: &str = include_str!("defaults/primary/default.md");
 
-你是 Fuyao（扶摇），一个智能 AI 助手。
+/// 内置探索子代理默认定义（`defaults/subagent/researcher.md`）
+const SUBAGENT_RESEARCHER_MD: &str = include_str!("defaults/subagent/researcher.md");
 
-## 核心能力
-- 代码编写、审查和重构
-- 文件系统操作（读取、写入、搜索）
-- 问题分析和解决方案设计
-- 技术文档编写
+/// 内置执行子代理默认定义（`defaults/subagent/executor.md`）
+const SUBAGENT_EXECUTOR_MD: &str = include_str!("defaults/subagent/executor.md");
 
-## 工作原则
-- **自主决策**：有明确任务时，使用工具获取信息，而非询问用户
-- **持续执行**：完成任务直到真正完成，不中途停止
-- **验证结果**：执行操作后验证结果是否符合预期
-- **清晰沟通**：简洁明了地汇报进展和结果
+/// 按 name 取内置默认定义的原始 Markdown 文本
+///
+/// 覆盖链的最后一环：用户 `agents/{name}.md` 不存在时，先查内置默认；
+/// 内置也没有该 name 时，调用方再回退到 [`DEFAULT_FUYAO_AGENT`]。
+///
+/// `""` 与 `"default"` 都映射到主 Agent 默认定义（与 `AgentConfig.definition = None`
+/// 时加载 `"default"` 的约定一致）。
+pub(crate) fn builtin_definition_md(name: &str) -> Option<&'static str> {
+    match name {
+        "" | "default" => Some(PRIMARY_DEFAULT_MD),
+        "researcher" => Some(SUBAGENT_RESEARCHER_MD),
+        "executor" => Some(SUBAGENT_EXECUTOR_MD),
+        _ => None,
+    }
+}
 
-## 行为准则
-- 谨慎处理敏感操作（删除、覆盖），必要时先备份
-- 遇到错误时分析原因并调整策略，不轻易放弃
-- 保持代码风格与项目现有风格一致
-- 使用工具前了解其功能，选择最合适的工具"#;
-
-/// 默认 Agent 定义（全局单例）
-pub static DEFAULT_FUYAO_AGENT: LazyLock<AgentDefinition> = LazyLock::new(|| AgentDefinition {
-    name: "fuyao".to_string(),
-    description: "Fuyao 默认助手".to_string(),
-    version: "1.0.0".to_string(),
-    author: "Fuyao".to_string(),
-    mode: AgentMode::All,
-    system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-    source_path: None,
+/// 默认主 Agent 定义（全局单例）
+///
+/// 由 [`PRIMARY_DEFAULT_MD`] 解析而来，保持「文件即唯一来源」——
+/// 改 `defaults/primary/default.md` 即改默认 Agent，无需同步两处。
+/// 解析失败（内置文件格式错误）直接 panic：编译期嵌入内容受开发者完全掌控，
+/// 解析失败属开发期 bug，应尽早暴露而非静默回退。
+pub static DEFAULT_FUYAO_AGENT: LazyLock<AgentDefinition> = LazyLock::new(|| {
+    crate::loader::parse_definition_from_content(PRIMARY_DEFAULT_MD, None)
+        .expect("内置默认 Agent 定义解析失败：defaults/primary/default.md 格式错误")
 });
 
 #[cfg(test)]
@@ -59,5 +65,18 @@ mod tests {
     fn default_agent_is_cloneable() {
         let clone = DEFAULT_FUYAO_AGENT.clone();
         assert_eq!(clone.name, DEFAULT_FUYAO_AGENT.name);
+    }
+
+    #[test]
+    fn builtin_definition_md_known_names() {
+        assert!(builtin_definition_md("default").is_some());
+        assert!(builtin_definition_md("").is_some());
+        assert!(builtin_definition_md("researcher").is_some());
+        assert!(builtin_definition_md("executor").is_some());
+    }
+
+    #[test]
+    fn builtin_definition_md_unknown_name() {
+        assert!(builtin_definition_md("nonexistent").is_none());
     }
 }

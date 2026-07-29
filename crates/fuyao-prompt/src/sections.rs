@@ -14,28 +14,39 @@
 //! | 7 | 运行环境 | ✅ 已实现 |
 
 use crate::default::DEFAULT_FUYAO_AGENT;
-use crate::loader::load_agent_definition_from_agent_paths;
+use crate::loader::{
+    load_agent_definition, load_agent_definition_from_agent_paths, load_builtin_definition,
+};
 use chrono::Local;
 use fuyao_api::{AgentConfig, AgentPaths};
 use fuyao_skills::find_all_skills;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// 构建 Agent 身份 section（Layer 1）
 ///
 /// 从 `agents/{definition}.md` 加载系统提示词。
 /// definition 由 agent_config.definition 提供，None 时加载 `"default"`。
+///
+/// mode 校验按 `usage` 方向：主 Agent session 校验 `is_usable_as_primary`，
+/// 子代理 session 校验 `is_usable_as_subagent`；不合法回退默认主 Agent 定义。
 pub fn build_agent_identity_section(
     agent_paths: &AgentPaths,
     agent_config: &AgentConfig,
+    usage: crate::PromptUsage,
 ) -> String {
     let def_name = agent_config.definition.as_deref().unwrap_or("default");
     let agent_def = load_agent_definition_from_agent_paths(agent_paths, def_name);
-    // 校验:子代理模式的定义不能用作主代理,回退默认定义
-    if !agent_def.mode.is_usable_as_primary() {
+    let usable = match usage {
+        crate::PromptUsage::Primary => agent_def.mode.is_usable_as_primary(),
+        crate::PromptUsage::Subagent => agent_def.mode.is_usable_as_subagent(),
+    };
+    if !usable {
         tracing::error!(
             definition = def_name,
             mode = ?agent_def.mode,
-            "Agent 定义标记为子代理模式,不能用作主代理,回退默认定义"
+            ?usage,
+            "Agent 定义的 mode 与当前用途不符，回退默认主 Agent 定义"
         );
         return DEFAULT_FUYAO_AGENT.system_prompt.clone();
     }
@@ -222,6 +233,73 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
     lines.join("\n")
 }
 
+/// 构建子代理索引 section（Layer 5.5）
+///
+/// 列出可用的子代理定义（name + description），供主 Agent 通过 `subagent` 工具的
+/// `subagent_type` 参数选择。仅注入主 Agent session（子代理不可再派生）。
+///
+/// 来源合并（低 → 高优先级，后者覆盖前者）：
+/// 1. 内置默认子代理（researcher / executor）—— 编译期嵌入，永远存在
+/// 2. 用户 `agents/*.md`（三层目录扫描，file stem 作为 name）—— mode 须 `is_usable_as_subagent`
+///
+/// 用户同名文件覆盖内置：与 [`load_agent_definition_from_agent_paths`] 的加载链一致。
+/// 内置主 Agent（default）mode = All 也算可用子代理，列入清单（LLM 可显式选它当子代理）。
+pub fn build_subagent_index_section(agent_paths: &AgentPaths) -> String {
+    // name → description，用户层覆盖内置层
+    let mut by_name: HashMap<String, String> = HashMap::new();
+
+    // 内置默认子代理（最低优先）
+    for builtin_name in ["researcher", "executor"] {
+        if let Some(def) = load_builtin_definition(builtin_name)
+            && def.mode.is_usable_as_subagent()
+        {
+            by_name.insert(builtin_name.to_string(), def.description);
+        }
+    }
+
+    // 用户文件（覆盖内置）
+    for dir in agent_paths.agents_def_dirs().merge_exists() {
+        let md_files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "md"))
+                .collect(),
+            Err(_) => continue,
+        };
+        for file_path in md_files {
+            let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if let Some(def) = load_agent_definition(&file_path)
+                && def.mode.is_usable_as_subagent()
+            {
+                by_name.insert(stem.to_string(), def.description);
+            }
+        }
+    }
+
+    if by_name.is_empty() {
+        return String::new();
+    }
+
+    // 按 name 排序，输出稳定可读
+    let mut entries: Vec<(String, String)> = by_name.into_iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut lines = vec!["可用子代理（subagent 工具的 subagent_type 参数可选值）：".to_string()];
+    for (name, desc) in &entries {
+        let desc = if desc.is_empty() {
+            String::new()
+        } else {
+            format!("：{desc}")
+        };
+        lines.push(format!("- {name}{desc}"));
+    }
+
+    lines.join("\n")
+}
+
 /// 构建日期时间 section（Layer 6）
 ///
 /// 提供当前日期时间信息。
@@ -279,7 +357,11 @@ mod tests {
     #[test]
     fn build_agent_identity_section_returns_default() {
         let ctx = AgentPaths::default();
-        let section = build_agent_identity_section(&ctx, &AgentConfig::default());
+        let section = build_agent_identity_section(
+            &ctx,
+            &AgentConfig::default(),
+            crate::PromptUsage::Primary,
+        );
         assert!(!section.is_empty());
         assert!(section.contains("Fuyao"));
     }
@@ -303,15 +385,15 @@ mod tests {
         let config = AgentConfig {
             definition: Some("reviewer".to_string()),
         };
-        let section = build_agent_identity_section(&ctx, &config);
+        let section = build_agent_identity_section(&ctx, &config, crate::PromptUsage::Primary);
         assert!(section.contains("代码审查专家"));
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn build_agent_identity_section_rejects_subagent_mode() {
-        // mode: subagent 的定义不能用作主代理,应回退 DEFAULT_FUYAO_AGENT
+    fn build_agent_identity_section_rejects_subagent_mode_as_primary() {
+        // mode: subagent 的定义不能用作主代理，应回退 DEFAULT_FUYAO_AGENT
         let temp = std::env::temp_dir().join("fuyao_test_sections_subagent_mode");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
@@ -325,10 +407,99 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let section = build_agent_identity_section(&ctx, &AgentConfig::default());
+        let section = build_agent_identity_section(
+            &ctx,
+            &AgentConfig::default(),
+            crate::PromptUsage::Primary,
+        );
         // subagent 被拒,回退默认(含 "Fuyao"),不含子代理提示词
         assert!(section.contains("Fuyao"));
         assert!(!section.contains("不应作主代理"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn build_agent_identity_section_rejects_primary_mode_as_subagent() {
+        // 对称校验：mode: primary 的定义不能用作子代理，应回退 DEFAULT_FUYAO_AGENT
+        let temp = std::env::temp_dir().join("fuyao_test_sections_primary_mode_as_sub");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("boss.md"),
+            "---\nname: boss\ndescription: 仅主代理\nmode: primary\n---\n你是专属主代理,不应作子代理",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let config = AgentConfig {
+            definition: Some("boss".to_string()),
+        };
+        let section = build_agent_identity_section(&ctx, &config, crate::PromptUsage::Subagent);
+        // primary 被拒,回退默认(含 "Fuyao"),不含 primary 专属提示词
+        assert!(section.contains("Fuyao"));
+        assert!(!section.contains("不应作子代理"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn build_subagent_index_section_lists_builtins() {
+        // 默认无用户 agents 目录 → 仅列内置 researcher / executor
+        let ctx = AgentPaths::default();
+        let section = build_subagent_index_section(&ctx);
+        assert!(section.contains("researcher"));
+        assert!(section.contains("executor"));
+        assert!(section.contains("只读探索"));
+        assert!(section.contains("通用执行"));
+    }
+
+    #[test]
+    fn build_subagent_index_section_user_overrides_builtin() {
+        // 用户 agents/researcher.md 覆盖内置 researcher 的 description
+        let temp = std::env::temp_dir().join("fuyao_test_subagent_index_override");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("researcher.md"),
+            "---\nname: researcher\ndescription: 我的自定义探索\nmode: subagent\n---\n自定义",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let section = build_subagent_index_section(&ctx);
+        assert!(section.contains("我的自定义探索"));
+        // 内置描述被覆盖，不再出现
+        assert!(!section.contains("只读探索"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn build_subagent_index_section_filters_primary_only_defs() {
+        // mode: primary 的定义不应出现在子代理索引
+        let temp = std::env::temp_dir().join("fuyao_test_subagent_index_filter");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("boss.md"),
+            "---\nname: boss\ndescription: 专属主代理\nmode: primary\n---\n仅主代理",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let section = build_subagent_index_section(&ctx);
+        assert!(!section.contains("boss"));
+        assert!(!section.contains("专属主代理"));
 
         std::fs::remove_dir_all(&temp).ok();
     }

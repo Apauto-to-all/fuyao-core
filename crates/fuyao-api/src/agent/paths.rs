@@ -205,6 +205,36 @@ impl AgentPaths {
         }
     }
 
+    /// Agent 定义目录分层路径（`agents/`）
+    ///
+    /// 列举所有存放 Agent 定义的 `agents/` 目录（三层，不含 agent 层），
+    /// 供调用方扫描目录下全部 `*.md`（如构建子代理索引）。各目录内的文件
+    /// 按 file stem 作为定义 name。
+    ///
+    /// - workspace: `{workspace}/.fuyao/agents/`
+    /// - global: `~/.fuyao/agents/`
+    /// - extra: `{插件根}/agents/`（仅保留存在的目录）
+    ///
+    /// 调用方用 `merge_exists()` 取所有存在的目录。
+    pub fn agents_def_dirs(&self) -> LayeredPaths {
+        let extra: Vec<PathBuf> = self
+            .extra_dirs
+            .iter()
+            .map(|d| d.join("agents"))
+            .filter(|d| d.is_dir())
+            .collect();
+
+        LayeredPaths {
+            global_: Some(self.fuyao_home.join("agents")),
+            agent: None,
+            workspace: self
+                .workspace
+                .as_ref()
+                .map(|ws| get_workspace_root(ws).join("agents")),
+            extra,
+        }
+    }
+
     /// 补充指令目录分层路径（`instructions/`）
     ///
     /// 四层优先级，仿 `skills_paths` 结构。每个目录下所有 `*.md` 全量拼接进补充区：

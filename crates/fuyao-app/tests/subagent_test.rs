@@ -96,6 +96,7 @@ fn subagent_call_events(prompt: &str) -> Vec<StreamEvent> {
             name: Some("subagent".to_string()),
             args_delta: Some(
                 serde_json::json!({
+                    "subagent_type": "researcher",
                     "description": "端到端测试",
                     "prompt": prompt
                 })
