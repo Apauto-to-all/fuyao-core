@@ -213,6 +213,30 @@ mod tests {
     }
 
     #[test]
+    fn subagent_batch_is_parallel() {
+        // subagent 派生独立 child session，无共享状态，多调用应并行
+        let config = ToolRunnerConfig::default();
+        let calls = vec![
+            make_tool_call(
+                "1",
+                "subagent",
+                r#"{"subagent_type":"executor","description":"a","prompt":"x"}"#,
+            ),
+            make_tool_call(
+                "2",
+                "subagent",
+                r#"{"subagent_type":"executor","description":"b","prompt":"y"}"#,
+            ),
+            make_tool_call(
+                "3",
+                "subagent",
+                r#"{"subagent_type":"researcher","description":"c","prompt":"z"}"#,
+            ),
+        ];
+        assert!(should_parallelize(&calls, &config));
+    }
+
+    #[test]
     fn mixed_safe_and_path_scoped_non_overlapping_are_parallel() {
         let config = ToolRunnerConfig::default();
         let calls = vec![

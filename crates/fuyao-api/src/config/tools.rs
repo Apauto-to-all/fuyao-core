@@ -97,6 +97,7 @@ impl Default for ToolRunnerConfig {
                 "grep".to_string(),
                 "skill".to_string(),
                 "webfetch".to_string(),
+                "subagent".to_string(),
             ]),
             path_scoped_tools: HashSet::from([
                 "read".to_string(),
@@ -230,6 +231,8 @@ path_scoped = ["read", "write"]
         assert!(config.parallel_safe_tools.contains("read"));
         assert!(config.parallel_safe_tools.contains("glob"));
         assert!(config.parallel_safe_tools.contains("grep"));
+        // subagent 派生独立 child session，无跨调用共享状态，可安全并行
+        assert!(config.parallel_safe_tools.contains("subagent"));
     }
 
     #[test]
