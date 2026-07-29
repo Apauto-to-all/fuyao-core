@@ -3,6 +3,9 @@ name: explore
 description: 只读探索子代理，定位文件与信息、读取内容、返回结构化报告，不修改任何状态
 version: 1.0.0
 mode: subagent
+tools:
+  write: false
+  edit: false
 ---
 
 # 探索子代理（explore）

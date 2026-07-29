@@ -315,10 +315,16 @@ mod tests {
         let explore = load_builtin_definition("explore").unwrap();
         assert_eq!(explore.name, "explore");
         assert_eq!(explore.mode, fuyao_api::AgentMode::Subagent);
+        // explore 只读收窄：禁用 write/edit，未列出的（read/glob/grep/bash/webfetch/...）默认启用
+        assert_eq!(explore.tools.get("write"), Some(&false));
+        assert_eq!(explore.tools.get("edit"), Some(&false));
+        assert!(explore.tools.get("read").is_none());
 
         let executor = load_builtin_definition("executor").unwrap();
         assert_eq!(executor.name, "executor");
         assert_eq!(executor.mode, fuyao_api::AgentMode::Subagent);
+        // executor 通用执行：不声明 tools = 全开（未列出默认启用）
+        assert!(executor.tools.is_empty());
     }
 
     #[test]
