@@ -68,19 +68,20 @@ pub(crate) async fn run_turn(
     // is_child 按 session.parent_session_id 判定：子 session 的工具列表过滤掉
     // child_invisible 的工具（递归防护——子 session 看不到派生类工具）
     let is_child = session.parent_session_id.is_some();
-    let resolved: ResolvedModel = match resolve_model(&model_config, &ctx.tools, is_child) {
-        Ok(r) => r,
-        Err(msg) => {
-            tracing::warn!(
-                session_id = ctx.emitter.session_id(),
-                cause = %msg,
-                "模型解析失败（model_id 无效或未配置 [models.default]）"
-            );
-            emit_config_error(ctx, &msg).await;
-            persist(ctx.emitter.session_id(), session, &ctx.store).await;
-            return;
-        }
-    };
+    let resolved: ResolvedModel =
+        match resolve_model(&model_config, &ctx.tools, is_child, &ctx.definition.tools) {
+            Ok(r) => r,
+            Err(msg) => {
+                tracing::warn!(
+                    session_id = ctx.emitter.session_id(),
+                    cause = %msg,
+                    "模型解析失败（model_id 无效或未配置 [models.default]）"
+                );
+                emit_config_error(ctx, &msg).await;
+                persist(ctx.emitter.session_id(), session, &ctx.store).await;
+                return;
+            }
+        };
     let provider: Arc<dyn Provider> = match ctx.providers.get(&resolved.provider_id) {
         Some(p) => p,
         None => {

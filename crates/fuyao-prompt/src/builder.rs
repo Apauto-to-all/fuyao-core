@@ -53,7 +53,7 @@ use crate::sections::{
     build_instructions_section, build_project_context_section, build_skills_section,
     build_subagent_index_section, build_tool_guidance_section,
 };
-use fuyao_api::{AgentConfig, AgentPaths};
+use fuyao_api::{AgentDefinition, AgentPaths};
 
 /// 系统提示词的构建用途
 ///
@@ -74,16 +74,18 @@ pub enum PromptUsage {
 /// 构建所有 section
 ///
 /// 按顺序调用各层构建函数，返回 (中文标题, 内容) 列表。
-/// `usage` 决定身份层校验方向与子代理索引层是否注入。
+/// `usage` 决定子代理索引层是否注入。`definition` 由调用方事先经
+/// [`resolve_definition`](crate::resolve_definition) 加载（含 mode 校验 + 回退），
+/// Layer 1 直接取其 `system_prompt`，不在本函数内重复加载。
 pub fn build_all_sections(
     agent_paths: &AgentPaths,
-    agent_config: &AgentConfig,
+    definition: &AgentDefinition,
     usage: PromptUsage,
 ) -> Vec<(String, String)> {
     let mut sections: Vec<(String, String)> = Vec::new();
 
-    // Layer 1: Agent 身份（从 agents/{definition}.md 加载，覆盖内置默认；按 usage 校验 mode）
-    let content = build_agent_identity_section(agent_paths, agent_config, usage);
+    // Layer 1: Agent 身份（definition 已加载，直接取 system_prompt）
+    let content = build_agent_identity_section(definition);
     if !content.is_empty() {
         sections.push(("Agent 定义".to_string(), content));
     }
@@ -151,14 +153,16 @@ fn sections_to_prompt(sections: Vec<(String, String)>) -> String {
 /// 构建系统提示词
 ///
 /// 分层组装各 section，返回完整系统提示词。
-/// Layer 1（Agent 身份）从 `agents/{definition}.md` 加载，definition 由 agent_config 提供；
-/// 按 `usage` 校验 mode 合法性，并决定是否注入子代理索引层。
+/// Layer 1（Agent 身份）取 `definition.system_prompt`——`definition` 由调用方事先经
+/// [`resolve_definition`](crate::resolve_definition) 加载（一份 definition 同时供
+/// 系统提示词构建与 per-session 工具过滤，避免重复加载）。
+/// 按 `usage` 决定是否注入子代理索引层。
 pub fn build_system_prompt(
     agent_paths: &AgentPaths,
-    agent_config: &AgentConfig,
+    definition: &AgentDefinition,
     usage: PromptUsage,
 ) -> String {
-    sections_to_prompt(build_all_sections(agent_paths, agent_config, usage))
+    sections_to_prompt(build_all_sections(agent_paths, definition, usage))
 }
 
 #[cfg(test)]
@@ -167,10 +171,19 @@ mod tests {
 
     const PRIMARY: PromptUsage = PromptUsage::Primary;
 
+    /// 加载默认 definition（测试 helper：复用 resolve_definition 拿含 "Fuyao" 的默认提示词）
+    fn default_definition(ctx: &AgentPaths) -> AgentDefinition {
+        crate::resolve_definition(
+            ctx,
+            &fuyao_api::AgentConfig::default(),
+            PromptUsage::Primary,
+        )
+    }
+
     #[test]
     fn build_all_sections_returns_non_empty() {
         let ctx = AgentPaths::default();
-        let sections = build_all_sections(&ctx, &AgentConfig::default(), PRIMARY);
+        let sections = build_all_sections(&ctx, &default_definition(&ctx), PRIMARY);
         assert!(!sections.is_empty());
         // 应该包含 Agent 定义和环境
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
@@ -181,7 +194,7 @@ mod tests {
     #[test]
     fn build_system_prompt_returns_non_empty() {
         let ctx = AgentPaths::default();
-        let prompt = build_system_prompt(&ctx, &AgentConfig::default(), PRIMARY);
+        let prompt = build_system_prompt(&ctx, &default_definition(&ctx), PRIMARY);
         assert!(!prompt.is_empty());
         assert!(prompt.contains("# Agent 定义"));
         assert!(prompt.contains("# 环境"));
@@ -191,7 +204,7 @@ mod tests {
     #[test]
     fn build_system_prompt_contains_datetime() {
         let ctx = AgentPaths::default();
-        let prompt = build_system_prompt(&ctx, &AgentConfig::default(), PRIMARY);
+        let prompt = build_system_prompt(&ctx, &default_definition(&ctx), PRIMARY);
         assert!(prompt.contains("当前时间："));
     }
 
@@ -199,7 +212,7 @@ mod tests {
     fn build_all_sections_order_is_correct() {
         // 默认无 instructions/，补充指令 section 不出现；验证其余顺序
         let ctx = AgentPaths::default();
-        let sections = build_all_sections(&ctx, &AgentConfig::default(), PRIMARY);
+        let sections = build_all_sections(&ctx, &default_definition(&ctx), PRIMARY);
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
         // 期望顺序：Agent 定义 → 项目上下文 → 工具使用指南 → 技能 skills → 子代理 → 环境
         let agent_idx = titles.iter().position(|t| *t == "Agent 定义").unwrap();
@@ -229,7 +242,7 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let sections = build_all_sections(&ctx, &AgentConfig::default(), PRIMARY);
+        let sections = build_all_sections(&ctx, &default_definition(&ctx), PRIMARY);
 
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
         let instr_idx = titles
@@ -255,7 +268,7 @@ mod tests {
     fn subagent_usage_omits_subagent_index_layer() {
         // Subagent 用途不注入子代理索引层（子代理不可再派生）
         let ctx = AgentPaths::default();
-        let sections = build_all_sections(&ctx, &AgentConfig::default(), PromptUsage::Subagent);
+        let sections = build_all_sections(&ctx, &default_definition(&ctx), PromptUsage::Subagent);
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
         assert!(!titles.contains(&"子代理"));
     }

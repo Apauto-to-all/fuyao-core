@@ -56,17 +56,32 @@ impl ToolRegistry {
         self.inner.len()
     }
 
-    /// 序列化工具定义为 JSON Value 数组，按当前 session 是否子任务过滤
+    /// 已注册的全部工具名（供工具配置未知名对账用）
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.inner.keys().map(String::as_str)
+    }
+
+    /// 序列化工具定义为 JSON Value 数组，按 session 上下文过滤可见子集
     ///
-    /// `is_child=true` 时跳过 [`ToolEntry::child_invisible`] 为 `true` 的工具
-    /// （递归防护：子 session 看不到派生类工具，LLM 不会尝试调用，根本性阻断嵌套派生）。
+    /// 两层过滤叠加（交集语义）：
+    /// - `is_child=true` 时跳过 [`ToolEntry::child_invisible`] 为 `true` 的工具
+    ///   （递归防护：子 session 看不到派生类工具，LLM 不会尝试调用，根本性阻断嵌套派生）。
+    /// - `definition_tools` 收窄：显式 `false` 的工具跳过（与全局 `[tools.enabled]` 同款语义，
+    ///   未列出默认启用）。定义层只能在全局允许的范围内加限制（全局禁用已在注册漏斗剔除）。
+    ///
+    /// 工具集改变会冲掉 LLM 前缀缓存，故 `definition_tools` 取自创建时定死的 `AgentDefinition`。
     ///
     /// `ToolDefinition` 已实现 `Serialize`，直接 `to_value` 即可。
     /// 空注册表返回空 Vec（调用方据此决定是否带 tools 字段）。
-    pub fn definitions_json_for(&self, is_child: bool) -> Vec<serde_json::Value> {
+    pub fn definitions_json_for(
+        &self,
+        is_child: bool,
+        definition_tools: &HashMap<String, bool>,
+    ) -> Vec<serde_json::Value> {
         self.inner
             .values()
             .filter(|e| !is_child || !e.child_invisible)
+            .filter(|e| definition_tools.get(&e.definition.function.name) != Some(&false))
             .filter_map(|e| serde_json::to_value(&e.definition).ok())
             .collect()
     }
@@ -132,11 +147,12 @@ mod tests {
     #[test]
     fn empty_registry() {
         let reg = ToolRegistry::builder().build();
+        let no_restrict = HashMap::new();
         assert!(reg.is_empty());
         assert_eq!(reg.len(), 0);
         assert!(reg.get("any").is_none());
-        assert!(reg.definitions_json_for(false).is_empty());
-        assert!(reg.definitions_json_for(true).is_empty());
+        assert!(reg.definitions_json_for(false, &no_restrict).is_empty());
+        assert!(reg.definitions_json_for(true, &no_restrict).is_empty());
     }
 
     #[test]
@@ -165,7 +181,8 @@ mod tests {
             .register_all([make_entry("read"), make_entry("write")])
             .build();
         // 主 session（is_child=false）看到全部工具
-        let defs = reg.definitions_json_for(false);
+        let no_restrict = HashMap::new();
+        let defs = reg.definitions_json_for(false, &no_restrict);
         assert_eq!(defs.len(), 2);
         // 每个都是 {type:"function", function:{name, description, parameters}}
         for d in &defs {
@@ -184,14 +201,15 @@ mod tests {
                 make_child_invisible_entry("subagent"),
             ])
             .build();
+        let no_restrict = HashMap::new();
         assert_eq!(reg.len(), 3);
 
         // 主 session（is_child=false）：看到全部 3 个
-        let main_defs = reg.definitions_json_for(false);
+        let main_defs = reg.definitions_json_for(false, &no_restrict);
         assert_eq!(main_defs.len(), 3);
 
         // 子 session（is_child=true）：只看到 2 个（subagent 被过滤）
-        let child_defs = reg.definitions_json_for(true);
+        let child_defs = reg.definitions_json_for(true, &no_restrict);
         assert_eq!(child_defs.len(), 2);
         let child_names: Vec<&str> = child_defs
             .iter()
@@ -200,6 +218,54 @@ mod tests {
         assert!(child_names.contains(&"read"));
         assert!(child_names.contains(&"write"));
         assert!(!child_names.contains(&"subagent"));
+    }
+
+    #[test]
+    fn definitions_json_for_applies_definition_tools_filter() {
+        // 定义层 tools 收窄：显式 false 的工具不出现在 schema（与全局 [tools.enabled] 同款语义）
+        let reg = ToolRegistry::builder()
+            .register_all([make_entry("read"), make_entry("write"), make_entry("bash")])
+            .build();
+
+        // 定义层禁用 write + bash（researcher 只读场景）
+        let mut definition_tools = HashMap::new();
+        definition_tools.insert("write".to_string(), false);
+        definition_tools.insert("bash".to_string(), false);
+        definition_tools.insert("read".to_string(), true); // 显式 true 仍启用
+
+        let defs = reg.definitions_json_for(false, &definition_tools);
+        assert_eq!(defs.len(), 1, "只读场景仅 read 可见");
+        let names: Vec<&str> = defs
+            .iter()
+            .map(|d| d["function"]["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(names.contains(&"read"));
+        assert!(!names.contains(&"write"));
+        assert!(!names.contains(&"bash"));
+    }
+
+    #[test]
+    fn definitions_json_for_empty_definition_tools_means_all_enabled() {
+        // 空 definition_tools = 无限制（全部启用，向后兼容）
+        let reg = ToolRegistry::builder()
+            .register_all([make_entry("read"), make_entry("write")])
+            .build();
+        let no_restrict = HashMap::new();
+        let defs = reg.definitions_json_for(false, &no_restrict);
+        assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn names_lists_all_registered_tool_names() {
+        let reg = ToolRegistry::builder()
+            .register_all([make_entry("read"), make_entry("write")])
+            .build();
+        let mut names: Vec<&str> = reg.names().collect();
+        names.sort();
+        assert_eq!(names, vec!["read", "write"]);
+
+        let empty = ToolRegistry::builder().build();
+        assert_eq!(empty.names().count(), 0);
     }
 
     #[test]

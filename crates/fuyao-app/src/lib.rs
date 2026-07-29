@@ -91,5 +91,19 @@ pub async fn build_tool_registry() -> (ToolRegistry, Option<Arc<MCPManager>>) {
         None
     };
 
-    (builder.build(), mcp_manager)
+    let registry = builder.build();
+
+    // 全局层未知名对账（与定义层 tools 同款逻辑：静默忽略 + WARN，用户错误用户承担）。
+    // 已知名取注册表全部（内置 + MCP），避免已配置的 MCP 工具名被误报未知。
+    for name in
+        fuyao_api::unknown_tool_names(&fuyao_api::get_config().tools.enabled, registry.names())
+    {
+        tracing::warn!(
+            tool_name = %name,
+            layer = "global",
+            "工具配置引用了未知的工具名，已忽略"
+        );
+    }
+
+    (registry, mcp_manager)
 }

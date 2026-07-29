@@ -135,6 +135,26 @@ impl ToolsConfig {
     }
 }
 
+/// 对账工具配置中的未知工具名（拼错 / 已卸载）
+///
+/// 统一两层工具配置的未知名处理：全局 `[tools.enabled]` 与定义层 `tools`
+/// 共用本函数。返回不在已知工具集合内的配置 key，调用方按所属层级
+/// （`layer` 字段）逐个记 WARN 日志后忽略——不阻断、不报错，用户错误由用户承担。
+///
+/// 纯函数（不记日志、不依赖 tracing），便于在不污染全局状态的前提下测试。
+/// 已知集合由调用方传入（全局层传注册表全部名、定义层同），避免本函数依赖 fuyao-core。
+pub fn unknown_tool_names(
+    tools: &HashMap<String, bool>,
+    known: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<String> {
+    let known: std::collections::HashSet<String> =
+        known.into_iter().map(|s| s.as_ref().to_string()).collect();
+    tools
+        .keys()
+        .filter(|name| !known.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +261,35 @@ path_scoped = ["read", "write"]
         assert!(config.path_scoped_tools.contains("read"));
         assert!(config.path_scoped_tools.contains("write"));
         assert!(config.path_scoped_tools.contains("edit"));
+    }
+
+    /// unknown_tool_names：返回不在已知集合内的配置 key
+    #[test]
+    fn unknown_tool_names_finds_misspelled() {
+        let mut tools = HashMap::new();
+        tools.insert("read".to_string(), true);
+        tools.insert("wrtie".to_string(), false); // 拼错的 write
+        tools.insert("bash".to_string(), false);
+
+        let known = ["read", "write", "bash"];
+        let mut unknown = unknown_tool_names(&tools, known);
+        unknown.sort();
+        assert_eq!(unknown, vec!["wrtie".to_string()]);
+    }
+
+    #[test]
+    fn unknown_tool_names_empty_when_all_known() {
+        let mut tools = HashMap::new();
+        tools.insert("read".to_string(), true);
+        tools.insert("bash".to_string(), false);
+        let unknown = unknown_tool_names(&tools, ["read", "write", "bash", "edit"]);
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn unknown_tool_names_empty_config() {
+        let tools = HashMap::new();
+        let unknown = unknown_tool_names(&tools, ["read"]);
+        assert!(unknown.is_empty());
     }
 }

@@ -61,12 +61,30 @@ pub(crate) fn parse_definition_from_content(
         .map(AgentMode::from)
         .unwrap_or_default();
 
+    // tools：与全局 [tools.enabled] 同款语义（工具名=是否启用）。
+    // frontmatter 是 serde_yaml::Mapping，tools 值为嵌套 Mapping；逐 key 取 bool，
+    // 非 bool 值（格式错误）静默跳过——值类型错误由用户承担，解析层不阻断。
+    let tools = frontmatter
+        .get("tools")
+        .and_then(|v| v.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| {
+                    let name = k.as_str()?;
+                    let enabled = v.as_bool()?;
+                    Some((name.to_string(), enabled))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     Some(AgentDefinition {
         name,
         description,
         version,
         author,
         mode,
+        tools,
         system_prompt: body.trim().to_string(),
         source_path,
     })
@@ -337,5 +355,39 @@ mod tests {
         assert_eq!(def.name, "my-explore");
 
         std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn parse_definition_from_content_parses_tools() {
+        // frontmatter 带 tools 字段，与全局 [tools.enabled] 同款语义
+        let md = "---\nname: researcher\nmode: subagent\ntools:\n  write: false\n  edit: false\n  bash: false\n  read: true\n---\n你是只读研究员";
+        let def = parse_definition_from_content(md, None).unwrap();
+        assert_eq!(def.tools.len(), 4);
+        assert_eq!(def.tools.get("write"), Some(&false));
+        assert_eq!(def.tools.get("edit"), Some(&false));
+        assert_eq!(def.tools.get("bash"), Some(&false));
+        assert_eq!(def.tools.get("read"), Some(&true));
+        // 未列出的工具不进 map（默认启用语义）
+        assert!(def.tools.get("grep").is_none());
+    }
+
+    #[test]
+    fn parse_definition_from_content_tools_default_empty() {
+        // 无 tools 字段 → 空 map（无限制，向后兼容）
+        let md = "---\nname: plain\n---\n普通定义";
+        let def = parse_definition_from_content(md, None).unwrap();
+        assert!(def.tools.is_empty());
+    }
+
+    #[test]
+    fn parse_definition_from_content_tools_skips_non_bool_values() {
+        // 非 bool 值（格式错误）静默跳过，不阻断解析
+        let md = "---\nname: mixed\ntools:\n  write: false\n  bad: \"not-a-bool\"\n  read: true\n---\n混合值";
+        let def = parse_definition_from_content(md, None).unwrap();
+        // bad 被跳过，只留 write / read
+        assert_eq!(def.tools.len(), 2);
+        assert_eq!(def.tools.get("write"), Some(&false));
+        assert_eq!(def.tools.get("read"), Some(&true));
+        assert!(def.tools.get("bad").is_none());
     }
 }

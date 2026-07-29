@@ -18,23 +18,30 @@ use crate::loader::{
     load_agent_definition, load_agent_definition_from_agent_paths, load_builtin_definition,
 };
 use chrono::Local;
-use fuyao_api::{AgentConfig, AgentPaths};
+use fuyao_api::{AgentConfig, AgentDefinition, AgentPaths};
 use fuyao_skills::find_all_skills;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// 构建 Agent 身份 section（Layer 1）
+/// 解析当前 session 使用的完整 Agent 定义
 ///
-/// 从 `agents/{definition}.md` 加载系统提示词。
-/// definition 由 agent_config.definition 提供，None 时加载 `"default"`。
+/// 统一定义加载 + mode 校验 + 回退的出口，供两个消费方共享：
+/// - [`build_agent_identity_section`]：取 `.system_prompt` 拼系统提示词
+/// - 引擎装配（`assemble_session`）：持有完整 `AgentDefinition`，用 `.tools` 做
+///   per-session 工具可见性过滤（定义层工具配置，与全局 `[tools.enabled]` 取交集）
 ///
-/// mode 校验按 `usage` 方向：主 Agent session 校验 `is_usable_as_primary`，
-/// 子代理 session 校验 `is_usable_as_subagent`；不合法回退默认主 Agent 定义。
-pub fn build_agent_identity_section(
+/// 加载链与 [`load_agent_definition_from_agent_paths`] 一致：
+/// 用户 `agents/{name}.md` → 内置默认 → [`DEFAULT_FUYAO_AGENT`]。
+/// `agent_config.definition` 为 None 时加载 `"default"`。
+///
+/// mode 校验按 `usage` 方向（主 Agent 校验 `is_usable_as_primary`、子代理校验
+/// `is_usable_as_subagent`）；不合法回退完整 [`DEFAULT_FUYAO_AGENT`]——此时
+/// `tools` 也回退为默认（空 = 无限制）。
+pub fn resolve_definition(
     agent_paths: &AgentPaths,
     agent_config: &AgentConfig,
     usage: crate::PromptUsage,
-) -> String {
+) -> AgentDefinition {
     let def_name = agent_config.definition.as_deref().unwrap_or("default");
     let agent_def = load_agent_definition_from_agent_paths(agent_paths, def_name);
     let usable = match usage {
@@ -48,9 +55,17 @@ pub fn build_agent_identity_section(
             ?usage,
             "Agent 定义的 mode 与当前用途不符，回退默认主 Agent 定义"
         );
-        return DEFAULT_FUYAO_AGENT.system_prompt.clone();
+        return DEFAULT_FUYAO_AGENT.clone();
     }
-    agent_def.system_prompt
+    agent_def
+}
+
+/// 构建 Agent 身份 section（Layer 1）
+///
+/// `definition` 已由调用方经 [`resolve_definition`] 加载（含 mode 校验 + 回退），
+/// 本函数仅取其 `system_prompt`。mode 校验 / 加载 / 回退逻辑统一收口于 [`resolve_definition`]。
+pub fn build_agent_identity_section(definition: &AgentDefinition) -> String {
+    definition.system_prompt.clone()
 }
 
 /// 构建项目上下文 section（Layer 2）
@@ -366,20 +381,16 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_identity_section_returns_default() {
+    fn resolve_definition_returns_default() {
         let ctx = AgentPaths::default();
-        let section = build_agent_identity_section(
-            &ctx,
-            &AgentConfig::default(),
-            crate::PromptUsage::Primary,
-        );
-        assert!(!section.is_empty());
-        assert!(section.contains("Fuyao"));
+        let def = resolve_definition(&ctx, &AgentConfig::default(), crate::PromptUsage::Primary);
+        assert!(!def.system_prompt.is_empty());
+        assert!(def.system_prompt.contains("Fuyao"));
     }
 
     #[test]
-    fn build_agent_identity_section_respects_definition_choice() {
-        // definition = Some("reviewer") → 加载 agents/reviewer.md（若存在）
+    fn resolve_definition_loads_named() {
+        // definition = Some("reviewer") → 加载 agents/reviewer.md
         let temp = std::env::temp_dir().join("fuyao_test_sections_def_choice");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
@@ -396,15 +407,15 @@ mod tests {
         let config = AgentConfig {
             definition: Some("reviewer".to_string()),
         };
-        let section = build_agent_identity_section(&ctx, &config, crate::PromptUsage::Primary);
-        assert!(section.contains("代码审查专家"));
+        let def = resolve_definition(&ctx, &config, crate::PromptUsage::Primary);
+        assert!(def.system_prompt.contains("代码审查专家"));
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn build_agent_identity_section_rejects_subagent_mode_as_primary() {
-        // mode: subagent 的定义不能用作主代理，应回退 DEFAULT_FUYAO_AGENT
+    fn resolve_definition_rejects_subagent_mode_as_primary() {
+        // mode: subagent 的定义不能用作主代理，应回退完整 DEFAULT_FUYAO_AGENT
         let temp = std::env::temp_dir().join("fuyao_test_sections_subagent_mode");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
@@ -418,21 +429,17 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let section = build_agent_identity_section(
-            &ctx,
-            &AgentConfig::default(),
-            crate::PromptUsage::Primary,
-        );
+        let def = resolve_definition(&ctx, &AgentConfig::default(), crate::PromptUsage::Primary);
         // subagent 被拒,回退默认(含 "Fuyao"),不含子代理提示词
-        assert!(section.contains("Fuyao"));
-        assert!(!section.contains("不应作主代理"));
+        assert!(def.system_prompt.contains("Fuyao"));
+        assert!(!def.system_prompt.contains("不应作主代理"));
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn build_agent_identity_section_rejects_primary_mode_as_subagent() {
-        // 对称校验：mode: primary 的定义不能用作子代理，应回退 DEFAULT_FUYAO_AGENT
+    fn resolve_definition_rejects_primary_mode_as_subagent() {
+        // 对称校验：mode: primary 的定义不能用作子代理，应回退完整 DEFAULT_FUYAO_AGENT
         let temp = std::env::temp_dir().join("fuyao_test_sections_primary_mode_as_sub");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
@@ -449,10 +456,37 @@ mod tests {
         let config = AgentConfig {
             definition: Some("boss".to_string()),
         };
-        let section = build_agent_identity_section(&ctx, &config, crate::PromptUsage::Subagent);
+        let def = resolve_definition(&ctx, &config, crate::PromptUsage::Subagent);
         // primary 被拒,回退默认(含 "Fuyao"),不含 primary 专属提示词
-        assert!(section.contains("Fuyao"));
-        assert!(!section.contains("不应作子代理"));
+        assert!(def.system_prompt.contains("Fuyao"));
+        assert!(!def.system_prompt.contains("不应作子代理"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn resolve_definition_carries_tools_field() {
+        // resolve_definition 返回完整 AgentDefinition，tools 字段一并带回（供 per-session 过滤）
+        let temp = std::env::temp_dir().join("fuyao_test_sections_def_tools");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("researcher.md"),
+            "---\nname: researcher\nmode: subagent\ntools:\n  write: false\n  bash: false\n---\n只读",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let config = AgentConfig {
+            definition: Some("researcher".to_string()),
+        };
+        let def = resolve_definition(&ctx, &config, crate::PromptUsage::Subagent);
+        assert_eq!(def.tools.get("write"), Some(&false));
+        assert_eq!(def.tools.get("bash"), Some(&false));
+        assert!(def.tools.get("read").is_none());
 
         std::fs::remove_dir_all(&temp).ok();
     }

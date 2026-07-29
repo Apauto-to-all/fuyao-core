@@ -52,7 +52,7 @@ pub use mcp::McpGlobalConfig;
 pub use models::{ModelRef, ModelSelection};
 pub use plugins::PluginsConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig, TitleConfig};
-pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig};
+pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, unknown_tool_names};
 
 // 加载相关
 pub use env::load_env;

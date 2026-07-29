@@ -27,12 +27,12 @@ impl Engine {
         &self,
         params: SessionParams,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
+        // 加载完整 Agent 定义一次：同时供系统提示词构建与 per-session 工具过滤（避免重复加载）
+        let usage = fuyao_prompt::PromptUsage::Primary;
+        let definition =
+            fuyao_prompt::resolve_definition(&self.params.agent_paths, &params.agent_config, usage);
         // 构建系统提示词（Agent 配置决定人格）
-        let system_prompt = build_system_prompt(
-            &self.params.agent_paths,
-            &params.agent_config,
-            fuyao_prompt::PromptUsage::Primary,
-        );
+        let system_prompt = build_system_prompt(&self.params.agent_paths, &definition, usage);
 
         // 创建 Session（8 位 UUID）
         let session = Session::new(None, Some(system_prompt));
@@ -46,7 +46,7 @@ impl Engine {
         // SessionParams 整体传下去，不在入口拆包——压缩重建 prompt 等运行时场景
         // 仍需 agent_config，贯穿到 SessionCtx 留存，将来加字段只动 SessionCtx 一处
         let (handle, rx_event) = self
-            .assemble_session(session_id.clone(), session, params)
+            .assemble_session(session_id.clone(), session, params, definition)
             .await;
         self.sessions
             .lock()
@@ -81,9 +81,21 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
+        // 加载完整 Agent 定义（创建时定死语义：恢复时按同一 agent_config 重新加载，
+        // per-session 持有供工具过滤）。usage 按恢复 session 的 parent 判定。
+        let usage = if session.parent_session_id.is_some() {
+            fuyao_prompt::PromptUsage::Subagent
+        } else {
+            fuyao_prompt::PromptUsage::Primary
+        };
+        let definition =
+            fuyao_prompt::resolve_definition(&self.params.agent_paths, &params.agent_config, usage);
+
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去（与 create_session 对称）
-        let (handle, rx_event) = self.assemble_session(id.clone(), session, params).await;
+        let (handle, rx_event) = self
+            .assemble_session(id.clone(), session, params, definition)
+            .await;
         self.sessions.lock().await.insert(id.clone(), handle);
 
         tracing::info!(session_id = %id, "恢复对话");
@@ -134,10 +146,17 @@ impl Engine {
         let new_session = self.build_forked_session(source_id, None).await?;
         let new_session_id = new_session.id.clone();
 
+        // 加载完整 Agent 定义（fork 出的独立 session parent=None → 主 Agent 用途）
+        let definition = fuyao_prompt::resolve_definition(
+            &self.params.agent_paths,
+            &params.agent_config,
+            fuyao_prompt::PromptUsage::Primary,
+        );
+
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表
         // SessionParams 整体传下去（与 create_session / resume_session 对称）
         let (handle, rx_event) = self
-            .assemble_session(new_session_id.clone(), new_session, params)
+            .assemble_session(new_session_id.clone(), new_session, params, definition)
             .await;
         self.sessions
             .lock()
@@ -187,24 +206,36 @@ impl Engine {
         source: ChildSessionSource,
         params: SessionParams,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
+        // 子任务 session 固定 Subagent 用途（parent_session_id = Some），definition 加载一次
+        // 供 Fresh 模式构建系统提示词 + assemble per-session 工具过滤复用
+        let usage = fuyao_prompt::PromptUsage::Subagent;
         // 先按模式构造 + 落库新 session（不带 assemble，assemble 在统一出口做）
-        let new_session = match source {
+        let (new_session, definition) = match source {
             ChildSessionSource::Fresh => {
-                // 全新子任务：空上下文，system_prompt 从 agent_config 构建（按子代理用途校验 mode）
-                let system_prompt = build_system_prompt(
+                // 全新子任务：空上下文，definition 加载后构建 system_prompt
+                let definition = fuyao_prompt::resolve_definition(
                     &self.params.agent_paths,
                     &params.agent_config,
-                    fuyao_prompt::PromptUsage::Subagent,
+                    usage,
                 );
+                let system_prompt =
+                    build_system_prompt(&self.params.agent_paths, &definition, usage);
                 let mut s = Session::new(None, Some(system_prompt));
                 s.parent_session_id = Some(parent_session_id.clone());
                 self.store.create(&s).await?;
-                s
+                (s, definition)
             }
             ChildSessionSource::Fork(ref source_id) => {
                 // fork 子任务：复制源可见上下文，parent 标记为父 session id
-                self.build_forked_session(source_id, Some(parent_session_id.clone()))
-                    .await?
+                let s = self
+                    .build_forked_session(source_id, Some(parent_session_id.clone()))
+                    .await?;
+                let definition = fuyao_prompt::resolve_definition(
+                    &self.params.agent_paths,
+                    &params.agent_config,
+                    usage,
+                );
+                (s, definition)
             }
         };
 
@@ -212,7 +243,7 @@ impl Engine {
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表（与 create_session 对称）
         let (handle, rx_event) = self
-            .assemble_session(new_session_id.clone(), new_session, params)
+            .assemble_session(new_session_id.clone(), new_session, params, definition)
             .await;
         self.sessions
             .lock()
@@ -302,6 +333,7 @@ impl Engine {
         session_id: SessionId,
         session: Session,
         session_params: SessionParams,
+        definition: fuyao_api::AgentDefinition,
     ) -> (SessionHandle, mpsc::UnboundedReceiver<OutputEvent>) {
         // 双队列
         let guide: SharedQueue = Arc::new(StdMutex::new(std::collections::VecDeque::new()));
@@ -311,6 +343,16 @@ impl Engine {
         // task 现读现用（跑 turn、压缩取 model_config）。一份 clone 给 SessionCtx，一份留 Handle。
         // 用 tokio::Mutex：Engine 写与 task 读均跨 async 上下文（与 SessionCtx.session_params 同型）。
         let session_params = Arc::new(Mutex::new(session_params));
+
+        // 定义层未知名对账（与全局 [tools.enabled] 同款：静默忽略 + WARN，用户错误用户承担）。
+        // definition 已由调用方加载（resolve_definition），此处仅留痕。
+        for name in fuyao_api::unknown_tool_names(&definition.tools, self.tools.names()) {
+            tracing::warn!(
+                tool_name = %name,
+                layer = "definition",
+                "工具配置引用了未知的工具名，已忽略"
+            );
+        }
 
         // 三条 session 级入站通道（载荷统一为 output 侧类型——入口转化后内核只认 output 侧）
         let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::message::output::UserMessage>(16);
@@ -351,6 +393,7 @@ impl Engine {
             Arc::clone(&self.tools),
             hooks,
             self.params.agent_paths.clone(),
+            definition,
             Arc::clone(&session_params),
             tx_event,
             Some(self.subagent_ops_weak()),

@@ -40,7 +40,7 @@ use fuyao_api::message::output::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
 };
-use fuyao_api::{CompressionConfig, EventBase, Session, SessionParams};
+use fuyao_api::{AgentDefinition, CompressionConfig, EventBase, Session, SessionParams};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{ProviderRegistry, StreamUsage};
 use fuyao_session::CompressionRuntimeState;
@@ -63,6 +63,14 @@ pub(crate) struct SessionCtx {
     /// 钩子注册表（引擎级共享，透传给本 session 的 dispatch 管道）
     pub hooks: SharedHooks,
     pub agent_paths: fuyao_api::AgentPaths,
+    /// 当前 session 的 Agent 定义（创建时加载定型，整 session 不可变）
+    ///
+    /// 由 `assemble_session` 经 `fuyao_prompt::resolve_definition` 加载（含 mode 校验 +
+    /// 回退）。per-session 持有完整定义：
+    /// - `.tools` 供 `resolve_model` 做 per-session 工具可见性过滤（定义层工具配置，
+    ///   与全局 `[tools.enabled]` 取交集；工具集改变会冲掉前缀缓存，故创建时定死）
+    /// - 后续 definition 字段扩展（如权限、资源限制）可直接复用本字段，无需再加容器
+    pub definition: AgentDefinition,
     /// 对话级参数（共享句柄，Engine 写 / task 现读现用）
     ///
     /// 整 session 全程只有一份：`Engine::update_session_params` 经 SessionHandle 写回，
@@ -128,6 +136,7 @@ pub(crate) async fn run_session(
     tools: Arc<ToolRegistry>,
     hooks: SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
+    definition: AgentDefinition,
     session_params: Arc<Mutex<SessionParams>>,
     tx_event: UnboundedSender<OutputEvent>,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
@@ -140,6 +149,7 @@ pub(crate) async fn run_session(
         tools,
         hooks,
         agent_paths,
+        definition,
         session_params,
         emitter: Emitter::new(tx_event, session_id.clone()),
         guide,
@@ -445,11 +455,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
             // X 已被压进摘要后不再误导模型
-            // agent_config 创建时定死不应变（前缀缓存红线），此处锁取快照即用
-            let agent_config = {
-                let p = ctx.session_params.lock().await;
-                p.agent_config.clone()
-            };
+            // definition 创建时定死不应变（前缀缓存红线），复用 ctx.definition 零加载
             // 用途按 parent_session_id 推断：子 session（子代理）用 Subagent 校验，
             // 主 session / fork 用 Primary。与创建时的用途保持一致。
             let usage = if session.parent_session_id.is_some() {
@@ -458,7 +464,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
                 fuyao_prompt::PromptUsage::Primary
             };
             let new_prompt =
-                fuyao_prompt::build_system_prompt(&ctx.agent_paths, &agent_config, usage);
+                fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.definition, usage);
 
             // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
             // keep_recent 已复制，system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，

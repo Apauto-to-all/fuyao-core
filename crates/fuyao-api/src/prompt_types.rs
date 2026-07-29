@@ -3,6 +3,7 @@
 //! Agent 定义等核心类型，从 `agents/*.md` 文件解析。
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Agent 定义的使用模式
 ///
@@ -48,6 +49,11 @@ impl From<&str> for AgentMode {
 ///
 /// 只包含纯身份和提示词信息。
 /// 模型和工具配置由 fuyao.toml 三层配置管理。
+///
+/// `tools` 字段例外：定义层的工具开关，与全局 `[tools.enabled]` 同款语义
+/// （`HashMap<工具名, 是否启用>`，未列出默认启用，显式 `false` 禁用）。
+/// 定义层 tools 与全局 `[tools.enabled]` 取交集——全局禁用是最高优先级硬约束，
+/// 定义层只能在全局允许的范围内收窄。默认空 = 无限制（向后兼容）。
 #[derive(Debug, Clone)]
 pub struct AgentDefinition {
     /// Agent 名称，为空时从文件名读取
@@ -60,6 +66,9 @@ pub struct AgentDefinition {
     pub author: String,
     /// 使用模式：主代理 / 子代理
     pub mode: AgentMode,
+    /// 定义层工具开关，与全局 `[tools.enabled]` 同款语义。
+    /// 空 = 无限制（全部启用，向后兼容）。
+    pub tools: HashMap<String, bool>,
     /// 系统提示词内容
     pub system_prompt: String,
     /// 来源文件路径
@@ -79,6 +88,7 @@ impl AgentDefinition {
             version: "1.0.0".to_string(),
             author: String::new(),
             mode: AgentMode::Primary,
+            tools: HashMap::new(),
             system_prompt: system_prompt.into(),
             source_path: None,
         }
@@ -93,6 +103,7 @@ impl Default for AgentDefinition {
             version: "1.0.0".to_string(),
             author: String::new(),
             mode: AgentMode::Primary,
+            tools: HashMap::new(),
             system_prompt: String::new(),
             source_path: None,
         }
@@ -111,6 +122,8 @@ mod tests {
         assert_eq!(def.system_prompt, "system prompt");
         assert_eq!(def.version, "1.0.0");
         assert_eq!(def.mode, AgentMode::Primary);
+        // 新建定义 tools 默认空（无限制）
+        assert!(def.tools.is_empty());
     }
 
     #[test]
@@ -120,6 +133,8 @@ mod tests {
         assert_eq!(def.version, "1.0.0");
         assert!(def.source_path.is_none());
         assert_eq!(def.mode, AgentMode::Primary);
+        // 默认 tools 空（无限制，向后兼容）
+        assert!(def.tools.is_empty());
     }
 
     #[test]

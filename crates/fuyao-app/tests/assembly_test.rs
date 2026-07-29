@@ -57,7 +57,7 @@ async fn build_registry_includes_core_tools() {
     // 无 mcp 配置 → mcp_manager 为 None
     assert!(mcp_manager.is_none(), "无 MCP 配置时 mcp_manager 应为 None");
 
-    let defs = registry.definitions_json_for(false);
+    let defs = registry.definitions_json_for(false, &std::collections::HashMap::new());
     assert!(
         defs.len() >= 5,
         "应注入至少 5 个内置工具，实际：{}",

@@ -29,7 +29,7 @@ pub use config::{
     LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef, ModelSelection,
     PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig, TitleConfig, ToolRunnerConfig,
     ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env, load_merged_config,
-    set_config,
+    set_config, unknown_tool_names,
 };
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;

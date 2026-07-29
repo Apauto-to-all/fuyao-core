@@ -17,6 +17,7 @@ use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_api::{MessageRole, ModelConfig};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 use fuyao_session::SessionStore;
+use std::collections::HashMap;
 
 /// 解析后的模型信息（一轮 ReAct 用）
 ///
@@ -125,7 +126,8 @@ pub(crate) async fn build_chat_request(
 /// 这与 provider_id 路由契约一致（ProviderRegistry 按 provider_id 查实例）。
 ///
 /// 思考控制参数（thinking_type / reasoning_effort）透传给 `StreamOptions`。
-/// 工具定义按 `is_child` 过滤后序列化（递归防护：子 session 看不到派生类工具）。
+/// 工具定义按 `is_child`（递归防护）+ `definition_tools`（定义层收窄）双重过滤后序列化，
+/// 两者取交集。
 ///
 /// 返回的 `ResolvedModel` 由调用方（turn.rs）继续从 `ctx.providers.get(provider_id)`
 /// 查 Provider 实例——本函数不查 registry（保持纯构造器职责，与 IO 解耦）。
@@ -133,6 +135,7 @@ pub(crate) fn resolve_model(
     model_config: &ModelConfig,
     tools: &ToolRegistry,
     is_child: bool,
+    definition_tools: &HashMap<String, bool>,
 ) -> Result<ResolvedModel, String> {
     // 1. 确定 model_id 字符串：显式指定 → 用它；None → 读 [models.default]
     let model_id: String = match model_config.model_id.as_deref() {
@@ -167,8 +170,8 @@ pub(crate) fn resolve_model(
         }
     };
 
-    // 3. 构造 StreamOptions（工具定义按 is_child 过滤——递归防护）
-    let tool_defs = tools.definitions_json_for(is_child);
+    // 3. 构造 StreamOptions（工具定义按 is_child + definition_tools 过滤——递归防护 + 定义层收窄）
+    let tool_defs = tools.definitions_json_for(is_child, definition_tools);
     let options = StreamOptions {
         temperature: None,
         tools: if tool_defs.is_empty() {
@@ -437,7 +440,8 @@ mod tests {
     fn resolve_model_explicit_id_splits_provider_and_model() {
         let tools = empty_registry();
         let params = params_with_model(Some("DeepSeek/deepseek-v4-flash"));
-        let r = resolve_model(&params, &tools, false).expect("显式 model_id 应解析成功");
+        let r = resolve_model(&params, &tools, false, &HashMap::new())
+            .expect("显式 model_id 应解析成功");
         // provider_id 小写化
         assert_eq!(r.provider_id, "deepseek");
         // model 保持原样
@@ -449,7 +453,8 @@ mod tests {
         // 默认状态：未 set_config，get_config 返回 default（models.default = None）
         let tools = empty_registry();
         let params = params_with_model(None);
-        let err = resolve_model(&params, &tools, false).expect_err("无 default 应返回 Err");
+        let err = resolve_model(&params, &tools, false, &HashMap::new())
+            .expect_err("无 default 应返回 Err");
         assert!(err.contains("未指定模型"), "错误信息应明确：{err}");
         assert!(
             err.contains("[models.default]"),
@@ -461,7 +466,8 @@ mod tests {
     fn resolve_model_invalid_format_no_slash_returns_err() {
         let tools = empty_registry();
         let params = params_with_model(Some("invalid-no-slash"));
-        let err = resolve_model(&params, &tools, false).expect_err("格式错误应返回 Err");
+        let err =
+            resolve_model(&params, &tools, false, &HashMap::new()).expect_err("格式错误应返回 Err");
         assert!(err.contains("格式错误"), "错误信息应明确：{err}");
     }
 
@@ -470,9 +476,9 @@ mod tests {
         let tools = empty_registry();
         // "/model" — provider 空
         let params = params_with_model(Some("/model"));
-        resolve_model(&params, &tools, false).expect_err("provider 空应报错");
+        resolve_model(&params, &tools, false, &HashMap::new()).expect_err("provider 空应报错");
         // "provider/" — model 空
         let params = params_with_model(Some("provider/"));
-        resolve_model(&params, &tools, false).expect_err("model 空应报错");
+        resolve_model(&params, &tools, false, &HashMap::new()).expect_err("model 空应报错");
     }
 }
