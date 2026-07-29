@@ -280,10 +280,10 @@ mod tests {
         let def = load_agent_definition(&md).unwrap();
         assert_eq!(def.mode, fuyao_api::AgentMode::Primary);
 
-        // 未指定 mode 默认 All
+        // 未指定 mode 默认 Primary
         std::fs::write(&md, "---\nname: any\n---\n任意").unwrap();
         let def = load_agent_definition(&md).unwrap();
-        assert_eq!(def.mode, fuyao_api::AgentMode::All);
+        assert_eq!(def.mode, fuyao_api::AgentMode::Primary);
 
         std::fs::remove_dir_all(&temp).ok();
     }

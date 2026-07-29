@@ -169,7 +169,7 @@ fn load_definition_falls_back_to_builtin_default_when_no_file() {
     let def = load_agent_definition_from_agent_paths(&paths, "default");
 
     assert_eq!(def.name, "fuyao", "无文件时回退内置默认");
-    assert_eq!(def.mode, AgentMode::All);
+    assert_eq!(def.mode, AgentMode::Primary);
 }
 
 #[test]

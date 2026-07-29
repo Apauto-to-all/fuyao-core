@@ -3,7 +3,7 @@ name: fuyao
 description: Fuyao 默认助手
 version: 1.0.0
 author: Fuyao
-mode: all
+mode: primary
 ---
 
 # Fuyao Agent

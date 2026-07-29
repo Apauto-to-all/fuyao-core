@@ -9,37 +9,37 @@ use serde::{Deserialize, Serialize};
 /// 区分主代理与子代理，控制 Agent 定义可用于哪些场景：
 /// - [`AgentMode::Primary`]：只能作为主代理（`agent_ctx.definition`）使用
 /// - [`AgentMode::Subagent`]：只能由子代理工具派生使用
-/// - [`AgentMode::All`]：主代理和子代理都能用（默认）
+///
+/// 二分设计：一个定义要么是主代理人格，要么是专职子代理，职责互斥、
+/// 子代理列表只含专职子代理，不会被主代理人格污染。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum AgentMode {
     /// 主代理（只能作为 agent_ctx.definition 使用）
+    #[default]
     Primary,
     /// 子代理（只能由子代理工具派生使用）
     Subagent,
-    /// 全部（主代理和子代理都能用，默认）
-    #[default]
-    All,
 }
 
 impl AgentMode {
     /// 是否可用作主代理
     pub fn is_usable_as_primary(&self) -> bool {
-        matches!(self, AgentMode::Primary | AgentMode::All)
+        matches!(self, AgentMode::Primary)
     }
 
     /// 是否可用作子代理
     pub fn is_usable_as_subagent(&self) -> bool {
-        matches!(self, AgentMode::Subagent | AgentMode::All)
+        matches!(self, AgentMode::Subagent)
     }
 }
 
-/// 从 frontmatter 字符串解析模式（未知值回退 All）
+/// 从 frontmatter 字符串解析模式（未知值回退 Primary）
 impl From<&str> for AgentMode {
     fn from(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
             "primary" => AgentMode::Primary,
             "subagent" => AgentMode::Subagent,
-            _ => AgentMode::All,
+            _ => AgentMode::Primary,
         }
     }
 }
@@ -58,7 +58,7 @@ pub struct AgentDefinition {
     pub version: String,
     /// 作者
     pub author: String,
-    /// 使用模式：主代理 / 子代理 / 全部
+    /// 使用模式：主代理 / 子代理
     pub mode: AgentMode,
     /// 系统提示词内容
     pub system_prompt: String,
@@ -78,7 +78,7 @@ impl AgentDefinition {
             description: description.into(),
             version: "1.0.0".to_string(),
             author: String::new(),
-            mode: AgentMode::All,
+            mode: AgentMode::Primary,
             system_prompt: system_prompt.into(),
             source_path: None,
         }
@@ -92,7 +92,7 @@ impl Default for AgentDefinition {
             description: String::new(),
             version: "1.0.0".to_string(),
             author: String::new(),
-            mode: AgentMode::All,
+            mode: AgentMode::Primary,
             system_prompt: String::new(),
             source_path: None,
         }
@@ -110,7 +110,7 @@ mod tests {
         assert_eq!(def.description, "desc");
         assert_eq!(def.system_prompt, "system prompt");
         assert_eq!(def.version, "1.0.0");
-        assert_eq!(def.mode, AgentMode::All);
+        assert_eq!(def.mode, AgentMode::Primary);
     }
 
     #[test]
@@ -119,12 +119,12 @@ mod tests {
         assert_eq!(def.name, "");
         assert_eq!(def.version, "1.0.0");
         assert!(def.source_path.is_none());
-        assert_eq!(def.mode, AgentMode::All);
+        assert_eq!(def.mode, AgentMode::Primary);
     }
 
     #[test]
-    fn agent_mode_default_is_all() {
-        assert_eq!(AgentMode::default(), AgentMode::All);
+    fn agent_mode_default_is_primary() {
+        assert_eq!(AgentMode::default(), AgentMode::Primary);
     }
 
     #[test]
@@ -134,19 +134,15 @@ mod tests {
 
         assert!(!AgentMode::Subagent.is_usable_as_primary());
         assert!(AgentMode::Subagent.is_usable_as_subagent());
-
-        assert!(AgentMode::All.is_usable_as_primary());
-        assert!(AgentMode::All.is_usable_as_subagent());
     }
 
     #[test]
     fn agent_mode_from_str() {
         assert_eq!(AgentMode::from("primary"), AgentMode::Primary);
         assert_eq!(AgentMode::from("subagent"), AgentMode::Subagent);
-        assert_eq!(AgentMode::from("all"), AgentMode::All);
-        // 未知值默认 All
-        assert_eq!(AgentMode::from("unknown"), AgentMode::All);
-        assert_eq!(AgentMode::from(""), AgentMode::All);
+        // 未知值/空值默认 Primary
+        assert_eq!(AgentMode::from("unknown"), AgentMode::Primary);
+        assert_eq!(AgentMode::from(""), AgentMode::Primary);
         // 大小写不敏感
         assert_eq!(AgentMode::from("Primary"), AgentMode::Primary);
         assert_eq!(AgentMode::from(" SUBAGENT "), AgentMode::Subagent);
