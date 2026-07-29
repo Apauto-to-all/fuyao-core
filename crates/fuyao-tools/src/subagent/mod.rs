@@ -7,6 +7,7 @@
 //! 子代理不能再派生子代理（[`SubagentOps`] 注入虽在，但 LLM 看不到本工具就不会调）。
 
 mod handler;
+mod types;
 
 use std::collections::HashMap;
 

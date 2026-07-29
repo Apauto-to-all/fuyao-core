@@ -25,19 +25,19 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 - `fuyao-core`：ReAct 循环 + dispatch 统一消息管道 + 多 session 调度，对外暴露四个动作（启动 / 创建 / 恢复 / 收发）。session 化双层架构的「能力共享层」，持有 provider / DB 句柄 / 出口通道
 
-**内核协作者**（core 的直接依赖，构成内核但不参与 ReAct 编排）：
+**内核协作者**（被 core 直接依赖 + 被能力层复用，构成内核但不参与 ReAct 编排）：
 
 - `fuyao-session`：会话持久化（SQLite CRUD）+ 上下文压缩 + 费用计算 + 标题生成
-- `fuyao-prompt`：系统提示词分层构建（覆盖区 + 补充区）+ Agent 定义加载与注册表
-- `fuyao-hooks`：钩子系统（拦截 + 观察）+ 插件两层模型（Plugin 工厂 / PluginInstance 实例）
+- `fuyao-prompt`：系统提示词分层构建（覆盖区 + 补充区）+ Agent 定义加载与注册表 + 内置默认子代理定义。**被 fuyao-core 与 fuyao-tools 双重消费**（fuyao-tools 的 subagent/skill 工具调其定义加载与列表查询能力）
+- `fuyao-hooks`：钩子系统（拦截 + 观察）+ 插件两层模型（Plugin 工厂 / PluginInstance 实例）。**被 fuyao-core 与 fuyao-guard 双重消费**
 
-**能力实现**（引擎装配的能力，彼此独立、可增删替换）：
+**能力实现**（引擎装配的能力，多数彼此独立、可增删替换；个别有跨层复用见各条说明）：
 
 - `fuyao-provider`：LLM 客户端（自建 HTTP，OpenAI 兼容）+ ProviderRegistry 多路由
 - `fuyao-mcp`：MCP Server 连接管理 + 工具发现 / 注册 / 调用
 - `fuyao-skills`：Agent Skills 协议（发现 / 加载 / 解析）
-- `fuyao-tools`：内置工具实现集合（file / terminal / web / todo / skill）
-- `fuyao-guard`：内置防护插件（循环检测，防重复执行 / 输出），基于 hooks 插件机制接入
+- `fuyao-tools`：内置工具实现集合（file / terminal / web / todo / skill / subagent）。**依赖 fuyao-prompt（子代理定义加载与校验、Agent 定义查询）+ fuyao-skills（skill 工具的发现能力）**
+- `fuyao-guard`：内置防护插件（循环检测，防重复执行 / 输出），基于 hooks 插件机制接入。**依赖 fuyao-hooks**
 
 **装配入口**（项目唯一的组装点，把下层能力装配成可用的引擎）：
 

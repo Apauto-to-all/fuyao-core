@@ -23,3 +23,4 @@ pub use registry::{
     AgentContent, AgentFile, AgentInfo, AgentRegistry, AgentSource, PagedAgents, RegistryError,
     UpdateContentRequest,
 };
+pub use sections::list_subagent_definitions;

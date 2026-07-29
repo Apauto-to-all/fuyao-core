@@ -233,10 +233,11 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
     lines.join("\n")
 }
 
-/// 构建子代理索引 section（Layer 5.5）
+/// 收集可用子代理定义（name + description）
 ///
-/// 列出可用的子代理定义（name + description），供主 Agent 通过 `subagent` 工具的
-/// `subagent_type` 参数选择。仅注入主 Agent session（子代理不可再派生）。
+/// 实时查询（每次调用现查，无缓存），供两个消费方共享：
+/// - [`build_subagent_index_section`]：格式化为系统提示词的「子代理」索引层
+/// - 子代理工具 handler：校验 `subagent_type` 是否合法，不合法时返可用列表
 ///
 /// 来源合并（低 → 高优先级，后者覆盖前者）：
 /// 1. 内置默认子代理（researcher / executor）—— 编译期嵌入，永远存在
@@ -244,7 +245,8 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
 ///
 /// 用户同名文件覆盖内置：与 [`load_agent_definition_from_agent_paths`] 的加载链一致。
 /// 内置主 Agent（default）mode = All 也算可用子代理，列入清单（LLM 可显式选它当子代理）。
-pub fn build_subagent_index_section(agent_paths: &AgentPaths) -> String {
+/// 返回结果按 name 升序排序，输出稳定可读。
+pub fn list_subagent_definitions(agent_paths: &AgentPaths) -> Vec<(String, String)> {
     // name → description，用户层覆盖内置层
     let mut by_name: HashMap<String, String> = HashMap::new();
 
@@ -279,13 +281,22 @@ pub fn build_subagent_index_section(agent_paths: &AgentPaths) -> String {
         }
     }
 
-    if by_name.is_empty() {
-        return String::new();
-    }
-
-    // 按 name 排序，输出稳定可读
     let mut entries: Vec<(String, String)> = by_name.into_iter().collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+/// 构建子代理索引 section（Layer 5.5）
+///
+/// 列出可用的子代理定义（name + description），供主 Agent 通过 `subagent` 工具的
+/// `subagent_type` 参数选择。仅注入主 Agent session（子代理不可再派生）。
+/// 数据来自 [`list_subagent_definitions`]，空列表返回空字符串（section 被跳过）。
+pub fn build_subagent_index_section(agent_paths: &AgentPaths) -> String {
+    let entries = list_subagent_definitions(agent_paths);
+
+    if entries.is_empty() {
+        return String::new();
+    }
 
     let mut lines = vec!["可用子代理（subagent 工具的 subagent_type 参数可选值）：".to_string()];
     for (name, desc) in &entries {

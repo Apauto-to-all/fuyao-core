@@ -15,6 +15,7 @@
 //! 经父 session 的 per-session 出站通道进 fan_out（事件 session_id 标的是 child，
 //! 前端按 child_id 过滤渲染到子代理区域）。事件已落 DB，转发失败仅 WARN 不阻断。
 
+use super::types::validate_subagent_type;
 use std::time::Duration;
 
 use fuyao_api::message::OutputEvent;
@@ -57,7 +58,19 @@ pub async fn subagent_handler(
         _ => return "❌ 子代理工具缺少 prompt 参数或为空".to_string(),
     };
 
-    // 2. upgrade SubagentOps（引擎弱引用 → 强引用）
+    // 2. 校验 subagent_type：实时查可用列表，不在则返错误 + 列表供 LLM 修正。
+    //    生产环境 agent_paths 总是注入；缺失（仅测试场景）时跳过校验不阻断。
+    //    此校验杜绝「错误 subagent_type 静默降级为主 Agent 人格」的严重 bug。
+    //    置于 SubagentOps upgrade 之前：输入校验优先，失败快返不触碰引擎。
+    if let Some(agent_paths) = &ctx.agent_paths {
+        if let Err(msg) = validate_subagent_type(&subagent_type, agent_paths) {
+            return format!("❌ {msg}");
+        }
+    } else {
+        tracing::warn!("agent_paths 未注入，跳过 subagent_type 校验");
+    }
+
+    // 3. upgrade SubagentOps（引擎弱引用 → 强引用）
     let Some(ops_weak) = &ctx.subagent_ops else {
         return "❌ 子代理工具未注入引擎能力（SubagentOps 不可用）".to_string();
     };
@@ -65,7 +78,7 @@ pub async fn subagent_handler(
         return "❌ 引擎已关闭，无法派生子代理".to_string();
     };
 
-    // 3. 派生子 session（Fresh 模式：空上下文，子代理不继承父会话历史）
+    // 4. 派生子 session（Fresh 模式：空上下文，子代理不继承父会话历史）
     //    subagent_type → definition，引擎按名加载 agents/{type}.md（含 mode 校验）
     let parent_id = ctx.session_id.as_deref().unwrap_or("");
     let params = SessionParams {
@@ -92,10 +105,10 @@ pub async fn subagent_handler(
         "子代理 session 已创建"
     );
 
-    // 4. 发 ChildSession(Started)——前端据此开辟子代理渲染区，后续 child session_id 的事件归此区
+    // 5. 发 ChildSession(Started)——前端据此开辟子代理渲染区，后续 child session_id 的事件归此区
     emit_child_session_event(ctx, &child_id, ChildSessionState::Started, description);
 
-    // 5. send 任务指令（Guide 模式：立即触发新 turn）
+    // 6. send 任务指令（Guide 模式：立即触发新 turn）
     let msg = InputEvent::User(UserMessage {
         base: EventBase::default(),
         payload: UserPayload {
@@ -111,7 +124,7 @@ pub async fn subagent_handler(
         return format!("❌ 子代理任务发送失败：{e}");
     }
 
-    // 6. 消费子事件流：取 finish_reason=stop 的最终回复；中间事件经 event_forwarder 转发
+    // 7. 消费子事件流：取 finish_reason=stop 的最终回复；中间事件经 event_forwarder 转发
     let mut final_content = String::new();
     let mut got_final = false;
     let deadline = tokio::time::Instant::now() + SUBAGENT_TIMEOUT;
@@ -169,12 +182,12 @@ pub async fn subagent_handler(
         }
     }
 
-    // 7. end_session（一次性子 session）
+    // 8. end_session（一次性子 session）
     let _ = ops.end_session(&child_id, "子代理完成").await;
     emit_child_session_event(ctx, &child_id, ChildSessionState::Ended, description);
     tracing::info!(child_id = %child_id, got_final, "子代理结束");
 
-    // 8. 返回最终回复
+    // 9. 返回最终回复
     if !got_final {
         "（子代理 session 退出，未产出最终回复）".to_string()
     } else if final_content.is_empty() {
@@ -266,6 +279,32 @@ mod tests {
         assert!(
             result.contains("SubagentOps 不可用"),
             "应有 SubagentOps 缺失错误，实际：{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_error_when_subagent_type_invalid() {
+        // subagent_type 不在可用列表（默认仅内置 researcher/executor）
+        // → 校验失败，返错误 + 可用列表，不进入 SubagentOps 路径
+        let mut ctx = ToolCallContext::default();
+        ctx.agent_paths = Some(fuyao_api::AgentPaths::default());
+        let result = subagent_handler(
+            serde_json::json!({
+                "subagent_type": "nonexistent_type",
+                "description": "测试",
+                "prompt": "做某事"
+            }),
+            &ctx,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result.contains("未找到子代理类型"),
+            "应拒绝未知 subagent_type，实际：{result}"
+        );
+        assert!(
+            result.contains("researcher") && result.contains("executor"),
+            "错误信息应含可用列表，实际：{result}"
         );
     }
 }
