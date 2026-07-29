@@ -252,6 +252,14 @@ pub(crate) async fn run_session(
 ///
 /// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
 async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
+    // 子代理 session 的压缩豁免（可配置，`[session.compression] skip_child` 默认 true）：
+    // 子代理以 Fresh 模式派生、只回传最终回复文本给父 Agent，自身完整历史留在子 session 内。
+    // 若子代理中途压缩，早期工具证据会被摘要替代，最终回复失真并作为 tool_result 传导给父 Agent
+    // 的决策；且压缩需额外调一次摘要 LLM，对一次性子代理在成本与质量上均不划算。
+    if session.parent_session_id.is_some() && ctx.compression_config.skip_child {
+        return;
+    }
+
     // 读取上一轮真实 usage（首轮无 usage 跳过——还没跑过没法判定）
     let usage = {
         let guard = ctx.last_usage.lock().await;

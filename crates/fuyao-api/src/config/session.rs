@@ -41,6 +41,13 @@ pub struct CompressionConfig {
     pub fallback_context: u32,
     /// 反抖动：连续两次压缩节省比例低于此值（%）时停压缩
     pub min_savings_pct: u8,
+    /// 是否跳过子 session（有 parent_session_id）的上下文压缩
+    ///
+    /// 子代理以 Fresh 模式派生、一次性运行，只把最终回复文本作为 tool_result 回喂父 Agent，
+    /// 自身完整历史留在子 session 内。若子代理中途压缩，早期工具证据会被摘要替代，
+    /// 失真的最终回复会传导给父 Agent 的决策；且压缩需额外调一次摘要 LLM，
+    /// 对一次性子代理在成本与质量上均不划算。默认 true：子 session 不自动压缩。
+    pub skip_child: bool,
 }
 
 impl Default for CompressionConfig {
@@ -53,6 +60,7 @@ impl Default for CompressionConfig {
             summary_max_tokens: 4096,
             fallback_context: 128_000,
             min_savings_pct: 10,
+            skip_child: true,
         }
     }
 }
@@ -146,6 +154,7 @@ mod tests {
         assert_eq!(c.summary_max_tokens, 4096);
         assert_eq!(c.fallback_context, 128_000);
         assert_eq!(c.min_savings_pct, 10);
+        assert!(c.skip_child);
     }
 
     #[test]
