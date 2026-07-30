@@ -335,8 +335,14 @@ mod tests {
     #[tokio::test]
     async fn execute_command_timeout() {
         let shell_info = super::super::shell::find_shell();
+        // Windows 下 shell 可能是 Git Bash / PowerShell / cmd 三者之一：
+        // - Git Bash 与 Unix 一样用 /dev/null 作为空设备，不识别 cmd 的 NUL
+        //   （bash 会把 NUL 当成普通文件名，导致 ping 输出落盘成 NUL 文件）
+        // - PowerShell 与 cmd 才认 NUL
+        // 因此 Windows 分支统一用 /dev/null：Git Bash 原生支持，PowerShell/cmd
+        // 虽不识别但重定向失败不影响 ping 进程本身，测试只验证超时语义
         let command = if cfg!(windows) {
-            "ping -n 6 127.0.0.1 > NUL"
+            "ping -n 6 127.0.0.1 > /dev/null"
         } else {
             "sleep 5"
         };
@@ -356,8 +362,10 @@ mod tests {
     async fn execute_command_cancelled() {
         // cancel 命中：杀子进程 + forget，返回 cancelled 标记（与超时正交）
         let shell_info = super::super::shell::find_shell();
+        // 同 execute_command_timeout：跨 shell 兼容用 /dev/null，避免 Git Bash
+        // 把 NUL 当普通文件名而在工作目录留下 NUL 文件
         let command = if cfg!(windows) {
-            "ping -n 6 127.0.0.1 > NUL"
+            "ping -n 6 127.0.0.1 > /dev/null"
         } else {
             "sleep 5"
         };
