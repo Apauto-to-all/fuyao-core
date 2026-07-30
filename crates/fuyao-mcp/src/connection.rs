@@ -101,8 +101,21 @@ impl MCPConnection {
         self.connected.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 启动连接（非阻塞，后台 Task 运行）
+    /// 启动连接（非阻塞，后台 Task 保活）
+    ///
+    /// 单连接设计：主流程负责建立一次连接（serve + list_tools），后台 Task 只负责
+    /// 保活监听（shutdown / reconnect 信号）与重连，不再重复 `serve()`。
+    /// 这样避免「后台 Task 与主流程各 serve 一次、产生两个 RunningService 争抢写
+    /// self.client」的双连接竞争——HTTP 场景下两个 serve 共享 session，一个被取消
+    /// 会拖垮另一个，最终残留的 cancelled 连接会让后续 call_tool 永久挂起。
     pub async fn start(&mut self) -> Result<(), ConnectionError> {
+        // 1. 主流程建立一次性初始连接（serve + list_tools + 写入 self.client）
+        let tools = self.try_connect_once().await?;
+        self.tools = tools;
+        self.connected
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // 2. 启动后台保活 Task：只监听信号做重连，不重复 serve
         let server_name = self.server_name.clone();
         let config = self.config.clone();
         let connected = self.connected.clone();
@@ -115,51 +128,44 @@ impl MCPConnection {
             let mcp_cfg = fuyao_api::get_config();
             let mcp = &mcp_cfg.mcp;
             let mut retries: u32 = 0;
-            let mut initial_retries: u32 = 0;
             let mut backoff: u64 = 1;
 
             loop {
-                match run_transport(&server_name, &config, &connected, &client, &rpc_lock).await {
-                    Ok(_discovered_tools) => {
-                        tokio::select! {
-                            _ = shutdown_rx.changed() => {
-                                if *shutdown_rx.borrow() {
-                                    break;
-                                }
-                            }
-                            _ = lifecycle_notify.notified() => {
-                                connected.store(false, std::sync::atomic::Ordering::Relaxed);
-                                continue;
-                            }
+                // 已建立连接：只等信号，不重建连接
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
                         }
                     }
-                    Err(e) => {
+                    _ = lifecycle_notify.notified() => {
+                        // 重连信号：标记断开后进入重连循环
                         connected.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
 
-                        if initial_retries < mcp.max_initial_connect_retries {
-                            initial_retries += 1;
+                // 重连循环：仅在未连接时尝试重建（连接已由主流程建立，此处处理断线恢复）
+                if connected.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+
+                match run_transport(&server_name, &config, &connected, &client, &rpc_lock).await {
+                    Ok(_) => {
+                        // 重连成功：重置退避，回到信号等待
+                        retries = 0;
+                        backoff = 1;
+                    }
+                    Err(e) => {
+                        if *shutdown_rx.borrow() {
                             tracing::warn!(
                                 server = %server_name,
-                                attempt = initial_retries,
-                                backoff_secs = backoff,
                                 cause = %e,
-                                "MCP server 初始连接失败，重试中"
+                                "MCP server 重连因 shutdown 中止"
                             );
-                            tokio::time::sleep(Duration::from_secs(backoff)).await;
-                            backoff = (backoff * 2).min(mcp.max_backoff_secs);
-
-                            if *shutdown_rx.borrow() {
-                                tracing::warn!(
-                                    server = %server_name,
-                                    cause = %e,
-                                    "MCP server 连接因 shutdown 中止"
-                                );
-                                break;
-                            }
-                            continue;
-                        }
-
-                        if *shutdown_rx.borrow() {
                             break;
                         }
 
@@ -189,18 +195,7 @@ impl MCPConnection {
         });
 
         self.task_handle = Some(handle);
-
-        // 尝试一次性初始连接
-        let init_result = self.try_connect_once().await;
-        match init_result {
-            Ok(tools) => {
-                self.tools = tools;
-                self.connected
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        Ok(())
     }
 
     /// 尝试一次性连接
@@ -226,7 +221,7 @@ impl MCPConnection {
             .as_ref()
             .ok_or(ConnectionError::MissingCommand)?;
 
-        let mut cmd = Command::new(command);
+        let mut cmd = Command::new(resolve_command(command));
         if let Some(args) = &config.args {
             cmd.args(args);
         }
@@ -418,6 +413,48 @@ impl MCPConnection {
     }
 }
 
+/// 解析 stdio 命令为 Windows 兼容的可执行程序名
+///
+/// Windows 上 npm 安装的命令（npx / node / pnpm 等）是 `.cmd` / `.bat` 批处理脚本，
+/// 而 `tokio::process::Command::new("npx")` 不带后缀时会 `program not found`
+/// （Windows 的 CreateProcess 不自动补 `.cmd`/`.bat` 后缀）。
+///
+/// 本函数在 Windows 上：若命令名不含路径分隔符、也无已知可执行后缀，则按 PATHEXT
+/// 在 PATH 中查找其实际文件名（如 `npx` → `npx.cmd`），让 Command 能命中。
+/// 非 Windows 平台原样返回（系统 shell 会自行解析）。
+fn resolve_command(command: &str) -> String {
+    // 非 Windows 直接返回，交由系统 PATH 解析
+    if !cfg!(windows) {
+        return command.to_string();
+    }
+
+    // 已含路径分隔符或可执行后缀：视为用户已写全，原样返回
+    let has_separator = command.contains('/') || command.contains('\\');
+    let has_exec_ext = ["exe", "cmd", "bat", "com", "ps1"]
+        .iter()
+        .any(|ext| command.to_lowercase().ends_with(&format!(".{ext}")));
+    if has_separator || has_exec_ext {
+        return command.to_string();
+    }
+
+    // 在 PATH 中查找实际可执行文件名（npx → npx.cmd）
+    // PATHEXT 含系统支持的后缀列表（如 .COM;.EXE;.BAT;.CMD;...）
+    let path_exts = std::env::var("PATHEXT").unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        for ext in path_exts.split(';') {
+            let candidate = dir.join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                // 返回找到的实际文件名（含后缀），不含目录——让系统按 PATH 命中
+                return format!("{command}{ext}");
+            }
+        }
+    }
+
+    // PATH 中未找到，原样返回（让系统给出标准的 program not found 错误）
+    command.to_string()
+}
+
 /// 运行传输层连接（长连接 Task 内部使用）
 async fn run_transport(
     server_name: &str,
@@ -481,7 +518,7 @@ async fn run_transport(
             .as_ref()
             .ok_or(ConnectionError::MissingCommand)?;
 
-        let mut cmd = Command::new(command);
+        let mut cmd = Command::new(resolve_command(command));
         if let Some(args) = &config.args {
             cmd.args(args);
         }
@@ -583,5 +620,19 @@ mod tests {
         let tools: Vec<Tool> = vec![];
         let result = convert_tools(&tools);
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_command_keeps_explicit_extension() {
+        // 已带可执行后缀：原样返回，不二次处理
+        assert_eq!(resolve_command("npx.cmd"), "npx.cmd");
+        assert_eq!(resolve_command("node.exe"), "node.exe");
+    }
+
+    #[test]
+    fn resolve_command_keeps_path_separated_command() {
+        // 含路径分隔符：视为用户写全，原样返回
+        assert_eq!(resolve_command("./bin/run"), "./bin/run");
+        assert_eq!(resolve_command("C:\\tools\\srv"), "C:\\tools\\srv");
     }
 }

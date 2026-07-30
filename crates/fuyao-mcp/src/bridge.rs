@@ -53,8 +53,24 @@ pub fn make_tool_call_handler(
             let conn = connection.clone();
 
             Box::pin(async move {
+                // 调用入口留痕：一被发起就记录，立即能区分「handler 没被调起」
+                // （无此日志 = 上游 tool_exec 的问题）vs「handler 在执行中卡住」
+                // （有此日志但长时间无完成日志 = MCP server / rmcp 卡住）
+                tracing::info!(
+                    server = %server_name,
+                    tool = %tool_name,
+                    timeout_secs = timeout_secs,
+                    "MCP 工具调用开始"
+                );
+
                 // 检查熔断器
                 if let Some(msg) = check_breaker(&server_name) {
+                    tracing::warn!(
+                        server = %server_name,
+                        tool = %tool_name,
+                        reason = %msg,
+                        "MCP 工具调用被熔断器拦截"
+                    );
                     return serde_json::json!({"error": msg}).to_string();
                 }
 
@@ -141,6 +157,14 @@ pub fn make_tool_call_handler(
                         .to_string()
                     }
                     Err(_) => {
+                        // 超时是可恢复故障，按日志规范记 WARN（突出故障态，与下方通用完成 INFO 互补）
+                        tracing::warn!(
+                            server = %server_name,
+                            tool = %tool_name,
+                            timeout_secs,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "MCP 工具调用超时"
+                        );
                         bump_error(&server_name);
                         serde_json::json!({
                         "error": format!("MCP tool '{tool_name}' timed out after {timeout_secs}s")
