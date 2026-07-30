@@ -85,6 +85,7 @@ mod tests {
             summary_max_tokens: 4096,
             fallback_context: 128_000,
             min_savings_pct: 10,
+            skip_child: true,
         }
     }
 
