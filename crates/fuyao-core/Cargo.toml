@@ -18,9 +18,10 @@ dirs.workspace = true
 rust_decimal.workspace = true
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt"] }
 
-# 仅测试用：MockProvider 的 async trait 实现 + stream! 宏
+# 仅测试用：MockProvider 的 async trait 实现 + stream! 宏 + tokio 测试宏 + Provider/Store 直查
 [dev-dependencies]
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 uuid = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
