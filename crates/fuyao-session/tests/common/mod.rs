@@ -121,7 +121,12 @@ impl Provider for FakeTitleProvider {
         Box::pin(futures_util::stream::empty())
     }
 
-    async fn chat(&self, _request: ChatRequest, _model: &str) -> Result<ChatResponse, StreamError> {
+    async fn chat(
+        &self,
+        _request: ChatRequest,
+        _model: &str,
+        _options: StreamOptions,
+    ) -> Result<ChatResponse, StreamError> {
         match &self.chat_content {
             Some(content) => Ok(ChatResponse {
                 content: Some(content.clone()),

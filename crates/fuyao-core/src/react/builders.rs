@@ -14,7 +14,7 @@ use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{AgentPaths, InputModality, MessageRole, ModelConfig};
+use fuyao_api::{AgentPaths, InputModality, MessageRole, ModelConfig, ThinkingType};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 use fuyao_session::SessionStore;
 use std::collections::HashMap;
@@ -22,15 +22,18 @@ use std::collections::HashMap;
 /// 解析后的模型信息（一轮 ReAct 用）
 ///
 /// `provider_id` 用于从 `ProviderRegistry` 查 Provider 实例；`model` 是裸模型名，
-/// 喂给 `provider.stream_chat`。两者从 `ModelConfig.model_id`（形如
-/// `"provider_id/model_id"`）拆分而来——model_id=None 时回退 `[models.default]`。
+/// 喂给 `provider.stream_chat`。`model_id` 是完整 `"provider_id/model_id"` 串，
+/// 供调用方写回 session（见 turn.rs 物化逻辑）+ 落进 assistant 消息 + 喂费用计算。
+/// 三者从 `ModelConfig.model_id` 拆分而来——model_id=None 时回退 `[models.default]`。
 #[derive(Debug)]
 pub(crate) struct ResolvedModel {
+    /// 完整模型 ID（`"provider_id/model_id"` 形，写回 session / 落库 / 计费用）
+    pub model_id: String,
     /// Provider ID（小写，给 ProviderRegistry.get 用）
     pub provider_id: String,
     /// 裸模型名（给 provider.stream_chat 用，不带 provider_id 前缀）
     pub model: String,
-    /// 流式选项
+    /// 流式选项（思考参数已合并：显式 session 优先，default 兜底）
     pub options: StreamOptions,
 }
 
@@ -159,7 +162,14 @@ pub(crate) fn model_supports_images(model_config: &ModelConfig, agent_paths: &Ag
 /// **model_id 格式必须是 `"provider_id/model_id"`**——不带 `/` 视为格式错误返回 `Err`。
 /// 这与 provider_id 路由契约一致（ProviderRegistry 按 provider_id 查实例）。
 ///
-/// 思考控制参数（thinking_type / reasoning_effort）透传给 `StreamOptions`。
+/// 思考参数（thinking_type / reasoning_effort）与 model_id 是一束，model_id 是锚：
+/// - `model_id = Some` → 用 session 自己的 3 字段（thinking 即便 None 也算数 = 该模型自身默认）
+/// - `model_id = None` → 整束从 `[models.default]` 取，session 原设的 thinking 一并丢弃
+///   （thinking 服务于被遗忘的 model_id，配到 default 模型上无意义）。
+///
+/// 结果进 `options`，调用方（turn.rs）据此写回 session 物化（见写回逻辑），保证
+/// DB 消息 / 费用 / 标题三处消费点都能读到实际生效值。
+///
 /// 工具定义按 `is_child`（递归防护）+ `definition_tools`（定义层收窄）双重过滤后序列化，
 /// 两者取交集。
 ///
@@ -171,19 +181,37 @@ pub(crate) fn resolve_model(
     is_child: bool,
     definition_tools: &HashMap<String, bool>,
 ) -> Result<ResolvedModel, String> {
-    // 1. 确定 model_id 字符串：显式指定 → 用它；None → 读 [models.default]
-    let model_id: String = match model_config.model_id.as_deref() {
-        Some(id) => id.to_string(),
+    // 1. 确定 model_id 字符串 + 2. 取思考参数（两步合一，避免借用逃逸临时 get_config()）
+    //
+    // 3 字段是一束，model_id 是锚：
+    // - model_id = Some → 用 session 自己的 3 字段（thinking 即便 None 也算数 = 该模型自身默认）
+    // - model_id = None → 整束从 [models.default] 取，session 原设的 thinking 一并丢弃
+    //   （thinking 服务于被遗忘的 model_id，配到 default 模型上无意义；用户若想用某 thinking，
+    //   必须连同其 model_id 一起指定）
+    let (model_id, thinking_type, reasoning_effort): (
+        String,
+        Option<ThinkingType>,
+        Option<String>,
+    ) = match model_config.model_id.as_deref() {
+        Some(id) => (
+            id.to_string(),
+            model_config.thinking_type.clone(),
+            model_config.reasoning_effort.clone(),
+        ),
         None => {
-            // 读全局配置（已由 init 阶段加载进 get_config）
-            let default_ref = fuyao_api::get_config()
+            let config = fuyao_api::get_config();
+            match config
                 .models
                 .default
                 .as_ref()
-                .map(|r| r.model.clone())
-                .filter(|s| !s.is_empty());
-            match default_ref {
-                Some(id) => id,
+                .filter(|r| !r.model.is_empty())
+            {
+                Some(r) => (
+                    // 整束取 default：model + thinking_type + reasoning_effort，忽略 session 的 thinking
+                    r.model.clone(),
+                    r.thinking_type.clone(),
+                    r.reasoning_effort.clone(),
+                ),
                 None => {
                     return Err(
                         "未指定模型：ModelConfig.model_id 为空且未配置 [models.default]"
@@ -194,7 +222,7 @@ pub(crate) fn resolve_model(
         }
     };
 
-    // 2. 拆 "provider_id/model_id" 格式
+    // 3. 拆 "provider_id/model_id" 格式
     let (provider_id, model) = match model_id.split_once('/') {
         Some((p, m)) if !p.is_empty() && !m.is_empty() => (p.to_lowercase(), m.to_string()),
         _ => {
@@ -204,7 +232,7 @@ pub(crate) fn resolve_model(
         }
     };
 
-    // 3. 构造 StreamOptions（工具定义按 is_child + definition_tools 过滤——递归防护 + 定义层收窄）
+    // 4. 构造 StreamOptions（工具定义按 is_child + definition_tools 过滤——递归防护 + 定义层收窄）
     let tool_defs = tools.definitions_json_for(is_child, definition_tools);
     let options = StreamOptions {
         temperature: None,
@@ -214,11 +242,12 @@ pub(crate) fn resolve_model(
             Some(tool_defs)
         },
         tool_choice: None,
-        thinking_type: model_config.thinking_type.clone(),
-        reasoning_effort: model_config.reasoning_effort.clone(),
+        thinking_type,
+        reasoning_effort,
     };
 
     Ok(ResolvedModel {
+        model_id,
         provider_id,
         model,
         options,
@@ -480,6 +509,25 @@ mod tests {
         assert_eq!(r.provider_id, "deepseek");
         // model 保持原样
         assert_eq!(r.model, "deepseek-v4-flash");
+        // model_id 完整串原样带回（供写回 / 落库 / 计费用）
+        assert_eq!(r.model_id, "DeepSeek/deepseek-v4-flash");
+    }
+
+    #[test]
+    fn resolve_model_carries_explicit_thinking_into_options() {
+        // 显式 model_config 的 thinking_type / reasoning_effort 透传进 options
+        let tools = empty_registry();
+        let params = ModelConfig {
+            model_id: Some("deepseek/deepseek-v4-flash".to_string()),
+            thinking_type: Some(fuyao_api::ThinkingType::Enabled),
+            reasoning_effort: Some("high".to_string()),
+        };
+        let r = resolve_model(&params, &tools, false, &HashMap::new()).expect("解析应成功");
+        assert_eq!(
+            r.options.thinking_type,
+            Some(fuyao_api::ThinkingType::Enabled)
+        );
+        assert_eq!(r.options.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

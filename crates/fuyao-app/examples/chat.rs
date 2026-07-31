@@ -198,18 +198,17 @@ async fn consume_turn(app: &App, lanes: &mut [Lane]) {
 
         // ChildSession 生命周期事件：base.session_id 是父（由父上下文发出），
         // payload 标 child 生命周期——先据此维护映射，再走通用渲染
-        if let OutputEvent::ChildSession(m) = &event {
-            if let Some(parent_idx) = lanes
+        if let OutputEvent::ChildSession(m) = &event
+            && let Some(parent_idx) = lanes
                 .iter()
                 .position(|l| l.session_id == m.payload.parent_session_id)
-            {
-                match m.payload.state {
-                    ChildSessionState::Started => {
-                        child_to_parent.insert(m.payload.child_session_id.clone(), parent_idx);
-                    }
-                    ChildSessionState::Ended => {
-                        child_to_parent.remove(&m.payload.child_session_id);
-                    }
+        {
+            match m.payload.state {
+                ChildSessionState::Started => {
+                    child_to_parent.insert(m.payload.child_session_id.clone(), parent_idx);
+                }
+                ChildSessionState::Ended => {
+                    child_to_parent.remove(&m.payload.child_session_id);
                 }
             }
         }

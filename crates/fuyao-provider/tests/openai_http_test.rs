@@ -213,7 +213,11 @@ async fn chat_parses_content_and_usage() {
 
     let provider = mock_provider(&server);
     let response = provider
-        .chat(simple_request("你好"), "test-model")
+        .chat(
+            simple_request("你好"),
+            "test-model",
+            StreamOptions::default(),
+        )
         .await
         .unwrap();
 
@@ -245,7 +249,11 @@ async fn chat_parses_tool_calls() {
 
     let provider = mock_provider(&server);
     let response = provider
-        .chat(simple_request("搜索"), "test-model")
+        .chat(
+            simple_request("搜索"),
+            "test-model",
+            StreamOptions::default(),
+        )
         .await
         .unwrap();
 
@@ -351,7 +359,9 @@ async fn chat_returns_auth_error_on_403() {
         .await;
 
     let provider = mock_provider(&server);
-    let result = provider.chat(simple_request("hi"), "test-model").await;
+    let result = provider
+        .chat(simple_request("hi"), "test-model", StreamOptions::default())
+        .await;
     assert!(
         matches!(result, Err(StreamError::AuthError(_))),
         "403 应映射为 AuthError"
@@ -379,7 +389,10 @@ async fn from_parts_trims_trailing_slash_from_base_url() {
         format!("{}/v1/", server.url()), // 注意尾斜杠
         reqwest::Client::new(),
     );
-    let response = provider.chat(simple_request("hi"), "m").await.unwrap();
+    let response = provider
+        .chat(simple_request("hi"), "m", StreamOptions::default())
+        .await
+        .unwrap();
     assert_eq!(response.content.as_deref(), Some("ok"));
     mock.assert_async().await; // 证明请求命中了正确 URL
 }

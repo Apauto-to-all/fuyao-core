@@ -91,6 +91,7 @@ impl Provider for ControllableProvider {
         &self,
         _request: fuyao_provider::ChatRequest,
         _model: &str,
+        _options: fuyao_provider::StreamOptions,
     ) -> Result<ChatResponse, StreamError> {
         Err(StreamError::ApiError("mock: chat 不支持".into()))
     }
@@ -205,6 +206,7 @@ impl Provider for MockProvider {
         &self,
         _request: fuyao_provider::ChatRequest,
         _model: &str,
+        _options: fuyao_provider::StreamOptions,
     ) -> Result<ChatResponse, StreamError> {
         Err(StreamError::ApiError("mock: chat 不支持".into()))
     }
@@ -1678,7 +1680,7 @@ async fn inject_images_persisted_when_model_supports() {
         agent_id: Some("test/images-support".into()),
         workspace: None,
         extra_dirs: vec![],
-        fuyao_home: std::path::PathBuf::from(std::env::temp_dir()).join("fuyao_core_test_home"),
+        fuyao_home: std::env::temp_dir().join("fuyao_core_test_home"),
     };
     let model = fuyao_api::Model {
         name: "test-model".into(),

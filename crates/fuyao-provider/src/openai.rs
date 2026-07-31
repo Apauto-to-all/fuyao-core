@@ -244,20 +244,15 @@ impl OpenAIProvider {
             body["tool_choice"] = tool_choice.clone();
         }
 
-        // 思考字段条件注入：thinking_type / reasoning_effort 为 Some 时才发
-        // Disabled 时强制不发 reasoning_effort（思考都关了，强度无意义）
+        // 思考字段独立注入：thinking_type 与 reasoning_effort 是两个正交字段，
+        // 各自为 Some 时各自发送，互不压制。配置了就必须发——禁止因 thinking_type=Disabled
+        // 而压掉 reasoning_effort，两者由服务器各自解释，fuyao 不替服务器做语义裁剪。
         if let Some(t) = &options.thinking_type {
             body["thinking"] = serde_json::json!({
                 "type": serde_json::to_value(t).expect("ThinkingType 序列化不会失败")
             });
         }
-        let disabled = matches!(
-            options.thinking_type,
-            Some(fuyao_api::ThinkingType::Disabled)
-        );
-        if let Some(e) = &options.reasoning_effort
-            && !disabled
-        {
+        if let Some(e) = &options.reasoning_effort {
             body["reasoning_effort"] = serde_json::Value::String(e.clone());
         }
 
@@ -740,9 +735,13 @@ impl Provider for OpenAIProvider {
         Box::pin(stream)
     }
 
-    async fn chat(&self, request: ChatRequest, model: &str) -> Result<ChatResponse, StreamError> {
+    async fn chat(
+        &self,
+        request: ChatRequest,
+        model: &str,
+        options: ProviderStreamOptions,
+    ) -> Result<ChatResponse, StreamError> {
         let started = std::time::Instant::now();
-        let options = ProviderStreamOptions::default();
         let body = self.build_request_body(request, model, &options, false);
         let response = self.send_request(body).await?;
 
@@ -1144,8 +1143,8 @@ mod tests {
     }
 
     #[test]
-    fn build_request_body_thinking_disabled_omits_effort() {
-        // 关思考：仅发 thinking:disabled，强制不发 reasoning_effort（强度此时无意义）
+    fn build_request_body_thinking_disabled_still_sends_effort() {
+        // 两字段独立：thinking_type=Disabled 不压制 reasoning_effort，配了就发
         let provider = test_provider();
         let request = ChatRequest::default();
         let options = ProviderStreamOptions {
@@ -1155,7 +1154,7 @@ mod tests {
         };
         let body = provider.build_request_body(request, "deepseek-v4-flash", &options, false);
         assert_eq!(body["thinking"]["type"], "disabled");
-        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["reasoning_effort"], "high");
     }
 
     #[test]

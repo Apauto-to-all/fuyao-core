@@ -376,6 +376,7 @@ mod tests {
             &self,
             _request: crate::provider::ChatRequest,
             _model: &str,
+            _options: crate::provider::StreamOptions,
         ) -> Result<crate::provider::ChatResponse, crate::provider::StreamError> {
             Ok(crate::provider::ChatResponse {
                 content: None,

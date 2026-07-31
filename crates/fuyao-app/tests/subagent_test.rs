@@ -45,6 +45,7 @@ fn ensure_test_config() {
         // 与 session_params() 的 model_id 同源：test/model → provider_id="test" / model="model"
         cfg.models.default = Some(ModelRef {
             model: "test/model".to_string(),
+            ..Default::default()
         });
         set_config(Arc::new(cfg));
     });
@@ -79,7 +80,12 @@ impl Provider for ScriptedProvider {
         Box::pin(stream::iter(events))
     }
 
-    async fn chat(&self, _request: ChatRequest, _model: &str) -> Result<ChatResponse, StreamError> {
+    async fn chat(
+        &self,
+        _request: ChatRequest,
+        _model: &str,
+        _options: StreamOptions,
+    ) -> Result<ChatResponse, StreamError> {
         Err(StreamError::ApiError("mock: chat 不支持".into()))
     }
 }

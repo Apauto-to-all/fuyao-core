@@ -52,6 +52,23 @@ fn shutdown_interrupt_payload() -> OutputInterruptPayload {
     OutputInterruptPayload::new("引擎关闭", InterruptSource::Shutdown)
 }
 
+/// 把解析出的 model_id + 思考参数物化进 ModelConfig
+///
+/// 3 字段是一束，model_id 是锚（与 resolve_model 同规则）：
+/// - `model_id = None`（走了 default 兜底）→ 整束写回：model_id + thinking_type + reasoning_effort
+///   全部用 resolved 值覆盖。连 session 原设的 thinking 也一并覆盖——它服务于被遗忘的
+///   model_id，配到 default 模型上无意义。
+/// - `model_id = Some`（用户显式指定）→ 全不动：3 字段都是用户意志。
+///
+/// 写回动机见 `run_turn` 调用处：让兜底解析的真值流转到 DB 消息 / 费用计算 / 标题生成三处消费点。
+fn materialize_resolved(config: &mut ModelConfig, resolved: &ResolvedModel) {
+    if config.model_id.is_none() {
+        config.model_id = Some(resolved.model_id.clone());
+        config.thinking_type = resolved.options.thinking_type.clone();
+        config.reasoning_effort = resolved.options.reasoning_effort.clone();
+    }
+}
+
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环注入 session.messages）
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
@@ -60,7 +77,7 @@ pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     session: &mut Session,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
-    model_config: ModelConfig,
+    mut model_config: ModelConfig,
 ) {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
     // 任一失败：发 Error 事件 + 落库 + 结束本轮（配置错误，永久不可恢复）
@@ -82,6 +99,16 @@ pub(crate) async fn run_turn(
                 return;
             }
         };
+    // 写回物化：把 resolved 真值落进 model_config（本 turn 两个 handler 立即读到 Some）
+    // + 共享 session_params（后续 turn 免解析 + 用户可观测实际所用模型）。
+    // 不写回的代价：DB assistant 消息 model_id=NULL / 费用漏算 / 标题生成回退读不到 model_id。
+    // per-field None 守卫：不覆盖并发的 update_session_params 显式切换（用户意志优先）。
+    materialize_resolved(&mut model_config, &resolved);
+    {
+        let mut params = ctx.session_params.lock().await;
+        materialize_resolved(&mut params.model_config, &resolved);
+    }
+
     let provider: Arc<dyn Provider> = match ctx.providers.get(&resolved.provider_id) {
         Some(p) => p,
         None => {
@@ -681,5 +708,106 @@ async fn emit_interrupt_and_complete_tool_results(
             );
             push_tool_result_event_to_history(ctx, session, ev).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::react::builders::ResolvedModel;
+    use fuyao_api::ThinkingType;
+    use fuyao_provider::StreamOptions;
+
+    /// 构造一个 model_id + thinking 都已解析的 ResolvedModel（模拟 default 兜底解析后的结果）
+    fn resolved_with(
+        default_id: &str,
+        thinking: Option<ThinkingType>,
+        effort: Option<&str>,
+    ) -> ResolvedModel {
+        ResolvedModel {
+            model_id: default_id.to_string(),
+            provider_id: "deepseek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+            options: StreamOptions {
+                thinking_type: thinking,
+                reasoning_effort: effort.map(String::from),
+                ..StreamOptions::default()
+            },
+        }
+    }
+
+    #[test]
+    fn materialize_fills_all_none_fields_from_resolved() {
+        // session 全 None（靠 default 兜底）→ 三个字段全被物化为 resolved 值
+        let mut cfg = ModelConfig::default();
+        let resolved = resolved_with(
+            "deepseek/deepseek-v4-flash",
+            Some(ThinkingType::Enabled),
+            Some("high"),
+        );
+        materialize_resolved(&mut cfg, &resolved);
+        assert_eq!(cfg.model_id.as_deref(), Some("deepseek/deepseek-v4-flash"));
+        assert_eq!(cfg.thinking_type, Some(ThinkingType::Enabled));
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn materialize_preserves_already_set_fields() {
+        // model_id 已 Some = 用户显式指定：整束全不动（用户意志优先），即便 thinking 是 Some
+        let mut cfg = ModelConfig {
+            model_id: Some("aliyun/qwen3.6-plus".to_string()),
+            thinking_type: Some(ThinkingType::Disabled),
+            reasoning_effort: Some("low".to_string()),
+        };
+        let resolved = resolved_with(
+            "deepseek/deepseek-v4-flash",
+            Some(ThinkingType::Enabled),
+            Some("high"),
+        );
+        materialize_resolved(&mut cfg, &resolved);
+        // 三字段均保持用户原值
+        assert_eq!(cfg.model_id.as_deref(), Some("aliyun/qwen3.6-plus"));
+        assert_eq!(cfg.thinking_type, Some(ThinkingType::Disabled));
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn materialize_overwrites_thinking_when_model_id_was_none() {
+        // Case B：model_id=None 但 thinking 已设 → 整束从 default 取，session 的 thinking 被覆盖
+        // （thinking 服务于被遗忘的 model_id，配到 default 模型上无意义）
+        let mut cfg = ModelConfig {
+            model_id: None,
+            thinking_type: Some(ThinkingType::Disabled),
+            reasoning_effort: Some("low".to_string()),
+        };
+        let resolved = resolved_with(
+            "deepseek/deepseek-v4-flash",
+            Some(ThinkingType::Enabled),
+            Some("high"),
+        );
+        materialize_resolved(&mut cfg, &resolved);
+        // 三字段全被 default 的整束覆盖
+        assert_eq!(cfg.model_id.as_deref(), Some("deepseek/deepseek-v4-flash"));
+        assert_eq!(cfg.thinking_type, Some(ThinkingType::Enabled));
+        assert_eq!(cfg.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn materialize_noop_when_model_id_explicit_even_if_thinking_none() {
+        // model_id 已 Some + thinking 为 None：全不动（显式模型用自身默认思考，不补 default 的）
+        let mut cfg = ModelConfig {
+            model_id: Some("aliyun/qwen3.6-plus".to_string()),
+            thinking_type: None,
+            reasoning_effort: None,
+        };
+        let resolved = resolved_with(
+            "deepseek/deepseek-v4-flash",
+            Some(ThinkingType::Enabled),
+            Some("high"),
+        );
+        materialize_resolved(&mut cfg, &resolved);
+        assert_eq!(cfg.model_id.as_deref(), Some("aliyun/qwen3.6-plus"));
+        assert_eq!(cfg.thinking_type, None);
+        assert_eq!(cfg.reasoning_effort, None);
     }
 }

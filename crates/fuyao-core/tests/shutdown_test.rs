@@ -280,6 +280,7 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
             &self,
             _request: ChatRequest,
             _model: &str,
+            _options: StreamOptions,
         ) -> Result<ChatResponse, StreamError> {
             Err(StreamError::ApiError("mock: chat 不支持".into()))
         }

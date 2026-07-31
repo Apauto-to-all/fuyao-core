@@ -270,36 +270,46 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         }
     };
 
-    // 解析本轮主模型的 model_id 和 Provider 实例
+    // 解析本轮主模型：model_id + 思考配置（一并取，压缩复用 session 全套模型配置）
     //
     // **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，
     // 否则原样发的请求会因为 endpoint 切换导致前缀缓存失效。
     // model_id 解析顺序与 turn.rs::resolve_model 一致：
     //   1. SessionParams.model_config.model_id = Some(...) → 用它（整 session 共享一份，现读）
-    //   2. None → 读 [models.default] 兜底
+    //   2. None → 读 [models.default] 兜底（含其 thinking，与 model_id 同源取）
     //   3. 都没有 → 无法确定主模型，跳过本次压缩（warn 记录原因）
-    let explicit_id: Option<String> = {
+    //
+    // 注：写回逻辑（turn.rs）已在首轮后把 model_id + thinking 物化进 session_params，
+    // 正常运行期这里读到的都是 Some。None→default 分支仅首轮前 / 未物化时兜底。
+    let (model_id, thinking_type, reasoning_effort) = {
         let p = ctx.session_params.lock().await;
-        p.model_config.model_id.as_deref().map(|id| id.to_string())
-    };
-    let model_id: String = match explicit_id {
-        Some(id) => id,
-        None => match fuyao_api::get_config()
-            .models
-            .default
-            .as_ref()
-            .map(|r| r.model.clone())
-            .filter(|s| !s.is_empty())
-        {
-            Some(id) => id,
-            None => {
-                tracing::warn!(
-                    session_id = ctx.emitter.session_id(),
-                    "压缩跳过：本轮主模型未指定且未配置 [models.default]"
-                );
-                return;
-            }
-        },
+        let mc = &p.model_config;
+        match mc.model_id.as_deref() {
+            Some(id) => (
+                id.to_string(),
+                mc.thinking_type.clone(),
+                mc.reasoning_effort.clone(),
+            ),
+            None => match fuyao_api::get_config()
+                .models
+                .default
+                .as_ref()
+                .filter(|r| !r.model.is_empty())
+            {
+                Some(r) => (
+                    r.model.clone(),
+                    r.thinking_type.clone(),
+                    r.reasoning_effort.clone(),
+                ),
+                None => {
+                    tracing::warn!(
+                        session_id = ctx.emitter.session_id(),
+                        "压缩跳过：本轮主模型未指定且未配置 [models.default]"
+                    );
+                    return;
+                }
+            },
+        }
     };
 
     // 拆 provider_id → 从 registry 取 Provider 实例（与主对话 stream_chat 同一个）
@@ -393,6 +403,13 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
     let (delta_tx, mut delta_rx) =
         tokio::sync::mpsc::channel::<(Option<String>, Option<String>)>(32);
 
+    // 构造压缩用 options：复用 session 思考配置（tools 由 generate_summary 内部强制清空）
+    let compression_options = fuyao_provider::StreamOptions {
+        thinking_type,
+        reasoning_effort,
+        ..fuyao_provider::StreamOptions::default()
+    };
+
     // callback 用 let 绑定避免临时值生命周期问题（future 会借用它）
     let mut on_delta = |content: Option<&str>, reasoning: Option<&str>| {
         let _ = delta_tx.try_send((content.map(String::from), reasoning.map(String::from)));
@@ -426,6 +443,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
             &visible_messages,
             &provider,
             &model_id,
+            compression_options,
             context_length,
             &ctx.compression_config,
             &mut on_delta,

@@ -66,9 +66,14 @@ pub struct StreamOptions {
     pub temperature: Option<f64>,
     pub tools: Option<Vec<serde_json::Value>>,
     pub tool_choice: Option<serde_json::Value>,
-    /// 思考开关（由 ModelConfig 透传，build_request_body 按是否 Some 注入）
+    /// 思考开关（对应 thinking.type 字段）。None 时不发，走模型默认
+    ///
+    /// **与 reasoning_effort 正交独立**：两者各自为 Some 时各自发送，互不压制。
+    /// 禁止因本字段为 Disabled 而压掉 reasoning_effort——配了就必发，由服务器各自解释。
     pub thinking_type: Option<ThinkingType>,
-    /// 思考强度档位名（用户自定义字符串，透传给服务器）
+    /// 思考强度档位名（用户自定义字符串，透传给服务器）。None 时不发，走模型默认
+    ///
+    /// **与 thinking_type 正交独立**：见 thinking_type 的约束说明。
     pub reasoning_effort: Option<String>,
 }
 
@@ -147,8 +152,16 @@ pub trait Provider: Send + Sync {
         options: StreamOptions,
     ) -> BoxStream<Result<StreamEvent, StreamError>>;
 
-    /// 非流式对话（用于压缩等不需要增量的场景）
-    async fn chat(&self, request: ChatRequest, model: &str) -> Result<ChatResponse, StreamError>;
+    /// 非流式对话（用于标题生成等一次性短文本场景）
+    ///
+    /// 与 stream_chat 共享同一套 options（含思考开关 / 思考强度）——
+    /// 非流式仅指响应一次性返回，思考能力与流式路径等价支持。
+    async fn chat(
+        &self,
+        request: ChatRequest,
+        model: &str,
+        options: StreamOptions,
+    ) -> Result<ChatResponse, StreamError>;
 }
 
 /// 流式错误

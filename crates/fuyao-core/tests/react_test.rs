@@ -284,6 +284,7 @@ async fn retry_no_retry_after_first_chunk() {
             &self,
             _request: ChatRequest,
             _model: &str,
+            _options: StreamOptions,
         ) -> Result<ChatResponse, StreamError> {
             Err(StreamError::ApiError("mock: chat 不支持".to_string()))
         }
@@ -362,6 +363,7 @@ async fn retry_emits_multiple_retry_events_under_persistent_error() {
             &self,
             _request: ChatRequest,
             _model: &str,
+            _options: StreamOptions,
         ) -> Result<ChatResponse, StreamError> {
             Err(StreamError::ApiError("mock: chat 不支持".to_string()))
         }

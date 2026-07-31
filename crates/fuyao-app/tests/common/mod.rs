@@ -34,7 +34,12 @@ impl Provider for MockProvider {
         Box::pin(stream::iter(events))
     }
 
-    async fn chat(&self, _request: ChatRequest, _model: &str) -> Result<ChatResponse, StreamError> {
+    async fn chat(
+        &self,
+        _request: ChatRequest,
+        _model: &str,
+        _options: StreamOptions,
+    ) -> Result<ChatResponse, StreamError> {
         Err(StreamError::ApiError("mock: chat 不支持".into()))
     }
 }

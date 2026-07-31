@@ -6,9 +6,20 @@
 //! - 从引擎级共享的 ProviderRegistry 取 Provider 实例（fast 可能跨 Provider）
 //! - 用非流式 `provider.chat()`（标题是短文本，无需流式增量）
 //! - 只生成标题文本；落库（`SessionStore::update_title`）与事件发布由调用方负责（职责分离）
+//!
+//! # 三者独立（禁止绑定）
+//!
+//! `[models.fast]` / `Provider::chat` / 标题生成是**三个毫不相关的东西**，仅在本模块恰好同框：
+//! - `[models.fast]`：一条模型配置（含 model / thinking_type / reasoning_effort 三字段），独立存在
+//! - `Provider::chat`：Provider 的非流式方法（带 options），独立存在
+//! - 标题生成：一个功能，恰好读 `[models.fast]` 的 model_id 选模型，恰好调 `chat()` 走非流式
+//!
+//! 标题生成**只取 fast 的 model_id，不取其 thinking**；调 `chat()` 恒传默认 options
+//! （`thinking_type=None` + `reasoning_effort=None`）——标题固定不思考，是标题自身的设计，
+//! 与 fast 配置、chat 的 options 能力均无关。禁止把三者绑成一个「标题专用链路」。
 
 use fuyao_api::{AgentPaths, get_config};
-use fuyao_provider::{ChatMessage, ChatRequest, ProviderRegistry, parse_model_id};
+use fuyao_provider::{ChatMessage, ChatRequest, ProviderRegistry, StreamOptions, parse_model_id};
 
 /// 标题生成系统提示词
 const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题（3-7 个词）。\
@@ -19,6 +30,8 @@ const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题�
 ///
 /// 模型优先级：`[models.fast]` → 当前引擎模型 → 放弃（返回 None）。
 /// fast 未配置或调用失败时自动回退到当前引擎模型；两者都失败则不重命名。
+///
+/// **只取 fast 的 model_id**（不取其 thinking）；标题固定不思考（见模块顶部「三者独立」）。
 ///
 /// # 参数
 /// - `user_message`：用户消息原文（内部截断）
@@ -39,7 +52,7 @@ pub async fn maybe_generate_title(
 ) -> Option<String> {
     let config = get_config();
 
-    // 1. 优先用 fast 模型（便宜快速）
+    // 1. 优先用 fast 模型（便宜快速）——只取 model_id，不取 thinking
     if let Some(fast_ref) = config.models.fast.as_ref()
         && !fast_ref.model.is_empty()
     {
@@ -62,6 +75,9 @@ pub async fn maybe_generate_title(
 ///
 /// 内部完成：按 model_id 从 ProviderRegistry 取 Provider → 截断输入 →
 /// 发非流式请求 → 清洗标题。
+///
+/// **标题固定不思考**：恒传 `StreamOptions::default()`（thinking 两字段为 None）。
+/// 这是标题自身的设计，与 fast 配置、chat 的 options 能力无关（见模块顶部「三者独立」）。
 ///
 /// 失败情形（返回 None）：
 /// - model_id 格式错误（无 `/`）
@@ -91,7 +107,11 @@ async fn generate_title(
         }],
     };
 
-    let response = provider.chat(request, &model_name).await.ok()?;
+    // 标题固定不思考：默认 options（thinking_type=None / reasoning_effort=None）
+    let response = provider
+        .chat(request, &model_name, StreamOptions::default())
+        .await
+        .ok()?;
     let content = response.content?;
     let title = clean_title(&content);
     if title.is_empty() { None } else { Some(title) }

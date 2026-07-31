@@ -61,21 +61,29 @@ fn to_chat_message(m: &Message) -> ChatMessage {
 
 /// 生成摘要：消息原样发 + 末尾追加摘要指令 + 流式收集
 ///
+/// **压缩铁律**：压缩 = 复用 session 当前模型配置（model + thinking_type + reasoning_effort
+/// 原样），仅禁用工具，流式调一次。与主对话唯一的差别是 tools 为空——独立摘要流，不进
+/// ReAct。system / messages 原样不动（前缀缓存生命线）。options 由调用方从 session 物化值
+/// 构造，本函数在执行边界强制 tools=None / tool_choice=None，确保「禁用工具」不变量不被绕过。
+///
 /// # 参数
 /// - `system_prompt`：session 原本的 system_prompt（保持不变，前缀缓存命中）
 /// - `messages`：当前 session 的可见消息（原样发，不构造、不序列化）
 /// - `provider`：LLM provider（用 `stream_chat()` 流式接口）
 /// - `model_id`：摘要用哪个模型（一般与主对话一致）
+/// - `options`：复用自 session 的流式选项（思考配置原样带；tools 在内部强制清空）
 /// - `context_length`：模型上下文长度（用于按比例计算保留窗口预算）
 /// - `cfg`：压缩配置
 /// - `on_delta`：流式增量回调。每个 TextDelta 调一次 `(Some(content), None)`，
 ///   每个 ReasoningDelta 调一次 `(None, Some(reasoning))`。调用方据此发 Compression Delta 事件。
 ///   回调是同步的（fnMut 不能 await），调用方若需异步处理应通过 channel 转发。
+#[allow(clippy::too_many_arguments)]
 pub async fn generate_summary(
     system_prompt: Option<&str>,
     messages: &[Message],
     provider: &std::sync::Arc<dyn Provider>,
     model_id: &str,
+    mut options: StreamOptions,
     context_length: u32,
     cfg: &CompressionConfig,
     on_delta: &mut impl FnMut(Option<&str>, Option<&str>),
@@ -106,9 +114,11 @@ pub async fn generate_summary(
         system: system_prompt.map(String::from),
     };
 
-    // 调 provider（流式 stream_chat，不带 tools）
+    // 调 provider（流式 stream_chat）。压缩铁律：强制禁用工具（独立摘要流，不进 ReAct）
+    options.tools = None;
+    options.tool_choice = None;
     let mut stream: BoxStream<Result<StreamEvent, StreamError>> =
-        provider.stream_chat(request, model_id, StreamOptions::default());
+        provider.stream_chat(request, model_id, options);
 
     let mut content = String::new();
     while let Some(result) = stream.next().await {
@@ -181,6 +191,7 @@ mod tests {
             &self,
             _request: ChatRequest,
             _model: &str,
+            _options: StreamOptions,
         ) -> Result<ChatResponse, StreamError> {
             // 压缩现在用 stream_chat，chat() 保留实现只为满足 trait
             let full = self.chunks.join("");
@@ -226,6 +237,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            StreamOptions::default(),
             128_000,
             &cfg_small_keep(),
             &mut cb,
@@ -249,6 +261,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            StreamOptions::default(),
             128_000,
             &cfg_small_keep(),
             &mut cb,
@@ -270,6 +283,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            StreamOptions::default(),
             128_000,
             &cfg_small_keep(),
             &mut cb,
@@ -298,6 +312,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            StreamOptions::default(),
             128_000,
             &cfg_small_keep(),
             &mut cb,
