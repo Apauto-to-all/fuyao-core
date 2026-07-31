@@ -2,9 +2,9 @@
 //!
 //! 通过 `fuyao_app::start` 一键装配启动引擎，验证项目完整可用。
 //! 启动时选择 session 数量：
-//! - 单对话：默认 deepseek 模型，事件以 JSON 原样打印（无颜色）
-//! - 双对话：同一条消息同时发给两个 session，流式输出交错到达，
-//!   用颜色区分来源（A 青色 / B 黄色），体现多 session 并发不阻塞
+//! - 单对话：使用默认模型（见 `DEFAULT_MODEL`），事件以 JSON 原样打印（无颜色）
+//! - 双对话：同一条消息同时发给两个 session，A/B 各用不同模型（见 `DEFAULT_MODEL` / `MODEL_B`），
+//!   流式输出交错到达，用颜色区分来源（A 青色 / B 黄色），体现多 session 并发不阻塞
 //! - 子代理派生期间，子 session 事件用紫色与父 lane 区分，仍归父 lane 渲染
 //!
 //! 本例不做任何事件特化处理——每条 OutputEvent 直接序列化为 JSON 打印，
@@ -25,8 +25,11 @@ use fuyao_api::{AgentPaths, EngineParams, ModelConfig, SessionParams};
 use fuyao_app::App;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// 默认模型（provider/model 形式，按项目约定）
-const DEFAULT_MODEL: &str = "deepseek/deepseek-v4-flash";
+/// 模型 1（默认，provider/model 形式，按项目约定）：单对话与双对话的 session A 使用此模型
+const DEFAULT_MODEL: &str = "sensenova/deepseek-v4-flash";
+
+/// 模型 2：双对话的 session B 使用此模型，与 A 并行对比两路回答
+const MODEL_B: &str = "sensenova/sensenova-6.7-flash-lite";
 
 /// ANSI 颜色码：双对话时 A 用青色、B 用黄色，两路交错一眼区分归属
 const COLOR_A: &str = "\x1b[36m"; // 青色
@@ -88,7 +91,7 @@ async fn main() {
         let session_b = app
             .create_session(SessionParams {
                 model_config: ModelConfig {
-                    model_id: Some(DEFAULT_MODEL.to_string()),
+                    model_id: Some(MODEL_B.to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -102,7 +105,7 @@ async fn main() {
             finished: false,
         });
         println!(
-            "\n已创建两个并发对话（颜色区分）：\n  {ca}[A]{r}  {cb}[B]{r}\n",
+            "\n已创建两个并发对话（颜色区分，A 用 {DEFAULT_MODEL} / B 用 {MODEL_B}）：\n  {ca}[A]{r}  {cb}[B]{r}\n",
             ca = COLOR_A,
             cb = COLOR_B,
             r = COLOR_RESET
@@ -132,7 +135,7 @@ async fn main() {
             break;
         }
 
-        // 同一条消息发给所有 session（各自带 DEFAULT_MODEL）
+        // 同一条消息发给所有 session（模型由各自 session 的 SessionParams 决定，创建时定）
         for lane in &lanes {
             send_to(&app, &lane.session_id, input).await;
         }
