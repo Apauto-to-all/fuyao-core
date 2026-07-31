@@ -804,6 +804,121 @@ async fn plugin_message_routes_through_dispatch() {
     assert!(got_plugin, "应收到 OutputEvent::Plugin");
 }
 
+/// Plugin 通知在**活跃 turn 期间**也能立即转发（不到等回 idle）。
+///
+/// 这是本次修复的核心回归保护：修复前 rx_plugin 仅在主循环 idle select! 消费，
+/// turn 运行（LLM 流式 + 工具执行）期间通知堆在通道里，延迟整轮。
+/// 修复后由独立 forwarder task 并发消费，turn 挂起在流上时通知仍即时透传。
+///
+/// 时序：ControllableProvider 吐一个 TextDelta 后流挂起（turn 仍活跃）→
+/// 发 Plugin 消息 → 断言 500ms 内收到 OutputEvent::Plugin。
+/// 修复前此断言会超时（流不结束 = 主循环不回 idle = 永不消费 plugin）。
+#[tokio::test]
+async fn plugin_forwards_during_active_turn() {
+    use fuyao_api::PluginEventSource;
+    use fuyao_api::message::output::{PluginMessage, PluginPayload};
+
+    // 1 轮事件流：吐一个 TextDelta 后挂起（第二个事件不发 → turn 停在流式 select!）
+    let (provider, txs) = ControllableProvider::with_batches(1);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+
+    let store = temp_store().await;
+    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    session.id = "plugin_active".to_string();
+    store.create(&session).await.unwrap();
+
+    let guide = empty_queue();
+    let pending = empty_queue();
+    // 预置一条 user 进 guide，让主循环进 turn（不需经 inbound 通道）
+    guide.lock().unwrap().push_back(make_inbound("问题"));
+    let (_tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
+    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
+    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+    std::mem::forget(rx_interrupt_tx);
+    let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
+
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn(run_session(
+        "plugin_active".to_string(),
+        Arc::clone(&guide),
+        Arc::clone(&pending),
+        rx_inbound,
+        rx_interrupt,
+        rx_plugin,
+        shutdown_token.clone(),
+        session,
+        Arc::clone(&store),
+        providers,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        fuyao_api::AgentDefinition::default(),
+        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        tx_event,
+        None,
+    ));
+
+    // 喂一个 TextDelta：run_session 进 turn，流式消费后挂起在第二个事件上（turn 活跃）
+    txs[0]
+        .send(Ok(StreamEvent::TextDelta {
+            content: "部分".to_string(),
+        }))
+        .unwrap();
+    // 等 turn 跑过 inject + build_chat_request(DB 查询) + 进入流式挂起
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+    // 活跃 turn 期间发 Plugin 消息
+    tx_plugin
+        .send(PluginMessage {
+            base: EventBase::default(),
+            payload: PluginPayload {
+                source: PluginEventSource {
+                    name: "test_plugin".into(),
+                },
+                event_type: "notify".into(),
+                data: None,
+                error: None,
+                message: Some("turn 中转发".into()),
+            },
+        })
+        .await
+        .unwrap();
+
+    // 断言：500ms 内收到 Plugin 事件（修复前会延迟整轮，流挂起=主循环永不回 idle=超时）
+    let got = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+        loop {
+            if let Some(ev) = rx_event.recv().await {
+                if let OutputEvent::Plugin(m) = ev {
+                    assert_eq!(m.payload.source.name, "test_plugin");
+                    assert_eq!(
+                        m.base.session_id.as_deref(),
+                        Some("plugin_active"),
+                        "Plugin 事件应盖 session_id 标签"
+                    );
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+
+    // 收尾：cancel shutdown 让挂起的 turn 经 shutdown 分支退出，再等 task 结束
+    shutdown_token.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+
+    assert!(
+        got.is_ok(),
+        "活跃 turn 期间 Plugin 事件应在 500ms 内转发；修复前会延迟整轮"
+    );
+}
+
 /// 中断-流式期间：流式中途发 Interrupt → 产出 Interrupt 事件 + 部分 AssistantMessage（finish_reason=interrupted）
 ///
 /// 时序：ControllableProvider 吐一个 TextDelta 后故意不发下一个（流挂起），

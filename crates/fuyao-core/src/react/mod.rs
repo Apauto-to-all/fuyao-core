@@ -162,6 +162,44 @@ pub(crate) async fn run_session(
         subagent_ops,
     };
 
+    // Plugin 转发独立 task：通知一到就转发，不阻塞在主循环的 turn 上
+    //
+    // Plugin 消息是纯通知：仅过 dispatch 管道转发（拦截 → 发送 → 观察），不碰 session
+    // 可变状态、不碰 guide/pending 队列、不参与 ReAct，故可与活跃 turn 安全并发。
+    // 修复前 Plugin 仅在主循环 idle select! 消费，turn 运行期间（pre-turn 压缩 +
+    // 注入 + LLM 流式 + 工具执行，可能很久）通知堆在通道里，延迟整轮才转发。
+    //
+    // 退出条件（双重，任一满足即退）：① shutdown_token 取消（Engine::shutdown 联动）；
+    // ② 所有 tx_plugin drop 致 recv 返 None（SessionHandle drop 时其 tx_plugin 随之 drop）。
+    // 无需追踪 forwarder 的 JoinHandle——靠 tx drop + shutdown_token 自然收尾，不过度设计。
+    {
+        let emitter = ctx.emitter.clone();
+        let hooks = ctx.hooks.clone();
+        let shutdown_token = ctx.shutdown_token.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    // shutdown 优先：取消即退，不等通道排空
+                    _ = shutdown_token.cancelled() => break,
+                    plugin_msg = rx_plugin.recv() => match plugin_msg {
+                        Some(msg) => {
+                            dispatch::dispatch(
+                                &emitter,
+                                &hooks,
+                                OutputEvent::Plugin(msg),
+                                None,
+                            )
+                            .await;
+                        }
+                        // 所有 tx_plugin 已 drop（session 结束）→ 退
+                        None => break,
+                    },
+                }
+            }
+        });
+    }
+
     // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断/shutdown
     loop {
         // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
@@ -200,7 +238,9 @@ pub(crate) async fn run_session(
             queue::inject_messages(&ctx, &mut session, msgs).await;
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, model_config).await;
         } else {
-            // guide 空：等入站消息（过管道入队）/ 中断 / Plugin 通知 / shutdown
+            // guide 空：等入站消息（过管道入队）/ 中断 / shutdown
+            // （Plugin 通知由 run_session 顶部 spawn 的独立 forwarder task 并发转发，
+            // 不在主循环消费——避免 turn 运行期间通知被阻塞延迟整轮）
             tokio::select! {
                 biased;
                 // shutdown 优先胜出（即使有消息积压也先退出）
@@ -229,11 +269,6 @@ pub(crate) async fn run_session(
                     // idle 中断：无活跃 turn，只发通知事件
                     emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
                     tracing::debug!(session_id = %ctx.emitter.session_id(), "idle 时收到中断信号");
-                }
-                Some(plugin_msg) = rx_plugin.recv() => {
-                    // 入站 Plugin 消息过 dispatch 管道发外部（带 session_id 标签）
-                    // Plugin 消息不参与 ReAct（不触发 turn）
-                    handle_inbound_plugin(&ctx, plugin_msg).await;
                 }
             }
         }
@@ -570,24 +605,4 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
             .unwrap_or_else(|e| e.into_inner())
             .push_back(inbound),
     }
-}
-
-/// 处理入站 Plugin 消息：通道承载的就是 output 侧 PluginMessage，
-/// 直接包成 `OutputEvent::Plugin` 过完整 dispatch 管道（拦截 → 发送 → 观察）。
-///
-/// process 段传 None——Plugin 消息无需特殊处理（不像 User 要入队），纯通知透传。
-/// 发送时 Emitter 自动盖 session_id 标签。
-fn handle_inbound_plugin(
-    ctx: &SessionCtx,
-    plugin_msg: OutputPluginMessage,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-    Box::pin(async move {
-        dispatch::dispatch(
-            &ctx.emitter,
-            &ctx.hooks,
-            OutputEvent::Plugin(plugin_msg),
-            None,
-        )
-        .await;
-    })
 }
