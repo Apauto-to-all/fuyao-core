@@ -25,3 +25,4 @@ async-trait = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 fuyao-session = { path = "../fuyao-session" }
+base64 = { workspace = true }
