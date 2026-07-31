@@ -15,7 +15,7 @@
 mod common;
 
 use common::temp_store;
-use fuyao_api::{Message, MessageKind, MessageRole, Session};
+use fuyao_api::{ImageContent, Message, MessageKind, MessageRole, Session};
 use fuyao_session::accumulate_session_total;
 
 // ============================================================================
@@ -66,6 +66,50 @@ async fn messages_preserve_role_and_content_on_roundtrip() {
     assert_eq!(visible[0].kind, MessageKind::Message);
     assert_eq!(visible[1].role, MessageRole::Assistant);
     assert_eq!(visible[1].content.as_deref(), Some("助手回答"));
+}
+
+#[tokio::test]
+async fn images_preserve_on_roundtrip() {
+    // 带图消息插入后读回，images 应完整保持（多图 + mime + base64 逐字段一致）
+    let store = temp_store().await;
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let images = vec![
+        ImageContent {
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        },
+        ImageContent {
+            mime_type: "image/jpeg".into(),
+            data: "d29ybGQ=".into(),
+        },
+    ];
+    let mut msg = Message::user_with_images("看图说话".to_string(), images.clone());
+    store.insert_message(&session.id, &mut msg).await.unwrap();
+
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].images.len(), 2);
+    assert_eq!(visible[0].images, images);
+
+    // 全量历史读回同样带图
+    let full = store.load_full_history(&session.id).await.unwrap();
+    assert_eq!(full[0].images, images);
+}
+
+#[tokio::test]
+async fn no_images_roundtrips_empty() {
+    // 纯文本消息读回 images 恒为空（NULL 列 → 空 vec）
+    let store = temp_store().await;
+    let session = Session::new(None, None);
+    store.create(&session).await.unwrap();
+
+    let mut msg = Message::user("纯文本".to_string());
+    store.insert_message(&session.id, &mut msg).await.unwrap();
+
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
+    assert!(visible[0].images.is_empty());
 }
 
 #[tokio::test]

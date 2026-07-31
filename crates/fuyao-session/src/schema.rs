@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS messages (
     model_id              TEXT,
     role                  TEXT NOT NULL,
     content               TEXT,
+    images                TEXT,
     tool_call_id          TEXT,
     tool_calls            TEXT,
     tool_name             TEXT,

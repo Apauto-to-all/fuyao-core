@@ -55,6 +55,7 @@ pub(super) struct MessageRow {
     pub(super) model_id: Option<String>,
     pub(super) role: String,
     pub(super) content: Option<String>,
+    pub(super) images: Option<String>,
     pub(super) tool_call_id: Option<String>,
     pub(super) tool_calls: Option<String>,
     pub(super) tool_name: Option<String>,
@@ -83,14 +84,20 @@ impl From<MessageRow> for Message {
         if !MessageRole::is_known(&r.role) {
             tracing::warn!(role = %r.role, "未知消息角色，兜底为 User");
         }
+        let images = r.images.and_then(|s| match serde_json::from_str(&s) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(cause = %e, "images 反序列化失败，已丢弃");
+                None
+            }
+        });
         Message {
             id: r.id,
             session_id: r.session_id,
             model_id: r.model_id,
             role: MessageRole::parse(&r.role),
             content: r.content,
-            // 图片持久化列尚未接入，当前读回恒为空
-            images: vec![],
+            images: images.unwrap_or_default(),
             reasoning: r.reasoning,
             tool_call_id: r.tool_call_id,
             tool_calls,

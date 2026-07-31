@@ -51,6 +51,7 @@ fn to_chat_message(m: &Message) -> ChatMessage {
     ChatMessage {
         role: m.role,
         content: m.content.clone(),
+        images: m.images.clone(),
         reasoning: m.reasoning.clone(),
         tool_calls: m.tool_calls.as_ref().and_then(|tc| tc.as_array().cloned()),
         tool_call_id: m.tool_call_id.clone(),

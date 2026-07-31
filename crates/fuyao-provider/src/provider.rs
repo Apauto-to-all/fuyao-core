@@ -85,6 +85,9 @@ pub struct ChatMessage {
     pub role: MessageRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// 图片内容列表（多模态输入，user 消息专用；wire 适配在协议实现层）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<fuyao_api::ImageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +103,7 @@ impl Default for ChatMessage {
         Self {
             role: MessageRole::User,
             content: None,
+            images: vec![],
             reasoning: None,
             tool_calls: None,
             tool_call_id: None,

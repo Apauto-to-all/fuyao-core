@@ -85,10 +85,10 @@ impl super::SessionStore {
 
         // 插入 compaction 边界消息（role='system' 避免与对话流混淆，kind='compaction' 是真标记）
         sqlx::query(
-            "INSERT INTO messages (session_id, model_id, role, content, tool_call_id,
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
                 tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                 reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, NULL, 'system', ?2, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL, ?5, 'compaction')",
+             VALUES (?1, NULL, 'system', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL, ?5, 'compaction')",
         )
         .bind(session_id)
         .bind(&summary)
@@ -274,7 +274,7 @@ impl super::SessionStore {
         session_id: &str,
     ) -> Result<Vec<Message>, SessionError> {
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, tool_call_id,
+            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
                     tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                     reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
              FROM messages
@@ -297,7 +297,7 @@ impl super::SessionStore {
     /// 用途：审计、调试、导出。不参与 ReAct 循环。
     pub async fn load_full_history(&self, session_id: &str) -> Result<Vec<Message>, SessionError> {
         let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, tool_call_id,
+            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
                     tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                     reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
              FROM messages WHERE session_id = ?1 ORDER BY seq",

@@ -77,6 +77,7 @@ pub(crate) async fn build_chat_request(
         messages.push(ChatMessage {
             role: m.role,
             content: m.content.clone(),
+            images: m.images.clone(),
             reasoning: m.reasoning.clone(),
             tool_calls: m.tool_calls.as_ref().and_then(|tc| tc.as_array().cloned()),
             tool_call_id: m.tool_call_id.clone(),
@@ -94,6 +95,7 @@ pub(crate) async fn build_chat_request(
                     messages.push(ChatMessage {
                         role: MessageRole::Tool,
                         content: Some("[工具执行被拦截或中断]".to_string()),
+                        images: vec![],
                         reasoning: None,
                         tool_calls: None,
                         tool_call_id: Some(id.to_string()),

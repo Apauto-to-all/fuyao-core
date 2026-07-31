@@ -44,16 +44,21 @@ impl super::SessionStore {
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
 
+        // 图片列表存 JSON 数组（`[{mime_type, data}]`），空列表存 NULL
+        let images_json = (!msg.images.is_empty())
+            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
+
         sqlx::query(
-            "INSERT INTO messages (session_id, model_id, role, content, tool_call_id,
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
                 tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                 reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .bind(session_id)
         .bind(msg.model_id.as_deref())
         .bind(msg.role.as_str())
         .bind(msg.content.as_deref())
+        .bind(images_json.as_deref())
         .bind(msg.tool_call_id.as_deref())
         .bind(tool_calls_json.as_deref())
         .bind(msg.tool_name.as_deref())
