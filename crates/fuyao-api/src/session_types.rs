@@ -322,52 +322,6 @@ impl Message {
             ..Self::default()
         }
     }
-
-    /// 转换为 OpenAI API 格式的 JSON Value
-    pub fn to_openai(&self) -> serde_json::Value {
-        let mut msg = serde_json::Map::new();
-        msg.insert("role".to_string(), serde_json::json!(self.role.as_str()));
-
-        match self.role {
-            MessageRole::Assistant => {
-                // Qwen 不接受 tool_calls + content=""，有工具调用且无内容时不设置 content
-                if self.tool_calls.is_some() && self.content.is_none() {
-                    // 不设置 content
-                } else {
-                    msg.insert(
-                        "content".to_string(),
-                        serde_json::json!(self.content.as_deref().unwrap_or("")),
-                    );
-                }
-                if let Some(tool_calls) = &self.tool_calls {
-                    msg.insert("tool_calls".to_string(), tool_calls.clone());
-                }
-                if let Some(reasoning) = &self.reasoning {
-                    msg.insert(
-                        "reasoning_content".to_string(),
-                        serde_json::json!(reasoning),
-                    );
-                }
-            }
-            MessageRole::Tool => {
-                if let Some(tool_call_id) = &self.tool_call_id {
-                    msg.insert("tool_call_id".to_string(), serde_json::json!(tool_call_id));
-                }
-                msg.insert(
-                    "content".to_string(),
-                    serde_json::json!(self.content.as_deref().unwrap_or("")),
-                );
-            }
-            MessageRole::User | MessageRole::System => {
-                msg.insert(
-                    "content".to_string(),
-                    serde_json::json!(self.content.as_deref().unwrap_or("")),
-                );
-            }
-        }
-
-        serde_json::Value::Object(msg)
-    }
 }
 
 /// 待办事项
@@ -505,53 +459,6 @@ mod tests {
     fn message_system_creates_system_role() {
         let msg = Message::system("系统提示".to_string());
         assert_eq!(msg.role, MessageRole::System);
-    }
-
-    #[test]
-    fn message_to_openai_user() {
-        let msg = Message::user("你好".to_string());
-        let openai = msg.to_openai();
-        assert_eq!(openai["role"], "user");
-        assert_eq!(openai["content"], "你好");
-    }
-
-    #[test]
-    fn message_to_openai_assistant_with_tool_calls() {
-        let tool_calls = serde_json::json!([{
-            "id": "call_1",
-            "type": "function",
-            "function": { "name": "bash", "arguments": "{}" }
-        }]);
-        let msg = Message {
-            role: MessageRole::Assistant,
-            content: None,
-            tool_calls: Some(tool_calls),
-            ..Message::default()
-        };
-        let openai = msg.to_openai();
-        assert_eq!(openai["role"], "assistant");
-        assert!(openai.get("content").is_none());
-        assert!(openai["tool_calls"].is_array());
-    }
-
-    #[test]
-    fn message_to_openai_tool_result() {
-        let msg = Message::tool_result("call_123".to_string(), "文件内容".to_string());
-        let openai = msg.to_openai();
-        assert_eq!(openai["role"], "tool");
-        assert_eq!(openai["tool_call_id"], "call_123");
-    }
-
-    #[test]
-    fn message_to_openai_assistant_with_reasoning() {
-        let msg = Message {
-            role: MessageRole::Assistant,
-            content: Some("回复".to_string()),
-            reasoning: Some("思考过程".to_string()),
-            ..Message::default()
-        };
-        let openai = msg.to_openai();
-        assert_eq!(openai["reasoning_content"], "思考过程");
     }
 
     #[test]

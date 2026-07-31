@@ -20,7 +20,9 @@ const MAX_IMAGE_PIXELS: u32 = 2000;
 const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
 
 /// JPEG 压缩质量档位（降序尝试，首个达标即用）
-const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
+///
+/// 从最高画质起降：优先保留画质，文件过大则逐档牺牲画质换体积。
+const JPEG_QUALITIES: [u8; 5] = [85, 80, 70, 55, 40];
 
 /// 等比缩放目标尺寸：最大边长 > 2000px 时缩到 2000px，否则原尺寸
 fn scaled_dimensions(w: u32, h: u32) -> (u32, u32) {
@@ -39,9 +41,13 @@ fn scaled_dimensions(w: u32, h: u32) -> (u32, u32) {
 ///
 /// 返回 `None` 表示无法得到达标图（解码失败 / 全档压缩仍超限），调用方降级。
 pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
+    // 入站归一：data URL → 裸 base64（统一后续处理基准与落库形态）
+    // 非 data URL（裸 base64）from_data_url 返回 None，沿用入参原值
+    let img = ImageContent::from_data_url(&img.data).unwrap_or_else(|| img.clone());
+
     // 字节达标：原样保留（压缩有损，不重复动）
     if img.data.len() <= MAX_IMAGE_BASE64_BYTES {
-        return Some(img.clone());
+        return Some(img);
     }
 
     // 超限：解码 → 缩放 → JPEG 档位压缩
@@ -80,6 +86,23 @@ pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
     }
 
     None
+}
+
+/// 批量入站节流：逐图归一 data URL + 超限压缩，返回 (达标图, 失败计数)
+///
+/// 失败 = 解码失败 / 压缩后仍超限；失败图不进达标列表，调用方按 `failed` 计数
+/// 决定是否附加占位文本。整批在同一阻塞线程内处理（由调用方经 `spawn_blocking` 调入），
+/// 避免每张图各自 spawn 一次任务。
+pub(crate) fn normalize_images(images: &[ImageContent]) -> (Vec<ImageContent>, usize) {
+    let mut kept = Vec::with_capacity(images.len());
+    let mut failed = 0usize;
+    for img in images {
+        match normalize_image(img) {
+            Some(n) => kept.push(n),
+            None => failed += 1,
+        }
+    }
+    (kept, failed)
 }
 
 #[cfg(test)]
@@ -196,5 +219,36 @@ mod tests {
         let (w, h) = scaled_dimensions(1, 100_000);
         assert_eq!(w, 1);
         assert_eq!(h, 2000);
+    }
+
+    #[test]
+    fn normalize_image_accepts_data_url_input() {
+        // data URL 入站：归一为裸 base64，mime 取自 data URL 内嵌声明
+        let png = small_png_base64(64);
+        let img = ImageContent {
+            mime_type: String::new(),
+            data: format!("data:image/png;base64,{png}"),
+        };
+        let out = normalize_image(&img).expect("data URL 达标图应成功");
+        assert_eq!(out.mime_type, "image/png");
+        assert_eq!(out.data, png, "应剥离 data: 前缀保留裸 base64");
+    }
+
+    #[test]
+    fn normalize_images_batch_collects_kept_and_failed() {
+        // 一张达标裸 base64 + 一张超限且不可解码 → kept=1, failed=1
+        let good = ImageContent {
+            mime_type: "image/png".into(),
+            data: small_png_base64(32),
+        };
+        let bad = ImageContent {
+            mime_type: "image/png".into(),
+            data: base64::engine::general_purpose::STANDARD
+                .encode(b"not an image")
+                .repeat(400_000),
+        };
+        let (kept, failed) = normalize_images(&[good, bad]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(failed, 1);
     }
 }

@@ -15,7 +15,7 @@ use super::SessionCtx;
 use crate::dispatch;
 use crate::engine::types::SharedQueue;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
-use fuyao_api::{Message, OutputEvent, Session};
+use fuyao_api::{ImageContent, Message, OutputEvent, Session};
 
 /// 一次性取出 guide 全部消息（非阻塞，drain 清空队列）
 pub(crate) fn consume_all_guide(guide: &SharedQueue) -> Vec<OutputUserMessage> {
@@ -62,6 +62,28 @@ pub(crate) async fn inject_messages(
     };
 
     for m in msgs {
+        // 入站节流（CPU 密集：base64 解码 + 图像编解码）放阻塞线程池，避免占用 async worker
+        let (kept, failed) = if m.payload.images.is_empty() || !supports_images {
+            (Vec::new(), 0usize)
+        } else {
+            let imgs = m.payload.images.clone();
+            let total = imgs.len();
+            match tokio::task::spawn_blocking(move || super::normalize::normalize_images(&imgs))
+                .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        image_count = total,
+                        cause = %e,
+                        "图片节流任务异常，全部按失败处理"
+                    );
+                    (Vec::new(), total)
+                }
+            }
+        };
+
         let event = OutputEvent::User(m);
         let _ = dispatch::emit_to_history(
             &ctx.emitter,
@@ -69,7 +91,7 @@ pub(crate) async fn inject_messages(
             ctx.store.as_ref(),
             session,
             event,
-            |ev| user_msg_from_event(ev, supports_images),
+            move |ev| user_msg_from_event(ev, supports_images, kept, failed),
         )
         .await;
     }
@@ -86,14 +108,21 @@ const IMAGE_PROCESS_FAILED_PLACEHOLDER: &str = "[图片已省略：图片处理�
 /// 拦截后的 content 用于构造 Message——保证「拦截 → 存储 → 发送」三者一致。
 /// 带图消息按模型能力分流：
 /// - 不支持 → 图丢弃、content 附加占位文本并告警（对话连续性优先，整体不失败）
-/// - 支持 → 逐图入站节流（normalize）：成功图随消息落库；失败图（解码失败 /
-///   压缩后仍超限）替换为占位文本，不拖累其余图
-fn user_msg_from_event(ev: &OutputEvent, supports_images: bool) -> Option<Message> {
+/// - 支持 → 图已在 [`inject_messages`] 经阻塞池节流得到 `kept`（达标图）与 `failed`
+///   （失败计数），失败图替换为占位文本，不拖累其余图
+fn user_msg_from_event(
+    ev: &OutputEvent,
+    supports_images: bool,
+    kept: Vec<ImageContent>,
+    failed: usize,
+) -> Option<Message> {
     match ev {
         OutputEvent::User(m) => {
+            // 无图消息：纯文本落库
             if m.payload.images.is_empty() {
                 return Some(Message::user(m.payload.content.clone()));
             }
+            // 模型不支持图像输入：图不落库，content 附加占位文本
             if !supports_images {
                 tracing::warn!(
                     session_id = %m.base.session_id.as_deref().unwrap_or(""),
@@ -105,16 +134,7 @@ fn user_msg_from_event(ev: &OutputEvent, supports_images: bool) -> Option<Messag
                     IMAGE_OMITTED_PLACEHOLDER,
                 )));
             }
-
-            // 模型支持图：逐图入站节流，失败图替换为占位文本
-            let mut kept = Vec::new();
-            let mut failed = 0usize;
-            for img in &m.payload.images {
-                match super::normalize::normalize_image(img) {
-                    Some(normalized) => kept.push(normalized),
-                    None => failed += 1,
-                }
-            }
+            // 模型支持：用阻塞池节流结果（kept 达标图 + failed 失败计数）
             if failed > 0 {
                 tracing::warn!(
                     session_id = %m.base.session_id.as_deref().unwrap_or(""),
