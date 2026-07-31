@@ -21,6 +21,7 @@
 //! 工具结果不走队列：它是 ReAct 循环内部中间产物，产生即落 DB（事件级落库）。
 
 mod builders;
+mod normalize;
 pub(crate) mod queue;
 pub(crate) mod retry;
 #[cfg(test)]

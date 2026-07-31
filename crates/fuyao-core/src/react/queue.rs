@@ -78,35 +78,67 @@ pub(crate) async fn inject_messages(
 /// 模型不支持图像输入时的占位文本（可见于对话，告知用户图片未发送的原因）
 const IMAGE_OMITTED_PLACEHOLDER: &str = "[图片已省略：当前模型不支持图像输入]";
 
+/// 图片入站节流失败时的占位文本（解码失败 / 压缩后仍超限）
+const IMAGE_PROCESS_FAILED_PLACEHOLDER: &str = "[图片已省略：图片处理失败]";
+
 /// 从 User 输出事件构造 Message（emit_to_history 闭包）
 ///
 /// 拦截后的 content 用于构造 Message——保证「拦截 → 存储 → 发送」三者一致。
-/// 带图消息按 `supports_images` 分流：支持 → 图随消息落库；不支持 → 图丢弃、
-/// content 附加占位文本并告警（对话连续性优先，整体不失败）。
+/// 带图消息按模型能力分流：
+/// - 不支持 → 图丢弃、content 附加占位文本并告警（对话连续性优先，整体不失败）
+/// - 支持 → 逐图入站节流（normalize）：成功图随消息落库；失败图（解码失败 /
+///   压缩后仍超限）替换为占位文本，不拖累其余图
 fn user_msg_from_event(ev: &OutputEvent, supports_images: bool) -> Option<Message> {
     match ev {
         OutputEvent::User(m) => {
             if m.payload.images.is_empty() {
                 return Some(Message::user(m.payload.content.clone()));
             }
-            if supports_images {
-                return Some(Message::user_with_images(
-                    m.payload.content.clone(),
-                    m.payload.images.clone(),
-                ));
+            if !supports_images {
+                tracing::warn!(
+                    session_id = %m.base.session_id.as_deref().unwrap_or(""),
+                    image_count = m.payload.images.len(),
+                    "图片已省略：当前模型不支持图像输入"
+                );
+                return Some(Message::user(append_placeholder(
+                    &m.payload.content,
+                    IMAGE_OMITTED_PLACEHOLDER,
+                )));
             }
-            tracing::warn!(
-                session_id = %m.base.session_id.as_deref().unwrap_or(""),
-                image_count = m.payload.images.len(),
-                "图片已省略：当前模型不支持图像输入"
-            );
-            let content = if m.payload.content.trim().is_empty() {
-                IMAGE_OMITTED_PLACEHOLDER.to_string()
+
+            // 模型支持图：逐图入站节流，失败图替换为占位文本
+            let mut kept = Vec::new();
+            let mut failed = 0usize;
+            for img in &m.payload.images {
+                match super::normalize::normalize_image(img) {
+                    Some(normalized) => kept.push(normalized),
+                    None => failed += 1,
+                }
+            }
+            if failed > 0 {
+                tracing::warn!(
+                    session_id = %m.base.session_id.as_deref().unwrap_or(""),
+                    image_count = m.payload.images.len(),
+                    failed = failed,
+                    "图片处理失败，已省略并附加占位文本"
+                );
+            }
+            let content = if failed > 0 {
+                append_placeholder(&m.payload.content, IMAGE_PROCESS_FAILED_PLACEHOLDER)
             } else {
-                format!("{}\n\n{}", m.payload.content, IMAGE_OMITTED_PLACEHOLDER)
+                m.payload.content.clone()
             };
-            Some(Message::user(content))
+            Some(Message::user_with_images(content, kept))
         }
         _ => None,
+    }
+}
+
+/// 在消息文本后附加占位文本（纯图消息则占位文本即全文）
+fn append_placeholder(content: &str, placeholder: &str) -> String {
+    if content.trim().is_empty() {
+        placeholder.to_string()
+    } else {
+        format!("{content}\n\n{placeholder}")
     }
 }
