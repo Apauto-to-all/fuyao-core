@@ -24,6 +24,7 @@ pub mod env;
 pub mod error;
 pub mod guard;
 pub mod hooks;
+pub mod image;
 pub mod llm;
 pub mod loader;
 pub mod logging;
@@ -46,6 +47,7 @@ use crate::provider::Provider;
 pub use engine::EngineConfig;
 pub use guard::{GuardConfig, LoopGuardConfig};
 pub use hooks::HooksConfig;
+pub use image::ImageConfig;
 pub use llm::{LlmConfig, RetryConfig};
 pub use logging::{LogRotation, LoggingConfig};
 pub use mcp::McpGlobalConfig;
@@ -87,6 +89,9 @@ pub struct FuyaoConfig {
 
     /// LLM 调用层（超时 / 退避）
     pub llm: LlmConfig,
+
+    /// 图片处理（入站节流 / token 估算）
+    pub image: ImageConfig,
 
     /// 会话（压缩 / 存储）
     pub session: SessionConfig,
@@ -151,6 +156,7 @@ mod tests {
         assert_eq!(c.tools.limits.terminal_max_timeout_secs, 6000);
         assert_eq!(c.guard.loop_.tool_repeat_threshold, 4);
         assert_eq!(c.llm.request_timeout_secs, 300);
+        assert_eq!(c.image.max_pixels, 2000);
         assert_eq!(c.session.compression.threshold, 0.85);
         assert_eq!(c.mcp.tool_timeout_secs, 120);
         assert_eq!(c.engine.output_channel_capacity, 256);

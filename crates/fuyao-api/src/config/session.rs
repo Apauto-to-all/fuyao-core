@@ -41,6 +41,8 @@ pub struct CompressionConfig {
     pub fallback_context: u32,
     /// 反抖动：连续两次压缩节省比例低于此值（%）时停压缩
     pub min_savings_pct: u8,
+    /// 压缩 token 估算：每张图固定占用 token（不按 base64 字符数，避免撑爆触发误压缩），原 `compressor/window.rs TOKENS_PER_IMAGE = 1000`
+    pub tokens_per_image: usize,
     /// 是否跳过子 session（有 parent_session_id）的上下文压缩
     ///
     /// 子代理以 Fresh 模式派生、一次性运行，只把最终回复文本作为 tool_result 回喂父 Agent，
@@ -60,6 +62,7 @@ impl Default for CompressionConfig {
             summary_max_tokens: 4096,
             fallback_context: 128_000,
             min_savings_pct: 10,
+            tokens_per_image: 1000,
             skip_child: true,
         }
     }
@@ -225,6 +228,7 @@ mod tests {
 max_connections = 10
 [session.compression]
 threshold = 0.9
+tokens_per_image = 2000
 "#;
         #[derive(Deserialize)]
         struct Wrap {
@@ -237,5 +241,6 @@ threshold = 0.9
         assert!((w.session.compression.threshold - 0.9).abs() < f64::EPSILON);
         assert!((w.session.compression.keep_ratio - 0.05).abs() < f64::EPSILON);
         assert_eq!(w.session.compression.keep_tokens_max, 8000);
+        assert_eq!(w.session.compression.tokens_per_image, 2000);
     }
 }

@@ -25,11 +25,11 @@ mod tool;
 // 导出常用类型
 pub use agent::{AgentConfig, AgentPaths, EngineParams, ModelConfig, SessionParams};
 pub use config::{
-    CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig, LlmConfig,
-    LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef, ModelSelection,
-    PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig, TitleConfig, ToolRunnerConfig,
-    ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env, load_merged_config,
-    set_config, unknown_tool_names,
+    CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig,
+    ImageConfig, LlmConfig, LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef,
+    ModelSelection, PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig, TitleConfig,
+    ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env,
+    load_merged_config, set_config, unknown_tool_names,
 };
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;

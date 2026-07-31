@@ -13,24 +13,13 @@ use base64::Engine;
 use fuyao_api::ImageContent;
 use std::io::Cursor;
 
-/// 图片最大边长（像素），超限等比缩放
-const MAX_IMAGE_PIXELS: u32 = 2000;
-
-/// 图片 base64 最大字节数，超限压缩
-const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
-
-/// JPEG 压缩质量档位（降序尝试，首个达标即用）
-///
-/// 从最高画质起降：优先保留画质，文件过大则逐档牺牲画质换体积。
-const JPEG_QUALITIES: [u8; 5] = [85, 80, 70, 55, 40];
-
-/// 等比缩放目标尺寸：最大边长 > 2000px 时缩到 2000px，否则原尺寸
-fn scaled_dimensions(w: u32, h: u32) -> (u32, u32) {
+/// 等比缩放目标尺寸：最大边长超限缩到 max_pixels，否则原尺寸
+fn scaled_dimensions(w: u32, h: u32, max_pixels: u32) -> (u32, u32) {
     let max = w.max(h);
-    if max <= MAX_IMAGE_PIXELS {
+    if max <= max_pixels {
         return (w, h);
     }
-    let scale = MAX_IMAGE_PIXELS as f64 / max as f64;
+    let scale = max_pixels as f64 / max as f64;
     (
         ((w as f64) * scale).max(1.0) as u32,
         ((h as f64) * scale).max(1.0) as u32,
@@ -41,12 +30,19 @@ fn scaled_dimensions(w: u32, h: u32) -> (u32, u32) {
 ///
 /// 返回 `None` 表示无法得到达标图（解码失败 / 全档压缩仍超限），调用方降级。
 pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
+    let cfg = fuyao_api::get_config();
+
     // 入站归一：data URL → 裸 base64（统一后续处理基准与落库形态）
     // 非 data URL（裸 base64）from_data_url 返回 None，沿用入参原值
     let img = ImageContent::from_data_url(&img.data).unwrap_or_else(|| img.clone());
 
     // 字节达标：原样保留（压缩有损，不重复动）
-    if img.data.len() <= MAX_IMAGE_BASE64_BYTES {
+    if img.data.len() <= cfg.image.max_base64_bytes {
+        return Some(img);
+    }
+
+    // 关闭压缩：超限图原样保留（仍含上方 data URL 归一结果），存储膨胀与发送超限风险由用户自负
+    if !cfg.image.compress {
         return Some(img);
     }
 
@@ -56,7 +52,7 @@ pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
         .ok()?;
     let dyn_img = image::load_from_memory(&bytes).ok()?;
     let (w, h) = (dyn_img.width(), dyn_img.height());
-    let (nw, nh) = scaled_dimensions(w, h);
+    let (nw, nh) = scaled_dimensions(w, h, cfg.image.max_pixels);
     let resized = if (nw, nh) != (w, h) {
         dyn_img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
     } else {
@@ -66,18 +62,18 @@ pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
     // 统一转 RGB 后按质量档位编码 JPEG，首个达标即用
     let rgb = resized.to_rgb8();
     let (rw, rh) = (rgb.width(), rgb.height());
-    for quality in JPEG_QUALITIES {
+    for quality in &cfg.image.jpeg_qualities {
         let mut buf = Vec::new();
         {
             let mut cursor = Cursor::new(&mut buf);
             let mut encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality);
+                image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, *quality);
             encoder
                 .encode(rgb.as_raw(), rw, rh, image::ExtendedColorType::Rgb8)
                 .ok()?;
         }
         let data = base64::engine::general_purpose::STANDARD.encode(&buf);
-        if data.len() <= MAX_IMAGE_BASE64_BYTES {
+        if data.len() <= cfg.image.max_base64_bytes {
             return Some(ImageContent {
                 mime_type: "image/jpeg".to_string(),
                 data,
@@ -145,12 +141,13 @@ mod tests {
 
     #[test]
     fn normalize_keeps_small_image_untouched() {
+        let max_bytes = fuyao_api::get_config().image.max_base64_bytes;
         // 字节达标：原样保留（mime / data 完全一致）
         let img = ImageContent {
             mime_type: "image/png".into(),
             data: small_png_base64(64),
         };
-        assert!(img.data.len() < MAX_IMAGE_BASE64_BYTES);
+        assert!(img.data.len() < max_bytes);
         let out = normalize_image(&img).expect("达标图不应失败");
         assert_eq!(out.mime_type, "image/png");
         assert_eq!(out.data, img.data);
@@ -158,10 +155,13 @@ mod tests {
 
     #[test]
     fn normalize_compresses_oversized_image() {
+        let cfg = fuyao_api::get_config();
+        let max_bytes = cfg.image.max_base64_bytes;
+        let max_pixels = cfg.image.max_pixels;
         // 超限大图：压缩后必须 ≤5MB base64，且 mime 转 JPEG
         let raw = oversized_image_base64(3000);
         assert!(
-            raw.len() > MAX_IMAGE_BASE64_BYTES,
+            raw.len() > max_bytes,
             "测试前置：原始图必须超限，实际 {}",
             raw.len()
         );
@@ -171,7 +171,7 @@ mod tests {
         };
         let out = normalize_image(&img).expect("大图应能压缩");
         assert!(
-            out.data.len() <= MAX_IMAGE_BASE64_BYTES,
+            out.data.len() <= max_bytes,
             "压缩后应 ≤5MB，实际 {}",
             out.data.len()
         );
@@ -183,8 +183,8 @@ mod tests {
         let decoded = image::load_from_memory(&bytes).unwrap();
         let (w, h) = (decoded.width(), decoded.height());
         assert!(
-            w.max(h) <= MAX_IMAGE_PIXELS,
-            "缩放后最大边应 ≤2000，实际 {w}x{h}"
+            w.max(h) <= max_pixels,
+            "缩放后最大边应 ≤{max_pixels}，实际 {w}x{h}"
         );
     }
 
@@ -211,12 +211,13 @@ mod tests {
 
     #[test]
     fn scaled_dimensions_shrinks_only_oversized() {
-        assert_eq!(scaled_dimensions(100, 200), (100, 200));
-        assert_eq!(scaled_dimensions(2000, 1500), (2000, 1500));
-        assert_eq!(scaled_dimensions(4000, 2000), (2000, 1000));
-        assert_eq!(scaled_dimensions(8000, 4000), (2000, 1000));
+        let max_pixels = 2000;
+        assert_eq!(scaled_dimensions(100, 200, max_pixels), (100, 200));
+        assert_eq!(scaled_dimensions(2000, 1500, max_pixels), (2000, 1500));
+        assert_eq!(scaled_dimensions(4000, 2000, max_pixels), (2000, 1000));
+        assert_eq!(scaled_dimensions(8000, 4000, max_pixels), (2000, 1000));
         // 极端长条不压成 0
-        let (w, h) = scaled_dimensions(1, 100_000);
+        let (w, h) = scaled_dimensions(1, 100_000, max_pixels);
         assert_eq!(w, 1);
         assert_eq!(h, 2000);
     }

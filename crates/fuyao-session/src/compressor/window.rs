@@ -8,13 +8,6 @@ use fuyao_api::{Message, MessageKind, MessageRole};
 /// 4 字符 ≈ 1 token 的粗估
 const CHARS_PER_TOKEN: usize = 4;
 
-/// 每张图片估算 token（对齐高分辨率档位）
-///
-/// 不按 base64 字符数估算——否则一张图按 4 字符≈1 token 会被算成几十万 token，
-/// 撑爆估算直接误触压缩。图片 token 由像素尺寸决定，与 base64 体积无线性关系，
-/// 固定值覆盖高分辨率档位（2048px 档的实际消耗），保守偏大不误触。
-const TOKENS_PER_IMAGE: usize = 1000;
-
 /// 窗口切分结果
 #[derive(Debug)]
 pub struct Window<'a> {
@@ -26,6 +19,8 @@ pub struct Window<'a> {
 
 /// 估算单条消息的 token 数
 fn estimate_message_tokens(msg: &Message) -> usize {
+    // 每张图固定占用 token（不按 base64 字符数估算，避免撑爆触发误压缩）
+    let tokens_per_image = fuyao_api::get_config().session.compression.tokens_per_image;
     let text_len =
         msg.content.as_deref().unwrap_or("").len() + msg.reasoning.as_deref().unwrap_or("").len();
     // 不解析 tool_calls JSON 深度估算——保留粗估，压缩触发偏保守没问题
@@ -37,7 +32,7 @@ fn estimate_message_tokens(msg: &Message) -> usize {
     text_len.div_ceil(CHARS_PER_TOKEN)
         + tool_len.div_ceil(CHARS_PER_TOKEN)
         + 4
-        + msg.images.len() * TOKENS_PER_IMAGE
+        + msg.images.len() * tokens_per_image
 }
 
 /// 估算一批消息的总 token 数
@@ -173,6 +168,7 @@ mod tests {
 
     #[test]
     fn estimate_tokens_with_images_adds_fixed_per_image() {
+        let tokens_per_image = fuyao_api::get_config().session.compression.tokens_per_image;
         // 无图：8 字符 → 2 + 4 开销 = 6
         let msg = Message::user("12345678".to_string());
         assert_eq!(estimate_message_tokens(&msg), 6);
@@ -186,7 +182,7 @@ mod tests {
             Message::user_with_images("12345678".to_string(), vec![img.clone(), img]);
         assert_eq!(
             estimate_message_tokens(&msg_with_images),
-            6 + 2 * TOKENS_PER_IMAGE
+            6 + 2 * tokens_per_image
         );
     }
 
