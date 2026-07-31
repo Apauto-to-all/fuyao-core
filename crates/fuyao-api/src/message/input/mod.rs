@@ -6,13 +6,16 @@
 //! - `User`: 用户消息（envelope {base, payload}）
 //! - `Interrupt`: 中断信号（envelope {base, payload}）
 //! - `Plugin`: 插件通知（envelope {base, payload}）
+//! - `Compress`: 手动压缩请求（envelope {base}，无业务载荷）
 
-// 子模块：每种事件类型独立文件
+// 子模块：每种事件类型独立文件管理
+mod compress;
 mod interrupt;
 mod plugin;
 mod user;
 
 // envelope / payload 在 input 层导出（外部通过 input::UserMessage 等路径访问）
+pub use compress::CompressRequest;
 pub use interrupt::{InterruptMessage, InterruptPayload, InterruptSource};
 pub use plugin::{PluginEventSource, PluginMessage, PluginPayload};
 pub use user::{
@@ -32,6 +35,11 @@ pub enum InputEvent {
     /// 插件通知：插件通过 SendInputFn 发送的通知（警告、状态等）
     /// 引擎收到后转发为 OutputEvent::Plugin 通知 UI
     Plugin(PluginMessage),
+    /// 手动压缩请求：用户 / 上层应用主动请求一次上下文压缩
+    ///
+    /// 经引擎入口送入控制通道，在 turn 边界触发压缩（跳过阈值与反抖动，
+    /// 复用自动压缩执行流程，触发原因标记为 manual）。
+    Compress(CompressRequest),
 }
 
 #[cfg(test)]
@@ -104,6 +112,17 @@ mod tests {
     }
 
     #[test]
+    fn compress_event_carries_base() {
+        let event = InputEvent::Compress(CompressRequest {
+            base: EventBase::default(),
+        });
+        match &event {
+            InputEvent::Compress(req) => assert!(!req.base.id.is_empty()),
+            _ => panic!("应为 Compress 变体"),
+        }
+    }
+
+    #[test]
     fn input_event_serde_roundtrip() {
         let event = InputEvent::User(UserMessage {
             base: EventBase::default(),
@@ -119,6 +138,19 @@ mod tests {
         match de {
             InputEvent::User(msg) => assert_eq!(msg.payload.content, "序列化"),
             _ => panic!("反序列化后应为 User 变体"),
+        }
+    }
+
+    #[test]
+    fn compress_event_serde_roundtrip() {
+        let event = InputEvent::Compress(CompressRequest {
+            base: EventBase::default(),
+        });
+        let json = serde_json::to_string(&event).expect("序列化失败");
+        let de: InputEvent = serde_json::from_str(&json).expect("反序列化失败");
+        match de {
+            InputEvent::Compress(req) => assert!(!req.base.id.is_empty()),
+            _ => panic!("反序列化后应为 Compress 变体"),
         }
     }
 }

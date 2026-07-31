@@ -5,9 +5,9 @@
 //! 全部为纯值类型，零 IO，零全局状态。
 
 use fuyao_api::message::input::{
-    InputEvent, InterruptMessage, InterruptPayload, InterruptSource, PluginEventSource,
-    PluginMessage, PluginPayload, PluginSource, SystemSource, UserMessage, UserMessageMode,
-    UserMessageSource, UserPayload,
+    CompressRequest, InputEvent, InterruptMessage, InterruptPayload, InterruptSource,
+    PluginEventSource, PluginMessage, PluginPayload, PluginSource, SystemSource, UserMessage,
+    UserMessageMode, UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, CompressionDeltaPayload,
@@ -90,11 +90,14 @@ fn input_event_samples() -> Vec<InputEvent> {
                 message: Some("检测到循环".into()),
             },
         }),
+        InputEvent::Compress(CompressRequest {
+            base: EventBase::default(),
+        }),
     ]
 }
 
 #[rstest]
-fn input_event_serde_preserves_variant(#[values(0, 1, 2)] idx: usize) {
+fn input_event_serde_preserves_variant(#[values(0, 1, 2, 3)] idx: usize) {
     let original = input_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: InputEvent = serde_json::from_str(&json).expect("反序列化失败");
@@ -104,6 +107,7 @@ fn input_event_serde_preserves_variant(#[values(0, 1, 2)] idx: usize) {
         (InputEvent::User(_), InputEvent::User(_)) => {}
         (InputEvent::Interrupt(_), InputEvent::Interrupt(_)) => {}
         (InputEvent::Plugin(_), InputEvent::Plugin(_)) => {}
+        (InputEvent::Compress(_), InputEvent::Compress(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
 }
