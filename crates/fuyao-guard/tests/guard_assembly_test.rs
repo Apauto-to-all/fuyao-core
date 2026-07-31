@@ -55,6 +55,7 @@ fn make_user_event_from_user() -> OutputEvent {
         base: EventBase::default(),
         payload: OutputUserPayload {
             content: "用户消息".to_string(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
         },
@@ -232,6 +233,7 @@ async fn plugin_injected_message_only_clears_pending() {
         base: EventBase::default(),
         payload: OutputUserPayload {
             content: "引导消息".to_string(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
                 name: "loop_guard".to_string(),

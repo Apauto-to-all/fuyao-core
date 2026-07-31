@@ -176,6 +176,41 @@ impl MessageRole {
     }
 }
 
+/// 图片内容块（多模态输入）
+///
+/// `data` 存**裸 base64**（不含 `data:` 前缀），`mime_type` 为图片 MIME 类型。
+/// 全链路（事件 → 落库 → 请求构造）统一此形态；data URL 在入站时解析归一化。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImageContent {
+    /// 图片 MIME 类型（如 `image/png` / `image/jpeg` / `image/webp`）
+    pub mime_type: String,
+    /// 图片数据（裸 base64，不含 `data:` 前缀）
+    pub data: String,
+}
+
+impl ImageContent {
+    /// 从 data URL 解析图片内容（`data:image/png;base64,xxxx`）
+    ///
+    /// 入站宽容：接受 data URL 或裸 base64 + 显式 mime（后者直接构造本类型）。
+    /// mime 段允许带参数（如 `data:image/png;charset=utf-8;base64,xxx`），取第一段。
+    /// 解析失败（非 data URL / mime 或数据为空）返回 `None`。
+    pub fn from_data_url(s: &str) -> Option<Self> {
+        let rest = s.strip_prefix("data:")?;
+        let (mime, b64) = rest.split_once(',')?;
+        if b64.is_empty() {
+            return None;
+        }
+        let mime = mime.split(';').next().unwrap_or("").trim();
+        if mime.is_empty() {
+            return None;
+        }
+        Some(Self {
+            mime_type: mime.to_string(),
+            data: b64.to_string(),
+        })
+    }
+}
+
 /// 消息（持久化单元）
 #[derive(Debug, Clone, Default)]
 pub struct Message {
@@ -189,6 +224,8 @@ pub struct Message {
     pub role: MessageRole,
     /// 消息内容
     pub content: Option<String>,
+    /// 图片内容列表（多模态输入，user 消息专用；其余角色恒为空）
+    pub images: Vec<ImageContent>,
     /// 推理内容
     pub reasoning: Option<String>,
     /// 工具调用 ID
@@ -223,6 +260,19 @@ impl Message {
         Self {
             role: MessageRole::User,
             content: Some(content),
+            timestamp: current_timestamp(),
+            ..Self::default()
+        }
+    }
+
+    /// 创建带图片的用户消息（多模态输入）
+    ///
+    /// 纯文本路径仍用 `user()`，图片是旁挂增量，两者并存。
+    pub fn user_with_images(content: String, images: Vec<ImageContent>) -> Self {
+        Self {
+            role: MessageRole::User,
+            content: Some(content),
+            images,
             timestamp: current_timestamp(),
             ..Self::default()
         }
@@ -371,6 +421,70 @@ mod tests {
         let msg = Message::user("你好".to_string());
         assert_eq!(msg.role, MessageRole::User);
         assert_eq!(msg.content, Some("你好".to_string()));
+        assert!(msg.images.is_empty());
+    }
+
+    #[test]
+    fn message_user_with_images_holds_images() {
+        let img = ImageContent {
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        };
+        let msg = Message::user_with_images("看图".to_string(), vec![img.clone()]);
+        assert_eq!(msg.role, MessageRole::User);
+        assert_eq!(msg.content, Some("看图".to_string()));
+        assert_eq!(msg.images, vec![img]);
+    }
+
+    #[test]
+    fn message_user_with_images_empty_images() {
+        let msg = Message::user_with_images("纯文本".to_string(), vec![]);
+        assert_eq!(msg.content, Some("纯文本".to_string()));
+        assert!(msg.images.is_empty());
+    }
+
+    #[test]
+    fn image_content_default_message_images_empty() {
+        // 无图消息的 images 恒为空
+        let msg = Message::assistant(Some("回复".to_string()));
+        assert!(msg.images.is_empty());
+    }
+
+    #[test]
+    fn image_content_from_data_url_parses() {
+        let img = ImageContent::from_data_url("data:image/png;base64,aGVsbG8=").unwrap();
+        assert_eq!(img.mime_type, "image/png");
+        assert_eq!(img.data, "aGVsbG8=");
+    }
+
+    #[test]
+    fn image_content_from_data_url_with_mime_params() {
+        // mime 段带参数时只取第一段
+        let img =
+            ImageContent::from_data_url("data:image/jpeg;charset=utf-8;base64,aGVsbG8=").unwrap();
+        assert_eq!(img.mime_type, "image/jpeg");
+        assert_eq!(img.data, "aGVsbG8=");
+    }
+
+    #[test]
+    fn image_content_from_data_url_rejects_invalid() {
+        // 非 data URL / 缺 mime / 空数据 均解析失败
+        assert!(ImageContent::from_data_url("http://example.com/a.png").is_none());
+        assert!(ImageContent::from_data_url("data:;base64,aGVsbG8=").is_none());
+        assert!(ImageContent::from_data_url("data:image/png;base64,").is_none());
+        assert!(ImageContent::from_data_url("data:image/png").is_none());
+        assert!(ImageContent::from_data_url("").is_none());
+    }
+
+    #[test]
+    fn image_content_serde_roundtrip() {
+        let img = ImageContent {
+            mime_type: "image/webp".into(),
+            data: "d2VicA==".into(),
+        };
+        let json = serde_json::to_string(&img).unwrap();
+        let de: ImageContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(de, img);
     }
 
     #[test]

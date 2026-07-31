@@ -84,6 +84,7 @@ impl SessionSender {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: content.into(),
+                images: vec![],
                 mode,
                 source: UserMessageSource::Plugin(PluginSource {
                     name: self.identity.name.clone(),

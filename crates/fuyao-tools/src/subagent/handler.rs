@@ -113,6 +113,7 @@ pub async fn subagent_handler(
         base: EventBase::default(),
         payload: UserPayload {
             content: prompt,
+            images: vec![],
             mode: Default::default(),
             source: Default::default(),
         },

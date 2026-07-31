@@ -66,6 +66,7 @@ fn input_event_samples() -> Vec<InputEvent> {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "用户消息".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
             },
@@ -124,6 +125,7 @@ fn output_event_samples() -> Vec<OutputEvent> {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "你好".into(),
+                images: vec![],
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
             },
@@ -292,6 +294,7 @@ fn user_message_source_serde_preserves_branch(
 ) {
     let payload = UserPayload {
         content: "x".into(),
+        images: vec![],
         mode: UserMessageMode::Guide,
         source,
     };
@@ -312,11 +315,13 @@ fn input_and_output_user_message_are_independent_types() {
     // 两者 payload 字段同名（content/mode/source），但分属 input / output 模块
     let input_payload = UserPayload {
         content: "input".into(),
+        images: vec![],
         mode: UserMessageMode::Guide,
         source: UserMessageSource::User,
     };
     let output_payload = OutputUserPayload {
         content: "output".into(),
+        images: vec![],
         mode: UserMessageMode::Pending,
         source: UserMessageSource::System(SystemSource {
             reason: "测试".into(),

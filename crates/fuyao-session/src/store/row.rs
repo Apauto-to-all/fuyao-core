@@ -89,6 +89,8 @@ impl From<MessageRow> for Message {
             model_id: r.model_id,
             role: MessageRole::parse(&r.role),
             content: r.content,
+            // 图片持久化列尚未接入，当前读回恒为空
+            images: vec![],
             reasoning: r.reasoning,
             tool_call_id: r.tool_call_id,
             tool_calls,

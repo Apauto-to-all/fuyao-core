@@ -608,6 +608,7 @@ mod tests {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "[循环检测] 请调整策略".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::Plugin(PluginSource {
                     name: "loop_guard".into(),
@@ -669,6 +670,7 @@ mod tests {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "[循环检测] 请调整策略".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::Plugin(PluginSource {
                     name: "loop_guard".into(),
@@ -715,6 +717,7 @@ mod tests {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "新任务".into(),
+                images: vec![],
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
             },

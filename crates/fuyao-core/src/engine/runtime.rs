@@ -43,6 +43,7 @@ impl Engine {
                     base: user_msg.base,
                     payload: fuyao_api::message::output::UserPayload {
                         content: user_msg.payload.content,
+                        images: user_msg.payload.images,
                         mode: user_msg.payload.mode,
                         source: user_msg.payload.source,
                     },

@@ -105,6 +105,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "你好".into(),
+                images: vec![],
                 mode: crate::message::UserMessageMode::Guide,
                 source: crate::message::UserMessageSource::User,
             },

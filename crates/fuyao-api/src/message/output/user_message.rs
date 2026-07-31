@@ -25,6 +25,9 @@ pub struct UserMessage {
 pub struct UserPayload {
     /// 消息文本内容
     pub content: String,
+    /// 图片附件列表（与输入侧一致，引擎回显图片形态不变）
+    #[serde(default)]
+    pub images: Vec<crate::ImageContent>,
     /// 消息模式
     pub mode: UserMessageMode,
     /// 消息来源
@@ -42,6 +45,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "你好".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
             },
@@ -57,6 +61,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "clone测试".into(),
+                images: vec![],
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
             },

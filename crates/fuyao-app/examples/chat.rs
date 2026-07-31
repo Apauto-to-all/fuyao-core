@@ -169,6 +169,7 @@ async fn send_to(app: &App, session_id: &str, content: &str) {
         base: EventBase::default(),
         payload: UserPayload {
             content: content.to_string(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
         },

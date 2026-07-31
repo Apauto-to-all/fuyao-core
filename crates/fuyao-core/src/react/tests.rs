@@ -266,6 +266,7 @@ fn make_inbound(content: &str) -> OutputUserMessage {
         base: EventBase::default(),
         payload: OutputUserPayload {
             content: content.to_string(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
         },
@@ -278,6 +279,7 @@ fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> OutputUserMes
         base: EventBase::default(),
         payload: OutputUserPayload {
             content: content.to_string(),
+            images: vec![],
             mode,
             source: UserMessageSource::User,
         },
@@ -1582,6 +1584,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         base: EventBase::default(),
         payload: OutputUserPayload {
             content: "循环检测提醒".into(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
                 name: "loop_guard".into(),

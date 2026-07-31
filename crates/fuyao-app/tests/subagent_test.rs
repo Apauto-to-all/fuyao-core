@@ -116,6 +116,7 @@ fn guide_msg(content: &str) -> InputEvent {
         base: EventBase::default(),
         payload: UserPayload {
             content: content.to_string(),
+            images: vec![],
             mode: Default::default(),
             source: Default::default(),
         },

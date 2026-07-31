@@ -45,6 +45,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "测试消息".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
             },
@@ -108,6 +109,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "序列化".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
             },

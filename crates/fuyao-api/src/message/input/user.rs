@@ -93,6 +93,9 @@ pub struct UserMessage {
 pub struct UserPayload {
     /// 消息文本内容（用户输入的文字）
     pub content: String,
+    /// 图片附件列表（多模态输入，可为空；data URL 或裸 base64 均接受，落库前归一为裸 base64）
+    #[serde(default)]
+    pub images: Vec<crate::ImageContent>,
     /// 消息模式：guide（引导）或 pending（排队），默认 guide
     pub mode: UserMessageMode,
     /// 消息来源：用户输入、系统注入或插件注入，默认 user
@@ -120,6 +123,7 @@ mod tests {
     fn user_payload_holds_fields() {
         let payload = UserPayload {
             content: "你好".into(),
+            images: vec![],
             mode: UserMessageMode::Pending,
             source: UserMessageSource::User,
         };
@@ -132,6 +136,7 @@ mod tests {
     fn user_payload_inject_source() {
         let payload = UserPayload {
             content: "检测到循环，请调整策略".into(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::Plugin(PluginSource {
                 name: "loop_guard".into(),
@@ -149,6 +154,7 @@ mod tests {
     fn user_payload_system_source() {
         let payload = UserPayload {
             content: "超时提醒".into(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::System(SystemSource {
                 reason: "timeout".into(),
@@ -168,6 +174,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "你好".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
             },
@@ -187,6 +194,7 @@ mod tests {
     fn user_payload_clone_works() {
         let payload = UserPayload {
             content: "clone测试".into(),
+            images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
         };
@@ -202,6 +210,7 @@ mod tests {
             base: EventBase::default(),
             payload: UserPayload {
                 content: "序列化测试".into(),
+                images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
             },
@@ -210,5 +219,33 @@ mod tests {
         let de: UserMessage = serde_json::from_str(&json).expect("反序列化失败");
         assert_eq!(de.payload.content, "序列化测试");
         assert_eq!(de.base.id, msg.base.id);
+    }
+
+    #[test]
+    fn user_payload_images_serde_roundtrip() {
+        let img = crate::ImageContent {
+            mime_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        };
+        let payload = UserPayload {
+            content: "看图".into(),
+            images: vec![img],
+            mode: UserMessageMode::Guide,
+            source: UserMessageSource::User,
+        };
+        let json = serde_json::to_string(&payload).expect("序列化失败");
+        let de: UserPayload = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(de.images.len(), 1);
+        assert_eq!(de.images[0].mime_type, "image/png");
+        assert_eq!(de.images[0].data, "aGVsbG8=");
+    }
+
+    #[test]
+    fn user_payload_images_serde_default_when_missing() {
+        // 旧格式事件（无 images 字段）反序列化时 images 默认为空——事件协议零迁移
+        let old_json = r#"{"content":"旧消息","mode":"Guide","source":"User"}"#;
+        let de: UserPayload = serde_json::from_str(old_json).expect("反序列化失败");
+        assert_eq!(de.content, "旧消息");
+        assert!(de.images.is_empty());
     }
 }
