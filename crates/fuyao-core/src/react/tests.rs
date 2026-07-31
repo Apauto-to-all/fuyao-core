@@ -325,6 +325,19 @@ async fn make_harness_with_hooks(
     tools: Arc<ToolRegistry>,
     hooks: fuyao_hooks::SharedHooks,
 ) -> TestHarness {
+    make_harness_full(provider, tools, hooks, fuyao_api::AgentPaths::default()).await
+}
+
+/// 同 make_harness_with_hooks，但可指定 agent_paths
+///
+/// 全局模型缓存按 agent_paths 隔离——需要注册独立模型配置（如图片能力）的测试
+/// 用独立的 agent_id 键，避免污染/被污染其他并行测试的缓存。
+async fn make_harness_full(
+    provider: Arc<dyn Provider>,
+    tools: Arc<ToolRegistry>,
+    hooks: fuyao_hooks::SharedHooks,
+    agent_paths: fuyao_api::AgentPaths,
+) -> TestHarness {
     let store = temp_store().await;
     let mut session = Session::new(None, Some("系统提示词".to_string()));
     // 强制 session.id 与 emitter 的 session_id 一致
@@ -343,7 +356,7 @@ async fn make_harness_with_hooks(
         providers,
         tools,
         hooks,
-        agent_paths: fuyao_api::AgentPaths::default(),
+        agent_paths,
         definition: fuyao_api::AgentDefinition::default(),
         session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
         emitter: Emitter::new(tx_event, "test_session".to_string()),
@@ -1602,4 +1615,113 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         },
         _ => panic!("应为 User 事件"),
     }
+}
+
+/// 构造带图输出用户消息
+fn make_inbound_with_images(content: &str) -> OutputUserMessage {
+    OutputUserMessage {
+        base: EventBase::default(),
+        payload: OutputUserPayload {
+            content: content.to_string(),
+            images: vec![fuyao_api::ImageContent {
+                mime_type: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+            mode: UserMessageMode::Guide,
+            source: UserMessageSource::User,
+        },
+    }
+}
+
+#[tokio::test]
+async fn inject_images_omitted_when_model_unsupported() {
+    // 模型未声明图片能力（默认安全）：图不落库，content 附加占位文本告警
+    let provider = Arc::new(MockProvider::new(vec![]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    queue::inject_messages(
+        &h.ctx,
+        &mut h.session,
+        vec![make_inbound_with_images("看图")],
+    )
+    .await;
+
+    let visible = visible_messages(&h).await;
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].images.is_empty(), "不支持图时图片不应落库");
+    let content = visible[0].content.as_deref().unwrap();
+    assert!(content.starts_with("看图"), "文本应原样保留");
+    assert!(
+        content.contains("[图片已省略"),
+        "content 应含图片省略占位文本，实际：{content}"
+    );
+}
+
+#[tokio::test]
+async fn inject_images_empty_text_uses_placeholder_only() {
+    // 消息无文本只有图 + 模型不支持：content 就是占位文本本身
+    let provider = Arc::new(MockProvider::new(vec![]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    queue::inject_messages(&h.ctx, &mut h.session, vec![make_inbound_with_images("")]).await;
+
+    let visible = visible_messages(&h).await;
+    assert_eq!(
+        visible[0].content.as_deref(),
+        Some("[图片已省略：当前模型不支持图像输入]")
+    );
+}
+
+#[tokio::test]
+async fn inject_images_persisted_when_model_supports() {
+    // 模型声明输入模态含 image：图随消息完整落库，content 原样
+    // 用独立 agent_id 的缓存键注册模型，避免污染默认键上其他并行测试
+    let paths = fuyao_api::AgentPaths {
+        agent_id: Some("test/images-support".into()),
+        workspace: None,
+        extra_dirs: vec![],
+        fuyao_home: std::path::PathBuf::from(std::env::temp_dir()).join("fuyao_core_test_home"),
+    };
+    let model = fuyao_api::Model {
+        name: "test-model".into(),
+        cost: Default::default(),
+        limit: Default::default(),
+        reasoning_efforts: vec![],
+        modalities: fuyao_api::ModelModalities {
+            input: vec!["text".into(), "image".into()],
+            output: vec!["text".into()],
+        },
+    };
+    let key = fuyao_provider::agent_paths_cache_key(&paths);
+    fuyao_provider::register_model("test/test-model", model, &key);
+
+    let provider = Arc::new(MockProvider::new(vec![]));
+    let mut h = make_harness_full(
+        provider,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        paths.clone(),
+    )
+    .await;
+    queue::inject_messages(
+        &h.ctx,
+        &mut h.session,
+        vec![make_inbound_with_images("看图")],
+    )
+    .await;
+
+    let visible = visible_messages(&h).await;
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0].images.len(), 1, "支持图时图片应完整落库");
+    assert_eq!(visible[0].images[0].mime_type, "image/png");
+    assert_eq!(visible[0].images[0].data, "aGVsbG8=");
+    assert_eq!(visible[0].content.as_deref(), Some("看图"), "content 原样");
+    assert!(
+        !visible[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("[图片已省略")
+    );
+
+    // 清理独立缓存键（只影响本测试）
+    fuyao_provider::clear_cache(&paths);
 }

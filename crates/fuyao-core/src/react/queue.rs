@@ -46,11 +46,21 @@ pub(crate) fn drain_pending_to_guide(guide: &SharedQueue, pending: &SharedQueue)
 /// 改写或阻断 user 消息（修复"拦截裂缝在 user 消息上重现"的结构性缺陷）。
 ///
 /// Block 时：该消息不落库、不发（插件的责任，与 assistant Block 语义一致）。
+///
+/// **图片降级决策在落库入口**：消费时按 session 模型能力判断一次——
+/// 模型不支持图像输入则图不落库、content 附加占位文本。此后所有读库路径
+/// （主对话请求 / 上下文压缩 / 标题生成）看到的都是降级后的形态，全链路一致。
 pub(crate) async fn inject_messages(
     ctx: &SessionCtx,
     session: &mut Session,
     msgs: Vec<OutputUserMessage>,
 ) {
+    // 会话模型配置（现读快照）+ 图片能力判定
+    let supports_images = {
+        let params = ctx.session_params.lock().await;
+        super::builders::model_supports_images(&params.model_config, &ctx.agent_paths)
+    };
+
     for m in msgs {
         let event = OutputEvent::User(m);
         let _ = dispatch::emit_to_history(
@@ -59,18 +69,44 @@ pub(crate) async fn inject_messages(
             ctx.store.as_ref(),
             session,
             event,
-            user_msg_from_event,
+            |ev| user_msg_from_event(ev, supports_images),
         )
         .await;
     }
 }
 
-/// 从 User 输出事件构造 `Message::user`（emit_to_history 闭包）
+/// 模型不支持图像输入时的占位文本（可见于对话，告知用户图片未发送的原因）
+const IMAGE_OMITTED_PLACEHOLDER: &str = "[图片已省略：当前模型不支持图像输入]";
+
+/// 从 User 输出事件构造 Message（emit_to_history 闭包）
 ///
 /// 拦截后的 content 用于构造 Message——保证「拦截 → 存储 → 发送」三者一致。
-fn user_msg_from_event(ev: &OutputEvent) -> Option<Message> {
+/// 带图消息按 `supports_images` 分流：支持 → 图随消息落库；不支持 → 图丢弃、
+/// content 附加占位文本并告警（对话连续性优先，整体不失败）。
+fn user_msg_from_event(ev: &OutputEvent, supports_images: bool) -> Option<Message> {
     match ev {
-        OutputEvent::User(m) => Some(Message::user(m.payload.content.clone())),
+        OutputEvent::User(m) => {
+            if m.payload.images.is_empty() {
+                return Some(Message::user(m.payload.content.clone()));
+            }
+            if supports_images {
+                return Some(Message::user_with_images(
+                    m.payload.content.clone(),
+                    m.payload.images.clone(),
+                ));
+            }
+            tracing::warn!(
+                session_id = %m.base.session_id.as_deref().unwrap_or(""),
+                image_count = m.payload.images.len(),
+                "图片已省略：当前模型不支持图像输入"
+            );
+            let content = if m.payload.content.trim().is_empty() {
+                IMAGE_OMITTED_PLACEHOLDER.to_string()
+            } else {
+                format!("{}\n\n{}", m.payload.content, IMAGE_OMITTED_PLACEHOLDER)
+            };
+            Some(Message::user(content))
+        }
         _ => None,
     }
 }

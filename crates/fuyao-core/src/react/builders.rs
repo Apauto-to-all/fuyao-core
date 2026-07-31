@@ -14,7 +14,7 @@ use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{MessageRole, ModelConfig};
+use fuyao_api::{AgentPaths, MessageRole, ModelConfig};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 use fuyao_session::SessionStore;
 use std::collections::HashMap;
@@ -114,6 +114,33 @@ pub(crate) async fn build_chat_request(
         messages,
         system: system_prompt.map(String::from),
     }
+}
+
+/// 查询模型是否支持图片输入（`modalities.input` 含 `"image"`）
+///
+/// model_id 解析与 [`resolve_model`] 同序：显式指定 → `[models.default]` 兜底。
+/// 未指定 / 格式非法 / 配置缺失（模型未声明 modalities）一律按不支持处理（安全默认）。
+///
+/// 消费点：user 消息落库时做图片降级决策——模型不支持则图不落库、
+/// 以占位文本代替，后续所有读库路径（主对话 / 压缩 / 标题）自然一致。
+pub(crate) fn model_supports_images(model_config: &ModelConfig, agent_paths: &AgentPaths) -> bool {
+    let model_id = match model_config.model_id.as_deref() {
+        Some(id) => id.to_string(),
+        None => {
+            let config = fuyao_api::get_config();
+            let Some(default_ref) = config.models.default.as_ref() else {
+                return false;
+            };
+            let id = default_ref.model.clone();
+            if id.is_empty() {
+                return false;
+            }
+            id
+        }
+    };
+    fuyao_provider::get_model(&model_id, agent_paths)
+        .map(|m| m.modalities.input.iter().any(|x| x == "image"))
+        .unwrap_or(false)
 }
 
 /// 从 ModelConfig 解析本轮模型信息
