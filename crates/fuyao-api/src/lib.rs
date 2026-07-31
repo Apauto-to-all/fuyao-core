@@ -11,6 +11,7 @@
 
 mod agent;
 mod config;
+mod control;
 mod error;
 mod mcp_types;
 pub mod message;
@@ -31,6 +32,7 @@ pub use config::{
     ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config, load_config, load_env,
     load_merged_config, set_config, unknown_tool_names,
 };
+pub use control::ControlCommand;
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{

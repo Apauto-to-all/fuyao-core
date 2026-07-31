@@ -358,6 +358,9 @@ impl Engine {
         let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::message::output::UserMessage>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
         let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
+        // 控制通道：承载 ControlCommand（手动压缩等 B 类信号），主循环 turn 边界消费。
+        // 容量小（8）——B 类命令频率低，主循环串行消费天然去重。
+        let (tx_control, rx_control) = mpsc::channel::<fuyao_api::ControlCommand>(8);
 
         // 该 session 的 per-session 出站通道（无界——事件入 channel 前已落库，
         // 不让 emit 阻塞反压到 ReAct turn 推进）
@@ -386,6 +389,7 @@ impl Engine {
             rx_inbound,
             rx_interrupt,
             rx_plugin,
+            rx_control,
             shutdown_token.clone(),
             session,
             Arc::clone(&self.store),
@@ -406,6 +410,7 @@ impl Engine {
                 tx_inbound,
                 tx_interrupt,
                 tx_plugin,
+                tx_control,
                 task,
                 shutdown_token,
                 session_params,

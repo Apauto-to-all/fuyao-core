@@ -9,13 +9,13 @@
 //! - `Compress`: 手动压缩请求（envelope {base}，无业务载荷）
 
 // 子模块：每种事件类型独立文件管理
-mod compress;
+mod compress_request;
 mod interrupt;
 mod plugin;
 mod user;
 
 // envelope / payload 在 input 层导出（外部通过 input::UserMessage 等路径访问）
-pub use compress::CompressRequest;
+pub use compress_request::CompressRequest;
 pub use interrupt::{InterruptMessage, InterruptPayload, InterruptSource};
 pub use plugin::{PluginEventSource, PluginMessage, PluginPayload};
 pub use user::{

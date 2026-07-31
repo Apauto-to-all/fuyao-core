@@ -643,6 +643,8 @@ async fn pending_consumed_when_task_idle() {
     std::mem::forget(rx_interrupt_tx);
     // Plugin 通道（保持打开，避免 rx_plugin.recv() 提前返回 None）
     let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
+    // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
+    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     // 启动 session 执行流（两队列都空，task 进入 select! 等待）
@@ -656,6 +658,7 @@ async fn pending_consumed_when_task_idle() {
         rx_inbound,
         rx_interrupt,
         rx_plugin,
+        rx_control,
         tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
@@ -731,6 +734,8 @@ async fn plugin_message_routes_through_dispatch() {
     std::mem::forget(rx_interrupt_tx);
     // tx_plugin 需要保留以发送消息
     let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
+    // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
+    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -743,6 +748,7 @@ async fn plugin_message_routes_through_dispatch() {
         rx_inbound,
         rx_interrupt,
         rx_plugin,
+        rx_control,
         tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
@@ -836,6 +842,8 @@ async fn plugin_forwards_during_active_turn() {
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
     let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
+    // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
+    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -849,7 +857,8 @@ async fn plugin_forwards_during_active_turn() {
         rx_inbound,
         rx_interrupt,
         rx_plugin,
-        shutdown_token.clone(),
+        rx_control,
+        tokio_util::sync::CancellationToken::new(),
         session,
         Arc::clone(&store),
         providers,
@@ -894,16 +903,16 @@ async fn plugin_forwards_during_active_turn() {
     // 断言：500ms 内收到 Plugin 事件（修复前会延迟整轮，流挂起=主循环永不回 idle=超时）
     let got = tokio::time::timeout(std::time::Duration::from_millis(500), async {
         loop {
-            if let Some(ev) = rx_event.recv().await {
-                if let OutputEvent::Plugin(m) = ev {
-                    assert_eq!(m.payload.source.name, "test_plugin");
-                    assert_eq!(
-                        m.base.session_id.as_deref(),
-                        Some("plugin_active"),
-                        "Plugin 事件应盖 session_id 标签"
-                    );
-                    return;
-                }
+            if let Some(ev) = rx_event.recv().await
+                && let OutputEvent::Plugin(m) = ev
+            {
+                assert_eq!(m.payload.source.name, "test_plugin");
+                assert_eq!(
+                    m.base.session_id.as_deref(),
+                    Some("plugin_active"),
+                    "Plugin 事件应盖 session_id 标签"
+                );
+                return;
             }
         }
     })
@@ -1844,4 +1853,58 @@ async fn inject_images_persisted_when_model_supports() {
 
     // 清理独立缓存键（只影响本测试）
     fuyao_provider::clear_cache(&paths);
+}
+
+/// 手动压缩：直接调 run_manual_compression，验证跳过阈值 + reason=manual + 复用执行流程
+///
+/// 关键点：last_usage 仍为 None（从未跑过 turn），自动压缩会因此早退；
+/// 手动压缩必须无视阈值直接执行，且 Started/Ended 的 reason 标记为 manual。
+#[tokio::test]
+async fn manual_compression_skips_threshold_and_marks_manual() {
+    use fuyao_api::message::output::{CompressionPayload, CompressionReason};
+
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "压缩摘要",
+    )]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    // 调小 fallback_context：让 keep 预算极小，旧消息进入 to_compress 窗口（否则全部
+    // 落 keep_recent → NothingToCompress 结构性跳过，与阈值无关）
+    h.ctx.compression_config.fallback_context = 10;
+    // 预置多条可见消息（压缩对象）
+    preload_user(&mut h, "第一段对话内容").await;
+    preload_user(&mut h, "第二段对话内容").await;
+    preload_user(&mut h, "第三段对话内容").await;
+    preload_user(&mut h, "第四段对话内容").await;
+    // last_usage 为 None（harness 默认）——自动压缩会早退，手动压缩必须照常执行
+
+    run_manual_compression(&h.ctx, &mut h.session).await;
+
+    let events = collect_events(&mut h.rx_event).await;
+
+    // Started：reason=manual
+    let started = events.iter().find_map(|e| match e {
+        OutputEvent::Compression(m) => match &m.payload {
+            CompressionPayload::Started(p) => Some(p),
+            _ => None,
+        },
+        _ => None,
+    });
+    let started = started.expect("应有 Compression Started 事件");
+    assert_eq!(
+        started.reason,
+        CompressionReason::Manual,
+        "手动压缩 reason 应为 manual"
+    );
+
+    // Ended：reason=manual + 摘要内容
+    let ended = events.iter().find_map(|e| match e {
+        OutputEvent::Compression(m) => match &m.payload {
+            CompressionPayload::Ended(p) => Some(p),
+            _ => None,
+        },
+        _ => None,
+    });
+    let ended = ended.expect("应有 Compression Ended 事件");
+    assert_eq!(ended.reason, CompressionReason::Manual);
+    assert_eq!(ended.content, "压缩摘要");
 }

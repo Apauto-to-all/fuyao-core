@@ -31,7 +31,7 @@ L0  fuyao-api（零内部依赖）
 - **公开 API**：
   - **Params 两件套**：`EngineParams` / `SessionParams`（内层 `ModelConfig` / `AgentConfig`）；`AgentPaths`
   - **配置**：`FuyaoConfig` 及全子配置（`CompressionConfig` / `SessionStorageConfig` / `TitleConfig` / `RetryConfig` / `LlmConfig` / `ToolsConfig` 等）；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`
-  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Plugin 三变体）/ `OutputEvent`（12 变体）及消息族（`InboundUser` / `InterruptSource` / `PluginEventSource` / `UserMessageMode` / `UserMessageSource` / `ChildSessionOrigin` / `ChildSessionState` 等）
+  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Plugin / Compress 四变体）/ `OutputEvent`（12 变体）及消息族（`InboundUser` / `InterruptSource` / `PluginEventSource` / `UserMessageMode` / `UserMessageSource` / `ChildSessionOrigin` / `ChildSessionState` / `CompressRequest` 等）
   - **Provider 类型**：`Provider` trait / `Model` / `ModelCost` / `ModelLimit` / `ThinkingType` 等
   - **会话类型**：`Session` / `Message`（含多模态图片附件 `images`）/ `MessageKind` / `ImageContent`（`{mime_type, data}`，data 为裸 base64，`from_data_url` 做入站归一）/ `TodoItem`
   - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）

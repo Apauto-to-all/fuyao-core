@@ -86,6 +86,15 @@ impl Engine {
                     .await
                     .map_err(|_| EngineError::Shutdown)?;
             }
+            InputEvent::Compress(_) => {
+                // 控制通道：手动压缩请求转化为 ControlCommand::Compress，送主循环 turn 边界消费
+                //（跳过阈值 / 反抖动，复用自动压缩执行流程，reason=manual）
+                handle
+                    .tx_control
+                    .send(fuyao_api::ControlCommand::Compress)
+                    .await
+                    .map_err(|_| EngineError::Shutdown)?;
+            }
         }
 
         Ok(())

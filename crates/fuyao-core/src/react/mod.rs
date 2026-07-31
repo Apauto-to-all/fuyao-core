@@ -41,7 +41,9 @@ use fuyao_api::message::output::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
 };
-use fuyao_api::{AgentDefinition, CompressionConfig, EventBase, Session, SessionParams};
+use fuyao_api::{
+    AgentDefinition, CompressionConfig, ControlCommand, EventBase, Session, SessionParams,
+};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{ProviderRegistry, StreamUsage};
 use fuyao_session::CompressionRuntimeState;
@@ -130,6 +132,7 @@ pub(crate) async fn run_session(
     mut rx_inbound: Receiver<OutputUserMessage>,
     mut rx_interrupt: Receiver<OutputInterruptMessage>,
     mut rx_plugin: Receiver<OutputPluginMessage>,
+    mut rx_control: Receiver<ControlCommand>,
     shutdown_token: CancellationToken,
     mut session: Session,
     store: Arc<fuyao_session::SessionStore>,
@@ -202,6 +205,14 @@ pub(crate) async fn run_session(
 
     // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断/shutdown
     loop {
+        // === 控制通道消费（turn 边界）===
+        // 每次循环顶部 try_recv 排空控制通道：处理 turn 运行期间到达的 B 类命令（手动压缩等），
+        // 在 guide 检查前于 turn 边界执行（不抢占在途 turn，等当前 turn 跑完下轮顶部才处理）。
+        // 忠实执行：每条命令各跑一次，不做同批次去重 / 合并——引擎是忠实执行器，不解释意图
+        //（去重是上层职责，见 AGENTS.md「引擎是忠实执行器」）。
+        while let Ok(cmd) = rx_control.try_recv() {
+            handle_control(&ctx, &mut session, cmd).await;
+        }
         // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
         // → 此时 pending 与 guide 语义等价，立即解禁进 guide 触发新 turn
         // （否则只发 pending 时 pending 会死信，永远进不了 turn）
@@ -268,54 +279,52 @@ pub(crate) async fn run_session(
                 Some(interrupt_msg) = rx_interrupt.recv() => {
                     // idle 中断：无活跃 turn，只发通知事件
                     emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
-                    tracing::debug!(session_id = %ctx.emitter.session_id(), "idle 时收到中断信号");
+                    tracing::debug!(session_id = ctx.emitter.session_id(), "idle 时收到中断信号");
+                }
+                Some(cmd) = rx_control.recv() => {
+                    // idle 时控制命令到达：处理后回顶部 drain 取其余（同 task 串行消费，天然互斥）
+                    handle_control(&ctx, &mut session, cmd).await;
+                    continue;
                 }
             }
         }
     }
 }
 
-/// Pre-turn 上下文压缩检查
+/// 压缩执行依赖的解析结果（model_id / 思考配置 / provider / 上下文长度）
 ///
-/// 在主循环注入新消息前、调 LLM 前，根据上一轮真实 usage 判定要不要压缩。
-/// 触发条件满足时：调一次独立 LLM（`tools=[]`）拿摘要 → `mark_compaction` 落库 →
-/// 复制 keep_recent 为新 seq（下次 `load_visible_messages` 自然看到 compaction 边界 + keep_recent）。
-///
-/// 失败处理（失败保持边界 + 错误分级）：
-/// - 摘要为空 / 无可压缩内容：log warn 跳过
-/// - LLM 调用失败：log warn 跳过（不进 cooldown，下次还会触发判定）
-/// - 落库失败：log warn 跳过
-///
-/// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
-async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
-    // 子代理 session 的压缩豁免（可配置，`[session.compression] skip_child` 默认 true）：
-    // 子代理以 Fresh 模式派生、只回传最终回复文本给父 Agent，自身完整历史留在子 session 内。
-    // 若子代理中途压缩，早期工具证据会被摘要替代，最终回复失真并作为 tool_result 传导给父 Agent
-    // 的决策；且压缩需额外调一次摘要 LLM，对一次性子代理在成本与质量上均不划算。
-    if session.parent_session_id.is_some() && ctx.compression_config.skip_child {
-        return;
-    }
+/// 由 [`resolve_compression_model`] 一次性解析，供 [`run_compression`] 直接消费——
+/// 把「该不该压」（阈值门）与「怎么压」（执行体）解耦，自动 / 手动两条触发路径共用执行体。
+struct CompressionModel {
+    model_id: String,
+    thinking_type: Option<fuyao_api::ThinkingType>,
+    reasoning_effort: Option<String>,
+    provider: std::sync::Arc<dyn fuyao_provider::Provider>,
+    context_length: u32,
+}
 
-    // 读取上一轮真实 usage（首轮无 usage 跳过——还没跑过没法判定）
-    let usage = {
-        let guard = ctx.last_usage.lock().await;
-        match guard.clone() {
-            Some(u) => u,
-            None => return,
-        }
-    };
+/// 子代理 session 的压缩豁免判定（可配置，`[session.compression] skip_child` 默认 true）
+///
+/// 子代理以 Fresh 模式派生、只回传最终回复文本给父 Agent，自身完整历史留在子 session 内。
+/// 若子代理中途压缩，早期工具证据会被摘要替代，最终回复失真并作为 tool_result 传导给父 Agent
+/// 的决策；且压缩需额外调一次摘要 LLM，对一次性子代理在成本与质量上均不划算。
+/// 仅自动触发路径（[`run_pre_turn_compression`]）使用此豁免——引擎替用户挡不划算的压缩；
+/// 手动触发（[`run_manual_compression`]）不豁免：用户显式要对子会话压缩是用户的选择，照做。
+fn compression_exempt(ctx: &SessionCtx, session: &Session) -> bool {
+    session.parent_session_id.is_some() && ctx.compression_config.skip_child
+}
 
-    // 解析本轮主模型：model_id + 思考配置（一并取，压缩复用 session 全套模型配置）
-    //
-    // **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，
-    // 否则原样发的请求会因为 endpoint 切换导致前缀缓存失效。
-    // model_id 解析顺序与 turn.rs::resolve_model 一致：
-    //   1. SessionParams.model_config.model_id = Some(...) → 用它（整 session 共享一份，现读）
-    //   2. None → 读 [models.default] 兜底（含其 thinking，与 model_id 同源取）
-    //   3. 都没有 → 无法确定主模型，跳过本次压缩（warn 记录原因）
-    //
-    // 注：写回逻辑（turn.rs）已在首轮后把 model_id + thinking 物化进 session_params，
-    // 正常运行期这里读到的都是 Some。None→default 分支仅首轮前 / 未物化时兜底。
+/// 解析压缩执行所需的模型信息（model_id + 思考配置 + provider + 上下文长度）
+///
+/// **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，否则原样发的请求
+/// 会因 endpoint 切换导致前缀缓存失效。model_id 解析顺序与 turn.rs::resolve_model 一致：
+///   1. SessionParams.model_config.model_id = Some(...) → 用它（整 session 共享一份，现读）
+///   2. None → 读 [models.default] 兜底（含其 thinking，与 model_id 同源取）
+///   3. 都没有 → 返回 None（warn 记录原因）
+///
+/// 注：写回逻辑（turn.rs）已在首轮后把 model_id + thinking 物化进 session_params，
+/// 正常运行期这里读到的都是 Some。None→default 分支仅首轮前 / 未物化时兜底。
+async fn resolve_compression_model(ctx: &SessionCtx) -> Option<CompressionModel> {
     let (model_id, thinking_type, reasoning_effort) = {
         let p = ctx.session_params.lock().await;
         let mc = &p.model_config;
@@ -341,7 +350,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
                         session_id = ctx.emitter.session_id(),
                         "压缩跳过：本轮主模型未指定且未配置 [models.default]"
                     );
-                    return;
+                    return None;
                 }
             },
         }
@@ -356,7 +365,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
                 model_id = %model_id,
                 "压缩跳过：model_id 格式错误"
             );
-            return;
+            return None;
         }
     };
     let provider = match ctx.providers.get(&provider_id) {
@@ -367,13 +376,42 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
                 provider_id = %provider_id,
                 "压缩跳过：Provider 实例未注册"
             );
-            return;
+            return None;
         }
     };
 
     let context_length = fuyao_provider::get_model(&model_id, &ctx.agent_paths)
         .map(|m| m.limit.context)
         .unwrap_or(ctx.compression_config.fallback_context);
+
+    Some(CompressionModel {
+        model_id,
+        thinking_type,
+        reasoning_effort,
+        provider,
+        context_length,
+    })
+}
+
+/// Pre-turn 自动上下文压缩检查（「该不该压」的阈值门）
+///
+/// 在主循环注入新消息前、调 LLM 前，根据上一轮真实 usage 判定要不要压缩。
+/// 触发条件满足时调 [`run_compression`]（reason = auto）。手动触发见 [`run_manual_compression`]。
+async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
+    if compression_exempt(ctx, session) {
+        return;
+    }
+
+    // 读取上一轮真实 usage（首轮无 usage 跳过——还没跑过没法判定）
+    let usage = match ctx.last_usage.lock().await.clone() {
+        Some(u) => u,
+        None => return,
+    };
+
+    let model = match resolve_compression_model(ctx).await {
+        Some(m) => m,
+        None => return,
+    };
 
     // 阈值检测（含反抖动判定）
     let trigger = {
@@ -383,7 +421,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
             .unwrap_or_else(|e| e.into_inner());
         fuyao_session::should_compress(
             usage.prompt_tokens,
-            context_length,
+            model.context_length,
             &ctx.compression_config,
             &state,
         )
@@ -392,11 +430,74 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         return;
     }
 
+    run_compression(
+        ctx,
+        session,
+        CompressionReason::Auto,
+        usage.prompt_tokens,
+        &model,
+    )
+    .await;
+}
+
+/// 手动触发上下文压缩（控制通道 Compress 命令的处理）
+///
+/// 与自动压缩（[`run_pre_turn_compression`]）共用 [`run_compression`] 执行流程，区别有二：
+/// ① 跳过阈值检测与反抖动（用户意图优先，不判「该不该压」）；
+/// ② 不适用子会话豁免——用户显式要对子会话压缩是用户的选择，引擎照做，
+///    子代理失真风险由用户自担（自动压缩替用户挡不划算的压缩，手动不挡）。
+/// 触发原因标记为 manual。
+async fn run_manual_compression(ctx: &SessionCtx, session: &mut Session) {
+    let model = match resolve_compression_model(ctx).await {
+        Some(m) => m,
+        None => return,
+    };
+
+    // prompt_tokens：取上一轮真实 usage（首轮前无 usage 则 0——仅用于 Started 事件展示）
+    let prompt_tokens = ctx
+        .last_usage
+        .lock()
+        .await
+        .as_ref()
+        .map(|u| u.prompt_tokens)
+        .unwrap_or(0);
+
+    run_compression(
+        ctx,
+        session,
+        CompressionReason::Manual,
+        prompt_tokens,
+        &model,
+    )
+    .await;
+}
+
+/// 执行一次上下文压缩（「怎么压」的执行体）
+///
+/// 自动 / 手动两条触发路径共用本函数：
+/// - 自动（[`run_pre_turn_compression`]）：先过阈值门 + 反抖动，命中才调（reason = auto）
+/// - 手动（[`run_manual_compression`]）：跳过阈值门直接调（reason = manual，用户意图优先）
+///
+/// 流程：发 Started → 调摘要 LLM（流式 Delta 并发转发）→ apply 落库 → 发 Ended。
+/// 失败处理（失败保持边界 + 错误分级）：
+/// - 摘要为空 / 无可压缩内容：log warn 跳过
+/// - LLM 调用失败：log warn 跳过（不进 cooldown，下次还会触发判定）
+/// - 落库失败：log warn 跳过
+///
+/// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
+async fn run_compression(
+    ctx: &SessionCtx,
+    session: &mut Session,
+    reason: CompressionReason,
+    prompt_tokens: u32,
+    model: &CompressionModel,
+) {
     tracing::info!(
         session_id = ctx.emitter.session_id(),
-        prompt_tokens = usage.prompt_tokens,
-        context_length = context_length,
-        model_id = model_id,
+        reason = ?reason,
+        prompt_tokens = prompt_tokens,
+        context_length = model.context_length,
+        model_id = %model.model_id,
         "触发上下文压缩"
     );
 
@@ -407,9 +508,9 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         OutputEvent::Compression(CompressionMessage {
             base: EventBase::default(),
             payload: CompressionPayload::Started(CompressionStartedPayload {
-                reason: CompressionReason::Auto,
-                prompt_tokens: usage.prompt_tokens,
-                context_length,
+                reason,
+                prompt_tokens,
+                context_length: model.context_length,
             }),
         }),
         None,
@@ -440,13 +541,15 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
 
     // 构造压缩用 options：复用 session 思考配置（tools 由 generate_summary 内部强制清空）
     let compression_options = fuyao_provider::StreamOptions {
-        thinking_type,
-        reasoning_effort,
+        thinking_type: model.thinking_type.clone(),
+        reasoning_effort: model.reasoning_effort.clone(),
         ..fuyao_provider::StreamOptions::default()
     };
 
     // callback 用 let 绑定避免临时值生命周期问题（future 会借用它）
-    let mut on_delta = |content: Option<&str>, reasoning: Option<&str>| {
+    // move：让闭包持有 delta_tx，select! 后 drop(on_delta) 即释放 delta_tx，
+    // 使 delta_consumer 的 recv 返回 None 退出（否则 delta_tx 留在作用域致死锁）
+    let mut on_delta = move |content: Option<&str>, reasoning: Option<&str>| {
         let _ = delta_tx.try_send((content.map(String::from), reasoning.map(String::from)));
     };
 
@@ -476,10 +579,10 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         s = fuyao_session::generate_summary(
             session.system_prompt.as_deref(),
             &visible_messages,
-            &provider,
-            &model_id,
+            &model.provider,
+            &model.model_id,
             compression_options,
-            context_length,
+            model.context_length,
             &ctx.compression_config,
             &mut on_delta,
         ) => {
@@ -499,7 +602,9 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
             unreachable!("Delta 消费者先于 summary 结束")
         }
     };
-    // 等 Delta 消费者把剩余积压推完（summary 完成后 on_delta/delta_tx drop，recv 返回 None 退出）
+    // drop on_delta：释放其持有的 delta_tx → delta_consumer 的 recv 返回 None 自然退出
+    drop(on_delta);
+    // 等 Delta 消费者把剩余积压推完
     let _ = (&mut delta_consumer).await;
 
     // 落地层：mark_compaction + 复制 keep_recent 为新 seq
@@ -508,7 +613,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         &summary,
         ctx.emitter.session_id(),
         &ctx.compression_config,
-        context_length,
+        model.context_length,
         ctx.store.as_ref(),
     )
     .await
@@ -562,7 +667,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
                 OutputEvent::Compression(CompressionMessage {
                     base: EventBase::default(),
                     payload: CompressionPayload::Ended(CompressionEndedPayload {
-                        reason: CompressionReason::Auto,
+                        reason,
                         content: summary.content.clone(),
                         tokens_before: summary.tokens_before as u32,
                         tokens_after: summary.tokens_after as u32,
@@ -604,5 +709,15 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push_back(inbound),
+    }
+}
+
+/// 处理一条控制命令（turn 边界执行）
+///
+/// 控制通道载荷在此分发：每个 [`ControlCommand`] 变体对应一个主循环动作。
+/// 由主循环顶部 drain 与 idle select! 臂两处调用（同一 task 串行消费，天然互斥）。
+async fn handle_control(ctx: &SessionCtx, session: &mut Session, cmd: ControlCommand) {
+    match cmd {
+        ControlCommand::Compress => run_manual_compression(ctx, session).await,
     }
 }
