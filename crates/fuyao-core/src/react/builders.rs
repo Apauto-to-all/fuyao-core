@@ -14,7 +14,7 @@ use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{AgentPaths, MessageRole, ModelConfig};
+use fuyao_api::{AgentPaths, InputModality, MessageRole, ModelConfig};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 use fuyao_session::SessionStore;
 use std::collections::HashMap;
@@ -116,7 +116,7 @@ pub(crate) async fn build_chat_request(
     }
 }
 
-/// 查询模型是否支持图片输入（`modalities.input` 含 `"image"`）
+/// 查询模型是否支持图片输入（`modalities.input` 含 [`InputModality::Image`]）
 ///
 /// model_id 解析与 [`resolve_model`] 同序：显式指定 → `[models.default]` 兜底。
 /// 未指定 / 格式非法 / 配置缺失（模型未声明 modalities）一律按不支持处理（安全默认）。
@@ -139,7 +139,12 @@ pub(crate) fn model_supports_images(model_config: &ModelConfig, agent_paths: &Ag
         }
     };
     fuyao_provider::get_model(&model_id, agent_paths)
-        .map(|m| m.modalities.input.iter().any(|x| x == "image"))
+        .map(|m| {
+            m.modalities
+                .input
+                .iter()
+                .any(|x| matches!(x, InputModality::Image))
+        })
         .unwrap_or(false)
 }
 

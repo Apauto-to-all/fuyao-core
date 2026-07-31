@@ -21,7 +21,8 @@
 use std::collections::HashMap;
 
 use crate::provider::{
-    Model, ModelCost, ModelLimit, ModelModalities, PriceTier, Provider, ProviderOptions,
+    InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
+    Provider, ProviderOptions,
 };
 
 /// 将 TOML 数值转换为 f64（兼容整数和浮点）
@@ -80,13 +81,35 @@ fn parse_cost(cost_data: &toml::Value) -> ModelCost {
 }
 
 /// 默认输入模态：text
-fn default_modalities_input() -> Vec<String> {
-    vec!["text".to_string()]
+fn default_modalities_input() -> Vec<InputModality> {
+    vec![InputModality::Text]
 }
 
 /// 默认输出模态：text
-fn default_modalities_output() -> Vec<String> {
-    vec!["text".to_string()]
+fn default_modalities_output() -> Vec<OutputModality> {
+    vec![OutputModality::Text]
+}
+
+/// 将字符串解析为 [`InputModality`]
+///
+/// 仅识别 `"text"` / `"image"`（不区分大小写）；未知值返回 `None`，
+/// 由调用方决定跳过或记录。
+fn parse_input_modality(s: &str) -> Option<InputModality> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "text" => Some(InputModality::Text),
+        "image" => Some(InputModality::Image),
+        _ => None,
+    }
+}
+
+/// 将字符串解析为 [`OutputModality`]
+///
+/// 仅识别 `"text"`（不区分大小写）；未知值返回 `None`，由调用方决定跳过或记录。
+fn parse_output_modality(s: &str) -> Option<OutputModality> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "text" => Some(OutputModality::Text),
+        _ => None,
+    }
 }
 
 /// 解析单个 Model 配置
@@ -127,14 +150,14 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         })
         .unwrap_or_default();
 
-    // modalities 可选，默认 ["text"]
+    // modalities 可选，默认 ["text"]；非法模态值静默跳过
     let input = table
         .get("modalities")
         .and_then(|v| v.as_table())
         .and_then(|m| m.get("input").and_then(|v| v.as_array()))
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter_map(|v| v.as_str().and_then(parse_input_modality))
                 .collect()
         })
         .unwrap_or_else(default_modalities_input);
@@ -144,7 +167,7 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         .and_then(|m| m.get("output").and_then(|v| v.as_array()))
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter_map(|v| v.as_str().and_then(parse_output_modality))
                 .collect()
         })
         .unwrap_or_else(default_modalities_output);

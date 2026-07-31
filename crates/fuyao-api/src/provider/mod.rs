@@ -11,7 +11,10 @@ pub mod model;
 
 use std::collections::HashMap;
 
-pub use model::{Model, ModelCost, ModelLimit, ModelModalities, PriceTier, ThinkingType};
+pub use model::{
+    InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
+    ThinkingType,
+};
 
 // === 供应商配置类型 ===
 

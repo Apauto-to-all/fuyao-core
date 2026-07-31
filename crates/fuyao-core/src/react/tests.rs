@@ -1686,8 +1686,11 @@ async fn inject_images_persisted_when_model_supports() {
         limit: Default::default(),
         reasoning_efforts: vec![],
         modalities: fuyao_api::ModelModalities {
-            input: vec!["text".into(), "image".into()],
-            output: vec!["text".into()],
+            input: vec![
+                fuyao_api::InputModality::Text,
+                fuyao_api::InputModality::Image,
+            ],
+            output: vec![fuyao_api::OutputModality::Text],
         },
     };
     let key = fuyao_provider::agent_paths_cache_key(&paths);

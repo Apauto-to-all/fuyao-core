@@ -43,8 +43,8 @@ pub use paths::{
 };
 pub use prompt_types::{AgentDefinition, AgentMode};
 pub use provider::{
-    Model, ModelCost, ModelLimit, ModelModalities, PriceTier, Provider, ProviderOptions,
-    ThinkingType,
+    InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
+    Provider, ProviderOptions, ThinkingType,
 };
 pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
 pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};

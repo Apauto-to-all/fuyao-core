@@ -55,21 +55,50 @@ pub struct ModelLimit {
     pub output: u32,
 }
 
+/// 输入模态
+///
+/// 模型可接受的输入内容类型。以穷尽枚举约束合法值——新增类型时编译器会
+/// 强制处理所有匹配分支，避免松散字符串带来的拼写错误与隐式约定。
+///
+/// 序列化为 snake_case：`Text` → `"text"`、`Image` → `"image"`，
+/// 与配置文件中 `modalities.input = ["text", "image"]` 的写法一致。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputModality {
+    /// 纯文本
+    Text,
+    /// 图片
+    Image,
+}
+
+/// 输出模态
+///
+/// 模型可产出的内容类型。与 [`InputModality`] 分离建模——两者拓展方向不同，
+/// 独立枚举避免输出侧误声明仅输入合法的类型（如 `Image`）。
+///
+/// 序列化为 snake_case：`Text` → `"text"`。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputModality {
+    /// 纯文本
+    Text,
+}
+
 /// 模型模态支持
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ModelModalities {
     /// 输入模态
-    pub input: Vec<String>,
+    pub input: Vec<InputModality>,
 
     /// 输出模态
-    pub output: Vec<String>,
+    pub output: Vec<OutputModality>,
 }
 
 impl Default for ModelModalities {
     fn default() -> Self {
         Self {
-            input: vec!["text".to_string()],
-            output: vec!["text".to_string()],
+            input: vec![InputModality::Text],
+            output: vec![OutputModality::Text],
         }
     }
 }
@@ -134,8 +163,39 @@ mod tests {
     #[test]
     fn model_modalities_default_has_text_only() {
         let modalities = ModelModalities::default();
-        assert_eq!(modalities.input, vec!["text".to_string()]);
-        assert_eq!(modalities.output, vec!["text".to_string()]);
+        assert_eq!(modalities.input, vec![InputModality::Text]);
+        assert_eq!(modalities.output, vec![OutputModality::Text]);
+    }
+
+    #[test]
+    fn input_modality_serializes_snake_case() {
+        // 文本序列化为 "text"
+        let json = serde_json::to_string(&vec![InputModality::Text]).unwrap();
+        assert_eq!(json, "[\"text\"]");
+        // 图片序列化为 "image"
+        let json = serde_json::to_string(&vec![InputModality::Image]).unwrap();
+        assert_eq!(json, "[\"image\"]");
+        // 文本+图片保持声明顺序
+        let json = serde_json::to_string(&vec![InputModality::Text, InputModality::Image]).unwrap();
+        assert_eq!(json, "[\"text\",\"image\"]");
+    }
+
+    #[test]
+    fn output_modality_serializes_snake_case() {
+        let json = serde_json::to_string(&vec![OutputModality::Text]).unwrap();
+        assert_eq!(json, "[\"text\"]");
+    }
+
+    #[test]
+    fn modalities_round_trips_through_json() {
+        // 模拟配置文件写法：input = ["text", "image"], output = ["text"]
+        let json = r#"{"input":["text","image"],"output":["text"]}"#;
+        let modalities: ModelModalities = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            modalities.input,
+            vec![InputModality::Text, InputModality::Image]
+        );
+        assert_eq!(modalities.output, vec![OutputModality::Text]);
     }
 
     #[test]
