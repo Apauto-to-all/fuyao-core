@@ -9,12 +9,12 @@
 ```text
 trait Provider {
     fn stream_chat(request, model, options) -> BoxStream<Result<StreamEvent, StreamError>>
-    fn chat(request, model) -> Result<ChatResponse, StreamError>
+    fn chat(request, model, options) -> Result<ChatResponse, StreamError>
 }
 ```
 
 - `stream_chat`：流式调用，返回 BoxStream（核心方法，ReAct 循环用）
-- `chat`：非流式调用（标题生成用）
+- `chat`：非流式调用（响应一次性返回）；与 stream_chat 共享同一套 options（含思考配置），思考能力等价支持
 
 ### StreamEvent
 
@@ -76,16 +76,16 @@ HTTP 响应非 2xx 时 classify_http_error：
 
 ### 思考字段注入（thinking_type / reasoning_effort）
 
-`SessionParams.model_config` 携带 `thinking_type` 和 `reasoning_effort`，在构建请求体时条件注入：
+`StreamOptions` 携带 `thinking_type` 和 `reasoning_effort`，在构建请求体时各自独立注入：
 
-| 条件 | 行为 |
-|------|------|
-| `thinking_type = Some(Enabled)` | 请求体加 `thinking: { type: "enabled" }` |
-| `thinking_type = Some(Disabled)` | **强制不发** `reasoning_effort`（强度对 Disabled 无意义） |
-| `thinking_type = None` | 不发 `thinking` 字段；`reasoning_effort` 如有则发 |
-| `reasoning_effort` | 接受**任意字符串**透传（fuyao 不校验档位名，由服务器决定） |
+| 字段 | Some 时行为 | None 时行为 |
+|------|------------|------------|
+| `thinking_type` | 请求体加 `thinking: { type: "enabled" / "disabled" }` | 不发 `thinking` 字段 |
+| `reasoning_effort` | 请求体加该档位名字符串（透传） | 不发该字段 |
 
-> `reasoning_effort` 的可选值由模型配置的 `reasoning_efforts` 字段声明（如 `["low","medium","high","max"]`），但实际发送时 fuyao 不校验。
+**两字段正交独立**：各自为 Some 时各自发送，互不压制。fuyao 不替服务器做语义裁剪——不因 `thinking_type = Disabled` 而压掉 `reasoning_effort`，配了就必发，由服务器各自解释。
+
+> `reasoning_effort` 的可选值由模型配置的 `reasoning_efforts` 字段声明（如 `["low","medium","high","max"]`），但实际发送时 fuyao 不校验档位名，透传原始字符串。
 
 ## 多 Provider 路由（ProviderRegistry）
 

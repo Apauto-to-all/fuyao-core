@@ -19,7 +19,7 @@ fuyao.toml 用 TOML **内联表**（inline table，`{ key = value }`）精简配
 两条可读性经验：
 
 - **每个模型保留独立节头** `[providers.xxx.models.<id>]`，不要把所有模型挤进同一个 `[providers.xxx.models]` 下内联
-- **`[models]` 是例外**：`default` / `fast` 每个就一个字段，适合全部内联
+- **`[models]` 是例外**：`default` / `fast` 字段少（`model` 必填，`thinking_type` / `reasoning_effort` 可选），适合全部内联
 
 ## 常见场景的精简写法
 
@@ -86,7 +86,7 @@ limit = { context = 1000000, output = 65536 }
 
 ### 多模型标签 models
 
-`[models]` 下每个标签只一个字段，全部内联：
+`[models]` 下每个标签字段少（`model` 必填，思考两字段可选），全部内联：
 
 ```toml
 # 避免
@@ -95,9 +95,9 @@ model = "deepseek/deepseek-v4-flash"
 [models.fast]
 model = "deepseek/sensenova-6.7-flash-lite"
 
-# 推荐
+# 推荐：思考字段同样内联进表，可选不填即走模型默认
 [models]
-default = { model = "deepseek/deepseek-v4-flash" }
+default = { model = "deepseek/deepseek-v4-flash", thinking_type = "enabled", reasoning_effort = "high" }
 fast = { model = "deepseek/sensenova-6.7-flash-lite" }
 ```
 
@@ -130,9 +130,9 @@ limit = { context = 128000, output = 8192 }  # 上下文 128K，输出 8K
 把上面规则合到一起，一个典型的精简配置片段：
 
 ```toml
-# 多模型标签：内联
+# 多模型标签：内联（思考字段可选，配了就内联进表）
 [models]
-default = { model = "deepseek/deepseek-v4-flash" }
+default = { model = "deepseek/deepseek-v4-flash", thinking_type = "enabled", reasoning_effort = "high" }
 fast = { model = "deepseek/sensenova-6.7-flash-lite" }
 
 # 供应商 + 连接选项：options 内联
