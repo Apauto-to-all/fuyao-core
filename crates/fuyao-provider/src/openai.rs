@@ -15,12 +15,42 @@ use crate::provider::{
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use fuyao_api::AgentPaths;
+use fuyao_api::{AgentPaths, ImageContent, MessageRole};
 use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
 // =========== OpenAI Provider ===========
+
+/// OpenAI 协议支持的图片 MIME 白名单（仅图像：PNG / JPEG / WEBP / 非动画 GIF）
+const SUPPORTED_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+
+/// 单图解码后字节上限（OpenAI 协议约束；base64 长度 /4*3 估算解码字节数）
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// 校验并过滤图片：MIME 白名单 + 协议字节上限，不合规的丢弃并告警
+///
+/// 校验失败只丢单张图、不中断整条消息——图像是辅助信息，文本对话照常。
+fn filter_valid_images(images: &[ImageContent]) -> Vec<&ImageContent> {
+    images
+        .iter()
+        .filter(|img| {
+            if !SUPPORTED_IMAGE_MIMES.contains(&img.mime_type.as_str()) {
+                tracing::warn!(mime_type = %img.mime_type, "图片 MIME 不在协议白名单，已丢弃");
+                return false;
+            }
+            if img.data.len() / 4 * 3 > MAX_IMAGE_BYTES {
+                tracing::warn!(
+                    mime_type = %img.mime_type,
+                    base64_len = img.data.len(),
+                    "图片超过 20MB 协议上限，已丢弃"
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
+}
 
 /// OpenAI 兼容 Provider
 ///
@@ -113,9 +143,38 @@ impl OpenAIProvider {
                 "role": msg.role.as_str(),
             });
 
-            // 内容
-            if let Some(content) = &msg.content {
-                msg_value["content"] = serde_json::Value::String(content.clone());
+            // 内容：带图 user 消息转 parts 数组（text + image_url），纯文本保持字符串（零回归）
+            let valid_images = if matches!(msg.role, MessageRole::User) {
+                filter_valid_images(&msg.images)
+            } else {
+                if !msg.images.is_empty() {
+                    tracing::warn!(role = %msg.role.as_str(), "非 user 消息携带图片，已忽略");
+                }
+                vec![]
+            };
+
+            if valid_images.is_empty() {
+                // 无图（含图片全部被过滤）：保持原纯字符串形态
+                if let Some(content) = &msg.content {
+                    msg_value["content"] = serde_json::Value::String(content.clone());
+                }
+            } else {
+                // 有图：content 升级为 parts 数组，图片以 data URL 内联
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                if let Some(text) = &msg.content
+                    && !text.is_empty()
+                {
+                    parts.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                for img in valid_images {
+                    parts.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", img.mime_type, img.data),
+                        }
+                    }));
+                }
+                msg_value["content"] = serde_json::Value::Array(parts);
             }
 
             // 思考内容（部分供应商需要在历史消息中传递）
@@ -791,6 +850,157 @@ mod tests {
             provider.chat_url(),
             "https://api.test.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn build_request_body_image_message_uses_parts_array() {
+        // 带图 user 消息：content 升级为 parts 数组（text + image_url data URL）
+        let provider = test_provider();
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: Some("看图".to_string()),
+                images: vec![ImageContent {
+                    mime_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }],
+                ..Default::default()
+            }],
+            system: None,
+        };
+        let body = provider.build_request_body(
+            request,
+            "qwen3.6-plus",
+            &ProviderStreamOptions::default(),
+            false,
+        );
+
+        let content = &body["messages"][0]["content"];
+        assert!(content.is_array(), "带图消息 content 应为数组");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "看图");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn build_request_body_image_message_without_text_omits_text_part() {
+        // content 为空时只发图片 part
+        let provider = test_provider();
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: None,
+                images: vec![ImageContent {
+                    mime_type: "image/webp".into(),
+                    data: "d2VicA==".into(),
+                }],
+                ..Default::default()
+            }],
+            system: None,
+        };
+        let body = provider.build_request_body(
+            request,
+            "qwen3.6-plus",
+            &ProviderStreamOptions::default(),
+            false,
+        );
+
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content.as_array().map(Vec::len), Some(1));
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn build_request_body_drops_unsupported_mime_image() {
+        // 非法 MIME 图片被丢弃：消息回退为纯文本字符串形态
+        let provider = test_provider();
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: Some("文本".to_string()),
+                images: vec![
+                    ImageContent {
+                        mime_type: "application/pdf".into(),
+                        data: "x".into(),
+                    },
+                    ImageContent {
+                        mime_type: "image/png".into(),
+                        data: "aGVsbG8=".into(),
+                    },
+                ],
+                ..Default::default()
+            }],
+            system: None,
+        };
+        let body = provider.build_request_body(
+            request,
+            "qwen3.6-plus",
+            &ProviderStreamOptions::default(),
+            false,
+        );
+
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content.as_array().map(Vec::len), Some(2), "pdf 图应被丢弃");
+    }
+
+    #[test]
+    fn build_request_body_drops_oversized_image() {
+        // 超过 20MB 协议上限的图片被丢弃（base64 长度 = 解码字节 × 4/3）
+        let provider = test_provider();
+        let oversized = "A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 100);
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::User,
+                content: Some("大图".to_string()),
+                images: vec![ImageContent {
+                    mime_type: "image/png".into(),
+                    data: oversized,
+                }],
+                ..Default::default()
+            }],
+            system: None,
+        };
+        let body = provider.build_request_body(
+            request,
+            "qwen3.6-plus",
+            &ProviderStreamOptions::default(),
+            false,
+        );
+
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content, "大图", "超限图被丢弃后应回退为纯字符串");
+    }
+
+    #[test]
+    fn build_request_body_ignores_images_on_non_user_messages() {
+        // 防御：非 user 角色携带图片时忽略（协议侧 tool/assistant content 只认字符串）
+        let provider = test_provider();
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some("回复".to_string()),
+                images: vec![ImageContent {
+                    mime_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }],
+                ..Default::default()
+            }],
+            system: None,
+        };
+        let body = provider.build_request_body(
+            request,
+            "qwen3.6-plus",
+            &ProviderStreamOptions::default(),
+            false,
+        );
+
+        assert_eq!(body["messages"][0]["content"], "回复");
     }
 
     #[test]
