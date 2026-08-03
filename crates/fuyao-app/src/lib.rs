@@ -14,6 +14,7 @@ mod app;
 mod init;
 mod logging;
 mod mcp;
+mod session_manager;
 mod tools;
 
 use std::sync::Arc;
@@ -21,10 +22,12 @@ use std::sync::Arc;
 use fuyao_api::EngineParams;
 use fuyao_core::{Engine, PluginHost, ToolRegistry, ToolRegistryBuilder};
 use fuyao_mcp::MCPManager;
+use fuyao_session::SessionStore;
 
 pub use app::App;
 pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
+pub use session_manager::SessionManager;
 
 /// 装配错误
 #[derive(Debug, thiserror::Error)]
@@ -32,16 +35,38 @@ pub enum SetupError {
     #[error(transparent)]
     /// 引擎装配准备失败（配置加载、Provider 创建、模型校验等）
     Init(#[from] InitError),
+
+    /// 会话存储初始化失败（打开数据库、建表等）
+    #[error("会话存储初始化失败: {0}")]
+    Storage(String),
 }
 
-/// 一键启动：init_engine → build_tool_registry → Engine::new → App 装配
+/// 装配产物：运行时交互入口 + 会话管理入口
+///
+/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到两个正交门面：
+/// - [`app`](self::FuyaoApp::app)：运行时交互（create / send / recv / 对话生命周期）
+/// - [`sessions`](self::FuyaoApp::sessions)：会话管理查询（列会话 / 查历史）
+///
+/// 两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
+/// 各持一份 `Arc` 克隆，零拷贝共享连接池）。
+pub struct FuyaoApp {
+    /// 运行时交互门面（对话的进行）
+    pub app: App,
+    /// 会话管理门面（会话的检索与浏览）
+    pub sessions: SessionManager,
+}
+
+/// 一键启动：init_engine → build_tool_registry → 创建 store → Engine::new → 装配
 ///
 /// 这是绝大多数应用推荐的入口：一行完成配置/日志/Provider 准备 +
-/// 工具收集（内置 + MCP）+ 引擎启动 + fan-in 装配，返回可直接使用的 [`App`]。
+/// 工具收集（内置 + MCP）+ 会话存储创建 + 引擎启动 + 装配，返回可直接使用的 [`FuyaoApp`]。
+///
+/// 与早期只返单个 [`App`] 的差异：store 所有权上移到装配层——Engine 不再内部创建 store，
+/// 而是由本函数创建后注入 Engine 与 [`SessionManager`]，两者共享同一份连接池。
 ///
 /// 需要在中间介入（如动态追加工具）时，改用 [`init_engine`] + [`build_tool_registry`]
-/// 分步装配，再自行调 `Engine::new` + [`App::new`]。
-pub async fn start(params: EngineParams) -> Result<App, SetupError> {
+/// 分步装配，再自行创建 store、调 `Engine::new` + [`App::new`] + [`SessionManager::new`]。
+pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
     // 1. 配置 / 日志 / Provider 准备（init_engine 内部取出 agent_paths 供子流程定位路径）
     let init::InitResult {
         provider,
@@ -60,14 +85,26 @@ pub async fn start(params: EngineParams) -> Result<App, SetupError> {
     let mut plugin_host = PluginHost::new();
     plugin_host.add(Box::new(fuyao_guard::LoopGuardPlugin::new()));
 
-    // 4. 启动引擎（工具 + 插件工厂构造时注入）
+    // 4. 创建会话存储（所有权归装配层，注入 Engine 与 SessionManager 共享）
+    //    store 由装配层创建，Engine 与 SessionManager 各持 Arc 克隆，共享同一连接池。
+    let db_path = params.agent_paths.sessions_db_path();
+    let store = Arc::new(
+        SessionStore::new(db_path)
+            .await
+            .map_err(|e| SetupError::Storage(e.to_string()))?,
+    );
+
+    // 5. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
-    let engine = Engine::new(params, provider, tools, plugin_host).await;
+    let engine = Engine::new(params, provider, tools, plugin_host, store.clone()).await;
 
     tracing::info!("引擎启动完成");
 
-    // 5. 装配 App（fan-in 单一出口）
-    Ok(App::new(engine, mcp_manager, log_guard))
+    // 6. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）
+    Ok(FuyaoApp {
+        app: App::new(engine, mcp_manager, log_guard),
+        sessions: SessionManager::new(store),
+    })
 }
 
 /// 收集工具（内置 + MCP），汇总成引擎可注入的 `ToolRegistry`

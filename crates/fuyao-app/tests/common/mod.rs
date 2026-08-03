@@ -59,6 +59,18 @@ pub fn temp_agent_paths() -> (AgentPaths, TempDir) {
     (paths, home)
 }
 
+/// 由 agent_paths 创建会话存储（Arc 包裹，可直接注入 Engine::new）
+///
+/// store 所有权归调用方（装配方），创建后注入 `Engine::new` 与可能的 SessionManager。
+pub async fn make_store(agent_paths: &AgentPaths) -> std::sync::Arc<fuyao_session::SessionStore> {
+    let db_path = agent_paths.sessions_db_path();
+    std::sync::Arc::new(
+        fuyao_session::SessionStore::new(db_path)
+            .await
+            .expect("创建会话存储失败"),
+    )
+}
+
 /// 构造纯文本回复事件序列
 pub fn text_events(content: &str) -> Vec<StreamEvent> {
     vec![

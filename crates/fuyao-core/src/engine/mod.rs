@@ -126,7 +126,7 @@ pub struct Engine {
 impl Engine {
     /// 启动引擎（动作一）
     ///
-    /// 构造即启动：用 `params.agent_paths` 打开数据库、装配 provider 与工具注册表。
+    /// 构造即启动：装配 provider、工具注册表，注入会话存储。
     /// 启动完成后才可创建/恢复对话。
     ///
     /// 返回 `Arc<Engine>`——用 `Arc::new_cyclic` 构造，让引擎拿到自身的弱引用，
@@ -143,6 +143,11 @@ impl Engine {
     /// [`PluginHost::create_instances`] 生成该 session 的独立实例，
     /// 各实例 register 到该 session 私有的 HooksRegistry。拦截/观察在 session task 内执行。
     ///
+    /// `store` 是会话存储句柄，由装配方创建并注入。Engine 是 store 的消费者
+    /// （LLM 流程落库），不是创建者——存储的所有权归装配层，便于查询门面
+    /// （如 [`SessionManager`](../../fuyao_app/session_manager/struct.SessionManager.html)）
+    /// 共享同一份 store。注入的 `Arc` 与其他消费者共享同一连接池。
+    ///
     /// **不建立出口通道**——per-session 出站通道在 [`Engine::assemble_session`]
     /// 时按 session 独立创建，rx 随创建方法返回给调用方。
     pub async fn new(
@@ -150,17 +155,12 @@ impl Engine {
         providers: ProviderRegistry,
         tools: ToolRegistry,
         plugin_host: PluginHost,
+        store: Arc<SessionStore>,
     ) -> Arc<Self> {
-        // 用 agent_paths 解析 db_path，打开数据库
-        let db_path = params.agent_paths.sessions_db_path();
-        let store = SessionStore::new(db_path)
-            .await
-            .expect("打开会话数据库失败");
-
         // Arc::new_cyclic：构造 Engine 时拿到自身的 Weak 引用，
         // 存入 engine_weak 字段供后续注入工具 ctx（子代理工具用）
         Arc::new_cyclic(|weak| Engine {
-            store: Arc::new(store),
+            store,
             providers: Arc::new(providers),
             tools: Arc::new(tools),
             plugin_host: Arc::new(plugin_host),

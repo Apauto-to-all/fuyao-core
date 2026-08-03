@@ -14,7 +14,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{MockProvider, temp_agent_paths, text_events};
+use common::{MockProvider, make_store, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{ChildSessionSource, EngineParams, ModelConfig, SessionParams};
@@ -58,6 +58,7 @@ fn as_providers<P: fuyao_provider::Provider + 'static>(p: P) -> fuyao_provider::
 #[tokio::test]
 async fn end_session_removes_from_schedule() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
@@ -67,6 +68,7 @@ async fn end_session_removes_from_schedule() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -104,6 +106,7 @@ async fn end_session_removes_from_schedule() {
 #[tokio::test]
 async fn end_session_persists_ended_at_and_reason() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let engine = Engine::new(
         EngineParams {
@@ -114,6 +117,7 @@ async fn end_session_persists_ended_at_and_reason() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -168,6 +172,7 @@ async fn end_session_persists_ended_at_and_reason() {
 #[tokio::test]
 async fn end_session_does_not_affect_other_sessions() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let engine = Engine::new(
         EngineParams {
@@ -178,6 +183,7 @@ async fn end_session_does_not_affect_other_sessions() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -248,6 +254,7 @@ async fn end_session_does_not_affect_other_sessions() {
 #[tokio::test]
 async fn child_session_has_independent_channel_from_parent() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
@@ -257,6 +264,7 @@ async fn child_session_has_independent_channel_from_parent() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -331,6 +339,7 @@ async fn child_session_has_independent_channel_from_parent() {
 #[tokio::test]
 async fn child_session_rx_returns_none_after_session_exits() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
@@ -340,6 +349,7 @@ async fn child_session_rx_returns_none_after_session_exits() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 

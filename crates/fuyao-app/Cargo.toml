@@ -11,6 +11,7 @@ fuyao-guard = { path = "../fuyao-guard" }
 fuyao-hooks = { path = "../fuyao-hooks" }
 fuyao-mcp = { path = "../fuyao-mcp" }
 fuyao-provider = { path = "../fuyao-provider" }
+fuyao-session = { path = "../fuyao-session" }
 fuyao-tools = { path = "../fuyao-tools" }
 serde_json.workspace = true
 thiserror.workspace = true
@@ -24,5 +25,4 @@ futures-util = { workspace = true }
 async-trait = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
-fuyao-session = { path = "../fuyao-session" }
 base64 = { workspace = true }

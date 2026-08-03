@@ -54,9 +54,10 @@ struct Lane {
 async fn main() {
     println!("=== fuyao 引擎端到端冒烟测试 ===\n");
 
-    // 1. 一键装配：init（配置 / 日志 / Provider）→ 工具收集 → 启动引擎 → App fan-in 装配
+    // 1. 一键装配：init（配置 / 日志 / Provider）→ 工具收集 → 创建 store → 启动引擎 → 装配
+    //    返回 FuyaoApp { app（运行时交互）, sessions（会话管理）}，本例只用 app 跑对话
     //    from_cwd：以当前工作目录为 workspace，使 .fuyao/skills 等项目级资源生效
-    let app = fuyao_app::start(EngineParams {
+    let fuyao_app::FuyaoApp { app, .. } = fuyao_app::start(EngineParams {
         agent_paths: AgentPaths::from_cwd(),
     })
     .await

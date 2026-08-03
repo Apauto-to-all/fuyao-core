@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{MockProvider, temp_agent_paths, text_events};
+use common::{MockProvider, make_store, temp_agent_paths, text_events};
 use fuyao_api::EngineParams;
 use fuyao_app::{App, LogGuard, build_tool_registry};
 use fuyao_core::{Engine, PluginHost};
@@ -68,16 +68,18 @@ async fn build_registry_includes_core_tools() {
 /// + self drop），而非 Engine 自身的 shutdown 语义（后者见 fuyao-core/tests/shutdown_test.rs）。
 #[tokio::test]
 async fn shutdown_with_no_mcp_manager_does_not_panic() {
-    let (_, _home) = temp_agent_paths();
+    let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
     let engine = Engine::new(
         EngineParams {
-            agent_paths: fuyao_api::AgentPaths::default(),
+            agent_paths: agent_paths.clone(),
         },
         as_providers(MockProvider {
             events: text_events("ok"),
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 

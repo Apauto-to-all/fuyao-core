@@ -14,7 +14,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{FlakyThenSuccessProvider, MockProvider, temp_agent_paths, text_events};
+use common::{FlakyThenSuccessProvider, MockProvider, make_store, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{EngineParams, ModelConfig, SessionParams};
@@ -58,6 +58,7 @@ fn as_providers<P: Provider + 'static>(p: P) -> fuyao_provider::ProviderRegistry
 #[tokio::test]
 async fn shutdown_blocks_send_with_shutdown_error() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
@@ -67,6 +68,7 @@ async fn shutdown_blocks_send_with_shutdown_error() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -90,6 +92,7 @@ async fn shutdown_blocks_send_with_shutdown_error() {
 #[tokio::test]
 async fn shutdown_returns_none_for_recv() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
     let engine = Engine::new(
         EngineParams {
             agent_paths: agent_paths.clone(),
@@ -99,6 +102,7 @@ async fn shutdown_returns_none_for_recv() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -124,6 +128,7 @@ async fn shutdown_returns_none_for_recv() {
 #[tokio::test]
 async fn shutdown_terminates_active_session_and_persists() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let engine = Engine::new(
         EngineParams {
@@ -134,6 +139,7 @@ async fn shutdown_terminates_active_session_and_persists() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -195,6 +201,7 @@ async fn shutdown_terminates_active_session_and_persists() {
 #[tokio::test]
 async fn shutdown_unblocks_task_in_retry_backoff() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     // 持续 RateLimit（retry_after_ms 设大，模拟退避 sleep 中——故意远超 shutdown 超时阈值）
     let provider = FlakyThenSuccessProvider::new(
@@ -212,6 +219,7 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
         as_providers(provider),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -287,6 +295,7 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
     }
 
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let engine = Engine::new(
         EngineParams {
@@ -295,6 +304,7 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
         as_providers(AlwaysRateLimitProvider),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 

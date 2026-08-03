@@ -12,7 +12,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{FlakyThenSuccessProvider, MockProvider, temp_agent_paths, text_events};
+use common::{FlakyThenSuccessProvider, MockProvider, make_store, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{EngineParams, ModelConfig, SessionParams};
@@ -63,6 +63,7 @@ fn as_providers<P: Provider + 'static>(p: P) -> fuyao_provider::ProviderRegistry
 #[tokio::test]
 async fn engine_runs_react_loop_on_direct_channel() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let engine = Engine::new(
         EngineParams {
@@ -73,6 +74,7 @@ async fn engine_runs_react_loop_on_direct_channel() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -129,6 +131,7 @@ async fn engine_runs_react_loop_on_direct_channel() {
 #[tokio::test]
 async fn retry_emits_retry_event_then_succeeds() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let provider = FlakyThenSuccessProvider::new(
         vec![StreamError::RateLimit {
@@ -145,6 +148,7 @@ async fn retry_emits_retry_event_then_succeeds() {
         as_providers(provider),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -202,6 +206,7 @@ async fn retry_emits_retry_event_then_succeeds() {
 #[tokio::test]
 async fn retry_no_retry_on_auth_error() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let provider = FlakyThenSuccessProvider::new(
         vec![StreamError::AuthError("invalid key".to_string())],
@@ -215,6 +220,7 @@ async fn retry_no_retry_on_auth_error() {
         as_providers(provider),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -257,6 +263,7 @@ async fn retry_no_retry_on_auth_error() {
 #[tokio::test]
 async fn retry_no_retry_after_first_chunk() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     // 构造一个始终吐「TextDelta + RateLimit 错误」的 Provider
     struct AlwaysFirstChunkThenError;
@@ -297,6 +304,7 @@ async fn retry_no_retry_after_first_chunk() {
         as_providers(AlwaysFirstChunkThenError),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -341,6 +349,7 @@ async fn retry_no_retry_after_first_chunk() {
 #[tokio::test]
 async fn retry_emits_multiple_retry_events_under_persistent_error() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     // 构造永远失败的 Provider（每次都返带 retry-after-ms=10 的 RateLimit）
     struct AlwaysRateLimit;
@@ -376,6 +385,7 @@ async fn retry_emits_multiple_retry_events_under_persistent_error() {
         as_providers(AlwaysRateLimit),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 
@@ -421,6 +431,7 @@ async fn retry_emits_multiple_retry_events_under_persistent_error() {
 #[tokio::test]
 async fn send_to_unknown_session_returns_not_found() {
     let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
 
     let engine = Engine::new(
         EngineParams {
@@ -431,6 +442,7 @@ async fn send_to_unknown_session_returns_not_found() {
         }),
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
 

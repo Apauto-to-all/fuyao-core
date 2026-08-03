@@ -67,7 +67,13 @@ async fn image_input_described_by_real_llm() {
 
     // 注入空 ToolRegistry：本测试无需 AI 调工具，空表不随请求发给 LLM，省 token
     let empty_tools = ToolRegistry::builder().build();
-    let engine = Engine::new(engine_params, provider, empty_tools, plugin_host).await;
+    // store 所有权归装配方，创建后注入 Engine（与 SessionManager 共享同一份）
+    let store = std::sync::Arc::new(
+        fuyao_session::SessionStore::new(engine_params.agent_paths.sessions_db_path())
+            .await
+            .expect("创建会话存储失败"),
+    );
+    let engine = Engine::new(engine_params, provider, empty_tools, plugin_host, store).await;
     let app = App::new(engine, None, log_guard);
 
     // 2. 读本地图片 → base64 → ImageContent（mime 按扩展名推断）

@@ -18,7 +18,7 @@ use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use common::{temp_agent_paths, text_events};
+use common::{make_store, temp_agent_paths, text_events};
 use futures_util::stream;
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::output::{ChildSessionOrigin, ChildSessionState};
@@ -160,6 +160,7 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
 
     let (agent_paths, _home) = temp_agent_paths();
     let (registry, _mcp_manager) = build_tool_registry().await;
+    let store = make_store(&agent_paths).await;
 
     // 脚本按 stream_chat 调用顺序：
     // - [0] 父 turn1：返回 subagent tool_call
@@ -181,6 +182,7 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
         as_providers(provider),
         registry,
         PluginHost::new(),
+        store,
     )
     .await;
     let app = App::new(engine, None, LogGuard::default());

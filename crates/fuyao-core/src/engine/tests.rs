@@ -27,11 +27,15 @@ async fn make_engine() -> (Arc<Engine>, tempfile::TempDir) {
         extra_dirs: Vec::new(),
         fuyao_home,
     };
+    // store 所有权归装配方（测试），创建后注入 Engine
+    let db_path = agent_paths.sessions_db_path();
+    let store = Arc::new(SessionStore::new(db_path).await.expect("创建会话存储失败"));
     let engine = Engine::new(
         EngineParams { agent_paths },
         ProviderRegistry::default(),
         ToolRegistry::builder().build(),
         PluginHost::new(),
+        store,
     )
     .await;
     (engine, dir)
