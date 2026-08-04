@@ -100,7 +100,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## 发生了什么？
 
 1. `AgentPaths::default()` 创建默认路径（全局层），决定配置和数据位置
-2. `fuyao_app::start` 完成全部装配：加载配置 → 批量构造 Provider 实例 → 收集工具（内置 + MCP）→ 装配 LoopGuardPlugin → 启动引擎 → 包装成 `App`（fan-in 单一出口），返回 `App`
+2. `fuyao_app::start` 完成全部装配：加载配置 → 批量构造 Provider 实例 → 收集工具（内置 + MCP）→ 装配 LoopGuardPlugin → 启动引擎 → 包装成 `App`（fan-in 单一出口），返回 `FuyaoApp { app, sessions }`——`app` 跑对话，`sessions` 查历史
 3. `app.create_session` 从零创建一个新对话，返回 session_id（同时构建系统提示词、落库元数据、spawn session task；该 session 的 rx 由 App 内部 forwarder 消费进 fan_out）
 4. `app.send` 把用户消息经单一入口路由到对应 session 的入站通道（不阻塞）
 5. `app.recv` 从单一出口取出事件流——`Chunk` 是流式文本片段，`Assistant` 是完整回复

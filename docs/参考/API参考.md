@@ -40,13 +40,17 @@ cargo doc --workspace --no-deps --open
 ```rust
 use fuyao_api::{AgentPaths, EngineParams};
 
-let app = fuyao_app::start(EngineParams {
+let fuyao = fuyao_app::start(EngineParams {
     agent_paths: AgentPaths::default(),
 }).await?;
-// app: fuyao_app::App —— 持 Engine + fan-in 出口
+// fuyao: fuyao_app::FuyaoApp { app, sessions }
+//   app: App         —— 运行时交互（create / send / recv / end）
+//   sessions: SessionManager —— 会话检索（list_sessions / session_count）
+let app = fuyao.app;               // 跑对话
+let sessions = fuyao.sessions;     // 查历史
 ```
 
-`start` 串联 `init_engine`（配置 / 日志 / Provider）→ `build_tool_registry`（内置 + MCP 工具）→ 装配 `LoopGuardPlugin` → `Engine::new` → `App::new`，返回的 `App`（`fuyao_app::App`）即可直接用，签名见 rustdoc `fuyao_app` 首页。
+`start` 串联 `init_engine`（配置 / 日志 / Provider）→ `build_tool_registry`（内置 + MCP 工具）→ 装配 `LoopGuardPlugin` → 创建 `SessionStore` → `Engine::new`（注入 store）→ `App::new` → `SessionManager::new`，返回 `FuyaoApp { app, sessions }`——`app` 与 `sessions` 共享同一份 `Arc<SessionStore>`，平级正交。签名见 rustdoc `fuyao_app` 首页。
 
 ### App 动作清单（应用层主入口）
 
@@ -54,7 +58,7 @@ let app = fuyao_app::start(EngineParams {
 
 | 动作 | 方法 | 入参 | 返回 |
 |------|------|------|------|
-| 启动 | `fuyao_app::start` | `EngineParams` | `Result<App, SetupError>` |
+| 启动 | `fuyao_app::start` | `EngineParams` | `Result<FuyaoApp { app, sessions }, SetupError>` |
 | 创建对话 | `app.create_session` | `SessionParams` | `Result<SessionId, EngineError>`（rx 由内部 forwarder 消费进 fan_out） |
 | 恢复对话 | `app.resume_session` | `&SessionId` / `SessionParams` | `Result<SessionId, EngineError>` |
 | 派生对话（fork） | `app.fork_session` | `&SessionId`（源）/ `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = None`，独立 session） |
@@ -63,6 +67,8 @@ let app = fuyao_app::start(EngineParams {
 | 出事件 | `app.recv` | — | `Option<OutputEvent>`（单一出口，所有主 session 的事件汇聚于此） |
 | 销毁单对话 | `app.end_session` | `&SessionId` / `&str（end_reason）` | `Result<(), EngineError>` |
 | 关闭 | `app.shutdown` | 消费 `self` | `()`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop） |
+| 列历史会话 | `sessions.list_sessions` | `Option<&str>`（workspace 过滤）/ `i64` limit / `i64` offset | `Result<Vec<Session>, SessionError>`（按 `last_active_at` 倒序） |
+| 会话总数 | `sessions.session_count` | `Option<&str>`（workspace 过滤） | `Result<i64, SessionError>` |
 
 > **子 session 不进 fan_out**：子任务 session（`create_child_session` 产出）的 rx 直接返调用方独占消费——子代理 tool handler 用它取最终回复，fire-and-forget 后台任务 spawn 独立 task 消费。UI 出口只暴露主对话，避免子任务事件污染主对话流。
 
