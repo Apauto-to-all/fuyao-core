@@ -17,8 +17,8 @@ impl super::SessionStore {
             "INSERT INTO sessions (id, started_at, ended_at, end_reason,
                 message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                 total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                compression_count, last_compacted_seq, parent_session_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )
         .bind(session.id.as_str())
         .bind(session.started_at)
@@ -36,6 +36,8 @@ impl super::SessionStore {
         .bind(session.compression_count)
         .bind(session.last_compacted_seq)
         .bind(session.parent_session_id.as_deref())
+        .bind(session.workspace.as_deref())
+        .bind(session.last_active_at)
         .execute(&self.pool)
         .await?;
 
@@ -51,7 +53,7 @@ impl super::SessionStore {
             "SELECT id, started_at, ended_at, end_reason,
                     message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                     total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                    compression_count, last_compacted_seq, parent_session_id
+                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at
              FROM sessions WHERE id = ?1",
         )
         .bind(session_id)
@@ -73,7 +75,8 @@ impl super::SessionStore {
                 total_prompt_tokens = ?6, total_completion_tokens = ?7,
                 total_reasoning_tokens = ?8, total_cached_tokens = ?9,
                 total_cost = ?10, title = ?11, system_prompt = ?12,
-                compression_count = ?13, last_compacted_seq = ?14, parent_session_id = ?15
+                compression_count = ?13, last_compacted_seq = ?14, parent_session_id = ?15,
+                last_active_at = unixepoch()
              WHERE id = ?1",
         )
         .bind(session.id.as_str())
@@ -110,15 +113,29 @@ impl super::SessionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// 列出会话（不含消息，分页）
-    pub async fn list_all(&self, limit: i64, offset: i64) -> Result<Vec<Session>, SessionError> {
+    /// 列出会话（不含消息，分页，按最近活动时间倒序）
+    ///
+    /// 排序用 `last_active_at DESC`——用户刚交互的会话排最前（类即时通讯的「最近会话」）。
+    /// `last_active_at` 在每次 [`update`](Self::update) 落库时刷新为当前时间。
+    ///
+    /// `workspace_filter` 传 `Some(path)` 只看该工作目录的会话；`None` 看全部（含无 workspace 的）。
+    /// 过滤在 SQL 层完成（走索引），不做内存截断。
+    pub async fn list_all(
+        &self,
+        workspace_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Session>, SessionError> {
         let rows = sqlx::query_as::<_, SessionRow>(
             "SELECT id, started_at, ended_at, end_reason,
                     message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                     total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                    compression_count, last_compacted_seq, parent_session_id
-             FROM sessions ORDER BY started_at DESC LIMIT ?1 OFFSET ?2",
+                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at
+             FROM sessions
+             WHERE (?1 IS NULL OR workspace = ?1)
+             ORDER BY last_active_at DESC LIMIT ?2 OFFSET ?3",
         )
+        .bind(workspace_filter)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -132,6 +149,23 @@ impl super::SessionStore {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
             .fetch_one(&self.pool)
             .await?;
+        Ok(count)
+    }
+
+    /// 获取会话总数（可选按工作目录过滤）
+    ///
+    /// 与 [`list_all`](Self::list_all) 的 `workspace_filter` 配对，供上层计算分页总页数。
+    /// `workspace_filter` 为 `None` 时等价于 [`count`](Self::count)。
+    pub async fn count_with_filter(
+        &self,
+        workspace_filter: Option<&str>,
+    ) -> Result<i64, SessionError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE (?1 IS NULL OR workspace = ?1)",
+        )
+        .bind(workspace_filter)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(count)
     }
 }

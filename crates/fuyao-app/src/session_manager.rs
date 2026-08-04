@@ -41,22 +41,32 @@ impl SessionManager {
     }
 
     // ── 会话查询 ───────────────────────────────────────────────
-    // 接口占位：分页语义、返回结构等细节待后续设计落实。
 
-    /// 列举历史会话（分页）
+    /// 列举历史会话（分页，按最近活动时间倒序）
     ///
-    /// 返回按会话开始时间倒序排列的历史会话列表。分页参数语义、返回结构待后续设计落实。
-    pub async fn list_sessions(&self) -> Vec<Session> {
-        let _ = &self.store;
-        todo!("分页列举历史会话：待设计落实分页参数与返回结构")
+    /// 返回的会话按 `last_active_at` 倒序——用户刚交互的会话排最前。
+    ///
+    /// # 参数
+    /// - `workspace_filter`：传 `Some(path)` 只列该工作目录的会话；`None` 列全部（含无 workspace 的）
+    /// - `limit` / `offset`：分页，单页条数与偏移量
+    pub async fn list_sessions(
+        &self,
+        workspace_filter: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Session>, fuyao_session::SessionError> {
+        self.store.list_all(workspace_filter, limit, offset).await
     }
 
-    /// 会话总数
+    /// 会话总数（可选按工作目录过滤）
     ///
     /// 配合 [`list_sessions`](Self::list_sessions) 的分页，供上层计算总页数。
-    pub async fn session_count(&self) -> i64 {
-        let _ = &self.store;
-        todo!("统计会话总数：待设计落实")
+    /// `workspace_filter` 须与 `list_sessions` 传的一致，否则总数与列表对不上。
+    pub async fn session_count(
+        &self,
+        workspace_filter: Option<&str>,
+    ) -> Result<i64, fuyao_session::SessionError> {
+        self.store.count_with_filter(workspace_filter).await
     }
 
     // ── 消息查询 ───────────────────────────────────────────────

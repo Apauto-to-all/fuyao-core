@@ -26,7 +26,7 @@ use fuyao_session::accumulate_session_total;
 async fn visible_messages_match_inserted_count() {
     // 插入 N 条消息后，count_messages 与 load_visible_messages 长度应一致（未经压缩）
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     for i in 0..5 {
@@ -44,7 +44,7 @@ async fn visible_messages_match_inserted_count() {
 async fn messages_preserve_role_and_content_on_roundtrip() {
     // 消息插入后读回，role / content / kind 应保持（持久化往返契约）
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut user_msg = Message::user("用户提问".to_string());
@@ -72,7 +72,7 @@ async fn messages_preserve_role_and_content_on_roundtrip() {
 async fn images_preserve_on_roundtrip() {
     // 带图消息插入后读回，images 应完整保持（多图 + mime + base64 逐字段一致）
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let images = vec![
@@ -102,7 +102,7 @@ async fn images_preserve_on_roundtrip() {
 async fn no_images_roundtrips_empty() {
     // 纯文本消息读回 images 恒为空（NULL 列 → 空 vec）
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut msg = Message::user("纯文本".to_string());
@@ -116,7 +116,7 @@ async fn no_images_roundtrips_empty() {
 async fn seq_is_monotonically_increasing_across_inserts() {
     // insert_message 分配的 seq 应单调递增（UNIQUE(session_id, seq) 保证）
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut seqs = Vec::new();
@@ -141,7 +141,7 @@ async fn update_roundtrips_all_metadata_fields() {
     // update 修改的元数据字段（message_count / tool_call_count / 各 token 总计 / cost），
     // get 读回应完全一致——验证全量 UPDATE 的往返无丢失。
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
+    let mut session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     // 业务层累积后修改元数据
@@ -173,7 +173,7 @@ async fn update_roundtrips_all_metadata_fields() {
 async fn update_title_and_system_prompt_roundtrip() {
     // 单字段更新（update_title / update_system_prompt）后 get 读回应反映新值
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     store.update_title(&session.id, "新标题").await.unwrap();
@@ -197,7 +197,7 @@ async fn accumulated_cost_persists_through_update_roundtrip() {
     // store.update（store 模块）落库 → store.get 读回。
     // 验证 Decimal 累积的 total_cost 跨 DB 往返无精度漂移。
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
+    let mut session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     // 累积多条 assistant 消息（只有 assistant 角色accumulated）
@@ -224,7 +224,7 @@ async fn accumulate_only_counts_assistant_messages_in_session() {
     // accumulate_session_total 只累积 assistant 角色；user/tool 消息不计。
     // 验证累积逻辑在「混合消息 + 落库」场景下只认 assistant。
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
+    let mut session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     // 一条 user（不计）+ 一条 assistant（计）+ 一条 tool（不计）
@@ -257,8 +257,8 @@ async fn accumulate_only_counts_assistant_messages_in_session() {
 async fn multiple_sessions_isolate_messages() {
     // 两个 session 各自插入消息，load_visible_messages 不应串扰
     let store = temp_store().await;
-    let session_a = Session::new(None, None);
-    let session_b = Session::new(None, None);
+    let session_a = Session::new(None, None, None);
+    let session_b = Session::new(None, None, None);
     store.create(&session_a).await.unwrap();
     store.create(&session_b).await.unwrap();
 
@@ -294,12 +294,12 @@ async fn count_and_list_all_reflect_multiple_sessions() {
     // count / list_all 应正确反映多 session 状态
     let store = temp_store().await;
     for _ in 0..3 {
-        let session = Session::new(None, None);
+        let session = Session::new(None, None, None);
         store.create(&session).await.unwrap();
     }
 
     assert_eq!(store.count().await.unwrap(), 3);
-    let listed = store.list_all(100, 0).await.unwrap();
+    let listed = store.list_all(None, 100, 0).await.unwrap();
     assert_eq!(listed.len(), 3);
 }
 
@@ -312,7 +312,7 @@ async fn full_session_lifecycle_create_to_end() {
     // 端到端 happy-path：create → insert → accumulate cost → update → end_session → get 读回 ended_at
     // 这条跨多方法的链路单测从未覆盖
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
+    let mut session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     // 插入对话

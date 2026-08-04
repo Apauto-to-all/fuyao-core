@@ -22,7 +22,7 @@ async fn temp_store() -> SessionStore {
 #[tokio::test]
 async fn store_create_and_get() {
     let store = temp_store().await;
-    let session = Session::new(Some("测试".to_string()), None);
+    let session = Session::new(None, Some("测试".to_string()), None);
     store.create(&session).await.unwrap();
 
     let loaded = store.get(&session.id).await.unwrap().unwrap();
@@ -42,7 +42,7 @@ async fn store_get_returns_none_for_missing() {
 #[tokio::test]
 async fn store_delete_removes_session() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let deleted = store.delete(&session.id).await.unwrap();
@@ -53,28 +53,34 @@ async fn store_delete_removes_session() {
 #[tokio::test]
 async fn store_list_all_returns_sessions() {
     let store = temp_store().await;
-    let s1 = Session::new(Some("会话1".to_string()), None);
-    let s2 = Session::new(Some("会话2".to_string()), None);
+    let s1 = Session::new(None, Some("会话1".to_string()), None);
+    let s2 = Session::new(None, Some("会话2".to_string()), None);
     store.create(&s1).await.unwrap();
     store.create(&s2).await.unwrap();
 
-    let list = store.list_all(10, 0).await.unwrap();
+    let list = store.list_all(None, 10, 0).await.unwrap();
     assert_eq!(list.len(), 2);
-    assert_eq!(list[0].title, Some("会话2".to_string()));
+    // 排序按 last_active_at 倒序，两会话几乎同时创建，仅校验两者都在结果中
+    let titles: Vec<String> = list
+        .iter()
+        .filter_map(|s| s.title.as_deref().map(str::to_string))
+        .collect();
+    assert!(titles.contains(&"会话1".to_string()));
+    assert!(titles.contains(&"会话2".to_string()));
 }
 
 #[tokio::test]
 async fn store_count_returns_correct_count() {
     let store = temp_store().await;
     assert_eq!(store.count().await.unwrap(), 0);
-    store.create(&Session::new(None, None)).await.unwrap();
+    store.create(&Session::new(None, None, None)).await.unwrap();
     assert_eq!(store.count().await.unwrap(), 1);
 }
 
 #[tokio::test]
 async fn store_update_syncs_metadata() {
     let store = temp_store().await;
-    let mut session = Session::new(None, None);
+    let mut session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     // 改一些元数据后 update
@@ -93,7 +99,7 @@ async fn store_update_syncs_metadata() {
 async fn parent_session_id_defaults_none_on_create() {
     // 主 session（create_session / resume_session 产出）：parent_session_id 应为 None
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let loaded = store.get(&session.id).await.unwrap().unwrap();
@@ -104,10 +110,10 @@ async fn parent_session_id_defaults_none_on_create() {
 async fn parent_session_id_persists_and_roundtrips() {
     // 子任务 session：parent_session_id 应为父 id，且 create/get/update 全程保持
     let store = temp_store().await;
-    let parent = Session::new(Some("父会话".to_string()), None);
+    let parent = Session::new(None, Some("父会话".to_string()), None);
     store.create(&parent).await.unwrap();
 
-    let mut child = Session::new(None, None);
+    let mut child = Session::new(None, None, None);
     child.parent_session_id = Some(parent.id.clone());
     store.create(&child).await.unwrap();
 
@@ -139,7 +145,7 @@ async fn fork_copy_visible_messages_to_child() {
     let store = temp_store().await;
 
     // 源 session：2 条普通消息
-    let parent = Session::new(None, Some("父系统提示词".to_string()));
+    let parent = Session::new(None, None, Some("父系统提示词".to_string()));
     store.create(&parent).await.unwrap();
     let mut m1 = Message::user("父消息1".to_string());
     store.insert_message(&parent.id, &mut m1).await.unwrap();
@@ -164,7 +170,7 @@ async fn fork_copy_visible_messages_to_child() {
         .iter()
         .filter(|m| matches!(m.kind, MessageKind::Message))
         .count();
-    let mut child = Session::new(None, parent.system_prompt.clone());
+    let mut child = Session::new(None, None, parent.system_prompt.clone());
     child.parent_session_id = Some(parent.id.clone());
     child.message_count = non_compaction_count as i64;
     store.create(&child).await.unwrap();
@@ -208,7 +214,7 @@ async fn fork_copy_visible_messages_to_child() {
 #[tokio::test]
 async fn insert_message_assigns_sequential_seq() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut m1 = Message::user("第一条".to_string());
@@ -225,7 +231,7 @@ async fn insert_message_assigns_sequential_seq() {
 #[tokio::test]
 async fn insert_message_serializes_tool_calls() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut msg = Message::assistant(None);
@@ -245,7 +251,7 @@ async fn insert_message_serializes_tool_calls() {
 #[tokio::test]
 async fn count_messages_excludes_compaction_boundary() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut m1 = Message::user("a".to_string());
@@ -272,7 +278,7 @@ async fn count_messages_excludes_compaction_boundary() {
 #[tokio::test]
 async fn mark_compaction_inserts_boundary_message() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut m1 = Message::user("hello".to_string());
@@ -305,7 +311,7 @@ async fn mark_compaction_inserts_boundary_message() {
 #[tokio::test]
 async fn mark_compaction_updates_session_metadata() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let new_seq = store
@@ -335,7 +341,7 @@ async fn mark_compaction_returns_not_found_for_missing_session() {
 #[tokio::test]
 async fn update_system_prompt_updates_db_row() {
     let store = temp_store().await;
-    let session = Session::new(None, Some("旧提示词".to_string()));
+    let session = Session::new(None, None, Some("旧提示词".to_string()));
     store.create(&session).await.unwrap();
 
     store
@@ -364,7 +370,7 @@ async fn update_system_prompt_errors_on_missing_session() {
 #[tokio::test]
 async fn update_title_updates_db_row() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
     assert_eq!(session.title.as_deref(), Some("新会话"));
 
@@ -391,7 +397,7 @@ async fn update_title_errors_on_missing_session() {
 #[tokio::test]
 async fn end_session_updates_db_row() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
     // 新建 session 未结束
     let before = store.get(&session.id).await.unwrap().unwrap();
@@ -423,7 +429,7 @@ async fn end_session_errors_on_missing_session() {
 #[tokio::test]
 async fn load_visible_returns_all_when_never_compacted() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut m1 = Message::user("m1".to_string());
@@ -438,7 +444,7 @@ async fn load_visible_returns_all_when_never_compacted() {
 #[tokio::test]
 async fn load_visible_returns_only_after_boundary() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     for content in ["old1", "old2", "old3"] {
@@ -471,7 +477,7 @@ async fn load_visible_returns_only_after_boundary() {
 #[tokio::test]
 async fn load_visible_returns_latest_after_multiple_compactions() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut m = Message::user("v1-1".to_string());
@@ -506,7 +512,7 @@ async fn load_visible_returns_latest_after_multiple_compactions() {
 #[tokio::test]
 async fn load_full_history_includes_compacted_messages() {
     let store = temp_store().await;
-    let session = Session::new(None, None);
+    let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
 
     let mut m1 = Message::user("old".to_string());
@@ -523,4 +529,134 @@ async fn load_full_history_includes_compacted_messages() {
     // 全量 = 2 条原始消息 + 1 条 compaction 边界
     assert_eq!(full.len(), 3);
     assert_eq!(full[2].kind, MessageKind::Compaction);
+}
+
+// ===== workspace 字段持久化 + 按工作目录过滤 / 最近活动排序 =====
+
+#[tokio::test]
+async fn store_create_and_get_preserves_workspace() {
+    // workspace 创建时定死，落库后 get 能读回原值
+    let store = temp_store().await;
+    let session = Session::new(
+        Some("/home/u/proj-a".to_string()),
+        Some("项目A".to_string()),
+        None,
+    );
+    store.create(&session).await.unwrap();
+
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert_eq!(loaded.workspace.as_deref(), Some("/home/u/proj-a"));
+}
+
+#[tokio::test]
+async fn store_create_and_get_workspace_none() {
+    // 无工作目录时 workspace 为 None，往返不丢失
+    let store = temp_store().await;
+    let session = Session::new(None, None, None);
+    store.create(&session).await.unwrap();
+
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert!(loaded.workspace.is_none());
+}
+
+#[tokio::test]
+async fn store_list_all_filters_by_workspace() {
+    // 按工作目录过滤：只返回匹配 workspace 的会话
+    let store = temp_store().await;
+    let proj_a_1 = Session::new(Some("/proj-a".to_string()), None, None);
+    let proj_a_2 = Session::new(Some("/proj-a".to_string()), None, None);
+    let proj_b = Session::new(Some("/proj-b".to_string()), None, None);
+    let no_workspace = Session::new(None, None, None);
+    store.create(&proj_a_1).await.unwrap();
+    store.create(&proj_a_2).await.unwrap();
+    store.create(&proj_b).await.unwrap();
+    store.create(&no_workspace).await.unwrap();
+
+    // 只看 proj-a
+    let a_list = store.list_all(Some("/proj-a"), 100, 0).await.unwrap();
+    assert_eq!(a_list.len(), 2);
+    assert!(
+        a_list
+            .iter()
+            .all(|s| s.workspace.as_deref() == Some("/proj-a"))
+    );
+
+    // 只看 proj-b
+    let b_list = store.list_all(Some("/proj-b"), 100, 0).await.unwrap();
+    assert_eq!(b_list.len(), 1);
+
+    // 不过滤 = 全部（含无 workspace 的）
+    let all = store.list_all(None, 100, 0).await.unwrap();
+    assert_eq!(all.len(), 4);
+}
+
+#[tokio::test]
+async fn store_count_with_filter_matches_list() {
+    // count_with_filter 与 list_all 的 workspace_filter 语义一致，总数对得上
+    let store = temp_store().await;
+    store
+        .create(&Session::new(Some("/proj-a".to_string()), None, None))
+        .await
+        .unwrap();
+    store
+        .create(&Session::new(Some("/proj-a".to_string()), None, None))
+        .await
+        .unwrap();
+    store
+        .create(&Session::new(Some("/proj-b".to_string()), None, None))
+        .await
+        .unwrap();
+
+    assert_eq!(store.count_with_filter(Some("/proj-a")).await.unwrap(), 2);
+    assert_eq!(store.count_with_filter(Some("/proj-b")).await.unwrap(), 1);
+    assert_eq!(store.count_with_filter(None).await.unwrap(), 3);
+    assert_eq!(store.count().await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn store_update_refreshes_last_active_at() {
+    // update 落库时刷新 last_active_at：update 后 DB 里的值应晚于创建时的初始值
+    let store = temp_store().await;
+    let mut session = Session::new(None, None, None);
+    store.create(&session).await.unwrap();
+    let created_active = session.last_active_at;
+
+    // sleep 一小段，确保 unixepoch() 推进（SQLite unixepoch 精度为秒）
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    session.message_count = 5; // 随便改个字段触发 update
+    store.update(&session).await.unwrap();
+
+    let loaded = store.get(&session.id).await.unwrap().unwrap();
+    assert!(
+        loaded.last_active_at > created_active,
+        "update 后 last_active_at 应晚于创建初值：{} > {}",
+        loaded.last_active_at,
+        created_active
+    );
+}
+
+#[tokio::test]
+async fn store_list_all_orders_by_last_active_at_desc() {
+    // 最近活动的会话排最前：先建的老会话 update 一次，应排到前面
+    let store = temp_store().await;
+    let old_session = Session::new(None, Some("老会话".to_string()), None);
+    let new_session = Session::new(None, Some("新会话".to_string()), None);
+    store.create(&old_session).await.unwrap();
+    // sleep 确保新会话创建时间晚于老会话
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    store.create(&new_session).await.unwrap();
+
+    // 此时新会话的 last_active_at 更晚 → 新会话在前
+    let list = store.list_all(None, 10, 0).await.unwrap();
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].title.as_deref(), Some("新会话"));
+
+    // 现在对老会话做 update（刷新它的 last_active_at），它应跳到前面
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let mut old_loaded = store.get(&old_session.id).await.unwrap().unwrap();
+    old_loaded.message_count = 1;
+    store.update(&old_loaded).await.unwrap();
+
+    let list2 = store.list_all(None, 10, 0).await.unwrap();
+    assert_eq!(list2[0].title.as_deref(), Some("老会话"));
 }

@@ -34,8 +34,10 @@ impl Engine {
         // 构建系统提示词（Agent 配置决定人格）
         let system_prompt = build_system_prompt(&self.params.agent_paths, &definition, usage);
 
-        // 创建 Session（8 位 UUID）
-        let session = Session::new(None, Some(system_prompt));
+        // 创建 Session（8 位 UUID）。工作目录来自 agent_paths.workspace，创建时定死，
+        // 经 normalize_workspace 统一分隔符为正斜杠（跨平台形态一致，按项目过滤匹配稳定）。
+        let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
+        let session = Session::new(workspace, None, Some(system_prompt));
 
         // 落库元数据（消息产生时由 emit_to_history 单条 insert_message 落库）
         self.store.create(&session).await?;
@@ -220,7 +222,8 @@ impl Engine {
                 );
                 let system_prompt =
                     build_system_prompt(&self.params.agent_paths, &definition, usage);
-                let mut s = Session::new(None, Some(system_prompt));
+                let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
+                let mut s = Session::new(workspace, None, Some(system_prompt));
                 s.parent_session_id = Some(parent_session_id.clone());
                 self.store.create(&s).await?;
                 (s, definition)
@@ -298,7 +301,8 @@ impl Engine {
             .iter()
             .filter(|m| matches!(m.kind, MessageKind::Message))
             .count() as i64;
-        let mut new_session = Session::new(None, source.system_prompt.clone());
+        let mut new_session =
+            Session::new(source.workspace.clone(), None, source.system_prompt.clone());
         new_session.parent_session_id = parent_session_id;
         new_session.message_count = message_count;
 

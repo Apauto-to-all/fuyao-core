@@ -341,7 +341,7 @@ async fn make_harness_full(
     agent_paths: fuyao_api::AgentPaths,
 ) -> TestHarness {
     let store = temp_store().await;
-    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
     // 强制 session.id 与 emitter 的 session_id 一致
     // （build_chat_request 用 emitter.session_id() 查 DB，必须匹配）
     session.id = "test_session".to_string();
@@ -629,7 +629,7 @@ async fn pending_consumed_when_task_idle() {
     )]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
     session.id = "test_session".to_string();
     store.create(&session).await.unwrap();
 
@@ -722,7 +722,7 @@ async fn plugin_message_routes_through_dispatch() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
     session.id = "plugin_session".to_string();
     store.create(&session).await.unwrap();
 
@@ -829,7 +829,7 @@ async fn plugin_forwards_during_active_turn() {
     let provider: Arc<dyn Provider> = Arc::new(provider);
 
     let store = temp_store().await;
-    let mut session = Session::new(None, Some("系统提示词".to_string()));
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
     session.id = "plugin_active".to_string();
     store.create(&session).await.unwrap();
 

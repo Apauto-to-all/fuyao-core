@@ -9,6 +9,11 @@
 //! - messages 加 `UNIQUE(session_id, seq)` 约束
 //! - 新增 `idx_messages_session_seq` + `idx_messages_session_kind_seq` 索引
 //!
+//! v3 改动（会话列表排序与工作目录区分）：
+//! - sessions 加 `workspace`（工作目录路径，创建时定死，供列表按项目过滤）
+//! - sessions 加 `last_active_at`（最近活动时间，每次 update 刷新，供列表按最近活动倒序）
+//! - 新增 `idx_sessions_last_active`（支撑按最近活动倒序的列表查询）
+//!
 //! `parent_session_id` 字段历史：
 //! - 最初为「链式分裂压缩方案」引入，后随方案废弃而删除（一并删除 `idx_sessions_parent`）
 //! - 现重新加回，语义为**通用子任务标记**（非 fork 专属）：
@@ -43,7 +48,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     system_prompt     TEXT,
     compression_count      INTEGER NOT NULL DEFAULT 0,
     last_compacted_seq     INTEGER,
-    parent_session_id      TEXT
+    parent_session_id      TEXT,
+    workspace               TEXT,
+    last_active_at          REAL NOT NULL DEFAULT (unixepoch())
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -70,6 +77,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_session_kind_seq ON messages(session_id, kind, seq);

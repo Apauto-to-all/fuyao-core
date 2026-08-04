@@ -43,7 +43,7 @@ async fn make_engine() -> (Arc<Engine>, tempfile::TempDir) {
 
 /// 在 store 里建一个带 2 条普通消息的源 session，返回其 id
 async fn seed_source_session(engine: &Engine) -> SessionId {
-    let source = Session::new(None, Some("源系统提示词".to_string()));
+    let source = Session::new(None, None, Some("源系统提示词".to_string()));
     engine.store.create(&source).await.unwrap();
     let mut m1 = Message::user("源消息1".to_string());
     engine

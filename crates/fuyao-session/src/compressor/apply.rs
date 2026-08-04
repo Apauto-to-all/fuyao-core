@@ -83,7 +83,7 @@ mod tests {
     #[tokio::test]
     async fn apply_inserts_boundary_and_clones_keep_recent() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None);
+        let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
 
         // 10 条消息逐条插入（事件级落库模式）

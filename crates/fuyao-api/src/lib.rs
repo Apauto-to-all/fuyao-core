@@ -49,7 +49,9 @@ pub use provider::{
     Provider, ProviderOptions, ThinkingType,
 };
 pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
-pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
+pub use session_types::{
+    ImageContent, Message, MessageKind, MessageRole, Session, TodoItem, normalize_workspace,
+};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{
     CancellationToken, ChildSessionSource, SubagentOps, ToolCallContext, ToolDefinition, ToolFn,

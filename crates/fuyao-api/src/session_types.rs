@@ -2,6 +2,7 @@
 //!
 //! Session、Message、TodoItem 类型。
 
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn current_timestamp() -> f64 {
@@ -9,6 +10,21 @@ fn current_timestamp() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs_f64()
+}
+
+/// 把工作目录路径归一化为持久化形态：统一分隔符为正斜杠 `/`
+///
+/// Windows 下 `current_dir()` 返回反斜杠路径（如 `C:\a\b`），直接 `to_string_lossy`
+/// 存入 DB 会引入反斜杠（escape 字符，跨平台展示 / 日志归一化时处理麻烦）。
+/// 统一换成正斜杠后，同一项目无论在 Windows 还是 Unix 下，workspace 字符串形态一致，
+/// 按项目过滤（`workspace = ?`）的匹配结果稳定。
+///
+/// 不做 `canonicalize`（解析符号链接 / 要求路径存在）——那会改变用户对路径的预期、
+/// 且路径不存在时会失败，对「展示 + 按项目过滤」不友好。
+pub fn normalize_workspace(workspace: &Option<PathBuf>) -> Option<String> {
+    workspace
+        .as_ref()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
 /// 会话
@@ -53,6 +69,16 @@ pub struct Session {
     ///
     /// 与历史「链式分裂压缩方案」的同名字段无任何关系——该方案已废弃，此处仅作通用子任务标记。
     pub parent_session_id: Option<String>,
+    /// 工作目录绝对路径（创建会话时定死，不再变化）
+    ///
+    /// 来源：引擎创建会话时的 `agent_paths.workspace`。无工作目录（纯 global 层运行）时为 `None`。
+    /// 用途：session 列表查询按项目过滤——同一 agent（同一 db）下不同工作目录的会话靠此字段区分。
+    pub workspace: Option<String>,
+    /// 最近活动时间（Unix 秒浮点）
+    ///
+    /// 创建时等于 `started_at`；每次会话交互后（`SessionStore::update` 落库时）刷新为当前时间。
+    /// 用途：session 列表查询按最近活动倒序——用户刚交互的会话排最前（类即时通讯的「最近会话」）。
+    pub last_active_at: f64,
     // 注：消息列表（messages）已从内存移除——每条消息产生即落 DB，
     // 需要时按 session_id 从数据库查询（见 SessionStore::load_visible_messages）。
     // 这样单个 session 内存占用恒定（不随历史增长），多 session 并发无内存压力。
@@ -60,13 +86,21 @@ pub struct Session {
 
 impl Session {
     /// 创建新会话，自动生成 8 位 UUID
-    pub fn new(title: Option<String>, system_prompt: Option<String>) -> Self {
+    ///
+    /// `workspace` 为工作目录绝对路径（创建时定死，来自引擎的 `agent_paths.workspace`），
+    /// 无工作目录时传 `None`。`last_active_at` 初始化为当前时间（等于 `started_at`）。
+    pub fn new(
+        workspace: Option<String>,
+        title: Option<String>,
+        system_prompt: Option<String>,
+    ) -> Self {
         let id = uuid::Uuid::new_v4()
             .to_string()
             .split('-')
             .next()
             .unwrap_or("unknown")
             .to_string();
+        let now = current_timestamp();
         Self {
             id,
             title: title.or_else(|| Some("新会话".to_string())),
@@ -78,12 +112,14 @@ impl Session {
             total_reasoning_tokens: 0,
             total_cached_tokens: 0,
             total_cost: 0.0,
-            started_at: current_timestamp(),
+            started_at: now,
+            last_active_at: now,
             ended_at: None,
             end_reason: None,
             compression_count: 0,
             last_compacted_seq: None,
             parent_session_id: None,
+            workspace,
         }
     }
 }
@@ -351,7 +387,7 @@ mod tests {
 
     #[test]
     fn session_new_generates_8_char_id() {
-        let session = Session::new(None, None);
+        let session = Session::new(None, None, None);
         assert_eq!(session.id.len(), 8);
         assert_eq!(session.title, Some("新会话".to_string()));
     }
@@ -359,15 +395,63 @@ mod tests {
     #[test]
     fn session_new_parent_session_id_defaults_none() {
         // 用户会话（非派生）：parent_session_id 应为 None
-        let session = Session::new(None, None);
+        let session = Session::new(None, None, None);
         assert!(session.parent_session_id.is_none());
     }
 
     #[test]
     fn session_new_with_custom_title() {
-        let session = Session::new(Some("测试会话".to_string()), Some("系统提示".to_string()));
+        let session = Session::new(
+            None,
+            Some("测试会话".to_string()),
+            Some("系统提示".to_string()),
+        );
         assert_eq!(session.title, Some("测试会话".to_string()));
         assert_eq!(session.system_prompt, Some("系统提示".to_string()));
+    }
+
+    #[test]
+    fn session_new_workspace_and_last_active_at() {
+        // workspace 创建时定死；last_active_at 初始化等于 started_at
+        let session = Session::new(Some("/home/u/proj".to_string()), None, None);
+        assert_eq!(session.workspace.as_deref(), Some("/home/u/proj"));
+        assert_eq!(session.started_at, session.last_active_at);
+    }
+
+    #[test]
+    fn session_new_workspace_none_when_absent() {
+        let session = Session::new(None, None, None);
+        assert!(session.workspace.is_none());
+    }
+
+    #[test]
+    fn normalize_workspace_none_when_workspace_absent() {
+        // workspace=None → workspace=None
+        assert_eq!(normalize_workspace(&None), None);
+    }
+
+    #[test]
+    fn normalize_workspace_converts_backslashes_to_forward() {
+        // Windows 反斜杠路径 → 统一为正斜杠（跨平台形态一致）
+        let ws = Some(PathBuf::from(r"C:\Users\TF\proj"));
+        assert_eq!(
+            normalize_workspace(&ws).as_deref(),
+            Some("C:/Users/TF/proj")
+        );
+    }
+
+    #[test]
+    fn normalize_workspace_keeps_forward_slashes_unchanged() {
+        // Unix 正斜杠路径 → 原样保留
+        let ws = Some(PathBuf::from("/home/u/proj"));
+        assert_eq!(normalize_workspace(&ws).as_deref(), Some("/home/u/proj"));
+    }
+
+    #[test]
+    fn normalize_workspace_mixed_separators() {
+        // 混用分隔符（Windows 下手写配置可能出现）→ 统一为正斜杠
+        let ws = Some(PathBuf::from(r"C:\a/b\c"));
+        assert_eq!(normalize_workspace(&ws).as_deref(), Some("C:/a/b/c"));
     }
 
     #[test]

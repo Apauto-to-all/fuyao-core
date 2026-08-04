@@ -347,7 +347,7 @@ mod tests {
         let store = fuyao_session::SessionStore::new(dir.join("test.db"))
             .await
             .expect("构造 SessionStore 失败");
-        let mut session = fuyao_api::Session::new(None, None);
+        let mut session = fuyao_api::Session::new(None, None, None);
         session.id = "sess1".to_string();
         store.create(&session).await.unwrap();
 
