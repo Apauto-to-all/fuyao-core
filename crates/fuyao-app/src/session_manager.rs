@@ -24,8 +24,6 @@ use fuyao_session::SessionStore;
 /// - `SessionManager` 管「会话的检索与浏览」（列会话 / 查历史）
 ///
 /// 两者共享同一份 `SessionStore`（Arc 克隆，零拷贝共享连接池）。
-///
-/// 查询接口目前为占位（方法体 `todo!()`），分页语义、返回结构等细节待后续设计落实。
 pub struct SessionManager {
     /// 会话存储句柄（与 Engine 共享同一份，Arc 克隆）
     store: Arc<SessionStore>,
@@ -70,22 +68,47 @@ impl SessionManager {
     }
 
     // ── 消息查询 ───────────────────────────────────────────────
-    // 接口占位：分页语义、排序方向、窗口口径待后续设计落实。
 
-    /// 获取指定会话的最近消息（给人看的，分页）
+    /// 默认分页大小（每页消息条数）
     ///
-    /// 加载某个会话的历史消息供用户浏览。分页参数语义、排序方向、与压缩窗口的口径关系
-    /// 待后续设计落实。
-    pub async fn list_messages(&self, session_id: &str) -> Vec<Message> {
-        let _ = (&self.store, session_id);
-        todo!("分页加载会话历史消息：待设计落实分页参数、排序方向与窗口口径")
-    }
+    /// 向上滚动加载历史的常见档位：既不因每页过少而频繁请求，也不因过多撑爆渲染。
+    /// 调用方可经 `limit` 参数覆盖此默认值。
+    const DEFAULT_MESSAGE_PAGE_SIZE: i64 = 50;
 
-    /// 指定会话的消息总数
+    /// 游标分页加载历史消息（给人看的历史浏览，seq 倒序）
     ///
-    /// 配合 [`list_messages`](Self::list_messages) 的分页，供上层计算总页数。
-    pub async fn message_count(&self, session_id: &str) -> i64 {
-        let _ = (&self.store, session_id);
-        todo!("统计指定会话的消息总数：待设计落实")
+    /// 打开会话先看最新一页，向上滚动加载更早消息。与给 LLM 构造请求的可见窗口
+    /// （`SessionStore::load_visible_messages`）是正交两条路径，互不影响。
+    ///
+    /// # 游标分页（不用 OFFSET）
+    ///
+    /// 消息是持续追加的流，OFFSET 基于「位置」分页，新消息插入会让整页内容向后漂移、
+    /// 重复或遗漏。本接口基于消息的稳定标识 `seq`（单调递增、插入后永不改）做游标分页：
+    ///
+    /// - `before_seq = None`：从最新一条开始（第一页）
+    /// - `before_seq = Some(N)`：取 `seq < N` 的更早一页，锚点本身不含
+    ///
+    /// 「有没有下一页」用返回条数 == `limit` 判断，不提供总数。
+    ///
+    /// # 参数
+    ///
+    /// - `session_id`：会话 ID
+    /// - `before_seq`：游标锚点。`None` 取第一页（最新），`Some(N)` 向前翻（取 seq < N）
+    /// - `limit`：每页条数。`None` 用 [`DEFAULT_MESSAGE_PAGE_SIZE`](Self::DEFAULT_MESSAGE_PAGE_SIZE)
+    ///
+    /// # 压缩消息处理
+    ///
+    /// compaction 消息（摘要）当作对话流里的一个普通节点正常显示，不过滤——
+    /// 全部消息（普通 + 压缩）按 seq 倒序一起分页。
+    pub async fn list_messages(
+        &self,
+        session_id: &str,
+        before_seq: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<Message>, fuyao_session::SessionError> {
+        let limit = limit.unwrap_or(Self::DEFAULT_MESSAGE_PAGE_SIZE).max(1);
+        self.store
+            .list_messages_before(session_id, before_seq, limit)
+            .await
     }
 }

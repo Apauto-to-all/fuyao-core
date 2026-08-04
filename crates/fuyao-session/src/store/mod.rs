@@ -8,14 +8,16 @@
 //! - [`session`]：sessions 表的全部操作——CRUD + 单字段局部更新
 //!   （update_system_prompt / update_title / end_session）
 //! - [`message`]：messages 表的全部操作——写入（insert）/ 计数（count）/
-//!   查询（load_full_history 全量审计 / load_visible_messages LLM 可见窗口）
-//! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason）。
-//!   可见窗口的读取在 [`message`] 模块（本质是消息查询，只是压缩感知）
+//!   查询（load_full_history 全量审计 / list_messages_before 游标分页浏览）
+//! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason）
+//! - [`visible_window`]：给 LLM 的可见窗口动态拼接（压缩感知，摘要 + keep_recent + 新消息）。
+//!   与 [`message`] 的「给人看的」查询路径正交
 
 pub(crate) mod compaction;
 mod message;
 mod row;
 mod session;
+mod visible_window;
 
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
