@@ -370,7 +370,10 @@ mod tests {
             _ => panic!("应为 Assistant 事件"),
         }
         // 补发的 assistant 消息应进 DB
-        let visible = store.load_visible_messages("sess1").await.unwrap();
+        let visible = store
+            .load_visible_messages("sess1", usize::MAX)
+            .await
+            .unwrap();
         assert_eq!(visible.len(), 1, "中断补发应落 DB");
         assert_eq!(visible[0].content.as_deref(), Some("部分回复"));
         assert_eq!(visible[0].finish_reason.as_deref(), Some("interrupted"));

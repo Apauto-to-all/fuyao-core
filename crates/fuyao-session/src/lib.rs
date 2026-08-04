@@ -20,9 +20,7 @@ mod schema;
 mod store;
 mod title_generator;
 
-pub use compressor::{
-    CompressionState as CompressionRuntimeState, apply, generate_summary, should_compress,
-};
+pub use compressor::{apply, generate_summary, should_compress};
 pub use cost::{accumulate_session_total, calculate_cost, fill_message_cost};
 pub use error::SessionError;
 pub use store::SessionStore;

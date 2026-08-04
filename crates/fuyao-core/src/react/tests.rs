@@ -365,9 +365,6 @@ async fn make_harness_full(
         guide: empty_queue(),
         pending: empty_queue(),
         last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_state: Arc::new(std::sync::Mutex::new(
-            fuyao_session::CompressionRuntimeState::default(),
-        )),
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         subagent_ops: None,
@@ -427,7 +424,7 @@ async fn preload_user(h: &mut TestHarness, content: &str) {
 async fn visible_messages(h: &TestHarness) -> Vec<fuyao_api::Message> {
     h.ctx
         .store
-        .load_visible_messages(&h.session.id)
+        .load_visible_messages(&h.session.id, usize::MAX)
         .await
         .expect("加载可见消息失败")
 }
@@ -1261,7 +1258,7 @@ async fn messages_persisted_to_db() {
     let reloaded = h
         .ctx
         .store
-        .load_visible_messages(&session_id)
+        .load_visible_messages(&session_id, usize::MAX)
         .await
         .expect("load_visible_messages 不应失败");
     assert!(
@@ -1552,6 +1549,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
         h.ctx.store.as_ref(),
         &h.session.id,
         h.session.system_prompt.as_deref(),
+        usize::MAX,
     )
     .await;
     let assistant_in_request = request
@@ -1647,9 +1645,6 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         guide: empty_queue(),
         pending: empty_queue(),
         last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_state: Arc::new(std::sync::Mutex::new(
-            fuyao_session::CompressionRuntimeState::default(),
-        )),
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         subagent_ops: None,
@@ -1665,7 +1660,11 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     queue::inject_messages(&ctx, &mut session, msgs).await;
 
     // 验证：DB 里的 content 是拦截后的（带 [脱敏] 前缀）
-    let visible: Vec<_> = ctx.store.load_visible_messages(&session.id).await.unwrap();
+    let visible: Vec<_> = ctx
+        .store
+        .load_visible_messages(&session.id, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 2, "两条 user 消息应都进 DB");
     assert_eq!(
         visible[0].content.as_deref(),
@@ -1705,9 +1704,6 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         guide: empty_queue(),
         pending: empty_queue(),
         last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_state: Arc::new(std::sync::Mutex::new(
-            fuyao_session::CompressionRuntimeState::default(),
-        )),
         compression_config: fuyao_api::CompressionConfig::default(),
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         subagent_ops: None,
@@ -1867,10 +1863,8 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
         "压缩摘要",
     )]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    // 调小 fallback_context：让 keep 预算极小，旧消息进入 to_compress 窗口（否则全部
-    // 落 keep_recent → NothingToCompress 结构性跳过，与阈值无关）
-    h.ctx.compression_config.fallback_context = 10;
-    // 预置多条可见消息（压缩对象）
+    // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门，fallback_context 仅影响
+    // CompressionStarted 事件里的 context_length 展示值，不影响压缩能否执行。
     preload_user(&mut h, "第一段对话内容").await;
     preload_user(&mut h, "第二段对话内容").await;
     preload_user(&mut h, "第三段对话内容").await;

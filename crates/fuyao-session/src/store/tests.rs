@@ -160,9 +160,12 @@ async fn fork_copy_visible_messages_to_child() {
     let mut m3 = Message::user("压缩后消息".to_string());
     store.insert_message(&parent.id, &mut m3).await.unwrap();
 
-    let source_visible = store.load_visible_messages(&parent.id).await.unwrap();
-    // 源可见 = [compaction 边界, 压缩后消息]
-    assert_eq!(source_visible.len(), 2);
+    let source_visible = store
+        .load_visible_messages(&parent.id, usize::MAX)
+        .await
+        .unwrap();
+    // 源可见 = 动态拼接窗口：[compaction 边界, 父消息1, 父回复, 压缩后消息]
+    assert_eq!(source_visible.len(), 4);
 
     // 构造子 session（复制源系统提示词 + 标记 parent_session_id）
     // message_count 只计普通消息（排除 compaction 边界，与 count_messages 语义一致）
@@ -182,12 +185,17 @@ async fn fork_copy_visible_messages_to_child() {
         store.insert_message(&child.id, &mut clone).await.unwrap();
     }
 
-    // 子 session 的可见窗口应与源一致（compaction 边界 + 压缩后消息）
-    let child_visible = store.load_visible_messages(&child.id).await.unwrap();
+    // 子 session 的可见窗口应与源一致（动态拼接窗口逐条复制后，子读回应与源一致）
+    let child_visible = store
+        .load_visible_messages(&child.id, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(child_visible.len(), source_visible.len());
     assert_eq!(child_visible[0].kind, MessageKind::Compaction);
     assert_eq!(child_visible[0].content.as_deref(), Some("父摘要"));
-    assert_eq!(child_visible[1].content.as_deref(), Some("压缩后消息"));
+    let source_contents: Vec<_> = source_visible.iter().map(|m| m.content.clone()).collect();
+    let child_contents: Vec<_> = child_visible.iter().map(|m| m.content.clone()).collect();
+    assert_eq!(source_contents, child_contents, "子可见窗口应与源逐条一致");
 
     // 子 session 自身统计从 0 起算（费用 / token 不继承源），仅 message_count 对齐复制条数
     let child_meta = store.get(&child.id).await.unwrap().unwrap();
@@ -195,8 +203,8 @@ async fn fork_copy_visible_messages_to_child() {
         child_meta.parent_session_id.as_deref(),
         Some(parent.id.as_str())
     );
-    // message_count 只计普通消息（1 条），不含 compaction 边界
-    assert_eq!(child_meta.message_count, 1);
+    // message_count 只计普通消息，不含 compaction 边界
+    assert_eq!(child_meta.message_count, non_compaction_count as i64);
     assert_eq!(child_meta.total_prompt_tokens, 0);
     assert_eq!(child_meta.total_cost, 0.0);
     // 子 session 从未压缩过：自己的压缩指针为空（源的压缩边界只是被复制成普通行）
@@ -242,7 +250,10 @@ async fn insert_message_serializes_tool_calls() {
     }]));
     store.insert_message(&session.id, &mut msg).await.unwrap();
 
-    let visible = store.load_visible_messages(&session.id).await.unwrap();
+    let visible = store
+        .load_visible_messages(&session.id, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 1);
     assert!(visible[0].tool_calls.is_some());
     assert_eq!(visible[0].tool_calls.as_ref().unwrap()[0]["id"], "call_1");
@@ -304,7 +315,7 @@ async fn mark_compaction_inserts_boundary_message() {
     let boundary = &full[2];
     assert_eq!(boundary.seq, 3);
     assert_eq!(boundary.kind, MessageKind::Compaction);
-    assert_eq!(boundary.role, MessageRole::System);
+    assert_eq!(boundary.role, MessageRole::Assistant);
     assert_eq!(boundary.content.as_deref(), Some("## 目标\n- 测试"));
 }
 
@@ -437,12 +448,17 @@ async fn load_visible_returns_all_when_never_compacted() {
     let mut m2 = Message::user("m2".to_string());
     store.insert_message(&session.id, &mut m2).await.unwrap();
 
-    let visible = store.load_visible_messages(&session.id).await.unwrap();
+    let visible = store
+        .load_visible_messages(&session.id, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 2);
 }
 
 #[tokio::test]
-async fn load_visible_returns_only_after_boundary() {
+async fn load_visible_assembles_dynamic_window_after_boundary() {
+    // 动态拼接：可见窗口 = [最新摘要] + keep_recent(区间内原始记录) + 摘要后新消息
+    // keep_tokens=usize::MAX 保留区间内全部消息作 keep_recent
     let store = temp_store().await;
     let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
@@ -465,17 +481,23 @@ async fn load_visible_returns_only_after_boundary() {
         .await
         .unwrap();
 
-    let visible = store.load_visible_messages(&session.id).await.unwrap();
-    // 只看到 compaction 边界（seq=4）+ 之后的消息（seq=5）
-    assert_eq!(visible.len(), 2);
+    let visible = store
+        .load_visible_messages(&session.id, usize::MAX)
+        .await
+        .unwrap();
+    // [摘要, old1, old2, old3, new1]：摘要排最前，keep_recent 含区间内原始记录，新消息在末尾
+    assert_eq!(visible.len(), 5);
     assert_eq!(visible[0].kind, MessageKind::Compaction);
     assert_eq!(visible[0].seq, 4);
-    assert_eq!(visible[1].content.as_deref(), Some("new1"));
-    assert_eq!(visible[1].seq, 5);
+    assert_eq!(visible[1].content.as_deref(), Some("old1"));
+    assert_eq!(visible[3].content.as_deref(), Some("old3"));
+    assert_eq!(visible[4].content.as_deref(), Some("new1"));
+    assert_eq!(visible[4].seq, 5);
 }
 
 #[tokio::test]
-async fn load_visible_returns_latest_after_multiple_compactions() {
+async fn load_visible_keeps_window_between_last_two_summaries() {
+    // 多次压缩：keep_recent 只取最近两条摘要之间，不捞回已被更早摘要覆盖的旧消息
     let store = temp_store().await;
     let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
@@ -500,11 +522,15 @@ async fn load_visible_returns_latest_after_multiple_compactions() {
 
     assert!(seq2 > seq1);
 
-    let visible = store.load_visible_messages(&session.id).await.unwrap();
-    // 只看到最近一次 compaction 边界
-    assert_eq!(visible.len(), 1);
+    let visible = store
+        .load_visible_messages(&session.id, usize::MAX)
+        .await
+        .unwrap();
+    // [摘要2, v2-1]：摘要2（最近一次边界）排最前，v2-1 是两次摘要之间的 keep_recent
+    assert_eq!(visible.len(), 2);
     assert_eq!(visible[0].kind, MessageKind::Compaction);
     assert_eq!(visible[0].content.as_deref(), Some("摘要2"));
+    assert_eq!(visible[1].content.as_deref(), Some("v2-1"));
 }
 
 // ===== load_full_history 测试组 =====

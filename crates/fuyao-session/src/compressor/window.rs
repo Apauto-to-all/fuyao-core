@@ -11,8 +11,6 @@ const CHARS_PER_TOKEN: usize = 4;
 /// 窗口切分结果
 #[derive(Debug)]
 pub struct Window<'a> {
-    /// 被压缩的旧部分（apply 时从内存剔除，由 LLM 摘要覆盖）
-    pub to_compress: &'a [Message],
     /// 保留的近端窗口（apply 时原样留在可见消息流里）
     pub keep_recent: &'a [Message],
 }
@@ -35,22 +33,14 @@ fn estimate_message_tokens(msg: &Message) -> usize {
         + msg.images.len() * tokens_per_image
 }
 
-/// 估算一批消息的总 token 数
-pub fn estimate_tokens(messages: &[Message]) -> usize {
-    messages.iter().map(estimate_message_tokens).sum()
-}
-
-/// 选择保留窗口：返回 (to_compress, keep_recent)
+/// 选择保留窗口：返回 keep_recent
 ///
 /// 步骤：
 /// 1. 反向累加 token 到 keep_tokens → 找切分点
 /// 2. 扩大至 turn 完整边界（不切断 assistant+tool_result 块）
 pub fn select_recent<'a>(messages: &'a [Message], keep_tokens: usize) -> Window<'a> {
     if messages.is_empty() {
-        return Window {
-            to_compress: &[],
-            keep_recent: &[],
-        };
+        return Window { keep_recent: &[] };
     }
 
     // 反向累加找切分点
@@ -70,7 +60,6 @@ pub fn select_recent<'a>(messages: &'a [Message], keep_tokens: usize) -> Window<
     let cut = expand_for_integrity(messages, cut);
 
     Window {
-        to_compress: &messages[..cut],
         keep_recent: &messages[cut..],
     }
 }
@@ -193,13 +182,11 @@ mod tests {
             .collect();
         let w = select_recent(&msgs, 25);
         assert!(!w.keep_recent.is_empty());
-        assert_eq!(w.to_compress.len() + w.keep_recent.len(), msgs.len());
     }
 
     #[test]
     fn select_recent_returns_empty_for_empty_input() {
         let w: Window<'_> = select_recent(&[], 1000);
-        assert!(w.to_compress.is_empty());
         assert!(w.keep_recent.is_empty());
     }
 
@@ -207,7 +194,6 @@ mod tests {
     fn select_recent_keeps_everything_when_budget_large() {
         let msgs: Vec<Message> = (0..3).map(|i| Message::user(format!("m{i}"))).collect();
         let w = select_recent(&msgs, 100_000);
-        assert!(w.to_compress.is_empty());
         assert_eq!(w.keep_recent.len(), 3);
     }
 

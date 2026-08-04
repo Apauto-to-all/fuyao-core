@@ -21,9 +21,6 @@ use serde::Deserialize;
 /// ```
 /// - 小上下文模型（如 32K）按比例保留较少，避免撑爆
 /// - 大上下文模型（如 200K+）受 `keep_tokens_max` 上限保护，避免保留过多
-///
-/// 反抖动：连续两次压缩的 token 节省比例低于 `min_savings_pct` 时停压缩，
-/// 避免无效循环。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CompressionConfig {
@@ -39,8 +36,6 @@ pub struct CompressionConfig {
     pub summary_max_tokens: usize,
     /// 无法解析模型上下文长度时的回退值
     pub fallback_context: u32,
-    /// 反抖动：连续两次压缩节省比例低于此值（%）时停压缩
-    pub min_savings_pct: u8,
     /// 压缩 token 估算：每张图固定占用 token（不按 base64 字符数，避免撑爆触发误压缩），原 `compressor/window.rs TOKENS_PER_IMAGE = 1000`
     pub tokens_per_image: usize,
     /// 是否跳过子 session（有 parent_session_id）的上下文压缩
@@ -61,7 +56,6 @@ impl Default for CompressionConfig {
             keep_tokens_max: 8000,
             summary_max_tokens: 4096,
             fallback_context: 128_000,
-            min_savings_pct: 10,
             tokens_per_image: 1000,
             skip_child: true,
         }
@@ -156,7 +150,6 @@ mod tests {
         assert_eq!(c.keep_tokens_max, 8000);
         assert_eq!(c.summary_max_tokens, 4096);
         assert_eq!(c.fallback_context, 128_000);
-        assert_eq!(c.min_savings_pct, 10);
         assert!(c.skip_child);
     }
 

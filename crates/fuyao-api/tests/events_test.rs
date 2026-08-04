@@ -215,8 +215,6 @@ fn output_event_samples() -> Vec<OutputEvent> {
             payload: CompressionPayload::Ended(CompressionEndedPayload {
                 reason: CompressionReason::Auto,
                 content: "完整摘要".into(),
-                tokens_before: 12_000,
-                tokens_after: 3_000,
                 new_seq: 42,
             }),
         }),

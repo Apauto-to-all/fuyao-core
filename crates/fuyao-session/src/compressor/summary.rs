@@ -7,13 +7,12 @@
 //! - 强制 `tools=[]`，独立于主 ReAct 流，不进对话流
 //! - 用流式 `stream_chat()` 接口，每个 TextDelta/ReasoningDelta 经 callback 上报，
 //!   调用方（react 层）据此发 Compression Delta 事件供前端实时渲染
-//! - 多次压缩时旧 compaction 消息原样在序列里（role=system，content=旧摘要），
+//! - 多次压缩时旧 compaction 消息原样在序列里（role=assistant，content=旧摘要），
 //!   LLM 自然能看到，不需要单独提取 previous_summary 注入
 
 use crate::compressor::prompt::COMPRESSION_SYSTEM_PROMPT;
-use crate::compressor::window::{estimate_tokens, select_recent};
 use futures_util::StreamExt;
-use fuyao_api::{CompressionConfig, Message, MessageRole};
+use fuyao_api::{Message, MessageRole};
 use fuyao_provider::{
     BoxStream, ChatMessage, ChatRequest, Provider, StreamError, StreamEvent, StreamOptions,
 };
@@ -27,7 +26,7 @@ pub enum CompressionError {
     /// LLM 调用失败
     #[error("LLM 调用失败: {0}")]
     LlmError(#[from] StreamError),
-    /// 没有可压缩的内容（messages 为空或全在 tail）
+    /// 没有可压缩的内容（messages 少于 2 条）
     #[error("无可压缩内容")]
     NothingToCompress,
 }
@@ -37,10 +36,6 @@ pub enum CompressionError {
 pub struct SummaryResult {
     /// 摘要正文（content 全文，不含 reasoning——reasoning 不进落库边界）
     pub content: String,
-    /// 压缩前的 token 估算（反抖动统计用）
-    pub tokens_before: usize,
-    /// 压缩后的 token 估算（保留 tail + 摘要）
-    pub tokens_after: usize,
 }
 
 /// 把 fuyao_api::Message 原样转成 provider 的 ChatMessage
@@ -84,19 +79,9 @@ pub async fn generate_summary(
     provider: &std::sync::Arc<dyn Provider>,
     model_id: &str,
     mut options: StreamOptions,
-    context_length: u32,
-    cfg: &CompressionConfig,
     on_delta: &mut impl FnMut(Option<&str>, Option<&str>),
 ) -> Result<SummaryResult, CompressionError> {
     if messages.len() < 2 {
-        return Err(CompressionError::NothingToCompress);
-    }
-
-    // 窗口切分（仅用于估算 tokens_after / 决定 apply 时保留多少近账）
-    // 保留预算按模型上下文比例动态计算
-    let keep_tokens = cfg.effective_keep_tokens(context_length);
-    let window = select_recent(messages, keep_tokens);
-    if window.to_compress.is_empty() {
         return Err(CompressionError::NothingToCompress);
     }
 
@@ -141,15 +126,8 @@ pub async fn generate_summary(
         return Err(CompressionError::EmptySummary);
     }
 
-    // 估算压缩效果（反抖动统计用）
-    let tokens_before = estimate_tokens(messages);
-    let summary_tokens = content.len().div_ceil(4);
-    let tokens_after = estimate_tokens(window.keep_recent) + summary_tokens;
-
     Ok(SummaryResult {
         content: content.to_string(),
-        tokens_before,
-        tokens_after,
     })
 }
 
@@ -205,14 +183,6 @@ mod tests {
         }
     }
 
-    fn cfg_small_keep() -> CompressionConfig {
-        CompressionConfig {
-            keep_ratio: 1.0,     // 比例拉满，让 effective_keep_tokens 永远等于 keep_tokens_max
-            keep_tokens_max: 50, // 极小预算，强制压缩多数消息
-            ..CompressionConfig::default()
-        }
-    }
-
     fn make_messages(n: usize) -> Vec<Message> {
         (0..n)
             .map(|i| Message::user(format!("消息_{i}_{}", "x".repeat(40))))
@@ -238,14 +208,11 @@ mod tests {
             &provider,
             "model",
             StreamOptions::default(),
-            128_000,
-            &cfg_small_keep(),
             &mut cb,
         )
         .await
         .unwrap();
         assert_eq!(result.content, "## 目标\n- 测试");
-        assert!(result.tokens_before > 0);
     }
 
     #[tokio::test]
@@ -262,8 +229,6 @@ mod tests {
             &provider,
             "model",
             StreamOptions::default(),
-            128_000,
-            &cfg_small_keep(),
             &mut cb,
         )
         .await;
@@ -284,8 +249,6 @@ mod tests {
             &provider,
             "model",
             StreamOptions::default(),
-            128_000,
-            &cfg_small_keep(),
             &mut cb,
         )
         .await;
@@ -313,8 +276,6 @@ mod tests {
             &provider,
             "model",
             StreamOptions::default(),
-            128_000,
-            &cfg_small_keep(),
             &mut cb,
         )
         .await

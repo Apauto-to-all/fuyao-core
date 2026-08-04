@@ -46,7 +46,6 @@ use fuyao_api::{
 };
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{ProviderRegistry, StreamUsage};
-use fuyao_session::CompressionRuntimeState;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{Receiver, UnboundedSender};
@@ -90,8 +89,6 @@ pub(crate) struct SessionCtx {
     ///
     /// 由 [`turn::handle_final_reply`] 写入，主循环 pre-turn 读。None 表示首轮尚未跑过。
     pub last_usage: Arc<Mutex<Option<StreamUsage>>>,
-    /// 压缩运行时状态（反抖动统计，per-session）
-    pub compression_state: Arc<std::sync::Mutex<CompressionRuntimeState>>,
     /// 压缩配置（从全局 config 读取，启动时定死）
     pub compression_config: CompressionConfig,
     /// 该 session 的关闭信号（Engine::shutdown 时 cancel）
@@ -159,7 +156,6 @@ pub(crate) async fn run_session(
         guide,
         pending,
         last_usage: Arc::new(Mutex::new(None)),
-        compression_state: Arc::new(std::sync::Mutex::new(CompressionRuntimeState::default())),
         compression_config: fuyao_api::get_config().session.compression.clone(),
         shutdown_token: shutdown_token.clone(),
         subagent_ops,
@@ -223,7 +219,7 @@ pub(crate) async fn run_session(
         }
         if !msgs.is_empty() {
             // === 上下文压缩检查（pre-turn）===
-            // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库 → 复制 keep_recent 为新 seq
+            // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库
             // 失败 log warn 跳过本次压缩，主流程继续
             run_pre_turn_compression(&ctx, &mut session).await;
 
@@ -413,19 +409,12 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         None => return,
     };
 
-    // 阈值检测（含反抖动判定）
-    let trigger = {
-        let state = ctx
-            .compression_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        fuyao_session::should_compress(
-            usage.prompt_tokens,
-            model.context_length,
-            &ctx.compression_config,
-            &state,
-        )
-    };
+    // 阈值检测：prompt_tokens >= threshold × (context_length - summary_max_tokens)
+    let trigger = fuyao_session::should_compress(
+        usage.prompt_tokens,
+        model.context_length,
+        &ctx.compression_config,
+    );
     if !trigger {
         return;
     }
@@ -517,8 +506,14 @@ async fn run_compression(
     )
     .await;
 
-    // 从 DB 加载当前可见消息（事件级落库模式下消息不在内存）
-    let visible_messages = match ctx.store.load_visible_messages(session.id.as_str()).await {
+    // 从 DB 加载完整可见窗口（usize::MAX 不截 keep_recent）：generate_summary 内部不切窗，
+    // 需要看到全部待压缩内容来生成摘要；消息列表与主对话请求同源，前缀缓存可复用。
+    // （读取侧 load_visible_messages 的 keep_recent 切窗只服务主对话窗口构造，与摘要生成无关）
+    let visible_messages = match ctx
+        .store
+        .load_visible_messages(session.id.as_str(), usize::MAX)
+        .await
+    {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
@@ -582,8 +577,6 @@ async fn run_compression(
             &model.provider,
             &model.model_id,
             compression_options,
-            model.context_length,
-            &ctx.compression_config,
             &mut on_delta,
         ) => {
             match s {
@@ -607,17 +600,8 @@ async fn run_compression(
     // 等 Delta 消费者把剩余积压推完
     let _ = (&mut delta_consumer).await;
 
-    // 落地层：mark_compaction + 复制 keep_recent 为新 seq
-    match fuyao_session::apply(
-        &visible_messages,
-        &summary,
-        ctx.emitter.session_id(),
-        &ctx.compression_config,
-        model.context_length,
-        ctx.store.as_ref(),
-    )
-    .await
-    {
+    // 落地层：写 compaction 边界消息（不复制 keep_recent——可见窗口在读取侧动态拼接）
+    match fuyao_session::apply(&summary, ctx.emitter.session_id(), ctx.store.as_ref()).await {
         Ok(new_seq) => {
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在
@@ -633,8 +617,8 @@ async fn run_compression(
             let new_prompt =
                 fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.definition, usage);
 
-            // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库、
-            // keep_recent 已复制，system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，
+            // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库，
+            // system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，
             // DB 字段下次 update session 时会自然同步
             if let Err(e) = ctx
                 .store
@@ -648,19 +632,10 @@ async fn run_compression(
                 );
             }
 
-            // 更新反抖动统计（用块 scope 限定 MutexGuard 生命周期，避免跨 await 持锁）
-            {
-                let mut state = ctx
-                    .compression_state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                state.record_compaction(summary.tokens_before as u32, summary.tokens_after as u32);
-            }
-
             // 写回内存 session 的 system_prompt（messages 不在内存，无需重建）
             session.system_prompt = Some(new_prompt);
 
-            // 发 Compression Ended 事件：apply 落库成功后，让前端移除"压缩中"状态、展示统计
+            // 发 Compression Ended 事件：apply 落库成功后，让前端移除"压缩中"状态、展示摘要
             dispatch::dispatch(
                 &ctx.emitter,
                 &ctx.hooks,
@@ -669,8 +644,6 @@ async fn run_compression(
                     payload: CompressionPayload::Ended(CompressionEndedPayload {
                         reason,
                         content: summary.content.clone(),
-                        tokens_before: summary.tokens_before as u32,
-                        tokens_after: summary.tokens_after as u32,
                         new_seq,
                     }),
                 }),

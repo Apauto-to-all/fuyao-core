@@ -291,8 +291,12 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(source_id.clone()))?;
 
-        // 2. 加载源 session 的可见消息（尊重 compaction 边界，不含压缩前旧消息）
-        let visible = self.store.load_visible_messages(source_id).await?;
+        // 2. 加载源 session 的可见消息（动态拼接窗口），fork 复制完整可见范围不切窗
+        //    keep_tokens=usize::MAX 表示不截断 keep_recent，保留区间内全部消息
+        let visible = self
+            .store
+            .load_visible_messages(source_id, usize::MAX)
+            .await?;
 
         // 3. 构造新 session：系统提示词复制源值，parent_session_id 由调用方决定
         //    message_count 对齐复制的**普通消息**条数（排除 compaction 边界，

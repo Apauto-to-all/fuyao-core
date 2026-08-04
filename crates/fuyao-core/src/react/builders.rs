@@ -52,8 +52,9 @@ pub(crate) async fn build_chat_request(
     store: &SessionStore,
     session_id: &str,
     system_prompt: Option<&str>,
+    keep_tokens: usize,
 ) -> ChatRequest {
-    let history = match store.load_visible_messages(session_id).await {
+    let history = match store.load_visible_messages(session_id, keep_tokens).await {
         Ok(msgs) => msgs,
         Err(e) => {
             tracing::warn!(
@@ -411,8 +412,13 @@ mod tests {
         )
         .await;
 
-        let request =
-            build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
+        let request = build_chat_request(
+            &store,
+            &session.id,
+            session.system_prompt.as_deref(),
+            usize::MAX,
+        )
+        .await;
 
         // 应有：user + assistant + 1 真实结果 + 2 补充 error 结果 = 5 条
         let tool_msgs: Vec<_> = request
@@ -453,8 +459,13 @@ mod tests {
         )
         .await;
 
-        let request =
-            build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
+        let request = build_chat_request(
+            &store,
+            &session.id,
+            session.system_prompt.as_deref(),
+            usize::MAX,
+        )
+        .await;
         let tool_count = request
             .messages
             .iter()
@@ -475,8 +486,13 @@ mod tests {
         )
         .await;
 
-        let request =
-            build_chat_request(&store, &session.id, session.system_prompt.as_deref()).await;
+        let request = build_chat_request(
+            &store,
+            &session.id,
+            session.system_prompt.as_deref(),
+            usize::MAX,
+        )
+        .await;
         assert_eq!(request.messages.len(), 2, "无工具调用时消息数不变");
     }
 

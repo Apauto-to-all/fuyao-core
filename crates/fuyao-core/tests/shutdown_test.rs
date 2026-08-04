@@ -186,7 +186,7 @@ async fn shutdown_terminates_active_session_and_persists() {
         .await
         .expect("重新打开 store 失败");
     let persisted_msgs = store
-        .load_visible_messages(&session_id)
+        .load_visible_messages(&session_id, usize::MAX)
         .await
         .expect("DB 查询失败");
     assert!(

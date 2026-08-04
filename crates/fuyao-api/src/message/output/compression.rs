@@ -74,10 +74,6 @@ pub struct CompressionEndedPayload {
     pub reason: CompressionReason,
     /// 完整摘要正文（content 全文，不含 reasoning——reasoning 不进落库边界）
     pub content: String,
-    /// 压缩前 token 估算（反抖动统计用）
-    pub tokens_before: u32,
-    /// 压缩后 token 估算（保留 tail + 摘要）
-    pub tokens_after: u32,
     /// 新 compaction 边界消息的 seq（前端定位压缩在对话流中的位置）
     pub new_seq: i64,
 }
@@ -133,14 +129,10 @@ mod tests {
         let payload = CompressionEndedPayload {
             reason: CompressionReason::Manual,
             content: "完整摘要".into(),
-            tokens_before: 12_000,
-            tokens_after: 3_000,
             new_seq: 42,
         };
         assert_eq!(payload.reason, CompressionReason::Manual);
         assert_eq!(payload.content, "完整摘要");
-        assert_eq!(payload.tokens_before, 12_000);
-        assert_eq!(payload.tokens_after, 3_000);
         assert_eq!(payload.new_seq, 42);
     }
 
@@ -177,8 +169,6 @@ mod tests {
             payload: CompressionPayload::Ended(CompressionEndedPayload {
                 reason: CompressionReason::Auto,
                 content: "完整".into(),
-                tokens_before: 100,
-                tokens_after: 50,
                 new_seq: 1,
             }),
         };

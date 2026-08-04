@@ -78,7 +78,11 @@ async fn build_forked_session_pure_fork_parent_is_none() {
     // 落库后读回一致：parent None + 可见消息复制到位
     let loaded = engine.store.get(&new.id).await.unwrap().unwrap();
     assert!(loaded.parent_session_id.is_none());
-    let visible = engine.store.load_visible_messages(&new.id).await.unwrap();
+    let visible = engine
+        .store
+        .load_visible_messages(&new.id, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 2);
     assert_eq!(visible[0].content.as_deref(), Some("源消息1"));
     assert_eq!(visible[1].content.as_deref(), Some("源回复"));
@@ -99,7 +103,11 @@ async fn build_forked_session_child_fork_parent_is_set() {
     // parent_session_id 标记为父 id（子任务 session）
     assert_eq!(new.parent_session_id.as_deref(), Some(parent_id.as_str()));
     // 可见消息复制到位
-    let visible = engine.store.load_visible_messages(&new.id).await.unwrap();
+    let visible = engine
+        .store
+        .load_visible_messages(&new.id, usize::MAX)
+        .await
+        .unwrap();
     assert_eq!(visible.len(), 2);
 
     // 落库后 parent 一致

@@ -1,9 +1,10 @@
 //! 上下文压缩专用持久化（mark_compaction / load_visible_messages / load_full_history）
 //!
-//! 设计要点（对齐 1.4/1.6 设计决策）：
+//! 设计要点：
 //! - session_id 永不变，压缩不创建新会话
-//! - 压缩 = 插入一条 `kind='compaction'` 边界消息 + 更新 sessions 元数据
-//! - 模型可见窗口 = 最近一条 compaction 消息及之后的所有消息（SQL `seq >=` 过滤）
+//! - 压缩 = 插入一条 `kind='compaction'` 边界消息 + 更新 sessions 元数据，不复制 keep_recent
+//! - 模型可见窗口 = 动态拼接：最新摘要 + 以最新摘要为起点向前切的 keep_recent + 摘要后的新消息
+//!   （见 [`SessionStore::load_visible_messages`]），向前切遇到上一条 compaction 消息即停
 //! - 旧消息物理保留（不删除、不归档），可审计可恢复
 //! - 统计字段（token 累计）压缩不重置
 
@@ -83,12 +84,13 @@ impl super::SessionStore {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
-        // 插入 compaction 边界消息（role='system' 避免与对话流混淆，kind='compaction' 是真标记）
+        // 插入 compaction 边界消息（role='assistant'：摘要是助手产出的对话总结，
+        // 以 assistant 身份参与对话流；kind='compaction' 才是真正的类型标记）
         sqlx::query(
             "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
                 tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                 reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, NULL, 'system', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL, ?5, 'compaction')",
+             VALUES (?1, NULL, 'assistant', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL, ?5, 'compaction')",
         )
         .bind(session_id)
         .bind(&summary)
@@ -256,40 +258,134 @@ impl super::SessionStore {
         Ok(())
     }
 
-    /// 加载模型可见窗口消息
+    /// 加载模型可见窗口消息（动态拼接）
     ///
-    /// 返回「最近一条 compaction 消息（若有）及之后的所有消息」。
-    /// 从未压缩过则返回全部。核心查询（O(1) roundtrip，无递归）：
+    /// 返回给主对话 LLM 看的可见窗口，由三段显式拼接而成（顺序不可依赖单一 `ORDER BY seq`，
+    /// 因为摘要 seq 最大但逻辑上排最前）：
     ///
-    /// ```sql
-    /// SELECT * FROM messages WHERE session_id = ?
-    ///   AND seq >= COALESCE(
-    ///     (SELECT MAX(seq) FROM messages WHERE session_id = ? AND kind = 'compaction'),
-    ///     0
-    ///   )
-    /// ORDER BY seq;
+    /// ```text
+    /// 可见窗口 = [最新摘要]
+    ///          + select_recent( seq 在 (上一条摘要, 最新摘要) 区间的消息 )   ← keep_recent
+    ///          + [seq > 最新摘要 的所有新消息]
     /// ```
+    ///
+    /// - **最新摘要**：最近一条 `kind='compaction'` 消息，是可见窗口的逻辑起点
+    /// - **keep_recent**：以最新摘要为起点、在「最近两条摘要之间」向前按 token 预算切的近期消息，
+    ///   用原始记录（seq 不变），天然落在区间内、无需复制副本。向前切遇到上一条摘要即停，
+    ///   不捞回已被更早摘要覆盖的旧消息
+    /// - **新消息**：最新摘要之后追加的消息
+    ///
+    /// 从未压缩过（无任何 compaction 消息）时：上界视为 0，等价全部消息作 keep_recent 候选，
+    /// 返回全部消息。
+    ///
+    /// `keep_tokens` 是 keep_recent 的 token 预算上限，由调用方按模型上下文比例算好传入
+    /// （`CompressionConfig::effective_keep_tokens(context_length)`）。传 `usize::MAX`
+    /// 表示不截断 keep_recent（保留区间内全部消息）；传 0 反向累加立即超预算，仅保留
+    /// `select_recent` 保证的最小窗口（最后 1 条）。
+    ///
+    /// 性能：几次索引查询（走 `idx_messages_session_kind_seq` / `idx_messages_session_seq`）
+    /// + 内存拼接，复杂度低；仅在构造 LLM 请求时调一次，不在流式热路径。
     pub async fn load_visible_messages(
         &self,
         session_id: &str,
+        keep_tokens: usize,
     ) -> Result<Vec<Message>, SessionError> {
-        let rows = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages
-             WHERE session_id = ?1
-               AND seq >= COALESCE(
-                 (SELECT MAX(seq) FROM messages WHERE session_id = ?1 AND kind = 'compaction'),
-                 0
-               )
-             ORDER BY seq",
+        // 1. 取全部 compaction 消息的 seq（升序），用于定位最新摘要 M 与上一条摘要 M2
+        let compaction_seqs: Vec<i64> = sqlx::query_scalar(
+            "SELECT seq FROM messages WHERE session_id = ?1 AND kind = 'compaction' ORDER BY seq",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows.into_iter().map(Message::from).collect())
+        // 从未压缩过：全部消息作 keep_recent 候选，直接查全量按 seq 升序，再切窗
+        if compaction_seqs.is_empty() {
+            let all: Vec<Message> = sqlx::query_as::<_, MessageRow>(
+                "SELECT id, session_id, model_id, role, content, images, tool_call_id,
+                        tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                        reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
+                 FROM messages WHERE session_id = ?1 ORDER BY seq",
+            )
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(Message::from)
+            .collect();
+            let window = crate::compressor::window::select_recent(&all, keep_tokens);
+            return Ok(window.keep_recent.to_vec());
+        }
+
+        // 最新摘要 M = compaction_seqs 最后一个；上一条摘要 M2 = 倒数第二个（无则视为 0）
+        let latest_seq = *compaction_seqs.last().expect("非空");
+        let prev_seq = if compaction_seqs.len() >= 2 {
+            compaction_seqs[compaction_seqs.len() - 2]
+        } else {
+            0
+        };
+
+        // 2. 取最新摘要消息本身
+        let latest_summary: Vec<Message> = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
+                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
+             FROM messages
+             WHERE session_id = ?1 AND seq = ?2",
+        )
+        .bind(session_id)
+        .bind(latest_seq)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(Message::from)
+        .collect();
+
+        // 3. 取 (M2, M) 区间的消息作 keep_recent 候选，按 seq 升序
+        let keep_candidates: Vec<Message> = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
+                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
+             FROM messages
+             WHERE session_id = ?1 AND seq > ?2 AND seq < ?3
+             ORDER BY seq",
+        )
+        .bind(session_id)
+        .bind(prev_seq)
+        .bind(latest_seq)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(Message::from)
+        .collect();
+
+        // 向前切 keep_recent（基于 token 预算），用原始记录不复制
+        let window = crate::compressor::window::select_recent(&keep_candidates, keep_tokens);
+
+        // 4. 取最新摘要之后的新消息（seq > M），按 seq 升序
+        let newer: Vec<Message> = sqlx::query_as::<_, MessageRow>(
+            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
+                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
+             FROM messages
+             WHERE session_id = ?1 AND seq > ?2
+             ORDER BY seq",
+        )
+        .bind(session_id)
+        .bind(latest_seq)
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(Message::from)
+        .collect();
+
+        // 5. 显式拼接：摘要（最前）+ keep_recent + 新消息
+        //    摘要 seq 最大但逻辑排最前，不能靠单一 ORDER BY seq
+        let mut result =
+            Vec::with_capacity(latest_summary.len() + window.keep_recent.len() + newer.len());
+        result.extend(latest_summary);
+        result.extend(window.keep_recent.iter().cloned());
+        result.extend(newer);
+        Ok(result)
     }
 
     /// 加载全量历史（含被压缩掉的旧消息）
@@ -307,5 +403,157 @@ impl super::SessionStore {
         .await?;
 
         Ok(rows.into_iter().map(Message::from).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::SessionStore;
+    use super::*;
+    use fuyao_api::{Message, MessageKind, MessageRole};
+    use tempfile::tempdir;
+
+    async fn temp_store() -> SessionStore {
+        let dir = tempdir().expect("创建临时目录失败");
+        let db_path = dir.path().join("test.db");
+        std::mem::forget(dir);
+        SessionStore::new(db_path).await.expect("创建存储失败")
+    }
+
+    /// 插入一条 user 消息，返回分配的 seq
+    async fn insert_user(store: &SessionStore, sid: &str, content: &str) {
+        let mut msg = Message::user(content.to_string());
+        store.insert_message(sid, &mut msg).await.unwrap();
+    }
+
+    /// 从未压缩过：keep_tokens 足够大时返回全部，保持 seq 升序
+    #[tokio::test]
+    async fn load_visible_returns_all_when_never_compacted_and_budget_large() {
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        insert_user(&store, &session.id, "m1").await;
+        insert_user(&store, &session.id, "m2").await;
+
+        let visible = store
+            .load_visible_messages(&session.id, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].content.as_deref(), Some("m1"));
+        assert_eq!(visible[1].content.as_deref(), Some("m2"));
+    }
+
+    /// 单次压缩后：可见窗口 = [摘要] + keep_recent（区间内原始记录）+ 新消息
+    /// keep_tokens=0 表示不保留任何 keep_recent（区间内全截断），只看摘要 + 新消息
+    #[tokio::test]
+    async fn load_visible_assembles_summary_keep_recent_and_newer() {
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        // seq 1..=3：将被压缩的旧消息
+        for i in 1..=3 {
+            insert_user(&store, &session.id, &format!("old{i}")).await;
+        }
+        // 压缩：插入 seq=4 的 compaction 边界
+        store
+            .mark_compaction(&session.id, "摘要1".to_string(), CompressionReason::Auto)
+            .await
+            .unwrap();
+        // seq 5..=6：压缩后的新消息
+        insert_user(&store, &session.id, "new1").await;
+        insert_user(&store, &session.id, "new2").await;
+
+        // keep_tokens 足够大：摘要 + 无 keep_recent（区间 (0,4) 内是 old1..3，
+        //   但它们全部会被保留成 keep_recent）+ 新消息
+        // 区间 (prev=0, latest=4) = old1/old2/old3 → 全部保留为 keep_recent
+        let visible = store
+            .load_visible_messages(&session.id, usize::MAX)
+            .await
+            .unwrap();
+        // [摘要1, old1, old2, old3, new1, new2]
+        assert_eq!(visible.len(), 6);
+        // 摘要排最前（seq=4 最大但逻辑首位），role=assistant（助手产出的对话总结）
+        assert_eq!(visible[0].kind, MessageKind::Compaction);
+        assert_eq!(visible[0].role, MessageRole::Assistant);
+        assert_eq!(visible[0].content.as_deref(), Some("摘要1"));
+        assert_eq!(visible[0].seq, 4);
+        // keep_recent 是 old1..3（seq 1..3 升序）
+        assert_eq!(visible[1].content.as_deref(), Some("old1"));
+        assert_eq!(visible[3].content.as_deref(), Some("old3"));
+        // 新消息 seq 升序
+        assert_eq!(visible[4].content.as_deref(), Some("new1"));
+        assert_eq!(visible[5].content.as_deref(), Some("new2"));
+    }
+
+    /// keep_tokens=0：keep_recent 截到最小（select_recent 至少保留最后 1 条），
+    /// 可见窗口 = [摘要] + 最后 1 条 keep_recent + 新消息
+    #[tokio::test]
+    async fn load_visible_keeps_minimal_keep_recent_when_budget_zero() {
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        for i in 1..=3 {
+            insert_user(&store, &session.id, &format!("old{i}")).await;
+        }
+        store
+            .mark_compaction(&session.id, "摘要1".to_string(), CompressionReason::Auto)
+            .await
+            .unwrap();
+        insert_user(&store, &session.id, "new1").await;
+
+        let visible = store.load_visible_messages(&session.id, 0).await.unwrap();
+        // select_recent 保证至少保留最后 1 条：[摘要, old3, new1]
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].kind, MessageKind::Compaction);
+        // keep_recent 只剩最末一条 old3（预算 0 截断前面的）
+        assert_eq!(visible[1].content.as_deref(), Some("old3"));
+        assert_eq!(visible[2].content.as_deref(), Some("new1"));
+    }
+
+    /// 多次压缩：向前切只在最近两条摘要之间，不捞回已被更早摘要覆盖的旧消息
+    #[tokio::test]
+    async fn load_visible_bounds_keep_recent_between_last_two_summaries() {
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        // seq 1..=2：第一批旧消息（将被摘要1 覆盖）
+        insert_user(&store, &session.id, "old_a1").await;
+        insert_user(&store, &session.id, "old_a2").await;
+        // 摘要1：seq=3
+        store
+            .mark_compaction(&session.id, "摘要1".to_string(), CompressionReason::Auto)
+            .await
+            .unwrap();
+        // seq 4..=5：摘要1 后的新消息（在两次摘要之间，应能作 keep_recent）
+        insert_user(&store, &session.id, "mid1").await;
+        insert_user(&store, &session.id, "mid2").await;
+        // 摘要2：seq=6（最新摘要）
+        store
+            .mark_compaction(&session.id, "摘要2".to_string(), CompressionReason::Auto)
+            .await
+            .unwrap();
+        // seq 7：摘要2 后的新消息
+        insert_user(&store, &session.id, "new1").await;
+
+        // keep_tokens 足够大：可见窗口 = [摘要2] + keep_recent(区间(3,6)=mid1/mid2) + [new1]
+        // 关键：old_a1/old_a2（seq 1,2）在摘要1（seq=3）之前，已被覆盖，绝不被捞回
+        let visible = store
+            .load_visible_messages(&session.id, usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(visible.len(), 4, "应只含 摘要2 + mid1 + mid2 + new1");
+        assert_eq!(visible[0].kind, MessageKind::Compaction);
+        assert_eq!(visible[0].content.as_deref(), Some("摘要2"));
+        // keep_recent 是摘要1 与摘要2 之间的 mid1/mid2，不含 old_a*
+        let contents: Vec<_> = visible.iter().filter_map(|m| m.content.clone()).collect();
+        assert!(contents.contains(&"mid1".to_string()));
+        assert!(contents.contains(&"mid2".to_string()));
+        assert!(
+            !contents.contains(&"old_a1".to_string()),
+            "已被摘要1覆盖的旧消息不应被捞回"
+        );
+        assert!(!contents.contains(&"old_a2".to_string()));
+        assert_eq!(visible[3].content.as_deref(), Some("new1"));
     }
 }

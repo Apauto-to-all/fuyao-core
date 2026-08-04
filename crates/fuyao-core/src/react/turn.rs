@@ -130,16 +130,24 @@ pub(crate) async fn run_turn(
     let model = resolved.model.clone();
     let options = resolved.options.clone();
 
+    // 可见窗口的 keep_recent token 预算：按当前模型上下文比例算（与压缩侧同口径）
+    // context_length 解析与 resolve_compression_model 一致：查不到回退 fallback_context
+    let context_length = fuyao_provider::get_model(&resolved.model_id, &ctx.agent_paths)
+        .map(|m| m.limit.context)
+        .unwrap_or(ctx.compression_config.fallback_context);
+    let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
+
     loop {
         // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
         // 每次 loop 顶部新建；retry.rs 在重试时清空复用，保证不携带上一次的部分结果。
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));
         // 本轮的 ChatRequest（重试间复用同一份——一次 LLM 调用内 DB 历史不变）
-        // 消息已不在内存，每次构造时从 DB 查可见窗口
+        // 消息已不在内存，每次构造时从 DB 查可见窗口（动态拼接，按 keep_tokens 截近期）
         let request = build_chat_request(
             ctx.store.as_ref(),
             ctx.emitter.session_id(),
             session.system_prompt.as_deref(),
+            keep_tokens,
         )
         .await;
 
@@ -325,10 +333,11 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, i
         return;
     }
 
-    // 从 DB 加载可见消息（事件级落库模式下消息不在内存）
+    // 从 DB 加载可见消息（标题生成只需数 user 消息 + 取首条 user content，
+    // 不在乎窗口截断，keep_tokens=usize::MAX 不切 keep_recent）
     let visible = match ctx
         .store
-        .load_visible_messages(ctx.emitter.session_id())
+        .load_visible_messages(ctx.emitter.session_id(), usize::MAX)
         .await
     {
         Ok(m) => m,
@@ -677,9 +686,10 @@ async fn emit_interrupt_and_complete_tool_results(
     emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 
     // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
+    // 只需 tool_result 的 tool_call_id，不在乎窗口，keep_tokens=usize::MAX 不切 keep_recent
     let answered: std::collections::HashSet<String> = match ctx
         .store
-        .load_visible_messages(ctx.emitter.session_id())
+        .load_visible_messages(ctx.emitter.session_id(), usize::MAX)
         .await
     {
         Ok(msgs) => msgs
