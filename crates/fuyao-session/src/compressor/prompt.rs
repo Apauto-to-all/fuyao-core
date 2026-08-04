@@ -3,7 +3,7 @@
 //! 作为**末尾追加的 user 消息**触发摘要，原对话消息和 system_prompt 都不动——
 //! 这是前缀缓存的生命线（system + 原消息序列都不变，缓存完整命中，只末尾加一条指令）。
 //!
-//! 多次压缩场景：上一次的 compaction 消息（role=system, content=旧摘要）原样在
+//! 多次压缩场景：上一次的 compaction 消息（role=assistant, content=旧摘要）原样在
 //! 消息序列里，LLM 自然能看到，不需要单独提取 previous_summary 注入。
 
 /// 摘要指令（作为末尾追加的 user 消息内容）

@@ -67,7 +67,7 @@ pub fn select_recent<'a>(messages: &'a [Message], keep_tokens: usize) -> Window<
     }
 }
 
-/// 向前扩大窗口，确保 assistant+tool 块完整（搬自归档 `compressor/mod.rs:70`）
+/// 向前扩大窗口，确保 assistant+tool 块完整
 ///
 /// 从切分点 `cut` 向前扫描：若 messages[cut] 是 tool 或带 tool_calls 的 assistant，
 /// 说明这一块还没完，需要继续向前找到块的起点。

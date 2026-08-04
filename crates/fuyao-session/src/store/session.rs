@@ -1,17 +1,26 @@
-//! Session CRUD：创建 / 读取 / 更新 / 删除 / 列表 / 计数
+//! Session CRUD + 单字段局部更新
 //!
-//! 注：消息（Message）已不在内存——产生即通过 [`super::SessionStore::insert_message`]
-//! 单条落 DB，需要时按 session_id 用 `load_visible_messages` 查询。
-//! 本模块的 `create` / `update` 只维护 sessions 表的元数据（统计字段、system_prompt 等）。
+//! sessions 表的全部元数据操作归此:
+//! - 全量:create / get / update / delete / list_all / count / count_with_filter
+//! - 单字段局部更新:update_system_prompt / update_title / end_session
+//!
+//! 单字段更新与全量 `update` 并存的原因:并发更新间避免字段覆盖。全量 `update(&session)`
+//! 把内存 Session 对象的所有字段一次性写回,而某些场景(标题异步生成、压缩后重建提示词、
+//! 会话收尾)只需改一个字段且拿不到完整内存对象,走单字段 SQL 更安全。
+//!
+//! 注:消息(Message)不在内存——产生即通过 [`super::SessionStore::insert_message`]
+//! 单条落 DB,需要时按 session_id 查询(见 [`super::message`] 模块)。
 
 use super::row::SessionRow;
 use crate::error::SessionError;
 use fuyao_api::Session;
 
 impl super::SessionStore {
-    /// 创建会话（只 INSERT sessions 元数据行）
+    // ── 全量 CRUD ──────────────────────────────────────────────
+
+    /// 创建会话(只 INSERT sessions 元数据行)
     ///
-    /// 消息产生时由调用方经 `insert_message` 单条落库，不在此处批量写。
+    /// 消息产生时由调用方经 `insert_message` 单条落库,不在此处批量写。
     pub async fn create(&self, session: &Session) -> Result<(), SessionError> {
         sqlx::query(
             "INSERT INTO sessions (id, started_at, ended_at, end_reason,
@@ -44,7 +53,7 @@ impl super::SessionStore {
         Ok(())
     }
 
-    /// 获取会话（纯元数据，不含消息）
+    /// 获取会话(纯元数据,不含消息)
     ///
     /// 消息请用 [`load_visible_messages`](super::SessionStore::load_visible_messages)
     /// 或 [`load_full_history`](super::SessionStore::load_full_history) 单独查。
@@ -63,10 +72,13 @@ impl super::SessionStore {
         Ok(row.map(Session::from))
     }
 
-    /// 更新会话元数据（只 UPDATE sessions 表，不碰 messages 表）
+    /// 更新会话元数据(全量 UPDATE sessions 表,不碰 messages 表)
     ///
-    /// 消息已在产生时经 `insert_message` 落库，本方法只同步元数据
-    /// （统计字段、system_prompt、ended_at/end_reason、压缩指针等）。
+    /// 把内存 Session 对象的全部字段一次性写回。`last_active_at` 由 SQLite `unixepoch()`
+    /// 在 UPDATE 语句内自动刷新——不改动 `persist(&Session)` 签名、不改动调用点,
+    /// DB 与内存对象在下次 `get` / `list_all` 读 DB 时自然对齐。
+    ///
+    /// 消息已在产生时经 `insert_message` 落库,本方法只同步元数据。
     pub async fn update(&self, session: &Session) -> Result<(), SessionError> {
         sqlx::query(
             "UPDATE sessions SET
@@ -100,7 +112,7 @@ impl super::SessionStore {
         Ok(())
     }
 
-    /// 删除会话
+    /// 删除会话(cascade 删该会话的全部消息 + session 行)
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
         sqlx::query("DELETE FROM messages WHERE session_id = ?1")
             .bind(session_id)
@@ -113,13 +125,13 @@ impl super::SessionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// 列出会话（不含消息，分页，按最近活动时间倒序）
+    /// 列出会话(不含消息,分页,按最近活动时间倒序)
     ///
-    /// 排序用 `last_active_at DESC`——用户刚交互的会话排最前（类即时通讯的「最近会话」）。
-    /// `last_active_at` 在每次 [`update`](Self::update) 落库时刷新为当前时间。
+    /// 排序用 `last_active_at DESC`——用户刚交互的会话排最前(类即时通讯的「最近会话」)。
+    /// `last_active_at` 在每次 [`update`](Self::update) 落库时由 `unixepoch()` 刷新。
     ///
-    /// `workspace_filter` 传 `Some(path)` 只看该工作目录的会话；`None` 看全部（含无 workspace 的）。
-    /// 过滤在 SQL 层完成（走索引），不做内存截断。
+    /// `workspace_filter` 传 `Some(path)` 只看该工作目录的会话;`None` 看全部(含无 workspace 的)。
+    /// 过滤在 SQL 层完成(走索引),不做内存截断。
     pub async fn list_all(
         &self,
         workspace_filter: Option<&str>,
@@ -152,9 +164,9 @@ impl super::SessionStore {
         Ok(count)
     }
 
-    /// 获取会话总数（可选按工作目录过滤）
+    /// 获取会话总数(可选按工作目录过滤)
     ///
-    /// 与 [`list_all`](Self::list_all) 的 `workspace_filter` 配对，供上层计算分页总页数。
+    /// 与 [`list_all`](Self::list_all) 的 `workspace_filter` 配对,供上层计算分页总页数。
     /// `workspace_filter` 为 `None` 时等价于 [`count`](Self::count)。
     pub async fn count_with_filter(
         &self,
@@ -167,5 +179,476 @@ impl super::SessionStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(count)
+    }
+
+    // ── 单字段局部更新 ─────────────────────────────────────────
+    //
+    // 以下三个方法都只 UPDATE sessions 表的某个字段,不动其他字段、不动 messages 表。
+    // 它们服务于"只改一个字段且拿不到完整内存对象"的场景,与全量 `update` 互补,
+    // 避免并发更新间的字段覆盖。三者结构对称:校验 session 存在 → 单字段 UPDATE → 提交。
+
+    /// 更新 session 的 system_prompt(压缩后重建系统提示词用)
+    ///
+    /// 由 react 层在压缩触发后调用,把重新构建的提示词落库,避免旧 system_prompt 中残留的
+    /// 动态内容(如"基于刚才的 X 错误继续排查")在 X 已被压进摘要后误导模型。
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]:session_id 在数据库中不存在
+    pub async fn update_system_prompt(
+        &self,
+        session_id: &str,
+        new_system_prompt: &str,
+    ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        // 校验 session 存在(避免给不存在的 session 写脏数据)
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(SessionError::NotFound(session_id.to_string()));
+        }
+
+        sqlx::query("UPDATE sessions SET system_prompt = ?2 WHERE id = ?1")
+            .bind(session_id)
+            .bind(new_system_prompt)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            session_id = session_id,
+            prompt_len = new_system_prompt.len(),
+            "system_prompt 已更新（压缩后重建）"
+        );
+        Ok(())
+    }
+
+    /// 更新 session 的 title(标题自动生成后异步落库)
+    ///
+    /// 由 react 层 fire-and-forget spawn 的标题生成任务调用——spawn 的 future 是
+    /// `'static` 的,无法借用 `&mut Session`,故走单字段 SQL 而非全量 `update(session)`。
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]:session_id 在数据库中不存在
+    pub async fn update_title(
+        &self,
+        session_id: &str,
+        new_title: &str,
+    ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(SessionError::NotFound(session_id.to_string()));
+        }
+
+        sqlx::query("UPDATE sessions SET title = ?2 WHERE id = ?1")
+            .bind(session_id)
+            .bind(new_title)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            session_id = session_id,
+            title = new_title,
+            "会话标题已更新（自动生成）"
+        );
+        Ok(())
+    }
+
+    /// 标记会话结束(填 ended_at + end_reason)
+    ///
+    /// 由 `Engine::end_session` 在 session task 退出**之后**调用——确保 `ended_at` /
+    /// `end_reason` 是最终值,不被 task 退出时的全量 `update(&session)` 覆盖。
+    ///
+    /// 与 `update_title` / `update_system_prompt` 对称:单字段更新方法,走独立 SQL 路径
+    /// 而非全量 `update(session)`,避免并发更新间的字段覆盖。
+    ///
+    /// # 参数
+    /// - `session_id`:被结束的会话
+    /// - `end_reason`:结束原因(如 `"session_ended"` / `"engine_shutdown"`)
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]:session_id 在数据库中不存在
+    pub async fn end_session(
+        &self,
+        session_id: &str,
+        end_reason: &str,
+    ) -> Result<(), SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            return Err(SessionError::NotFound(session_id.to_string()));
+        }
+
+        // 秒级 f64 时间戳,与 started_at / ended_at 字段类型对齐
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        sqlx::query("UPDATE sessions SET ended_at = ?2, end_reason = ?3 WHERE id = ?1")
+            .bind(session_id)
+            .bind(now)
+            .bind(end_reason)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        tracing::info!(
+            session_id = session_id,
+            end_reason = end_reason,
+            "会话已标记结束"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::SessionStore;
+    use crate::error::SessionError;
+    use fuyao_api::Session;
+
+    /// 构造临时存储(隔离的临时目录)
+    async fn temp_store() -> SessionStore {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let db_path = dir.path().join("test.db");
+        // forget 让目录留到进程结束(async 测试里 SessionStore 跨 await 持有路径,dir 必须存活)
+        std::mem::forget(dir);
+        SessionStore::new(db_path).await.expect("创建存储失败")
+    }
+
+    // ===== 基础 CRUD 测试 =====
+
+    #[tokio::test]
+    async fn store_create_and_get() {
+        let store = temp_store().await;
+        let session = Session::new(None, Some("测试".to_string()), None);
+        store.create(&session).await.unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.title, Some("测试".to_string()));
+        assert_eq!(loaded.compression_count, 0);
+        assert!(loaded.last_compacted_seq.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_get_returns_none_for_missing() {
+        let store = temp_store().await;
+        let result = store.get("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_delete_removes_session() {
+        let store = temp_store().await;
+        let session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        let deleted = store.delete(&session.id).await.unwrap();
+        assert!(deleted);
+        assert!(store.get(&session.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn store_list_all_returns_sessions() {
+        let store = temp_store().await;
+        let s1 = Session::new(None, Some("会话1".to_string()), None);
+        let s2 = Session::new(None, Some("会话2".to_string()), None);
+        store.create(&s1).await.unwrap();
+        store.create(&s2).await.unwrap();
+
+        let list = store.list_all(None, 10, 0).await.unwrap();
+        assert_eq!(list.len(), 2);
+        let titles: Vec<String> = list
+            .iter()
+            .filter_map(|s| s.title.as_deref().map(str::to_string))
+            .collect();
+        assert!(titles.contains(&"会话1".to_string()));
+        assert!(titles.contains(&"会话2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn store_count_returns_correct_count() {
+        let store = temp_store().await;
+        assert_eq!(store.count().await.unwrap(), 0);
+        store.create(&Session::new(None, None, None)).await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_update_syncs_metadata() {
+        let store = temp_store().await;
+        let mut session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        session.total_prompt_tokens = 12345;
+        session.compression_count = 2;
+        store.update(&session).await.unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.total_prompt_tokens, 12345);
+        assert_eq!(loaded.compression_count, 2);
+    }
+
+    // ===== workspace 字段持久化 + 按工作目录过滤 / 最近活动排序 =====
+
+    #[tokio::test]
+    async fn store_create_and_get_preserves_workspace() {
+        let store = temp_store().await;
+        let session = Session::new(
+            Some("/home/u/proj-a".to_string()),
+            Some("项目A".to_string()),
+            None,
+        );
+        store.create(&session).await.unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.workspace.as_deref(), Some("/home/u/proj-a"));
+    }
+
+    #[tokio::test]
+    async fn store_create_and_get_workspace_none() {
+        let store = temp_store().await;
+        let session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert!(loaded.workspace.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_list_all_filters_by_workspace() {
+        let store = temp_store().await;
+        let proj_a_1 = Session::new(Some("/proj-a".to_string()), None, None);
+        let proj_a_2 = Session::new(Some("/proj-a".to_string()), None, None);
+        let proj_b = Session::new(Some("/proj-b".to_string()), None, None);
+        let no_workspace = Session::new(None, None, None);
+        store.create(&proj_a_1).await.unwrap();
+        store.create(&proj_a_2).await.unwrap();
+        store.create(&proj_b).await.unwrap();
+        store.create(&no_workspace).await.unwrap();
+
+        let a_list = store.list_all(Some("/proj-a"), 100, 0).await.unwrap();
+        assert_eq!(a_list.len(), 2);
+        assert!(
+            a_list
+                .iter()
+                .all(|s| s.workspace.as_deref() == Some("/proj-a"))
+        );
+
+        let b_list = store.list_all(Some("/proj-b"), 100, 0).await.unwrap();
+        assert_eq!(b_list.len(), 1);
+
+        let all = store.list_all(None, 100, 0).await.unwrap();
+        assert_eq!(all.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn store_count_with_filter_matches_list() {
+        let store = temp_store().await;
+        store
+            .create(&Session::new(Some("/proj-a".to_string()), None, None))
+            .await
+            .unwrap();
+        store
+            .create(&Session::new(Some("/proj-a".to_string()), None, None))
+            .await
+            .unwrap();
+        store
+            .create(&Session::new(Some("/proj-b".to_string()), None, None))
+            .await
+            .unwrap();
+
+        assert_eq!(store.count_with_filter(Some("/proj-a")).await.unwrap(), 2);
+        assert_eq!(store.count_with_filter(Some("/proj-b")).await.unwrap(), 1);
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 3);
+        assert_eq!(store.count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn store_update_refreshes_last_active_at() {
+        let store = temp_store().await;
+        let mut session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        let created_active = session.last_active_at;
+
+        // sleep 确保 unixepoch() 推进(SQLite unixepoch 精度为秒)
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        session.message_count = 5;
+        store.update(&session).await.unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert!(
+            loaded.last_active_at > created_active,
+            "update 后 last_active_at 应晚于创建初值：{} > {}",
+            loaded.last_active_at,
+            created_active
+        );
+    }
+
+    #[tokio::test]
+    async fn store_list_all_orders_by_last_active_at_desc() {
+        let store = temp_store().await;
+        let old_session = Session::new(None, Some("老会话".to_string()), None);
+        let new_session = Session::new(None, Some("新会话".to_string()), None);
+        store.create(&old_session).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        store.create(&new_session).await.unwrap();
+
+        let list = store.list_all(None, 10, 0).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].title.as_deref(), Some("新会话"));
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let mut old_loaded = store.get(&old_session.id).await.unwrap().unwrap();
+        old_loaded.message_count = 1;
+        store.update(&old_loaded).await.unwrap();
+
+        let list2 = store.list_all(None, 10, 0).await.unwrap();
+        assert_eq!(list2[0].title.as_deref(), Some("老会话"));
+    }
+
+    // ===== parent_session_id(通用子任务标记)测试组 =====
+
+    #[tokio::test]
+    async fn parent_session_id_defaults_none_on_create() {
+        let store = temp_store().await;
+        let session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert!(loaded.parent_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn parent_session_id_persists_and_roundtrips() {
+        let store = temp_store().await;
+        let parent = Session::new(None, Some("父会话".to_string()), None);
+        store.create(&parent).await.unwrap();
+
+        let mut child = Session::new(None, None, None);
+        child.parent_session_id = Some(parent.id.clone());
+        store.create(&child).await.unwrap();
+
+        let loaded = store.get(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.parent_session_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+
+        let mut modified = loaded;
+        modified.message_count = 5;
+        store.update(&modified).await.unwrap();
+        let reloaded = store.get(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            reloaded.parent_session_id.as_deref(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(reloaded.message_count, 5);
+    }
+
+    // ===== 单字段更新:update_system_prompt =====
+
+    #[tokio::test]
+    async fn update_system_prompt_updates_db_row() {
+        let store = temp_store().await;
+        let session = Session::new(None, None, Some("旧提示词".to_string()));
+        store.create(&session).await.unwrap();
+
+        store
+            .update_system_prompt(&session.id, "新提示词（压缩后重建）")
+            .await
+            .unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            loaded.system_prompt.as_deref(),
+            Some("新提示词（压缩后重建）")
+        );
+        assert_eq!(loaded.compression_count, 0);
+        assert!(loaded.last_compacted_seq.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_system_prompt_errors_on_missing_session() {
+        let store = temp_store().await;
+        let result = store.update_system_prompt("nonexistent", "新提示词").await;
+        assert!(matches!(result, Err(SessionError::NotFound(_))));
+    }
+
+    // ===== 单字段更新:update_title =====
+
+    #[tokio::test]
+    async fn update_title_updates_db_row() {
+        let store = temp_store().await;
+        let session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        assert_eq!(session.title.as_deref(), Some("新会话"));
+
+        store
+            .update_title(&session.id, "Rust 异步讨论")
+            .await
+            .unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Rust 异步讨论"));
+        assert_eq!(loaded.compression_count, 0);
+        assert!(loaded.last_compacted_seq.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_title_errors_on_missing_session() {
+        let store = temp_store().await;
+        let result = store.update_title("nonexistent", "标题").await;
+        assert!(matches!(result, Err(SessionError::NotFound(_))));
+    }
+
+    // ===== 单字段更新:end_session =====
+
+    #[tokio::test]
+    async fn end_session_updates_db_row() {
+        let store = temp_store().await;
+        let session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+        let before = store.get(&session.id).await.unwrap().unwrap();
+        assert!(before.ended_at.is_none());
+        assert!(before.end_reason.is_none());
+
+        store
+            .end_session(&session.id, "session_ended")
+            .await
+            .unwrap();
+
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert!(loaded.ended_at.is_some(), "ended_at 应已落库");
+        assert_eq!(loaded.end_reason.as_deref(), Some("session_ended"));
+        assert_eq!(loaded.compression_count, 0);
+        assert!(loaded.last_compacted_seq.is_none());
+    }
+
+    #[tokio::test]
+    async fn end_session_errors_on_missing_session() {
+        let store = temp_store().await;
+        let result = store.end_session("nonexistent", "session_ended").await;
+        assert!(matches!(result, Err(SessionError::NotFound(_))));
     }
 }

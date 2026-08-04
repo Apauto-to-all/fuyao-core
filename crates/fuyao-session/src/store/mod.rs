@@ -3,19 +3,19 @@
 //! 使用 sqlx（async）+ SqlitePool 连接池，原生 async，无需 spawn_blocking 包装。
 //! SessionStore 是 session 持久化的唯一入口，持有连接池供外部（如引擎层）共享。
 //!
-//! 模块组织：
+//! 模块组织（按职责分文件，各文件单一职责）：
 //! - [`row`]：sessions / messages 表的行映射（DB 行 ↔ 领域类型）
-//! - [`session`]：Session CRUD（创建 / 读取 / 更新 / 删除 / 列表 / 计数）
-//! - [`message`]：消息持久化助手（增量保存 / 加载，仅供本模块内部使用）
-//! - [`compaction`]：上下文压缩边界写入 + 可见窗口加载（compressor 模块消费）
+//! - [`session`]：sessions 表的全部操作——CRUD + 单字段局部更新
+//!   （update_system_prompt / update_title / end_session）
+//! - [`message`]：messages 表的全部操作——写入（insert）/ 计数（count）/
+//!   查询（load_full_history 全量审计 / load_visible_messages LLM 可见窗口）
+//! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason）。
+//!   可见窗口的读取在 [`message`] 模块（本质是消息查询，只是压缩感知）
 
 pub(crate) mod compaction;
 mod message;
 mod row;
 mod session;
-
-#[cfg(test)]
-mod tests;
 
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
