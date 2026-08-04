@@ -109,7 +109,7 @@ L0  fuyao-api（零内部依赖）
 - **内部依赖**：api
 - **公开 API**：
   - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update`（落库时经 `unixepoch()` 刷新 `last_active_at`）/ `delete` / `list_all(workspace_filter, limit, offset)`（按 `last_active_at` 倒序 + 可选按 workspace 过滤）/ `count` / `count_with_filter(workspace_filter)` / `insert_message` / `count_messages` / `load_visible_messages` / `load_full_history` / `mark_compaction` / `update_system_prompt` / `update_title` / `end_session`）
-  - **压缩模块**：`should_compress` / `generate_summary` / `apply` / `CompressionRuntimeState`（即 `CompressionState`）
+  - **压缩模块**：`should_compress` / `generate_summary` / `apply`
   - **费用统计**：`calculate_cost` / `fill_message_cost` / `accumulate_session_total`
   - **标题生成**：`maybe_generate_title`
   - **错误**：`SessionError`（`IoError` / `SqlxError` / `InvalidState` / `NotFound`）
