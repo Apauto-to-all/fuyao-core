@@ -38,17 +38,20 @@ fn estimate_message_tokens(msg: &Message) -> usize {
 /// 步骤：
 /// 1. 反向累加 token 到 keep_tokens → 找切分点
 /// 2. 扩大至 turn 完整边界（不切断 assistant+tool_result 块）
+///
+/// `keep_tokens` 语义：从消息列表尾部向前，最多保留这么多 token 的消息。
+/// 传 0 表示一条都不保留（keep_recent 为空切片）。
 pub fn select_recent<'a>(messages: &'a [Message], keep_tokens: usize) -> Window<'a> {
     if messages.is_empty() {
         return Window { keep_recent: &[] };
     }
 
-    // 反向累加找切分点
+    // 反向累加找切分点：从最后一条向前累加 token，累计超过 keep_tokens 就在该位置切分
     let mut accumulated = 0usize;
     let mut cut = messages.len();
     for (i, msg) in messages.iter().enumerate().rev() {
         let cost = estimate_message_tokens(msg);
-        if accumulated + cost > keep_tokens && i < messages.len() - 1 {
+        if accumulated + cost > keep_tokens {
             cut = i + 1;
             break;
         }

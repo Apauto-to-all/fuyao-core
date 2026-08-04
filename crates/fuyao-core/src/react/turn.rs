@@ -333,11 +333,11 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, i
         return;
     }
 
-    // 从 DB 加载可见消息（标题生成只需数 user 消息 + 取首条 user content，
-    // 不在乎窗口截断，keep_tokens=usize::MAX 不切 keep_recent）
+    // 标题生成在首轮对话后触发（仅 2 条消息，不可能压缩过），走从未压缩分支拿到全部消息，
+    // keep_tokens 不参与
     let visible = match ctx
         .store
-        .load_visible_messages(ctx.emitter.session_id(), usize::MAX)
+        .load_visible_messages(ctx.emitter.session_id(), 0)
         .await
     {
         Ok(m) => m,
@@ -686,10 +686,19 @@ async fn emit_interrupt_and_complete_tool_results(
     emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 
     // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
-    // 只需 tool_result 的 tool_call_id，不在乎窗口，keep_tokens=usize::MAX 不切 keep_recent
+    // keep_tokens 与主对话同口径（effective_keep_tokens 按 context_length 算）
+    let context_length = {
+        let p = ctx.session_params.lock().await;
+        p.model_config
+            .model_id
+            .as_deref()
+            .and_then(|id| fuyao_provider::get_model(id, &ctx.agent_paths).map(|m| m.limit.context))
+            .unwrap_or(ctx.compression_config.fallback_context)
+    };
+    let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
     let answered: std::collections::HashSet<String> = match ctx
         .store
-        .load_visible_messages(ctx.emitter.session_id(), usize::MAX)
+        .load_visible_messages(ctx.emitter.session_id(), keep_tokens)
         .await
     {
         Ok(msgs) => msgs

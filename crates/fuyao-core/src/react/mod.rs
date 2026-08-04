@@ -506,12 +506,14 @@ async fn run_compression(
     )
     .await;
 
-    // 从 DB 加载完整可见窗口（usize::MAX 不截 keep_recent）：generate_summary 内部不切窗，
-    // 需要看到全部待压缩内容来生成摘要；消息列表与主对话请求同源，前缀缓存可复用。
-    // （读取侧 load_visible_messages 的 keep_recent 切窗只服务主对话窗口构造，与摘要生成无关）
+    // 从 DB 加载可见窗口：与主对话同口径（effective_keep_tokens 按 context_length 算），
+    // 前缀缓存可复用。generate_summary 内部不切窗，把传入 messages 全量发给 LLM
+    let keep_tokens = ctx
+        .compression_config
+        .effective_keep_tokens(model.context_length);
     let visible_messages = match ctx
         .store
-        .load_visible_messages(session.id.as_str(), usize::MAX)
+        .load_visible_messages(session.id.as_str(), keep_tokens)
         .await
     {
         Ok(m) => m,

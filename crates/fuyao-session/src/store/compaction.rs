@@ -260,36 +260,50 @@ impl super::SessionStore {
 
     /// 加载模型可见窗口消息（动态拼接）
     ///
-    /// 返回给主对话 LLM 看的可见窗口，由三段显式拼接而成（顺序不可依赖单一 `ORDER BY seq`，
+    /// # 参数
+    ///
+    /// - `session_id`：会话 ID
+    /// - `keep_tokens`：**仅对已压缩过的会话生效**。压缩后，摘要覆盖了旧消息的全部细节，
+    ///   但近期上下文（具体代码、错误原文、工具返回）必须保真给 LLM，不能只靠摘要。
+    ///   `keep_tokens` 控制「附带多少条压缩前的近期消息」，单位 token，从最新摘要向前
+    ///   累加至该值即停。由调用方按模型上下文比例算好传入
+    ///   （`CompressionConfig::effective_keep_tokens(context_length)`），内部会强制
+    ///   截断到 `keep_tokens_max` 上限——任何调用方都不可能突破这个保护。
+    ///   传 0 表示「不附带压缩前的近期消息」，可见窗口只有 [摘要 + 新消息]。
+    ///
+    /// # 返回的可见窗口
+    ///
+    /// **已压缩过的会话**：三段显式拼接（顺序固定，不可依赖单一 `ORDER BY seq`，
     /// 因为摘要 seq 最大但逻辑上排最前）：
     ///
     /// ```text
     /// 可见窗口 = [最新摘要]
-    ///          + select_recent( seq 在 (上一条摘要, 最新摘要) 区间的消息 )   ← keep_recent
+    ///          + select_recent( seq 在 (上一条摘要, 最新摘要) 区间的消息, keep_tokens )   ← keep_recent
     ///          + [seq > 最新摘要 的所有新消息]
     /// ```
     ///
     /// - **最新摘要**：最近一条 `kind='compaction'` 消息，是可见窗口的逻辑起点
-    /// - **keep_recent**：以最新摘要为起点、在「最近两条摘要之间」向前按 token 预算切的近期消息，
-    ///   用原始记录（seq 不变），天然落在区间内、无需复制副本。向前切遇到上一条摘要即停，
-    ///   不捞回已被更早摘要覆盖的旧消息
+    /// - **keep_recent**：最新摘要之前的近期消息，按 `keep_tokens` 从尾部向前保留。
+    ///   只在「最近两条摘要之间」取——向前遇到上一条摘要即停，不捞回已被更早摘要覆盖的旧消息。
+    ///   用原始记录（seq 不变），不复制副本
     /// - **新消息**：最新摘要之后追加的消息
     ///
-    /// 从未压缩过（无任何 compaction 消息）时：上界视为 0，等价全部消息作 keep_recent 候选，
-    /// 返回全部消息。
+    /// **从未压缩过的会话**（无任何 compaction 消息）：`keep_tokens` 不参与，直接返回全部消息。
+    /// 没压缩过就没有「压缩前的消息」这个概念，不需要控制近期消息量。
     ///
-    /// `keep_tokens` 是 keep_recent 的 token 预算上限，由调用方按模型上下文比例算好传入
-    /// （`CompressionConfig::effective_keep_tokens(context_length)`）。传 `usize::MAX`
-    /// 表示不截断 keep_recent（保留区间内全部消息）；传 0 反向累加立即超预算，仅保留
-    /// `select_recent` 保证的最小窗口（最后 1 条）。
+    /// # 性能
     ///
-    /// 性能：几次索引查询（走 `idx_messages_session_kind_seq` / `idx_messages_session_seq`）
+    /// 几次索引查询（走 `idx_messages_session_kind_seq` / `idx_messages_session_seq`）
     /// + 内存拼接，复杂度低；仅在构造 LLM 请求时调一次，不在流式热路径。
     pub async fn load_visible_messages(
         &self,
         session_id: &str,
         keep_tokens: usize,
     ) -> Result<Vec<Message>, SessionError> {
+        // keep_tokens 兜底保护：强制截断到 keep_tokens_max，任何调用方都不可能突破上限
+        let keep_tokens =
+            keep_tokens.min(fuyao_api::get_config().session.compression.keep_tokens_max);
+
         // 1. 取全部 compaction 消息的 seq（升序），用于定位最新摘要 M 与上一条摘要 M2
         let compaction_seqs: Vec<i64> = sqlx::query_scalar(
             "SELECT seq FROM messages WHERE session_id = ?1 AND kind = 'compaction' ORDER BY seq",
@@ -298,7 +312,8 @@ impl super::SessionStore {
         .fetch_all(&self.pool)
         .await?;
 
-        // 从未压缩过：全部消息作 keep_recent 候选，直接查全量按 seq 升序，再切窗
+        // 从未压缩过：keep_tokens 不参与（没压缩就没有「压缩前的消息」需要控制量），
+        // 直接返回全部消息
         if compaction_seqs.is_empty() {
             let all: Vec<Message> = sqlx::query_as::<_, MessageRow>(
                 "SELECT id, session_id, model_id, role, content, images, tool_call_id,
@@ -312,8 +327,7 @@ impl super::SessionStore {
             .into_iter()
             .map(Message::from)
             .collect();
-            let window = crate::compressor::window::select_recent(&all, keep_tokens);
-            return Ok(window.keep_recent.to_vec());
+            return Ok(all);
         }
 
         // 最新摘要 M = compaction_seqs 最后一个；上一条摘要 M2 = 倒数第二个（无则视为 0）
@@ -486,10 +500,9 @@ mod tests {
         assert_eq!(visible[5].content.as_deref(), Some("new2"));
     }
 
-    /// keep_tokens=0：keep_recent 截到最小（select_recent 至少保留最后 1 条），
-    /// 可见窗口 = [摘要] + 最后 1 条 keep_recent + 新消息
+    /// keep_tokens=0：不附带任何压缩前的近期消息，可见窗口 = [摘要] + 新消息
     #[tokio::test]
-    async fn load_visible_keeps_minimal_keep_recent_when_budget_zero() {
+    async fn load_visible_omits_keep_recent_when_budget_zero() {
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -503,12 +516,10 @@ mod tests {
         insert_user(&store, &session.id, "new1").await;
 
         let visible = store.load_visible_messages(&session.id, 0).await.unwrap();
-        // select_recent 保证至少保留最后 1 条：[摘要, old3, new1]
-        assert_eq!(visible.len(), 3);
+        // keep_tokens=0 → keep_recent 为空：可见窗口只有 [摘要, new1]
+        assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].kind, MessageKind::Compaction);
-        // keep_recent 只剩最末一条 old3（预算 0 截断前面的）
-        assert_eq!(visible[1].content.as_deref(), Some("old3"));
-        assert_eq!(visible[2].content.as_deref(), Some("new1"));
+        assert_eq!(visible[1].content.as_deref(), Some("new1"));
     }
 
     /// 多次压缩：向前切只在最近两条摘要之间，不捞回已被更早摘要覆盖的旧消息
