@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 会话持久化（SQLite，事件级落库）
 - 上下文压缩（token 逼近上限时自动摘要）
 - 费用统计（每条 assistant 消息独立计费）
-- 自动重命名（首轮后异步生成标题）
+- 自动重命名（首条消息后异步生成标题）
 - 循环检测防护（LoopGuardPlugin）
 - LLM 重试（RateLimit / Timeout 等可恢复错误自动重试）
 

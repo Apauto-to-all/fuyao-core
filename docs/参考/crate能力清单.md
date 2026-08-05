@@ -108,7 +108,7 @@ L0  fuyao-api（零内部依赖）
 - **职责**：SQLite 持久化 + 上下文压缩 + 费用统计 + 标题生成
 - **内部依赖**：api
 - **公开 API**：
-  - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update`（落库时经 `unixepoch()` 刷新 `last_active_at`）/ `delete` / `list_all(workspace_filter, limit, offset)`（按 `last_active_at` 倒序 + 可选按 workspace 过滤）/ `count` / `count_with_filter(workspace_filter)` / `insert_message` / `count_messages` / `load_full_history`（全量审计，seq 升序）/ `list_messages_before(session_id, before_seq, limit)`（游标分页浏览，seq 倒序）/ `load_visible_messages`（LLM 可见窗口，压缩感知动态拼接）/ `mark_compaction` / `update_system_prompt` / `update_title` / `end_session`）
+  - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update`（落库时经 `unixepoch()` 刷新 `last_active_at`）/ `delete` / `list_all(workspace_filter, limit, offset)`（按 `last_active_at` 倒序 + 可选按 workspace 过滤）/ `count` / `count_with_filter(workspace_filter)` / `insert_message` / `count_messages` / `load_full_history`（全量审计，seq 升序）/ `list_messages_before(session_id, before_seq, limit)`（游标分页浏览，seq 倒序）/ `load_visible_messages`（LLM 可见窗口，压缩感知动态拼接）/ `mark_compaction` / `rollback_to(session_id, target_seq)`（对话回退，删目标 seq 之后消息 + 重算 count 类与压缩元数据，返回 `RollbackPayload`）/ `update_system_prompt` / `update_title` / `end_session`）
   - **压缩模块**：`should_compress` / `generate_summary` / `apply`
   - **费用统计**：`calculate_cost` / `fill_message_cost` / `accumulate_session_total`
   - **标题生成**：`maybe_generate_title`
