@@ -40,6 +40,7 @@ use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::output::{
     CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
+    RollbackMessage,
 };
 use fuyao_api::{
     AgentDefinition, CompressionConfig, ControlCommand, EventBase, Session, SessionParams,
@@ -699,5 +700,81 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
 async fn handle_control(ctx: &SessionCtx, session: &mut Session, cmd: ControlCommand) {
     match cmd {
         ControlCommand::Compress => run_manual_compression(ctx, session).await,
+        ControlCommand::Rollback { target_seq } => run_rollback(ctx, session, target_seq).await,
     }
+}
+
+/// 执行对话回退（控制通道 Rollback 命令的处理）
+///
+/// 与手动压缩在控制通道里地位对等：都是 task 在 turn 边界自执行的 DB 写命令。
+/// 复用 store 层 [`fuyao_session::SessionStore::rollback_to`] 的单事务原子执行体
+/// （删目标 seq 之后的所有消息 + 重算 count 类字段 + 局部 UPDATE sessions）。
+///
+/// 三步：
+/// 1. 调 `rollback_to`（内部已校验目标 role/kind，非法目标事务回滚、DB 不变）
+/// 2. 就地刷新内存 session 的 4 个状态字段——task 后续循环用的就是这份内存对象，
+///    不刷新的话下一轮 turn 结束 persist 会把旧 count 写回 DB，盖掉回退后的重算值
+/// 3. 发 `OutputEvent::Rollback` 事件（经 dispatch 管道：拦截 → 发送 → 观察），
+///    前端据此显示「已回退 N 条」通知 + 把目标用户消息填输入框
+///
+/// 失败处理：`rollback_to` 返回错误时（目标不存在 / 非法目标 / session 不存在），
+/// 发 `OutputEvent::Error` 让前端感知，不 panic、不影响 task 后续运行（turn 边界语义：
+/// 回退失败等价于没回退，task 继续按原状态跑）。
+async fn run_rollback(ctx: &SessionCtx, session: &mut Session, target_seq: i64) {
+    let payload = match ctx
+        .store
+        .rollback_to(ctx.emitter.session_id(), target_seq)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                target_seq = target_seq,
+                cause = %e,
+                "对话回退失败"
+            );
+            dispatch::dispatch(
+                &ctx.emitter,
+                &ctx.hooks,
+                OutputEvent::Error(fuyao_api::message::output::ErrorMessage {
+                    base: EventBase::default(),
+                    payload: fuyao_api::message::output::ErrorPayload {
+                        message: format!("对话回退失败：{e}"),
+                        recoverable: true,
+                    },
+                }),
+                None,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // 就地刷新内存 session 的 4 个状态字段，避免后续 persist 写回旧值盖掉重算结果。
+    // 消费类字段（token / cost）不动——rollback_to 内部本就保留原值，内存对象也无需改。
+    session.message_count = payload.message_count;
+    session.tool_call_count = payload.tool_call_count;
+    session.last_compacted_seq = payload.last_compacted_seq;
+    session.compression_count = payload.compression_count;
+
+    tracing::info!(
+        session_id = ctx.emitter.session_id(),
+        target_seq = payload.target_seq,
+        deleted_total = payload.deleted_total,
+        message_count = payload.message_count,
+        "对话回退完成"
+    );
+
+    // 发 Rollback 事件：前端据此显示「已回退 N 条」通知 + 把目标用户消息填输入框
+    dispatch::dispatch(
+        &ctx.emitter,
+        &ctx.hooks,
+        OutputEvent::Rollback(RollbackMessage {
+            base: EventBase::default(),
+            payload,
+        }),
+        None,
+    )
+    .await;
 }

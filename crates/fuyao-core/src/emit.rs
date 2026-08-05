@@ -67,5 +67,6 @@ fn stamp_session_id(event: &mut OutputEvent, session_id: &str) {
         OutputEvent::Title(m) => m.base.session_id = id,
         OutputEvent::Retry(m) => m.base.session_id = id,
         OutputEvent::ChildSession(m) => m.base.session_id = id,
+        OutputEvent::Rollback(m) => m.base.session_id = id,
     }
 }

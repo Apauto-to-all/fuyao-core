@@ -402,6 +402,7 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),
         OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
+        OutputEvent::Rollback(m) => m.base.session_id.as_deref(),
     }
 }
 
@@ -1901,4 +1902,131 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     let ended = ended.expect("应有 Compression Ended 事件");
     assert_eq!(ended.reason, CompressionReason::Manual);
     assert_eq!(ended.content, "压缩摘要");
+}
+
+/// 回退命令经控制通道执行：删目标 seq 之后的消息 + 刷内存 session count + 发 Rollback 事件。
+///
+/// 验证阶段 1 的核心链路——handle_control 的 Rollback 分支：
+/// 1. 调 store.rollback_to（删消息 + 重算）
+/// 2. 就地刷新内存 session 的状态字段
+/// 3. 经 dispatch 发 OutputEvent::Rollback 事件
+///
+/// 预置 user1(seq1) + assistant(seq2) + user2(seq3)，回退到 user1（target_seq=1），
+/// 期待删掉 seq2/seq3、内存 message_count 刷新为 1、收到 Rollback 事件。
+#[tokio::test]
+async fn rollback_command_deletes_and_refreshes_session() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+
+    // 预置三条消息：user1 → assistant → user2（insert 回填 seq，1/2/3）
+    let mut u1 = fuyao_api::Message::user("第一条用户消息".to_string());
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut u1)
+        .await
+        .unwrap();
+    let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut a1)
+        .await
+        .unwrap();
+    let mut u2 = fuyao_api::Message::user("第二条用户消息".to_string());
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut u2)
+        .await
+        .unwrap();
+    h.session.message_count = 2; // 两条 user（assistant 不计入 message_count 口径）
+    h.session.tool_call_count = 0;
+
+    // 执行回退命令：回到第一条 user 消息（target_seq = u1.seq）
+    handle_control(
+        &h.ctx,
+        &mut h.session,
+        ControlCommand::Rollback { target_seq: u1.seq },
+    )
+    .await;
+
+    // 1. 收到 Rollback 事件，payload 字段符合预期
+    let events = collect_events(&mut h.rx_event).await;
+    let rollback = events
+        .iter()
+        .find_map(|e| match e {
+            OutputEvent::Rollback(m) => Some(m),
+            _ => None,
+        })
+        .expect("应收到 Rollback 事件");
+    assert_eq!(
+        rollback.payload.target_seq, u1.seq,
+        "target_seq 应为回退目标"
+    );
+    assert_eq!(
+        rollback.payload.deleted_total, 2,
+        "应删掉 assistant + user2 共 2 条"
+    );
+    assert_eq!(
+        rollback.payload.deleted_count, 1,
+        "deleted_count 口径（user+compaction）应为 1（仅 user2）"
+    );
+    assert_eq!(
+        rollback.payload.message_count, 1,
+        "重算后 message_count 应为 1"
+    );
+    assert_eq!(rollback.base.session_id.as_deref(), Some("test_session"));
+
+    // 2. 内存 session 的状态字段已就地刷新（避免后续 persist 盖回旧值）
+    assert_eq!(h.session.message_count, 1, "内存 message_count 应已刷新");
+    assert_eq!(h.session.tool_call_count, 0);
+    assert_eq!(h.session.compression_count, 0);
+    assert!(h.session.last_compacted_seq.is_none());
+
+    // 3. DB 实际只剩 target 这一条
+    let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
+    assert_eq!(msgs.len(), 1, "DB 应只剩目标消息");
+    assert_eq!(msgs[0].seq, u1.seq);
+    assert_eq!(msgs[0].role, fuyao_api::MessageRole::User);
+}
+
+/// 回退到非法目标（assistant 消息）：校验在 store 层原子完成，
+/// 发 Error 事件、DB 不变、内存 session 不变。
+#[tokio::test]
+async fn rollback_to_invalid_target_emits_error_and_keeps_db() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+
+    // user1(seq1) + assistant(seq2)
+    let mut u1 = fuyao_api::Message::user("用户消息".to_string());
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut u1)
+        .await
+        .unwrap();
+    let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut a1)
+        .await
+        .unwrap();
+    h.session.message_count = 1;
+
+    // 回退到 assistant（非法目标——中间态不可作回退点）
+    handle_control(
+        &h.ctx,
+        &mut h.session,
+        ControlCommand::Rollback { target_seq: a1.seq },
+    )
+    .await;
+
+    // 收到 Error 事件（可恢复）
+    let events = collect_events(&mut h.rx_event).await;
+    let has_error = events
+        .iter()
+        .any(|e| matches!(e, OutputEvent::Error(m) if m.payload.recoverable));
+    assert!(has_error, "非法目标应发可恢复的 Error 事件");
+
+    // DB 不变（两条消息都在），内存 session 不变
+    let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
+    assert_eq!(msgs.len(), 2, "非法回退不应改动 DB");
+    assert_eq!(h.session.message_count, 1, "内存 session 不应变");
 }
