@@ -108,7 +108,7 @@ L0  fuyao-api（零内部依赖）
 - **职责**：SQLite 持久化 + 上下文压缩 + 费用统计 + 标题生成
 - **内部依赖**：api
 - **公开 API**：
-  - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update`（落库时经 `unixepoch()` 刷新 `last_active_at`）/ `delete` / `list_all(workspace_filter, limit, offset)`（按 `last_active_at` 倒序 + 可选按 workspace 过滤）/ `count` / `count_with_filter(workspace_filter)` / `insert_message` / `count_messages` / `load_visible_messages` / `load_full_history` / `mark_compaction` / `update_system_prompt` / `update_title` / `end_session`）
+  - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update`（落库时经 `unixepoch()` 刷新 `last_active_at`）/ `delete` / `list_all(workspace_filter, limit, offset)`（按 `last_active_at` 倒序 + 可选按 workspace 过滤）/ `count` / `count_with_filter(workspace_filter)` / `insert_message` / `count_messages` / `load_full_history`（全量审计，seq 升序）/ `list_messages_before(session_id, before_seq, limit)`（游标分页浏览，seq 倒序）/ `load_visible_messages`（LLM 可见窗口，压缩感知动态拼接）/ `mark_compaction` / `update_system_prompt` / `update_title` / `end_session`）
   - **压缩模块**：`should_compress` / `generate_summary` / `apply`
   - **费用统计**：`calculate_cost` / `fill_message_cost` / `accumulate_session_total`
   - **标题生成**：`maybe_generate_title`
@@ -129,7 +129,7 @@ L0  fuyao-api（零内部依赖）
   - **`start(EngineParams)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → 创建 `SessionStore` → `Engine::new`（注入 store）→ `App::new` → `SessionManager::new`），返回 `FuyaoApp { app, sessions }`——上层同时拿到运行时入口（`app`）与查询入口（`sessions`），两者共享同一份 `Arc<SessionStore>`
   - **`FuyaoApp`**（`start` 的聚合产物）：`app: App`（运行时交互：create/send/recv/end）+ `sessions: SessionManager`（会话检索：list/count），平级正交、互不依赖
   - **`App`**（运行时交互门面，持 `Engine` + fan-in 出口）：`new(engine, mcp_manager, log_guard)` / `create_session(SessionParams)` → `SessionId`（rx 由内部 forwarder 消费进 fan_out）/ `resume_session` / `fork_session` / `create_child_session(parent, source, params)` → `(SessionId, rx)`（**rx 不进 fan_out**，返调用方独占消费）/ `send` / `recv()` → `Option<OutputEvent>`（单一出口）/ `end_session` / `shutdown(self)`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop log_guard）
-  - **`SessionManager`**（会话检索门面，持同一份 `Arc<SessionStore>`，与 `App` 平级正交）：`new(store)` / `list_sessions(workspace_filter, limit, offset)` → `Vec<Session>`（按 `last_active_at` 倒序，可选按 workspace 过滤）/ `session_count(workspace_filter)` → `i64`；消息查询（`list_messages` / `message_count`）为占位，待后续设计落实
+  - **`SessionManager`**（会话检索门面，持同一份 `Arc<SessionStore>`，与 `App` 平级正交）：`new(store)` / `list_sessions(workspace_filter, limit, offset)` → `Vec<Session>`（按 `last_active_at` 倒序，可选按 workspace 过滤）/ `session_count(workspace_filter)` → `i64` / `list_messages(session_id, before_seq: Option<i64>, limit: Option<i64>)` → `Vec<Message>`（游标分页，seq 倒序；`before_seq=None` 取最新一页，`Some(N)` 向前翻；`limit=None` 用默认 50；compaction 消息正常显示不过滤；不提供总数，下一页用返回条数 == limit 判断）
   - **`init_engine(EngineParams)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`
   - **`build_tool_registry()`**：收集内置 + MCP 工具，返回 `(ToolRegistry, Option<Arc<MCPManager>>)`
   - **`LogGuard`**：drop 时 flush 文件日志
