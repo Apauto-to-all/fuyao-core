@@ -243,6 +243,11 @@ pub(crate) async fn run_session(
             };
             // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
             queue::inject_messages(&ctx, &mut session, msgs).await;
+            // 首轮 user 消息落库后立即触发标题生成（fire-and-forget，不等 AI 回复）：
+            // 在 run_turn 之前判定，解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤。
+            // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
+            let is_child = session.parent_session_id.is_some();
+            turn::maybe_spawn_title_generation(&ctx, is_child).await;
             turn::run_turn(&ctx, &mut session, &mut rx_interrupt, model_config).await;
         } else {
             // guide 空：等入站消息（过管道入队）/ 中断 / shutdown

@@ -294,17 +294,16 @@ async fn handle_final_reply(
     if msgs.is_empty() {
         // guide 和 pending 都空：落库，turn 结束
         persist(ctx.emitter.session_id(), session, &ctx.store).await;
-        // 首轮最终回复后异步生成标题（fire-and-forget，不阻塞主循环）
-        // 是否跳过子 session 由 [session.title] skip_child 控制（默认 true）
-        let is_child = session.parent_session_id.is_some();
-        maybe_spawn_title_generation(ctx, result, is_child).await;
     } else {
         // 有消息：全部注入（每条经 emit_to_history 拦截→落 DB→发送→观察），回 run_turn 顶部再调一轮 LLM
         queue::inject_messages(ctx, session, msgs).await;
     }
 }
 
-/// 首轮对话后触发标题自动生成（fire-and-forget）
+/// 首轮用户消息后触发标题自动生成（fire-and-forget）
+///
+/// 在 `inject_messages` 落库首条 user 消息后调用（早于 `run_turn`，不等 AI 回复），
+/// 解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤与长回复拖累问题。
 ///
 /// 触发条件（同时满足）：
 /// - `[session.title] enabled = true`
@@ -312,7 +311,7 @@ async fn handle_final_reply(
 ///   `parent_session_id` 表达归属，重命名反而扰乱父/子分组与前端过滤
 /// - DB 可见消息中 `role=user` 的消息数严格等于 1（首轮判定：计数法比
 ///   `title=="新会话"` 更稳——用户可能改过 title）
-/// - 能取到首条 user content 与本轮 assistant 文本
+/// - 能取到首条 user content 与当前引擎模型 ID
 ///
 /// 执行模型：`tokio::spawn` 独立 task，不阻塞主 ReAct 循环。
 /// spawn 的 future 是 `'static` 的，**不借用 `&mut Session`**——标题直接走
@@ -321,7 +320,7 @@ async fn handle_final_reply(
 ///
 /// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
 /// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
-async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, is_child: bool) {
+pub(super) async fn maybe_spawn_title_generation(ctx: &SessionCtx, is_child: bool) {
     let title_cfg = &fuyao_api::get_config().session.title;
     if !title_cfg.enabled {
         return;
@@ -333,7 +332,7 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, i
         return;
     }
 
-    // 标题生成在首轮对话后触发（仅 2 条消息，不可能压缩过），走从未压缩分支拿到全部消息，
+    // 标题生成在首轮 user 消息落库后触发（仅 1 条消息，不可能压缩过），走从未压缩分支拿到全部消息，
     // keep_tokens 不参与
     let visible = match ctx
         .store
@@ -351,7 +350,7 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, i
         }
     };
 
-    // 计数法判定首轮
+    // 计数法判定首轮：user 消息数严格等于 1（后续轮次 user_count 必然 >1，自然跳过）
     let user_count = visible
         .iter()
         .filter(|m| matches!(m.role, MessageRole::User))
@@ -360,22 +359,19 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, i
         return;
     }
 
-    // 取首条 user content + 本轮 assistant 文本（StreamResult.text 是本轮流式累积全文）
+    // 取首条 user content（标题仅基于用户首句意图）
     let user_content = visible
         .iter()
         .find(|m| matches!(m.role, MessageRole::User))
         .and_then(|m| m.content.clone())
         .unwrap_or_default();
-    let assistant_content = result.text.clone();
-    // 标题生成回退用的主模型 ID：从可见消息最后一条 assistant 消息读取
-    // （emit_to_history 闭包构造 Message 时已把 model_id 存进字段）。读不到则空串，
-    // maybe_generate_title 内部会因 model_id 无法解析返回 None。
-    let main_model_id = visible
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, MessageRole::Assistant))
-        .and_then(|m| m.model_id.clone())
-        .unwrap_or_default();
+
+    // 标题生成回退用的主模型 ID：从 session_params 现读模型配置（ReAct 主循环同款快照）。
+    // 读不到则空串，maybe_generate_title 内部会因 model_id 无法解析返回 None。
+    let main_model_id = {
+        let params = ctx.session_params.lock().await;
+        params.model_config.model_id.clone().unwrap_or_default()
+    };
 
     // clone 'static 依赖进 spawn（所有字段都是 Send + 'static）
     let store = Arc::clone(&ctx.store);
@@ -388,7 +384,6 @@ async fn maybe_spawn_title_generation(ctx: &SessionCtx, result: &StreamResult, i
     tokio::spawn(async move {
         match fuyao_session::maybe_generate_title(
             &user_content,
-            &assistant_content,
             &main_model_id,
             &providers,
             &agent_paths,

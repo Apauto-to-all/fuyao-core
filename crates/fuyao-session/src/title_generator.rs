@@ -1,7 +1,7 @@
 //! 会话标题自动生成
 //!
-//! 首轮对话后异步生成简短标题：
-//! - 用用户消息 + AI 回答（各截断 `[session.title] snippet_max_chars` 字符）喂给 LLM
+//! 首轮用户消息后立即异步生成简短标题（不等 AI 回复，避免长回复拖累延迟）：
+//! - 仅用用户首条消息（截断 `[session.title] snippet_max_chars` 字符）喂给 LLM
 //! - 模型优先级：`[models.fast]` → 当前引擎模型 → 放弃
 //! - 从引擎级共享的 ProviderRegistry 取 Provider 实例（fast 可能跨 Provider）
 //! - 用非流式 `provider.chat()`（标题是短文本，无需流式增量）
@@ -21,9 +21,9 @@
 use fuyao_api::{AgentPaths, get_config};
 use fuyao_provider::{ChatMessage, ChatRequest, ProviderRegistry, StreamOptions, parse_model_id};
 
-/// 标题生成系统提示词
-const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题（3-7 个词）。\
-标题应概括对话的主要主题或意图。使用与用户相同的语言撰写标题。\
+/// 标题生成系统提示词（仅基于用户首条消息）
+const TITLE_PROMPT: &str = "根据用户的第一条消息生成一个简短的描述性标题（3-7 个词）。\
+标题应概括用户的主要意图或主题。使用与用户消息相同的语言撰写标题。\
 只返回标题文本，不要加引号、不要加标点结尾、不要加前缀。";
 
 /// 生成会话标题
@@ -34,8 +34,7 @@ const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题�
 /// **只取 fast 的 model_id**（不取其 thinking）；标题固定不思考（见模块顶部「三者独立」）。
 ///
 /// # 参数
-/// - `user_message`：用户消息原文（内部截断）
-/// - `assistant_response`：AI 回答原文（内部截断）
+/// - `user_message`：用户首条消息原文（内部截断）
 /// - `main_model_id`：当前引擎使用的模型 ID（格式 provider_id/model_id），fast 不可用时回退
 /// - `providers`：引擎级共享的 Provider 实例注册表（fast 可能跨 Provider 配置）
 /// - `agent_paths`：Agent 三层目录（注册表查找用，保留以备未来扩展）
@@ -45,7 +44,6 @@ const TITLE_PROMPT: &str = "为以下对话生成一个简短的描述性标题�
 /// - `None`：fast 与主模型都失败，或生成结果为空
 pub async fn maybe_generate_title(
     user_message: &str,
-    assistant_response: &str,
     main_model_id: &str,
     providers: &ProviderRegistry,
     _agent_paths: &AgentPaths,
@@ -56,7 +54,7 @@ pub async fn maybe_generate_title(
     if let Some(fast_ref) = config.models.fast.as_ref()
         && !fast_ref.model.is_empty()
     {
-        match generate_title(user_message, assistant_response, &fast_ref.model, providers).await {
+        match generate_title(user_message, &fast_ref.model, providers).await {
             Some(title) => return Some(title),
             None => {
                 tracing::warn!(
@@ -68,7 +66,7 @@ pub async fn maybe_generate_title(
     }
 
     // 2. 回退到当前引擎模型；3. 再失败则放弃（返回 None）
-    generate_title(user_message, assistant_response, main_model_id, providers).await
+    generate_title(user_message, main_model_id, providers).await
 }
 
 /// 调用 LLM 生成标题（单次尝试）
@@ -86,7 +84,6 @@ pub async fn maybe_generate_title(
 /// - 响应为空或清洗后为空
 async fn generate_title(
     user_message: &str,
-    assistant_response: &str,
     model_id: &str,
     providers: &ProviderRegistry,
 ) -> Option<String> {
@@ -96,13 +93,12 @@ async fn generate_title(
 
     let title_cfg = &get_config().session.title;
     let user_snippet = truncate_chars(user_message, title_cfg.snippet_max_chars);
-    let assistant_snippet = truncate_chars(assistant_response, title_cfg.snippet_max_chars);
 
     let request = ChatRequest {
         system: Some(TITLE_PROMPT.to_string()),
         messages: vec![ChatMessage {
             role: fuyao_api::MessageRole::User,
-            content: Some(format!("用户: {user_snippet}\n\n助手: {assistant_snippet}")),
+            content: Some(format!("用户: {user_snippet}")),
             ..ChatMessage::default()
         }],
     };

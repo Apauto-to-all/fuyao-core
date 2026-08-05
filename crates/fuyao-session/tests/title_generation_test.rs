@@ -9,6 +9,8 @@
 //! - 主模型可用时正常生成 + clean_title 清洗（去引号、去前缀、限长）
 //! - 主模型调用失败时返回 None（放弃重命名）
 //!
+//! 标题仅基于用户首条消息生成（不等 AI 回复），测试入参只传 user_message。
+//!
 //! mock 决策：手写 FakeTitleProvider（Provider trait 标了 #[async_trait]，automock 不适用）。
 //! 全局状态规避：maybe_generate_title 读 get_config().models.fast，默认 None → 走 fallback，
 //! 不调 set_config（规避 OnceLock 串扰）。
@@ -34,14 +36,8 @@ async fn generates_title_from_main_model_when_fast_unconfigured() {
     let providers = registry_with_title_provider("关于 Rust 异步的讨论");
     let paths = common::unique_paths("title_ok");
 
-    let title = maybe_generate_title(
-        "讲讲 Rust 的 async",
-        "Rust 的 async/await...",
-        main_model_id(),
-        &providers,
-        &paths,
-    )
-    .await;
+    let title =
+        maybe_generate_title("讲讲 Rust 的 async", main_model_id(), &providers, &paths).await;
 
     assert_eq!(title.as_deref(), Some("关于 Rust 异步的讨论"));
     common::cleanup_unused(&paths);
@@ -53,8 +49,7 @@ async fn clean_title_strips_quotes_from_generated() {
     let providers = registry_with_title_provider("\"测试结果分析\"");
     let paths = common::unique_paths("title_quotes");
 
-    let title =
-        maybe_generate_title("分析测试", "结果如下", main_model_id(), &providers, &paths).await;
+    let title = maybe_generate_title("分析测试", main_model_id(), &providers, &paths).await;
 
     assert_eq!(title.as_deref(), Some("测试结果分析"));
     common::cleanup_unused(&paths);
@@ -66,14 +61,7 @@ async fn clean_title_strips_title_prefix() {
     let providers = registry_with_title_provider("标题: 数据库设计要点");
     let paths = common::unique_paths("title_prefix");
 
-    let title = maybe_generate_title(
-        "设计数据库",
-        "要点如下",
-        main_model_id(),
-        &providers,
-        &paths,
-    )
-    .await;
+    let title = maybe_generate_title("设计数据库", main_model_id(), &providers, &paths).await;
 
     assert_eq!(title.as_deref(), Some("数据库设计要点"));
     common::cleanup_unused(&paths);
@@ -87,7 +75,7 @@ async fn clean_title_truncates_overlong() {
     let providers = registry_with_title_provider(&long);
     let paths = common::unique_paths("title_long");
 
-    let title = maybe_generate_title("讲讲训练", "优化方法", main_model_id(), &providers, &paths)
+    let title = maybe_generate_title("讲讲训练", main_model_id(), &providers, &paths)
         .await
         .expect("应生成标题");
 
@@ -114,7 +102,7 @@ async fn returns_none_when_main_model_call_fails() {
     let providers = registry_with_failing_provider();
     let paths = common::unique_paths("title_fail");
 
-    let title = maybe_generate_title("提问", "回答", main_model_id(), &providers, &paths).await;
+    let title = maybe_generate_title("提问", main_model_id(), &providers, &paths).await;
 
     assert!(title.is_none(), "主模型失败时应返回 None");
     common::cleanup_unused(&paths);
@@ -126,7 +114,7 @@ async fn returns_none_when_generated_title_empty_after_clean() {
     let providers = registry_with_title_provider("   ");
     let paths = common::unique_paths("title_empty");
 
-    let title = maybe_generate_title("提问", "回答", main_model_id(), &providers, &paths).await;
+    let title = maybe_generate_title("提问", main_model_id(), &providers, &paths).await;
 
     assert!(title.is_none(), "清洗后为空应返回 None");
     common::cleanup_unused(&paths);
