@@ -23,6 +23,7 @@ use super::builders::{
     ResolvedModel, assistant_msg_to_payload, assistant_with_tool_calls_to_payload,
     build_chat_request, resolve_model, tool_call_data_to_event, tool_call_event_to_data,
 };
+use super::handle_control;
 use crate::interrupt::{
     SharedTurnState, TurnState, classify, emit_interrupt_event, handle_interrupt,
 };
@@ -30,6 +31,7 @@ use crate::react::queue;
 use crate::stream::StreamResult;
 use crate::tool_exec;
 use fuyao_api::InterruptSource;
+use fuyao_api::TurnDirective;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{
@@ -73,10 +75,13 @@ fn materialize_resolved(config: &mut ModelConfig, resolved: &ResolvedModel) {
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
+/// `rx_control` 为控制通道接收端，ReAct loop 顶部间隙检查点消费它——取到任意 StopTurn
+/// 命令（手动压缩 / 回退）则 persist + return，打断 ReAct 链让命令快速生效。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     session: &mut Session,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
+    rx_control: &mut Receiver<fuyao_api::ControlCommand>,
     mut model_config: ModelConfig,
 ) {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
@@ -138,6 +143,30 @@ pub(crate) async fn run_turn(
     let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
 
     loop {
+        // === 控制通道间隙检查点 ===
+        // 每轮 ReAct 开始前非阻塞排空控制通道。时机安全：上一轮工具结果已落库、
+        // 下一轮 LLM 还没调用——DB 稳定态。命令改 DB 后，紧接着的 build_chat_request
+        // 读到最新状态（回退重算的 count / 压缩新边界）。
+        //
+        // 忠实执行：while try_recv 逐条 FIFO 排空，不做同批去重 / 合并（引擎是忠实执行器）。
+        // 取到命令先问它的 turn_directive（命令自带，固有属性），任一条 StopTurn 即标记停止。
+        // 全排空后若有任意 StopTurn → persist + return，打断 ReAct 链交还控制权；
+        // 通道空 / 全是 Continue → 继续 ReAct。
+        //
+        // stop_turn 标志的必要性：while try_recv 可能一次取到多条命令，必须遍历完才能判断
+        // 「有没有出现过 StopTurn」，不用标志循环结束后无法回溯。
+        let mut stop_turn = false;
+        while let Ok(cmd) = rx_control.try_recv() {
+            if matches!(cmd.turn_directive(), TurnDirective::StopTurn) {
+                stop_turn = true;
+            }
+            handle_control(ctx, session, cmd).await;
+        }
+        if stop_turn {
+            persist(ctx.emitter.session_id(), session, &ctx.store).await;
+            return;
+        }
+
         // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
         // 每次 loop 顶部新建；retry.rs 在重试时清空复用，保证不携带上一次的部分结果。
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));

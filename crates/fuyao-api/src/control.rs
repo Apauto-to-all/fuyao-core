@@ -26,3 +26,33 @@ pub enum ControlCommand {
     /// fire-and-forget 的命令载体，回执由事件出口承担（同压缩）。
     Rollback { target_seq: i64 },
 }
+
+/// 控制命令对 turn 的处置指令
+///
+/// 每条 [`ControlCommand`] 自带一重语义——它指示执行后 turn 该怎么处置。
+/// 这是命令的固有属性（命令定义时即确定），不是执行后的结果：
+/// - `Continue`：执行后继续当前 turn（不改变 turn 持有的状态）
+/// - `StopTurn`：执行后 turn 退出（改变了 turn 持有的状态，继续跑无意义 / 会不一致）
+///
+/// 间隙检查点（run_turn 内 ReAct loop 顶部）取到命令时调
+/// [`ControlCommand::turn_directive`] 即知该不该停，无需执行后再判断。
+pub enum TurnDirective {
+    /// 命令执行后，turn 继续（不改变 turn 持有的状态）
+    Continue,
+    /// 命令执行后，turn 退出（改变了 turn 持有的状态，继续跑无意义 / 会不一致）
+    StopTurn,
+}
+
+impl ControlCommand {
+    /// 这条控制命令对 turn 的处置指令
+    ///
+    /// 命令的固有属性——执行前即可知。间隙检查点据此决定取到命令后要不要 return。
+    pub fn turn_directive(&self) -> TurnDirective {
+        match self {
+            // 手动压缩：压缩后原始消息被摘要替代，turn 持有的消息列表 / 边界失效 → StopTurn
+            ControlCommand::Compress => TurnDirective::StopTurn,
+            // 回退：删了消息 + 重算 count，turn 持有的 session 状态失效 → StopTurn
+            ControlCommand::Rollback { .. } => TurnDirective::StopTurn,
+        }
+    }
+}

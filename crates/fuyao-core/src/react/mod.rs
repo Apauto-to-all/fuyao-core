@@ -200,7 +200,9 @@ pub(crate) async fn run_session(
         });
     }
 
-    // 主循环：从 guide 全取消息 → 注入 → 跑一轮 ReAct；guide 空 → 等待入站/中断/shutdown
+    // 主循环：从 guide 全取消息 → 注入 → 跑 ReAct（自包含循环）。
+    // run_turn return 后落 select! 等待，不自动 consume——停止消费由 run_turn return 表达，
+    // 启动由 inbound（新用户消息）触发，回顶部 consume 开新 turn。
     loop {
         // === 控制通道消费（turn 边界）===
         // 每次循环顶部 try_recv 排空控制通道：处理 turn 运行期间到达的 B 类命令（手动压缩等），
@@ -249,45 +251,55 @@ pub(crate) async fn run_session(
             // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
             let is_child = session.parent_session_id.is_some();
             turn::maybe_spawn_title_generation(&ctx, is_child).await;
-            turn::run_turn(&ctx, &mut session, &mut rx_interrupt, model_config).await;
-        } else {
-            // guide 空：等入站消息（过管道入队）/ 中断 / shutdown
-            // （Plugin 通知由 run_session 顶部 spawn 的独立 forwarder task 并发转发，
-            // 不在主循环消费——避免 turn 运行期间通知被阻塞延迟整轮）
-            tokio::select! {
-                biased;
-                // shutdown 优先胜出（即使有消息积压也先退出）
-                _ = ctx.shutdown_token.cancelled() => {
-                    tracing::info!(
+            // run_turn 自包含跑完整个队列直到空、或被控制命令/中断打断 → return。
+            // return 后落下方 select! 等待，不回顶部 consume——停止消费由 return 表达。
+            turn::run_turn(
+                &ctx,
+                &mut session,
+                &mut rx_interrupt,
+                &mut rx_control,
+                model_config,
+            )
+            .await;
+        }
+        // === 等待（无条件）===
+        // 两类情况都进这里：① guide 空本来就等；② run_turn 刚 return（队列跑空 / 命令停 / 中断）。
+        // 停止消费：run_turn return 后到这里等，不自动 consume guide/pending。
+        // 启动：inbound 收到新用户消息 → 入队 → select! 结束 → 回顶部 consume 开新 turn。
+        // （Plugin 通知由 run_session 顶部 spawn 的独立 forwarder task 并发转发，
+        // 不在主循环消费——避免 turn 运行期间通知被阻塞延迟整轮）
+        tokio::select! {
+            biased;
+            // shutdown 优先胜出（即使有消息积压也先退出）
+            _ = ctx.shutdown_token.cancelled() => {
+                tracing::info!(
+                    session_id = %ctx.emitter.session_id(),
+                    "session 收到 shutdown 信号，正在落库退出"
+                );
+                // 落库保护 in-flight 状态（失败仅 warn，不阻塞关闭）
+                if let Err(e) = ctx.store.update(&session).await {
+                    tracing::warn!(
                         session_id = %ctx.emitter.session_id(),
-                        "session 收到 shutdown 信号，正在落库退出"
+                        cause = %e,
+                        "shutdown 落库失败，session 状态可能丢失最近一条未持久化的消息"
                     );
-                    // 落库保护 in-flight 状态（失败仅 warn，不阻塞关闭）
-                    if let Err(e) = ctx.store.update(&session).await {
-                        tracing::warn!(
-                            session_id = %ctx.emitter.session_id(),
-                            cause = %e,
-                            "shutdown 落库失败，session 状态可能丢失最近一条未持久化的消息"
-                        );
-                    }
-                    break;
                 }
-                Some(inbound) = rx_inbound.recv() => {
-                    // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察
-                    handle_inbound_user(&ctx, inbound).await;
-                    // 回循环顶部重新 consume（刚入队的消息会驱动新 turn）
-                    continue;
-                }
-                Some(interrupt_msg) = rx_interrupt.recv() => {
-                    // idle 中断：无活跃 turn，只发通知事件
-                    emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
-                    tracing::debug!(session_id = ctx.emitter.session_id(), "idle 时收到中断信号");
-                }
-                Some(cmd) = rx_control.recv() => {
-                    // idle 时控制命令到达：处理后回顶部 drain 取其余（同 task 串行消费，天然互斥）
-                    handle_control(&ctx, &mut session, cmd).await;
-                    continue;
-                }
+                break;
+            }
+            Some(inbound) = rx_inbound.recv() => {
+                // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察。
+                // select! 结束后回顶部 consume（刚入队的消息驱动新 turn）= 启动入口
+                handle_inbound_user(&ctx, inbound).await;
+            }
+            Some(interrupt_msg) = rx_interrupt.recv() => {
+                // idle 中断：无活跃 turn，只发通知事件
+                emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
+                tracing::debug!(session_id = ctx.emitter.session_id(), "idle 时收到中断信号");
+            }
+            Some(cmd) = rx_control.recv() => {
+                // idle 时控制命令到达：执行（同 task 串行消费，天然互斥）。
+                // select! 结束后回顶部 drain 取其余
+                handle_control(&ctx, &mut session, cmd).await;
             }
         }
     }
@@ -693,10 +705,15 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
     }
 }
 
-/// 处理一条控制命令（turn 边界执行）
+/// 处理一条控制命令（turn 边界 / ReAct 间隙执行）
 ///
-/// 控制通道载荷在此分发：每个 [`ControlCommand`] 变体对应一个主循环动作。
-/// 由主循环顶部 drain 与 idle select! 臂两处调用（同一 task 串行消费，天然互斥）。
+/// 控制通道载荷在此分发：每个 [`ControlCommand`] 变体对应一个执行体。
+/// 命令是否要求 turn 退出由命令自身的 [`ControlCommand::turn_directive`] 表达，
+/// 本函数只负责执行，不决策。
+///
+/// 三处调用（同一 task 串行消费，天然互斥）：
+/// - 主循环顶部 drain 与 idle select! 臂（turn 边界）
+/// - run_turn 内 ReAct loop 顶部间隙检查点
 async fn handle_control(ctx: &SessionCtx, session: &mut Session, cmd: ControlCommand) {
     match cmd {
         ControlCommand::Compress => run_manual_compression(ctx, session).await,
