@@ -12,9 +12,12 @@
 //! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason）
 //! - [`visible_window`]：给 LLM 的可见窗口动态拼接（压缩感知，摘要 + keep_recent + 新消息）。
 //!   与 [`message`] 的「给人看的」查询路径正交
+//! - [`rollback`]：对话回退（删目标 seq 之后消息 + 重算 count 类与压缩元数据，
+//!   保护消费类字段不动）
 
 pub(crate) mod compaction;
 mod message;
+mod rollback;
 mod row;
 mod session;
 mod visible_window;

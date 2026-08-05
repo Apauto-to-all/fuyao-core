@@ -20,4 +20,8 @@ pub enum SessionError {
     /// 会话未找到
     #[error("会话未找到: {0}")]
     NotFound(String),
+
+    /// 无效的回退目标（目标消息不是 user 消息也不是 compaction 消息）
+    #[error("无效的回退目标（只能回退到用户消息或压缩消息）: {0}")]
+    InvalidRollbackTarget(String),
 }
