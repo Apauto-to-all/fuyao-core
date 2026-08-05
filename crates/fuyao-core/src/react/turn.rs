@@ -71,19 +71,43 @@ fn materialize_resolved(config: &mut ModelConfig, resolved: &ResolvedModel) {
     }
 }
 
+/// run_turn 退出原因——主循环据此决定是否继续消费队列
+///
+/// 只传决策，不传消息：错误 / 中断的具体内容已通过 `OutputEvent`（Error / Interrupt）
+/// 流给上层，本枚举只表达「主循环要不要继续消费 guide/pending」这一决策。
+///
+/// - `Completed`：双队列跑空、AI 给最终回复。主循环可继续 consume（本就空）或落 select! 等
+/// - `HaltedByCommand`：间隙检查点取到 StopTurn 命令（回退 / 手动压缩）。主循环停消费，
+///   保留队列剩余，等用户新消息入队触发恢复
+/// - `Interrupted`：被用户中断打断。主循环停消费，保留队列剩余
+/// - `Failed`：配置错误 / LLM 失败（不可恢复）。主循环停消费
+pub(crate) enum TurnOutcome {
+    /// 正常完成：双队列跑空，AI 给了最终回复
+    Completed,
+    /// 被 StopTurn 命令打断（回退 / 手动压缩）。DB 已被命令改写，turn 持有状态失效
+    HaltedByCommand,
+    /// 被用户中断打断
+    Interrupted,
+    /// 配置错误 / LLM 失败（不可恢复）
+    Failed,
+}
+
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环注入 session.messages）
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
 /// `rx_control` 为控制通道接收端，ReAct loop 顶部间隙检查点消费它——取到任意 StopTurn
 /// 命令（手动压缩 / 回退）则 persist + return，打断 ReAct 链让命令快速生效。
+///
+/// 返回 [`TurnOutcome`]：主循环据此决定是否继续消费队列。非 `Completed` 的退出都意味着
+/// 「队列剩余不该继续跑」，主循环应跳过 consume 落 select! 等用户新消息恢复。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     session: &mut Session,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     rx_control: &mut Receiver<fuyao_api::ControlCommand>,
     mut model_config: ModelConfig,
-) {
+) -> TurnOutcome {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
     // 任一失败：发 Error 事件 + 落库 + 结束本轮（配置错误，永久不可恢复）
     //
@@ -101,7 +125,7 @@ pub(crate) async fn run_turn(
                 );
                 emit_config_error(ctx, &msg).await;
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                return;
+                return TurnOutcome::Failed;
             }
         };
     // 写回物化：把 resolved 真值落进 model_config（本 turn 两个 handler 立即读到 Some）
@@ -129,7 +153,7 @@ pub(crate) async fn run_turn(
             );
             emit_config_error(ctx, &msg).await;
             persist(ctx.emitter.session_id(), session, &ctx.store).await;
-            return;
+            return TurnOutcome::Failed;
         }
     };
     let model = resolved.model.clone();
@@ -164,7 +188,7 @@ pub(crate) async fn run_turn(
         }
         if stop_turn {
             persist(ctx.emitter.session_id(), session, &ctx.store).await;
-            return;
+            return TurnOutcome::HaltedByCommand;
         }
 
         // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
@@ -202,7 +226,7 @@ pub(crate) async fn run_turn(
                     };
                     handle_interrupt(&state, kind, &payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref(), session).await;
                     persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                    return;
+                    return TurnOutcome::Interrupted;
                 }
                 result = &mut retry_fut => result,
                 // 中断通道独立：此处只会收到 Interrupt
@@ -215,7 +239,7 @@ pub(crate) async fn run_turn(
                         };
                         handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref(), session).await;
                         persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                        return;
+                        return TurnOutcome::Interrupted;
                     }
                     // 中断通道关闭：忽略，继续等流式
                     continue;
@@ -228,11 +252,15 @@ pub(crate) async fn run_turn(
                 if result.tool_calls.is_empty() {
                     // 无工具调用：最终回复
                     handle_final_reply(ctx, session, &result, &model_config).await;
-                    return;
+                    return TurnOutcome::Completed;
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
-                    handle_tool_calls(ctx, session, rx_interrupt, &result, &model_config).await;
-                    // execute_tools 内部若被中断会直接 return（见下方），此处 assume 已完成
+                    // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
+                    let halted =
+                        handle_tool_calls(ctx, session, rx_interrupt, &result, &model_config).await;
+                    if halted {
+                        return TurnOutcome::Interrupted;
+                    }
                 }
             }
             Err(e) => {
@@ -252,7 +280,7 @@ pub(crate) async fn run_turn(
                 });
                 crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event, None).await;
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                return;
+                return TurnOutcome::Failed;
             }
         }
     }
@@ -444,6 +472,9 @@ pub(super) async fn maybe_spawn_title_generation(ctx: &SessionCtx, is_child: boo
 
 /// 处理工具调用：逐个拦截工具调用 → emit_to_history 同步 AssistantMessage → 执行整批工具 → 消费时机①
 ///
+/// 返回 `true` 表示执行期间被 shutdown / interrupt 打断（已 emit 事件 + 落库），调用方应据此
+/// 退出 turn；返回 `false` 表示整批工具正常完成，调用方可继续 ReAct 下一轮。
+///
 /// 工具调用两层拦截模型（清晰边界）：
 /// - **第一层：ToolCall 事件逐个拦截**（粒度细）：插件可独立 Block 单个 tool_call 或改其 args。
 ///   拦截后的 effective_tool_calls 作为「执行输入」+「存储字段」的权威数据源。
@@ -460,7 +491,7 @@ async fn handle_tool_calls(
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
-) {
+) -> bool {
     // 步骤1：逐个拦截 ToolCall 事件，构造 effective_tool_calls
     // 整批 tool_calls 拆成单个 ToolCall 事件各自拦截；Block 的跳过。
     let mut effective_tool_calls: Vec<fuyao_provider::ToolCallData> =
@@ -537,7 +568,7 @@ async fn handle_tool_calls(
         if !msgs.is_empty() {
             queue::inject_messages(ctx, session, msgs).await;
         }
-        return;
+        return false;
     }
 
     // 步骤3：中断点②——工具执行期间（含 shutdown）
@@ -578,7 +609,7 @@ async fn handle_tool_calls(
                     &shutdown_interrupt_payload(),
                 ).await;
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                return;
+                return true;
             }
             cmd = rx_interrupt.recv() => {
                 // interrupt 命中：显式 cancel 工具批 child_token（shutdown 靠 parent 传播，无需此处 cancel）
@@ -596,7 +627,7 @@ async fn handle_tool_calls(
                     ).await;
                 }
                 persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                return;
+                return true;
             }
             Some(r) = result_rx.recv() => {
                 // 完成一个：立即走 emit_to_history（拦截 → push messages → 发送事件）
@@ -618,6 +649,7 @@ async fn handle_tool_calls(
         queue::inject_messages(ctx, session, msgs).await;
     }
     // 回 run_turn 顶部：带 guide 消息（若有）+ 工具结果再调 LLM
+    false
 }
 
 /// 落库（边界时刻调用）

@@ -201,8 +201,14 @@ pub(crate) async fn run_session(
     }
 
     // 主循环：从 guide 全取消息 → 注入 → 跑 ReAct（自包含循环）。
-    // run_turn return 后落 select! 等待，不自动 consume——停止消费由 run_turn return 表达，
-    // 启动由 inbound（新用户消息）触发，回顶部 consume 开新 turn。
+    //
+    // 消费许可由 `outcome` 表达：只有上次 turn `Completed`（双队列跑空）才允许 consume guide。
+    // 任何非 Completed 退出（命令停 / 中断 / 失败）→ outcome 保持非 Completed → 下次 loop 顶部
+    // 跳过 consume，guide/pending 剩余原样保留，落 select! 等待。
+    //
+    // 恢复消费：select! 的 inbound 分支收到新用户消息时把 outcome 重置为 Completed——
+    // 新消息入队 = 新意图，回顶部 consume 把「旧剩余 + 新消息」一起跑（忠实消费，引擎不清队列）。
+    let mut outcome = turn::TurnOutcome::Completed;
     loop {
         // === 控制通道消费（turn 边界）===
         // 每次循环顶部 try_recv 排空控制通道：处理 turn 运行期间到达的 B 类命令（手动压缩等），
@@ -212,60 +218,67 @@ pub(crate) async fn run_session(
         while let Ok(cmd) = rx_control.try_recv() {
             handle_control(&ctx, &mut session, cmd).await;
         }
-        // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
-        // → 此时 pending 与 guide 语义等价，立即解禁进 guide 触发新 turn
-        // （否则只发 pending 时 pending 会死信，永远进不了 turn）
-        let mut msgs = queue::consume_all_guide(&ctx.guide);
-        if msgs.is_empty() {
-            queue::drain_pending_to_guide(&ctx.guide, &ctx.pending);
-            msgs = queue::consume_all_guide(&ctx.guide);
-        }
-        if !msgs.is_empty() {
-            // === 上下文压缩检查（pre-turn）===
-            // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库
-            // 失败 log warn 跳过本次压缩，主流程继续
-            run_pre_turn_compression(&ctx, &mut session).await;
-
-            // shutdown 检查（pre-turn 后）：避免压缩后又开新 turn
-            // shutdown_token 在 run_pre_turn_compression 期间被 cancel 的情况下，
-            // 这里 break 让 session 优雅退出（保护刚压缩完的状态不被新 turn 截断）
-            if ctx.shutdown_token.is_cancelled() {
-                tracing::info!(
-                    session_id = %ctx.emitter.session_id(),
-                    "session 收到 shutdown 信号，正在落库退出"
-                );
-                let _ = ctx.store.update(&session).await;
-                break;
+        // 消费许可：上次 turn 非 Completed（被命令停 / 中断 / 失败）→ 跳过 consume，
+        // guide/pending 剩余原样保留，直接落 select! 等待用户新消息恢复
+        if matches!(outcome, turn::TurnOutcome::Completed) {
+            // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
+            // → 此时 pending 与 guide 语义等价，立即解禁进 guide 触发新 turn
+            // （否则只发 pending 时 pending 会死信，永远进不了 turn）
+            let mut msgs = queue::consume_all_guide(&ctx.guide);
+            if msgs.is_empty() {
+                queue::drain_pending_to_guide(&ctx.guide, &ctx.pending);
+                msgs = queue::consume_all_guide(&ctx.guide);
             }
+            if !msgs.is_empty() {
+                // === 上下文压缩检查（pre-turn）===
+                // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库
+                // 失败 log warn 跳过本次压缩，主流程继续
+                run_pre_turn_compression(&ctx, &mut session).await;
 
-            // 取本轮模型配置：从 session 的 SessionParams 现读快照（整 session 共享一份，
-            // Engine::update_session_params 写回，这里读最新）。ReAct 多轮复用同一份模型。
-            let model_config = {
-                let p = ctx.session_params.lock().await;
-                p.model_config.clone()
-            };
-            // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
-            queue::inject_messages(&ctx, &mut session, msgs).await;
-            // 首轮 user 消息落库后立即触发标题生成（fire-and-forget，不等 AI 回复）：
-            // 在 run_turn 之前判定，解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤。
-            // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
-            let is_child = session.parent_session_id.is_some();
-            turn::maybe_spawn_title_generation(&ctx, is_child).await;
-            // run_turn 自包含跑完整个队列直到空、或被控制命令/中断打断 → return。
-            // return 后落下方 select! 等待，不回顶部 consume——停止消费由 return 表达。
-            turn::run_turn(
-                &ctx,
-                &mut session,
-                &mut rx_interrupt,
-                &mut rx_control,
-                model_config,
-            )
-            .await;
+                // shutdown 检查（pre-turn 后）：避免压缩后又开新 turn
+                // shutdown_token 在 run_pre_turn_compression 期间被 cancel 的情况下，
+                // 这里 break 让 session 优雅退出（保护刚压缩完的状态不被新 turn 截断）
+                if ctx.shutdown_token.is_cancelled() {
+                    tracing::info!(
+                        session_id = %ctx.emitter.session_id(),
+                        "session 收到 shutdown 信号，正在落库退出"
+                    );
+                    let _ = ctx.store.update(&session).await;
+                    break;
+                }
+
+                // 取本轮模型配置：从 session 的 SessionParams 现读快照（整 session 共享一份，
+                // Engine::update_session_params 写回，这里读最新）。ReAct 多轮复用同一份模型。
+                let model_config = {
+                    let p = ctx.session_params.lock().await;
+                    p.model_config.clone()
+                };
+                // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
+                queue::inject_messages(&ctx, &mut session, msgs).await;
+                // 首轮 user 消息落库后立即触发标题生成（fire-and-forget，不等 AI 回复）：
+                // 在 run_turn 之前判定，解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤。
+                // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
+                let is_child = session.parent_session_id.is_some();
+                turn::maybe_spawn_title_generation(&ctx, is_child).await;
+                // run_turn 自包含跑完整个队列直到空、或被控制命令/中断打断 → return TurnOutcome。
+                // outcome 决定下一轮 loop 顶部的消费许可：非 Completed 则跳过 consume 等恢复。
+                outcome = turn::run_turn(
+                    &ctx,
+                    &mut session,
+                    &mut rx_interrupt,
+                    &mut rx_control,
+                    model_config,
+                )
+                .await;
+            }
         }
         // === 等待（无条件）===
-        // 两类情况都进这里：① guide 空本来就等；② run_turn 刚 return（队列跑空 / 命令停 / 中断）。
-        // 停止消费：run_turn return 后到这里等，不自动 consume guide/pending。
-        // 启动：inbound 收到新用户消息 → 入队 → select! 结束 → 回顶部 consume 开新 turn。
+        // 三类情况都进这里：
+        // ① guide 空（Completed 且无消息）② run_turn 非 Completed return（队列剩余被保留）
+        // ③ 消费被跳过（outcome 非 Completed）。
+        // 停止消费：非 Completed 时 guide 剩余不跑，落这里等。
+        // 恢复消费：inbound 收到新用户消息 → 重置 outcome=Completed → 回顶部 consume，
+        // 旧剩余 + 新消息一起跑（忠实消费，不清队列）。
         // （Plugin 通知由 run_session 顶部 spawn 的独立 forwarder task 并发转发，
         // 不在主循环消费——避免 turn 运行期间通知被阻塞延迟整轮）
         tokio::select! {
@@ -288,7 +301,8 @@ pub(crate) async fn run_session(
             }
             Some(inbound) = rx_inbound.recv() => {
                 // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察。
-                // select! 结束后回顶部 consume（刚入队的消息驱动新 turn）= 启动入口
+                // 重置消费许可：新消息 = 新意图，回顶部 consume（旧剩余 + 新消息一起跑）
+                outcome = turn::TurnOutcome::Completed;
                 handle_inbound_user(&ctx, inbound).await;
             }
             Some(interrupt_msg) = rx_interrupt.recv() => {

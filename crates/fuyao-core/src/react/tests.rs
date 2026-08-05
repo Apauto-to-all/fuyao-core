@@ -2279,8 +2279,8 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
         .await
         .unwrap();
 
-    // run_turn 进 loop 顶部间隙检查点：捕获 Rollback → 执行 → persist → return
-    turn::run_turn(
+    // run_turn 进 loop 顶部间隙检查点：捕获 Rollback → 执行 → persist → return HaltedByCommand
+    let outcome = turn::run_turn(
         &h.ctx,
         &mut h.session,
         &mut h.rx_interrupt,
@@ -2288,6 +2288,10 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
         test_params(),
     )
     .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::HaltedByCommand),
+        "间隙检查 StopTurn 命令应让 run_turn 返回 HaltedByCommand"
+    );
 
     let events = collect_events(&mut h.rx_event).await;
 
@@ -2355,7 +2359,7 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
         .await
         .unwrap();
 
-    turn::run_turn(
+    let outcome = turn::run_turn(
         &h.ctx,
         &mut h.session,
         &mut h.rx_interrupt,
@@ -2363,6 +2367,10 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
         test_params(),
     )
     .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::HaltedByCommand),
+        "含 StopTurn 命令的批次应让 run_turn 返回 HaltedByCommand"
+    );
 
     let events = collect_events(&mut h.rx_event).await;
     // 两条命令都被执行：两次 Rollback 事件
@@ -2376,4 +2384,63 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
     let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].seq, u1.seq);
+}
+
+/// run_turn 正常完成（AI 给最终回复，无工具调用）应返回 `Completed`。
+///
+/// 这是主循环消费许可的「绿灯」——只有 Completed 才允许下一轮 consume。
+#[tokio::test]
+async fn run_turn_returns_completed_on_final_reply() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("完成")]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+
+    // 注入一条 user 消息驱动一轮 ReAct（无工具 → 最终回复 → 结束）
+    let mut u = fuyao_api::Message::user("你好".to_string());
+    h.ctx
+        .store
+        .insert_message(&h.session.id, &mut u)
+        .await
+        .unwrap();
+    h.session.message_count = 1;
+
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.session,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "AI 给最终回复、双队列空，run_turn 应返回 Completed"
+    );
+}
+
+/// run_turn 在 LLM 调用失败（不可恢复）时应返回 `Failed`。
+///
+/// 主循环据此停消费——失败后不该继续跑队列剩余消息。
+#[tokio::test]
+async fn run_turn_returns_failed_on_llm_error() {
+    // AuthError 经 retry 耗尽后冒泡为不可恢复错误（与 llm_error_emits_error_event 同源）
+    let provider = Arc::new(MockProvider::new(vec![vec![Err(StreamError::AuthError(
+        "无效密钥".into(),
+    ))]]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&mut h, "test").await;
+
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.session,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Failed),
+        "LLM 调用失败应让 run_turn 返回 Failed"
+    );
 }
