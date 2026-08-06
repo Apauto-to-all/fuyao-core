@@ -80,10 +80,15 @@ pub fn find_all_skills(ctx: &AgentPaths) -> Result<Vec<SkillMeta>, SkillsError> 
             };
 
             // 读取前 4000 字节解析 frontmatter
+            //
+            // 字节切片必须落在 UTF-8 字符边界上，否则 panic。中文等字符占 3 字节，
+            // 直接 `c[..4000]` 在 4000 落到多字节字符中间时 panic。用 floor_char_boundary
+            // 把 4000 回退到最近的字符起始边界，取一个不超 4000 字节的安全前缀。
             let content = match std::fs::read_to_string(&skill_md) {
                 Ok(c) => {
                     if c.len() > 4000 {
-                        c[..4000].to_string()
+                        let end = c.floor_char_boundary(4000);
+                        c[..end].to_string()
                     } else {
                         c
                     }
@@ -265,5 +270,27 @@ mod tests {
         assert!(EXCLUDED_DIRS.contains(&"__pycache__"));
         assert!(EXCLUDED_DIRS.contains(&"dist"));
         assert!(EXCLUDED_DIRS.contains(&"build"));
+    }
+
+    /// 字节截断必须落在 UTF-8 字符边界上，否则 panic
+    ///
+    /// 回归保护：中文等字符占 3 字节，`c[..4000]` 在 4000 落到多字节字符中间时
+    /// 会 panic（曾发现在含中文 frontmatter 的 SKILL.md 上崩溃）。
+    /// 用 floor_char_boundary 回退到最近的字符起始边界即可。
+    #[test]
+    fn truncate_at_byte_boundary_on_multibyte_content() {
+        // 构造长度 > 4000 字节、且 4000 落在中文字符中间的内容（中文 3 字节/字）
+        let content = "题".repeat(2000); // 6000 字节，全中文
+        assert!(content.len() > 4000);
+
+        // 旧写法会 panic：let _ = &content[..4000];
+        // 新写法：floor_char_boundary 回退到字符边界
+        let end = content.floor_char_boundary(4000);
+        let truncated = &content[..end];
+
+        // 截断点严格不超 4000，且是字符边界（UTF-8 合法，可重转 String）
+        assert!(end <= 4000);
+        assert!(end % 3 == 0, "全中文内容，字符边界应是 3 的倍数：{end}");
+        let _ = truncated.to_string(); // 不 panic 即合法 UTF-8
     }
 }
