@@ -25,8 +25,8 @@ mod deliver;
 mod intercept;
 
 use crate::emit::Emitter;
+use fuyao_api::Message;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::{Message, MessageRole, Session};
 use fuyao_hooks::SharedHooks;
 use fuyao_session::SessionStore;
 use std::future::Future;
@@ -82,13 +82,10 @@ pub(crate) async fn dispatch(
 /// `msg_from_event` 闭包从拦截后的 OutputEvent 提取字段构造 Message。
 /// 返回 `None` 表示该事件不应进历史（如转换失败或不匹配的事件类型）。
 ///
-/// **token + cost 自动累积**：闭包返回的 Message 应已填好 token + cost 字段
-/// （由调用方在闭包内用 `fuyao_session::fill_message_cost` 填充）。
-/// 本函数识别 assistant 角色自动累积 `session.total_*`——落库和计费强绑定，
-/// 未来新增 assistant 产出点不会漏算 cost。
-///
-/// **message_count 维护**：消息成功落库后 `session.message_count += 1`（内存计数器，
-/// 避免 persist 时多一次 COUNT(*) 查询——计数器随 update 自然同步到 DB）。
+/// **计数 / 费用随落库自动累加**：闭包返回的 Message 应已填好 token + cost 字段
+/// （由调用方在闭包内用 `fuyao_session::fill_message_cost` 填充）。`insert_message`
+/// 在事务内把 token/cost/message_count/tool_call_count 原子累加到 sessions 表——
+/// DB 唯一数据源，落库与计费强绑定，未来新增产出点不会漏算 cost / 计数。
 ///
 /// Block 时：不落库、不发，返回 None（调用方据此跳过后续动作，如入队）。
 /// 与现有 ToolCall Block 语义一致——消息不进历史、UI 看不到，是插件的责任。
@@ -98,30 +95,17 @@ pub(crate) async fn emit_to_history(
     emitter: &Emitter,
     hooks: &SharedHooks,
     store: &SessionStore,
-    session: &mut Session,
     event: OutputEvent,
     msg_from_event: impl FnOnce(&OutputEvent) -> Option<Message>,
 ) -> Option<OutputEvent> {
     // 1. 拦截
     let intercepted = intercept(emitter, hooks, event).await?;
 
-    // 2. 用拦截后事件构造 Message，识别 assistant 累积 session 总计后落 DB
-    //    闭包从 intercepted 借用所需字段（内部已 clone 出 Message 持有的 owned 数据）
+    // 2. 用拦截后事件构造 Message 后落 DB。
+    //    sessions 表的计数 / 费用累加由 insert_message 事务内原子完成（单一数据源，
+    //    不再维护内存 Session 镜像）。
     if let Some(mut msg) = msg_from_event(&intercepted) {
-        // 自动累积 session.total_*（仅 assistant 角色；cost 用 Decimal 精确累加，
-        // 避免 f64 加法误差——累积逻辑统一在 fuyao_session::accumulate_session_total）
-        let is_assistant = matches!(msg.role, MessageRole::Assistant);
-        let msg_cost = msg.cost;
-        fuyao_session::accumulate_session_total(session, &msg);
-        if is_assistant {
-            tracing::debug!(
-                session_id = emitter.session_id(),
-                cost = msg_cost,
-                total_cost = session.total_cost,
-                "本轮费用已累积"
-            );
-        }
-        // 事件级落库：单条 INSERT 进 DB（消息不进内存数组）
+        // 事件级落库：单条 INSERT 进 DB（事务内一并累加 sessions 计数 / 费用）
         // 失败仅 warn——保证拦截→发送→观察管道不被 DB 写失败阻塞；
         // 调用方继续推进（消息可能丢失但 turn 流程不卡死，对齐 fail-loud 但不崩原则）
         if let Err(e) = store.insert_message(emitter.session_id(), &mut msg).await {
@@ -131,8 +115,6 @@ pub(crate) async fn emit_to_history(
                 role = msg.role.as_str(),
                 "消息落库失败（已丢弃，不影响 turn 推进）"
             );
-        } else {
-            session.message_count += 1;
         }
     }
 

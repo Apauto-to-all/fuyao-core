@@ -42,8 +42,9 @@ pub(crate) struct ResolvedModel {
 /// 系统提示词单独填 request.system（不进 messages 数组），
 /// messages 只装 user/assistant/tool 对话历史。
 ///
-/// **事件级落库模式下消息不在内存**：每次构造 ChatRequest 都从 DB 查询
-/// 可见窗口（走 `idx_messages_session_seq` 索引，毫秒级）。
+/// **DB 唯一数据源**：消息与 system_prompt 均从 DB 现查——事件级落库模式下消息
+/// 不进内存，system_prompt 也不缓存（压缩重建后经 `update_system_prompt` 落库，
+/// 这里现读即最新值）。
 ///
 /// **配对兜底**：OpenAI/Anthropic 协议要求每个 assistant 的 tool_call 都有对应的
 /// tool 结果消息。被拦截 Block、中断的工具调用不会有结果——这里在拼消息时
@@ -51,7 +52,6 @@ pub(crate) struct ResolvedModel {
 pub(crate) async fn build_chat_request(
     store: &SessionStore,
     session_id: &str,
-    system_prompt: Option<&str>,
     keep_tokens: usize,
 ) -> ChatRequest {
     let history = match store.load_visible_messages(session_id, keep_tokens).await {
@@ -63,6 +63,26 @@ pub(crate) async fn build_chat_request(
                 "加载可见消息失败，本轮 LLM 调用将看到空历史"
             );
             Vec::new()
+        }
+    };
+
+    // system_prompt 从 DB 现读（压缩重建后已落库，这里读到的是最新值）
+    let system_prompt: Option<String> = match store.get(session_id).await {
+        Ok(Some(session)) => session.system_prompt,
+        Ok(None) => {
+            tracing::warn!(
+                session_id = session_id,
+                "session 行不存在，system_prompt 取空"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = session_id,
+                cause = %e,
+                "读 session.system_prompt 失败，本轮按空系统提示词继续"
+            );
+            None
         }
     };
 
@@ -116,7 +136,7 @@ pub(crate) async fn build_chat_request(
 
     ChatRequest {
         messages,
-        system: system_prompt.map(String::from),
+        system: system_prompt,
     }
 }
 
@@ -412,13 +432,7 @@ mod tests {
         )
         .await;
 
-        let request = build_chat_request(
-            &store,
-            &session.id,
-            session.system_prompt.as_deref(),
-            usize::MAX,
-        )
-        .await;
+        let request = build_chat_request(&store, &session.id, usize::MAX).await;
 
         // 应有：user + assistant + 1 真实结果 + 2 补充 error 结果 = 5 条
         let tool_msgs: Vec<_> = request
@@ -459,13 +473,7 @@ mod tests {
         )
         .await;
 
-        let request = build_chat_request(
-            &store,
-            &session.id,
-            session.system_prompt.as_deref(),
-            usize::MAX,
-        )
-        .await;
+        let request = build_chat_request(&store, &session.id, usize::MAX).await;
         let tool_count = request
             .messages
             .iter()
@@ -486,13 +494,7 @@ mod tests {
         )
         .await;
 
-        let request = build_chat_request(
-            &store,
-            &session.id,
-            session.system_prompt.as_deref(),
-            usize::MAX,
-        )
-        .await;
+        let request = build_chat_request(&store, &session.id, usize::MAX).await;
         assert_eq!(request.messages.len(), 2, "无工具调用时消息数不变");
     }
 

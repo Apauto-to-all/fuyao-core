@@ -21,7 +21,6 @@ use crate::dispatch;
 use crate::emit::Emitter;
 use fuyao_api::InterruptSource;
 use fuyao_api::Message;
-use fuyao_api::Session;
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, ToolResultMessage, ToolResultPayload,
@@ -107,7 +106,6 @@ pub(crate) async fn handle_interrupt(
     emitter: &Emitter,
     hooks: &SharedHooks,
     store: &SessionStore,
-    session: &mut Session,
 ) {
     // 先 clone 出所需数据再释放锁（不跨 await 持锁）
     let (text, reasoning, tool_calls) = {
@@ -158,7 +156,7 @@ pub(crate) async fn handle_interrupt(
                 },
             });
             // 闭包借用 valid_tool_calls：tool_calls 字段以累积的为准（与事件 payload 一致）
-            let _ = dispatch::emit_to_history(emitter, hooks, store, session, event, |ev| {
+            let _ = dispatch::emit_to_history(emitter, hooks, store, event, |ev| {
                 build_interrupted_assistant_msg(ev, &valid_tool_calls)
             })
             .await;
@@ -171,7 +169,7 @@ pub(crate) async fn handle_interrupt(
                     &interrupt.source,
                     &interrupt.reason,
                 );
-                let _ = dispatch::emit_to_history(emitter, hooks, store, session, event, |ev| {
+                let _ = dispatch::emit_to_history(emitter, hooks, store, event, |ev| {
                     build_tool_result_msg(ev)
                 })
                 .await;
@@ -203,24 +201,16 @@ pub(crate) async fn handle_interrupt(
                         cached_tokens: 0,
                     },
                 });
-                let _ =
-                    dispatch::emit_to_history(
-                        emitter,
-                        hooks,
-                        store,
-                        session,
-                        event,
-                        |ev| match ev {
-                            OutputEvent::Assistant(m) => {
-                                let mut msg = Message::assistant(m.payload.content.clone());
-                                msg.reasoning = m.payload.reasoning.clone();
-                                msg.finish_reason = Some("interrupted".to_string());
-                                Some(msg)
-                            }
-                            _ => None,
-                        },
-                    )
-                    .await;
+                let _ = dispatch::emit_to_history(emitter, hooks, store, event, |ev| match ev {
+                    OutputEvent::Assistant(m) => {
+                        let mut msg = Message::assistant(m.payload.content.clone());
+                        msg.reasoning = m.payload.reasoning.clone();
+                        msg.finish_reason = Some("interrupted".to_string());
+                        Some(msg)
+                    }
+                    _ => None,
+                })
+                .await;
             }
         }
     }
@@ -350,6 +340,7 @@ mod tests {
         let mut session = fuyao_api::Session::new(None, None, None);
         session.id = "sess1".to_string();
         store.create(&session).await.unwrap();
+        drop(session);
 
         handle_interrupt(
             &state,
@@ -358,7 +349,6 @@ mod tests {
             &emitter,
             &hooks,
             &store,
-            &mut session,
         )
         .await;
         let ev = rx.recv().await.expect("应有事件");

@@ -2,8 +2,11 @@
 //!
 //! 当前阶段：持久化地基（[`SessionStore`]：Session + Message 的 SQLite CRUD）
 //! + 上下文压缩（[`compressor`]：阈值检测 + 摘要生成 + 边界落库）
-//! + 费用计算（[`cost`] 模块：单条算 / 填字段 / 累积 session 总计，全部 Decimal 精确）
+//! + 费用计算（[`cost`] 模块：单条消息算费 / 填字段，全部 Decimal 精确）
 //! + 标题生成（[`title_generator`]：首轮后异步生成，跨 Provider fast 优先，内部自建 Provider）。
+//!
+//! session 总计（total_* / total_cost）的累积由 [`SessionStore::insert_message`] 事务内
+//! SQL 原子自增完成——DB 唯一数据源，不再有内存累积逻辑。
 //!
 //! 模块边界：
 //! - `error`：Session 错误类型
@@ -21,7 +24,7 @@ mod store;
 mod title_generator;
 
 pub use compressor::{apply, generate_summary, should_compress};
-pub use cost::{accumulate_session_total, calculate_cost, fill_message_cost};
+pub use cost::{calculate_cost, fill_message_cost};
 pub use error::SessionError;
 pub use store::SessionStore;
 pub use title_generator::maybe_generate_title;

@@ -1,15 +1,17 @@
 //! 费用计算器
 //!
-//! 所有费用相关的计算与累积**统一在本模块**，业务层（core 等）只调本模块的函数，
+//! 所有费用相关的计算**统一在本模块**，业务层（core 等）只调本模块的函数，
 //! 不直接做任何 cost 运算（避免精度处理散落）。
 //!
 //! 提供：
 //! - [`calculate_cost`]：单条消息费用（Decimal 精确，按模型价格表算）
 //! - [`fill_message_cost`]：填 Message 的 token + cost 字段（算 + 填一步到位）
-//! - [`accumulate_session_total`]：累积 Session.total_*（cost 用 Decimal 精确累加，
-//!   避免 f64 直接相加的精度误差）
+//!
+//! session 总计（total_* / total_cost）的累积不再由本模块负责——已下沉到
+//! [`SessionStore::insert_message`] 的事务内（DB 唯一数据源，SQL 原子自增）。
+//! 需要精确总额时从 `messages.cost` 列 `SUM` 重算。
 
-use fuyao_api::{AgentPaths, Message, MessageRole, PriceTier, Session};
+use fuyao_api::{AgentPaths, Message, PriceTier};
 use fuyao_provider::{StreamUsage, get_model};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
@@ -153,7 +155,8 @@ pub fn calculate_cost(
 /// model_id 缺失（理论不应发生）时跳过 cost 计算只填 token——不会污染 session 总计。
 ///
 /// 注：`msg.cost` 字段是 f64（DB schema 决定），Decimal → f64 转换在这一步发生。
-/// 精确累积在 [`accumulate_session_total`] 里保证（用 Decimal 临时转换避免 f64 加法误差）。
+/// session 总计的累积由 `insert_message` 事务内 SQL 原子自增完成（DB 唯一数据源）；
+/// 需要精确总额时从 `messages.cost` 列 `SUM` 重算，避免 f64 多次相加漂移。
 pub fn fill_message_cost(
     msg: &mut Message,
     usage: &StreamUsage,
@@ -178,30 +181,6 @@ pub fn fill_message_cost(
         );
         msg.cost = cost.to_f64().unwrap_or(0.0);
     }
-}
-
-/// 累积 Session.total_*（cost 用 Decimal 精确累加，避免 f64 加法误差）
-///
-/// 仅 assistant 角色的消息累积（只有 LLM 调用产生 token / cost）。
-/// token 是整数，加法无精度问题；cost 用 Decimal 临时转换做精确加法。
-///
-/// 落库走 `SessionStore::update`，全量 UPDATE 把 session.total_* 和 messages.cost 写入 DB。
-pub fn accumulate_session_total(session: &mut Session, msg: &Message) {
-    if !matches!(msg.role, MessageRole::Assistant) {
-        return;
-    }
-
-    // token 累加（整数，无精度问题）
-    session.total_prompt_tokens += msg.prompt_tokens;
-    session.total_completion_tokens += msg.completion_tokens;
-    session.total_reasoning_tokens += msg.reasoning_tokens;
-    session.total_cached_tokens += msg.cached_tokens;
-
-    // cost 用 Decimal 精确累加：f64 → Decimal → 相加 → f64
-    // 避免 f64 直接相加累积精度误差
-    let total = Decimal::from_f64(session.total_cost).unwrap_or(Decimal::ZERO)
-        + Decimal::from_f64(msg.cost).unwrap_or(Decimal::ZERO);
-    session.total_cost = total.to_f64().unwrap_or(0.0);
 }
 
 #[cfg(test)]
@@ -265,81 +244,7 @@ mod tests {
         assert_eq!(cost, Decimal::ZERO);
     }
 
-    // ===== accumulate_session_total 测试 =====
-
-    #[test]
-    fn accumulate_skips_non_assistant_message() {
-        // tool / user / system 角色不累积（只有 LLM 调用产生 token/cost）
-        let mut session = Session::default();
-        let mut msg = Message::user("hi".to_string());
-        msg.cost = 1.5;
-        accumulate_session_total(&mut session, &msg);
-        assert_eq!(session.total_cost, 0.0, "user 消息不应累积");
-        assert_eq!(session.total_prompt_tokens, 0);
-
-        let mut msg = Message::tool_result("c1".into(), "result".into());
-        msg.cost = 2.0;
-        accumulate_session_total(&mut session, &msg);
-        assert_eq!(session.total_cost, 0.0, "tool 消息不应累积");
-    }
-
-    #[test]
-    fn accumulate_assistant_message_tokens_and_cost() {
-        let mut session = Session::default();
-        let mut msg = Message::assistant(Some("hi".to_string()));
-        msg.prompt_tokens = 100;
-        msg.completion_tokens = 50;
-        msg.reasoning_tokens = 10;
-        msg.cached_tokens = 20;
-        msg.cost = 0.008;
-
-        accumulate_session_total(&mut session, &msg);
-
-        assert_eq!(session.total_prompt_tokens, 100);
-        assert_eq!(session.total_completion_tokens, 50);
-        assert_eq!(session.total_reasoning_tokens, 10);
-        assert_eq!(session.total_cached_tokens, 20);
-        assert!((session.total_cost - 0.008).abs() < 1e-9);
-    }
-
-    #[test]
-    fn accumulate_uses_decimal_precision_for_repeated_adds() {
-        // 多次累加同一个会损失 f64 精度的小数 cost——验证 Decimal 累积无误差
-        // 0.1 + 0.1 + ... + 0.1 (10 次) = 1.0（f64 直接加可能得 0.9999999999...）
-        let mut session = Session::default();
-        let mut msg = Message::assistant(Some("x".to_string()));
-        msg.cost = 0.1;
-        for _ in 0..10 {
-            accumulate_session_total(&mut session, &msg);
-        }
-
-        // f64 直接加 0.1 * 10 通常得 0.9999999999999999；Decimal 累加得精确 1.0
-        let diff = (session.total_cost - 1.0).abs();
-        assert!(
-            diff < 1e-10,
-            "Decimal 累积应精确等于 1.0，实际 = {}（误差 {}）",
-            session.total_cost,
-            diff
-        );
-    }
-
-    #[test]
-    fn accumulate_chain_does_not_drift() {
-        // 长链累积：1000 条消息每条 0.001 cost——验证不会随累积次数漂移
-        let mut session = Session::default();
-        let mut msg = Message::assistant(Some("x".to_string()));
-        msg.cost = 0.001;
-        for _ in 0..1000 {
-            accumulate_session_total(&mut session, &msg);
-        }
-
-        // 1000 * 0.001 = 1.0；f64 直接加会累积误差
-        let diff = (session.total_cost - 1.0).abs();
-        assert!(
-            diff < 1e-9,
-            "长链累积应精确等于 1.0，实际 = {}（误差 {}）",
-            session.total_cost,
-            diff
-        );
-    }
+    // accumulate_session_total 已删除——session 总计的累积下沉到
+    // SessionStore::insert_message 事务内（DB 原子自增），不再有内存累积逻辑可测。
+    // 保留的精确性保证由 messages.cost 列 + SUM 重算提供（DB 真值源）。
 }

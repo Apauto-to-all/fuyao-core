@@ -31,8 +31,26 @@ impl super::SessionStore {
     /// 这是消息进 DB 的唯一入口(事件级落库),所有产出消息(user / assistant /
     /// tool_result / 中断补发 / 工具执行结果)必经此入口。
     ///
-    /// 事务内 `SELECT COALESCE(MAX(seq), 0) + 1` 分配新 seq,保证并发安全;
-    /// INSERT 后回填 `msg.seq`,让调用方能继续使用(如返回到事件 payload)。
+    /// 事务内原子完成三件事(单一数据源,杜绝内存镜像覆盖):
+    /// 1. `SELECT COALESCE(MAX(seq), 0) + 1` 分配新 seq(并发安全)
+    /// 2. INSERT 消息行,回填 `msg.seq`
+    /// 3. UPDATE sessions 累加计数与费用(条件化,见下)
+    ///
+    /// # sessions 表原子累加规则
+    ///
+    /// 仅 `kind=Message` 的普通消息触发累加(compaction 边界消息由
+    /// [`mark_compaction`](super::SessionStore::mark_compaction) 独立路径处理,
+    /// 不走本方法):
+    /// - `message_count += 1`(任何普通消息)
+    /// - `tool_call_count += 1`(仅 `role=Tool`)
+    /// - `total_prompt_tokens += msg.prompt_tokens` 等 token 四项(仅 `role=Assistant`
+    ///   有非零值;user/tool 消息这些字段恒为 0,加 0 无害)
+    /// - `total_cost += msg.cost`(同上)
+    /// - `last_active_at = unixepoch()`(每次落消息刷新最近活动时间)
+    ///
+    /// 事务保证消息与统计同生共死,不再有"消息进 DB 但计数遗漏"的中间态。
+    /// 费用精度:`f64` 累加在超大 session 有漂移风险,真值源是 `messages.cost`,
+    /// 需要精确总额时 `SUM(cost)` 重算。
     pub async fn insert_message(
         &self,
         session_id: &str,
@@ -82,6 +100,38 @@ impl super::SessionStore {
         .bind(msg.kind.as_str())
         .execute(&mut *tx)
         .await?;
+
+        // 普通消息(kind=Message):事务内原子累加 sessions 表统计字段。
+        // compaction 边界消息由 mark_compaction 独立路径处理,不走本分支,不误增计数。
+        // tool_call_count 按 role=Tool 单独 +1;token/cost 始终加(非 assistant 恒为 0,加 0 无害)。
+        if matches!(msg.kind, fuyao_api::MessageKind::Message) {
+            let tool_delta: i64 = if matches!(msg.role, fuyao_api::MessageRole::Tool) {
+                1
+            } else {
+                0
+            };
+            sqlx::query(
+                "UPDATE sessions SET
+                    message_count = message_count + 1,
+                    tool_call_count = tool_call_count + ?2,
+                    total_prompt_tokens = total_prompt_tokens + ?3,
+                    total_completion_tokens = total_completion_tokens + ?4,
+                    total_reasoning_tokens = total_reasoning_tokens + ?5,
+                    total_cached_tokens = total_cached_tokens + ?6,
+                    total_cost = total_cost + ?7,
+                    last_active_at = unixepoch()
+                 WHERE id = ?1",
+            )
+            .bind(session_id)
+            .bind(tool_delta)
+            .bind(msg.prompt_tokens)
+            .bind(msg.completion_tokens)
+            .bind(msg.reasoning_tokens)
+            .bind(msg.cached_tokens)
+            .bind(msg.cost)
+            .execute(&mut *tx)
+            .await?;
+        }
 
         tx.commit().await?;
 

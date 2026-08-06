@@ -7,12 +7,16 @@ use super::*;
 use async_trait::async_trait;
 use futures_util::stream;
 use fuyao_api::MessageRole;
+use fuyao_api::Session;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
     UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
 };
+
+/// 测试固定使用的 session_id（落库后内核不再常驻内存 Session，只认 DB + id）
+const TEST_SESSION_ID: &str = "test_session";
 use fuyao_provider::{
     BoxStream, ChatResponse, FinishReason, Provider, StreamError, StreamEvent, StreamUsage,
 };
@@ -310,7 +314,8 @@ fn empty_hooks() -> fuyao_hooks::SharedHooks {
 #[allow(dead_code)]
 struct TestHarness {
     ctx: SessionCtx,
-    session: Session,
+    /// 本 harness 关联的 session_id（DB 唯一数据源，内核不再常驻内存 Session）
+    session_id: String,
     rx_interrupt: Receiver<OutputInterruptMessage>,
     #[allow(dead_code)]
     tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
@@ -345,11 +350,14 @@ async fn make_harness_full(
     agent_paths: fuyao_api::AgentPaths,
 ) -> TestHarness {
     let store = temp_store().await;
+    // DB 唯一数据源：构造 Session 仅用于落库，落库后内核不再持有内存 Session，
+    // 只凭 session_id 查 DB。此处 create 完即丢弃 Session 对象。
     let mut session = Session::new(None, None, Some("系统提示词".to_string()));
     // 强制 session.id 与 emitter 的 session_id 一致
     // （build_chat_request 用 emitter.session_id() 查 DB，必须匹配）
-    session.id = "test_session".to_string();
+    session.id = TEST_SESSION_ID.to_string();
     store.create(&session).await.unwrap();
+    drop(session);
     let (tx_event, rx_event) = mpsc::unbounded_channel();
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
     // 控制通道：tx 保留供测试注入命令，rx 供 run_turn 间隙检查点 try_recv
@@ -360,6 +368,7 @@ async fn make_harness_full(
         "test", provider,
     ));
     let ctx = SessionCtx {
+        is_child: false,
         store,
         providers,
         tools,
@@ -367,7 +376,7 @@ async fn make_harness_full(
         agent_paths,
         definition: fuyao_api::AgentDefinition::default(),
         session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
-        emitter: Emitter::new(tx_event, "test_session".to_string()),
+        emitter: Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
         guide: empty_queue(),
         pending: empty_queue(),
         last_usage: Arc::new(tokio::sync::Mutex::new(None)),
@@ -377,7 +386,7 @@ async fn make_harness_full(
     };
     TestHarness {
         ctx,
-        session,
+        session_id: TEST_SESSION_ID.to_string(),
         rx_interrupt,
         tx_interrupt,
         rx_control,
@@ -416,24 +425,22 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
 
 /// 预置一条 user 消息进 DB（模拟主循环 inject 后的状态）
 ///
-/// 消息已不在内存（事件级落库），直接调 store.insert_message 落 DB。
-/// 同步维护 session.message_count（emit_to_history 正常路径也会 +1，
-/// preload 走捷径直接 insert，需手动同步计数器避免后续 persist/update 时计数丢失）。
-async fn preload_user(h: &mut TestHarness, content: &str) {
+/// 消息直接调 store.insert_message 落 DB——sessions 表的 message_count 由
+/// insert_message 事务内原子累加，无需测试侧手动同步内存计数器。
+async fn preload_user(h: &TestHarness, content: &str) {
     let mut msg = fuyao_api::Message::user(content.to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut msg)
+        .insert_message(&h.session_id, &mut msg)
         .await
         .expect("preload 落库失败");
-    h.session.message_count += 1;
 }
 
-/// 从 DB 加载可见消息（事件级落库模式下消息不在内存）
+/// 从 DB 加载可见消息（DB 唯一数据源，断言一律走 DB 查询）
 async fn visible_messages(h: &TestHarness) -> Vec<fuyao_api::Message> {
     h.ctx
         .store
-        .load_visible_messages(&h.session.id, usize::MAX)
+        .load_visible_messages(&h.session_id, usize::MAX)
         .await
         .expect("加载可见消息失败")
 }
@@ -443,11 +450,10 @@ async fn visible_messages(h: &TestHarness) -> Vec<fuyao_api::Message> {
 async fn single_turn_no_tools() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("你好")]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "用户问题").await;
+    preload_user(&h, "用户问题").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -477,11 +483,10 @@ async fn react_loop_with_tool() {
         MockProvider::text_response("工具执行完毕"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "调工具").await;
+    preload_user(&h, "调工具").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -507,11 +512,10 @@ async fn tool_result_in_messages() {
         MockProvider::text_response("完成"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "test").await;
+    preload_user(&h, "test").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -534,11 +538,10 @@ async fn llm_error_emits_error_event() {
         "无效密钥".into(),
     ))]]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "test").await;
+    preload_user(&h, "test").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -565,14 +568,13 @@ async fn guide_all_consumed_on_tool_complete() {
         MockProvider::text_response("done"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "原始问题").await;
+    preload_user(&h, "原始问题").await;
     // 工具执行期间用户补充 2 条 guide 消息（模拟入队）
     h.ctx.guide.lock().unwrap().push_back(make_inbound("补充1"));
     h.ctx.guide.lock().unwrap().push_back(make_inbound("补充2"));
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -609,7 +611,7 @@ async fn pending_before_guide_on_final_reply() {
         MockProvider::text_response("回复2"),
     ]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "第一条").await;
+    preload_user(&h, "第一条").await;
     // 预置 pending 1 条 + guide 1 条（最终回复后应都被消费）
     h.ctx
         .pending
@@ -624,7 +626,6 @@ async fn pending_before_guide_on_final_reply() {
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -656,11 +657,10 @@ async fn pending_before_guide_on_final_reply() {
 async fn both_empty_turn_ends() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("回复")]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "问题").await;
+    preload_user(&h, "问题").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -715,7 +715,7 @@ async fn pending_consumed_when_task_idle() {
         rx_plugin,
         rx_control,
         tokio_util::sync::CancellationToken::new(),
-        session,
+        false,
         Arc::clone(&store),
         providers,
         Arc::new(ToolRegistry::builder().build()),
@@ -804,7 +804,7 @@ async fn turn_restart_on_new_inbound_after_drained() {
         rx_plugin,
         rx_control,
         tokio_util::sync::CancellationToken::new(),
-        session,
+        false,
         Arc::clone(&store),
         providers,
         Arc::new(ToolRegistry::builder().build()),
@@ -897,7 +897,7 @@ async fn plugin_message_routes_through_dispatch() {
         rx_plugin,
         rx_control,
         tokio_util::sync::CancellationToken::new(),
-        session,
+        false,
         Arc::clone(&store),
         providers,
         Arc::new(ToolRegistry::builder().build()),
@@ -1006,7 +1006,7 @@ async fn plugin_forwards_during_active_turn() {
         rx_plugin,
         rx_control,
         tokio_util::sync::CancellationToken::new(),
-        session,
+        false,
         Arc::clone(&store),
         providers,
         Arc::new(ToolRegistry::builder().build()),
@@ -1089,7 +1089,7 @@ async fn interrupt_during_streaming() {
     let (provider, txs) = ControllableProvider::with_batches(1);
     let provider: Arc<dyn Provider> = Arc::new(provider);
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "test").await;
+    preload_user(&h, "test").await;
 
     let tx_interrupt = h.tx_interrupt.clone();
 
@@ -1104,7 +1104,6 @@ async fn interrupt_during_streaming() {
     // yield_now 让出调度让 run_turn 进入挂起态，再发中断。
     let turn_fut = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1186,13 +1185,12 @@ async fn interrupt_during_tool_execution() {
         .build();
 
     let mut h = make_harness(provider, Arc::new(tools)).await;
-    preload_user(&mut h, "调工具").await;
+    preload_user(&h, "调工具").await;
 
     let tx_interrupt = h.tx_interrupt.clone();
 
     let turn_fut = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1254,7 +1252,7 @@ async fn shutdown_during_streaming() {
     let (provider, txs) = ControllableProvider::with_batches(1);
     let provider: Arc<dyn Provider> = Arc::new(provider);
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "test").await;
+    preload_user(&h, "test").await;
 
     // 先 clone shutdown_token，turn_fut 借用 &h.ctx 后仍能在 interrupter 里 cancel
     let shutdown_token = h.ctx.shutdown_token.clone();
@@ -1268,7 +1266,6 @@ async fn shutdown_during_streaming() {
 
     let turn_fut = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1353,13 +1350,12 @@ async fn shutdown_during_tool_execution() {
         .build();
 
     let mut h = make_harness(provider, Arc::new(tools)).await;
-    preload_user(&mut h, "调工具").await;
+    preload_user(&h, "调工具").await;
 
     let shutdown_token = h.ctx.shutdown_token.clone();
 
     let turn_fut = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1423,12 +1419,11 @@ async fn messages_persisted_to_db() {
         MockProvider::text_response("完成"),
     ]));
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "调工具").await;
-    let session_id = h.session.id.clone();
+    preload_user(&h, "调工具").await;
+    let session_id = h.session_id.clone();
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1500,11 +1495,10 @@ async fn usage_flows_to_final_assistant_message() {
         MockProvider::text_response_with_usage("回复内容", usage),
     ]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "提问").await;
+    preload_user(&h, "提问").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1593,47 +1587,50 @@ async fn cost_accumulated_per_assistant_message() {
     ]));
 
     let mut h = make_harness(provider, echo_registry()).await;
-    preload_user(&mut h, "测费用累积").await;
+    preload_user(&h, "测费用累积").await;
 
     // 用带 model_id 的 model_config，让累积逻辑能查到价格表
     let mut params = test_params();
     params.model_id = Some("test/cost-model".to_string());
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.session,
-        &mut h.rx_interrupt,
-        &mut h.rx_control,
-        params,
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.rx_interrupt, &mut h.rx_control, params).await;
 
     // 清理全局缓存（避免污染后续测试）
     fuyao_provider::clear_cache(&agent_paths);
 
+    // 从 DB 重新读取 session 行验证总计字段（DB 唯一数据源，
+    // token/cost 由 insert_message 事务内原子累加进 sessions 表）
+    let db_session = h
+        .ctx
+        .store
+        .get(&h.session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
+
     // === 验证 1：session 总计正确累积（两轮相加） ===
     assert_eq!(
-        h.session.total_prompt_tokens, 300,
+        db_session.total_prompt_tokens, 300,
         "工具调用轮(100) + 最终回复轮(200) = 300"
     );
     assert_eq!(
-        h.session.total_completion_tokens, 130,
+        db_session.total_completion_tokens, 130,
         "工具调用轮(50) + 最终回复轮(80) = 130"
     );
     assert_eq!(
-        h.session.total_reasoning_tokens, 30,
+        db_session.total_reasoning_tokens, 30,
         "工具调用轮(10) + 最终回复轮(20) = 30"
     );
     assert_eq!(
-        h.session.total_cached_tokens, 60,
+        db_session.total_cached_tokens, 60,
         "工具调用轮(20) + 最终回复轮(40) = 60"
     );
 
     // === 验证 2：cost 为非零（价格表已注入，按 /M 算） ===
     assert!(
-        h.session.total_cost > 0.0,
+        db_session.total_cost > 0.0,
         "注入价格表后 session.total_cost 应非零，实际 = {}",
-        h.session.total_cost
+        db_session.total_cost
     );
 
     // === 验证 3：持久化的 Message 字段携带 token（usage 持久化洞修复） ===
@@ -1681,11 +1678,11 @@ async fn cost_accumulated_per_assistant_message() {
 
     // === 验证 4：两条 Message.cost 之和 = session.total_cost（无丢失） ===
     let sum_costs = tool_turn.cost + final_turn.cost;
-    let diff = (sum_costs - h.session.total_cost).abs();
+    let diff = (sum_costs - db_session.total_cost).abs();
     assert!(
         diff < 1e-9,
         "两条 Message.cost({sum_costs}) 之和应等于 session.total_cost({})",
-        h.session.total_cost
+        db_session.total_cost
     );
 }
 
@@ -1725,11 +1722,10 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     }
 
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
-    preload_user(&mut h, "用户问题").await;
+    preload_user(&h, "用户问题").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1747,13 +1743,8 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     );
 
     // 2. 下轮 build_chat_request 用的是修改后内容（端到端一致性）
-    let request = super::builders::build_chat_request(
-        h.ctx.store.as_ref(),
-        &h.session.id,
-        h.session.system_prompt.as_deref(),
-        usize::MAX,
-    )
-    .await;
+    let request =
+        super::builders::build_chat_request(h.ctx.store.as_ref(), &h.session_id, usize::MAX).await;
     let assistant_in_request = request
         .messages
         .iter()
@@ -1791,11 +1782,10 @@ async fn intercept_block_skips_final_assistant_in_history() {
     }
 
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
-    preload_user(&mut h, "用户问题").await;
+    preload_user(&h, "用户问题").await;
 
     turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1808,8 +1798,15 @@ async fn intercept_block_skips_final_assistant_in_history() {
         .iter()
         .any(|m| matches!(m.role, MessageRole::Assistant));
     assert!(!has_assistant, "Block 时 assistant 消息不应进 DB");
-    // total_cost 也应为 0（拦截 Block 的消息不计费）
-    assert_eq!(h.session.total_cost, 0.0, "Block 时不应累积任何费用");
+    // total_cost 也应为 0（拦截 Block 的消息不计费）——从 DB 读 session 验证
+    let db_session = h
+        .ctx
+        .store
+        .get(&h.session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
+    assert_eq!(db_session.total_cost, 0.0, "Block 时不应累积任何费用");
 }
 
 /// 用户消息经 inject_messages 时走 emit_to_history：插件可在**消费时刻**拦截改写。
@@ -1840,6 +1837,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     }
     let store = temp_store().await;
     let ctx = SessionCtx {
+        is_child: false,
         store,
         providers: Arc::new(fuyao_provider::ProviderRegistry::with_instance(
             "test",
@@ -1858,20 +1856,22 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         subagent_ops: None,
     };
-    let mut session = Session {
+    // DB 唯一数据源：构造 Session 仅用于落库，之后只凭 session_id 查 DB
+    let session = Session {
         id: "test_session".to_string(),
         ..Session::default()
     };
+    let session_id = session.id.clone();
     ctx.store.create(&session).await.unwrap();
 
     // 投两条消息进队列，注入后应都被拦截改写
     let msgs = vec![make_inbound("秘密1"), make_inbound("秘密2")];
-    queue::inject_messages(&ctx, &mut session, msgs).await;
+    queue::inject_messages(&ctx, msgs).await;
 
     // 验证：DB 里的 content 是拦截后的（带 [脱敏] 前缀）
     let visible: Vec<_> = ctx
         .store
-        .load_visible_messages(&session.id, usize::MAX)
+        .load_visible_messages(&session_id, usize::MAX)
         .await
         .unwrap();
     assert_eq!(visible.len(), 2, "两条 user 消息应都进 DB");
@@ -1899,6 +1899,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
     let store = temp_store().await;
     let ctx = SessionCtx {
+        is_child: false,
         store,
         providers: Arc::new(fuyao_provider::ProviderRegistry::with_instance(
             "test",
@@ -1917,7 +1918,8 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         shutdown_token: tokio_util::sync::CancellationToken::new(),
         subagent_ops: None,
     };
-    let mut session = Session {
+    // DB 唯一数据源：构造 Session 仅用于落库，之后只凭 session_id 查 DB
+    let session = Session {
         id: "test_session".to_string(),
         ..Session::default()
     };
@@ -1935,7 +1937,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
             }),
         },
     };
-    queue::inject_messages(&ctx, &mut session, vec![inbound]).await;
+    queue::inject_messages(&ctx, vec![inbound]).await;
 
     // 收到的事件应是 OutputEvent::User 且 source = Plugin(loop_guard)
     let received = rx_event.try_recv().expect("应收到 User 事件");
@@ -1968,13 +1970,8 @@ fn make_inbound_with_images(content: &str) -> OutputUserMessage {
 async fn inject_images_omitted_when_model_unsupported() {
     // 模型未声明图片能力（默认安全）：图不落库，content 附加占位文本告警
     let provider = Arc::new(MockProvider::new(vec![]));
-    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    queue::inject_messages(
-        &h.ctx,
-        &mut h.session,
-        vec![make_inbound_with_images("看图")],
-    )
-    .await;
+    let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    queue::inject_messages(&h.ctx, vec![make_inbound_with_images("看图")]).await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(visible.len(), 1);
@@ -1991,8 +1988,8 @@ async fn inject_images_omitted_when_model_unsupported() {
 async fn inject_images_empty_text_uses_placeholder_only() {
     // 消息无文本只有图 + 模型不支持：content 就是占位文本本身
     let provider = Arc::new(MockProvider::new(vec![]));
-    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    queue::inject_messages(&h.ctx, &mut h.session, vec![make_inbound_with_images("")]).await;
+    let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    queue::inject_messages(&h.ctx, vec![make_inbound_with_images("")]).await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(
@@ -2028,19 +2025,14 @@ async fn inject_images_persisted_when_model_supports() {
     fuyao_provider::register_model("test/test-model", model, &key);
 
     let provider = Arc::new(MockProvider::new(vec![]));
-    let mut h = make_harness_full(
+    let h = make_harness_full(
         provider,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
         paths.clone(),
     )
     .await;
-    queue::inject_messages(
-        &h.ctx,
-        &mut h.session,
-        vec![make_inbound_with_images("看图")],
-    )
-    .await;
+    queue::inject_messages(&h.ctx, vec![make_inbound_with_images("看图")]).await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(visible.len(), 1);
@@ -2074,13 +2066,13 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门，fallback_context 仅影响
     // CompressionStarted 事件里的 context_length 展示值，不影响压缩能否执行。
-    preload_user(&mut h, "第一段对话内容").await;
-    preload_user(&mut h, "第二段对话内容").await;
-    preload_user(&mut h, "第三段对话内容").await;
-    preload_user(&mut h, "第四段对话内容").await;
+    preload_user(&h, "第一段对话内容").await;
+    preload_user(&h, "第二段对话内容").await;
+    preload_user(&h, "第三段对话内容").await;
+    preload_user(&h, "第四段对话内容").await;
     // last_usage 为 None（harness 默认）——自动压缩会早退，手动压缩必须照常执行
 
-    run_manual_compression(&h.ctx, &mut h.session).await;
+    run_manual_compression(&h.ctx).await;
 
     let events = collect_events(&mut h.rx_event).await;
 
@@ -2112,15 +2104,16 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     assert_eq!(ended.content, "压缩摘要");
 }
 
-/// 回退命令经控制通道执行：删目标 seq 之后的消息 + 刷内存 session count + 发 Rollback 事件。
+/// 回退命令经控制通道执行：删目标 seq 之后的消息 + 重算 session count + 发 Rollback 事件。
 ///
-/// 验证阶段 1 的核心链路——handle_control 的 Rollback 分支：
-/// 1. 调 store.rollback_to（删消息 + 重算）
-/// 2. 就地刷新内存 session 的状态字段
-/// 3. 经 dispatch 发 OutputEvent::Rollback 事件
+/// 验证 handle_control 的 Rollback 分支：
+/// 1. 调 store.rollback_to（删消息 + 单事务内重算 count 类字段并局部 UPDATE sessions 表）
+/// 2. 经 dispatch 发 OutputEvent::Rollback 事件
+///
+/// DB 唯一数据源——重算结果直接写进 sessions 表，下轮读路径从 DB 取即最新值。
 ///
 /// 预置 user1(seq1) + assistant(seq2) + user2(seq3)，回退到 user1（target_seq=1），
-/// 期待删掉 seq2/seq3、内存 message_count 刷新为 1、收到 Rollback 事件。
+/// 期待删掉 seq2/seq3、DB session 的 message_count 重算为 1、收到 Rollback 事件。
 #[tokio::test]
 async fn rollback_command_deletes_and_refreshes_session() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
@@ -2130,31 +2123,24 @@ async fn rollback_command_deletes_and_refreshes_session() {
     let mut u1 = fuyao_api::Message::user("第一条用户消息".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u1)
+        .insert_message(&h.session_id, &mut u1)
         .await
         .unwrap();
     let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut a1)
+        .insert_message(&h.session_id, &mut a1)
         .await
         .unwrap();
     let mut u2 = fuyao_api::Message::user("第二条用户消息".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u2)
+        .insert_message(&h.session_id, &mut u2)
         .await
         .unwrap();
-    h.session.message_count = 2; // 两条 user（assistant 不计入 message_count 口径）
-    h.session.tool_call_count = 0;
 
     // 执行回退命令：回到第一条 user 消息（target_seq = u1.seq）
-    handle_control(
-        &h.ctx,
-        &mut h.session,
-        ControlCommand::Rollback { target_seq: u1.seq },
-    )
-    .await;
+    handle_control(&h.ctx, ControlCommand::Rollback { target_seq: u1.seq }).await;
 
     // 1. 收到 Rollback 事件，payload 字段符合预期
     let events = collect_events(&mut h.rx_event).await;
@@ -2183,21 +2169,28 @@ async fn rollback_command_deletes_and_refreshes_session() {
     );
     assert_eq!(rollback.base.session_id.as_deref(), Some("test_session"));
 
-    // 2. 内存 session 的状态字段已就地刷新（避免后续 persist 盖回旧值）
-    assert_eq!(h.session.message_count, 1, "内存 message_count 应已刷新");
-    assert_eq!(h.session.tool_call_count, 0);
-    assert_eq!(h.session.compression_count, 0);
-    assert!(h.session.last_compacted_seq.is_none());
+    // 2. DB session 行的 count 类字段已被 rollback_to 事务内重算并写回
+    let db_session = h
+        .ctx
+        .store
+        .get(&h.session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
+    assert_eq!(db_session.message_count, 1, "DB message_count 应已重算");
+    assert_eq!(db_session.tool_call_count, 0);
+    assert_eq!(db_session.compression_count, 0);
+    assert!(db_session.last_compacted_seq.is_none());
 
     // 3. DB 实际只剩 target 这一条
-    let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
+    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
     assert_eq!(msgs.len(), 1, "DB 应只剩目标消息");
     assert_eq!(msgs[0].seq, u1.seq);
     assert_eq!(msgs[0].role, fuyao_api::MessageRole::User);
 }
 
 /// 回退到非法目标（assistant 消息）：校验在 store 层原子完成，
-/// 发 Error 事件、DB 不变、内存 session 不变。
+/// 发 Error 事件、DB 不变、DB session 行不变。
 #[tokio::test]
 async fn rollback_to_invalid_target_emits_error_and_keeps_db() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
@@ -2207,24 +2200,26 @@ async fn rollback_to_invalid_target_emits_error_and_keeps_db() {
     let mut u1 = fuyao_api::Message::user("用户消息".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u1)
+        .insert_message(&h.session_id, &mut u1)
         .await
         .unwrap();
     let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut a1)
+        .insert_message(&h.session_id, &mut a1)
         .await
         .unwrap();
-    h.session.message_count = 1;
+    // insert_message 事务内已累加 message_count，落库后从 DB 读作基线
+    let db_before = h
+        .ctx
+        .store
+        .get(&h.session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
 
     // 回退到 assistant（非法目标——中间态不可作回退点）
-    handle_control(
-        &h.ctx,
-        &mut h.session,
-        ControlCommand::Rollback { target_seq: a1.seq },
-    )
-    .await;
+    handle_control(&h.ctx, ControlCommand::Rollback { target_seq: a1.seq }).await;
 
     // 收到 Error 事件（可恢复）
     let events = collect_events(&mut h.rx_event).await;
@@ -2233,10 +2228,20 @@ async fn rollback_to_invalid_target_emits_error_and_keeps_db() {
         .any(|e| matches!(e, OutputEvent::Error(m) if m.payload.recoverable));
     assert!(has_error, "非法目标应发可恢复的 Error 事件");
 
-    // DB 不变（两条消息都在），内存 session 不变
-    let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
+    // DB 不变（两条消息都在），DB session 行不变
+    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
     assert_eq!(msgs.len(), 2, "非法回退不应改动 DB");
-    assert_eq!(h.session.message_count, 1, "内存 session 不应变");
+    let db_after = h
+        .ctx
+        .store
+        .get(&h.session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
+    assert_eq!(
+        db_after.message_count, db_before.message_count,
+        "DB session message_count 不应变"
+    );
 }
 
 /// ReAct 间隙检查点：控制通道有待处理的 StopTurn 命令时，run_turn 在 loop 顶部
@@ -2256,22 +2261,21 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
     let mut u1 = fuyao_api::Message::user("第一条用户消息".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u1)
+        .insert_message(&h.session_id, &mut u1)
         .await
         .unwrap();
     let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut a1)
+        .insert_message(&h.session_id, &mut a1)
         .await
         .unwrap();
     let mut u2 = fuyao_api::Message::user("第二条用户消息".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u2)
+        .insert_message(&h.session_id, &mut u2)
         .await
         .unwrap();
-    h.session.message_count = 2;
 
     // 预先投递 Rollback（回到第一条 user 消息）到控制通道
     h.tx_control
@@ -2279,10 +2283,9 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
         .await
         .unwrap();
 
-    // run_turn 进 loop 顶部间隙检查点：捕获 Rollback → 执行 → persist → return HaltedByCommand
+    // run_turn 进 loop 顶部间隙检查点：捕获 Rollback → 执行 → return HaltedByCommand
     let outcome = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2310,11 +2313,18 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
         "间隙检查在 LLM 调用前 return，不应有任何 LLM 产出事件"
     );
 
-    // DB 已删消息（只剩目标 seq1），内存 session 已刷新
-    let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
+    // DB 已删消息（只剩目标 seq1），DB session 行 count 已被 rollback_to 事务重算
+    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
     assert_eq!(msgs.len(), 1, "回退应已删除目标 seq 之后的消息");
     assert_eq!(msgs[0].seq, u1.seq);
-    assert_eq!(h.session.message_count, 1, "内存 session 应已刷新");
+    let db_session = h
+        .ctx
+        .store
+        .get(&h.session_id)
+        .await
+        .expect("get 不应失败")
+        .expect("session 应已落库");
+    assert_eq!(db_session.message_count, 1, "DB session 应已重算");
 }
 
 /// 间隙检查点 FIFO 忠实执行：多条命令按入队顺序逐条执行。
@@ -2332,22 +2342,21 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
     let mut u1 = fuyao_api::Message::user("用户1".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u1)
+        .insert_message(&h.session_id, &mut u1)
         .await
         .unwrap();
     let mut a1 = fuyao_api::Message::assistant(Some("回复".to_string()));
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut a1)
+        .insert_message(&h.session_id, &mut a1)
         .await
         .unwrap();
     let mut u2 = fuyao_api::Message::user("用户2".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u2)
+        .insert_message(&h.session_id, &mut u2)
         .await
         .unwrap();
-    h.session.message_count = 2;
 
     // 投两条 Rollback：第一条回到 seq1（删 seq2/3），第二条回到 seq1（此时只剩 seq1，无后续可删，合法）
     h.tx_control
@@ -2361,7 +2370,6 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
 
     let outcome = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2381,7 +2389,7 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
     assert_eq!(rollback_count, 2, "间隙检查应 FIFO 逐条执行所有待处理命令");
 
     // DB 最终只剩 seq1（第一条删了 seq2/3，第二条回退到 seq1 无后续可删）
-    let msgs = h.ctx.store.load_full_history(&h.session.id).await.unwrap();
+    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
     assert_eq!(msgs.len(), 1);
     assert_eq!(msgs[0].seq, u1.seq);
 }
@@ -2398,14 +2406,12 @@ async fn run_turn_returns_completed_on_final_reply() {
     let mut u = fuyao_api::Message::user("你好".to_string());
     h.ctx
         .store
-        .insert_message(&h.session.id, &mut u)
+        .insert_message(&h.session_id, &mut u)
         .await
         .unwrap();
-    h.session.message_count = 1;
 
     let outcome = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2428,11 +2434,10 @@ async fn run_turn_returns_failed_on_llm_error() {
         "无效密钥".into(),
     ))]]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    preload_user(&mut h, "test").await;
+    preload_user(&h, "test").await;
 
     let outcome = turn::run_turn(
         &h.ctx,
-        &mut h.session,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),

@@ -1,12 +1,15 @@
 //! Session CRUD + 单字段局部更新
 //!
 //! sessions 表的全部元数据操作归此:
-//! - 全量:create / get / update / delete / list_all / count / count_with_filter
+//! - 读 / 写生命周期:create(建行) / get / delete / list_all / count / count_with_filter
 //! - 单字段局部更新:update_system_prompt / update_title / end_session
 //!
-//! 单字段更新与全量 `update` 并存的原因:并发更新间避免字段覆盖。全量 `update(&session)`
-//! 把内存 Session 对象的所有字段一次性写回,而某些场景(标题异步生成、压缩后重建提示词、
-//! 会话收尾)只需改一个字段且拿不到完整内存对象,走单字段 SQL 更安全。
+//! **DB 唯一数据源**:session 的计数字段(message_count / tool_call_count /
+//! total_* / total_cost)由 [`super::message`] 模块的 `insert_message` 事务内
+//! SQL 原子自增维护,压缩元数据(compression_count / last_compacted_seq)由
+//! [`super::compaction`] / [`super::rollback`] 的局部 UPDATE 维护。本模块只管
+//! 「整行建(create)」与「离散单字段改」,不再有全量 `update`——避免单字段写
+//! 被全量写覆盖(标题 bug 的根因)。
 //!
 //! 注:消息(Message)不在内存——产生即通过 [`super::SessionStore::insert_message`]
 //! 单条落 DB,需要时按 session_id 查询(见 [`super::message`] 模块)。
@@ -16,7 +19,7 @@ use crate::error::SessionError;
 use fuyao_api::Session;
 
 impl super::SessionStore {
-    // ── 全量 CRUD ──────────────────────────────────────────────
+    // ── 生命周期读写（整行建 / 查 / 删 / 列）──────────────────────
 
     /// 创建会话(只 INSERT sessions 元数据行)
     ///
@@ -70,46 +73,6 @@ impl super::SessionStore {
         .await?;
 
         Ok(row.map(Session::from))
-    }
-
-    /// 更新会话元数据(全量 UPDATE sessions 表,不碰 messages 表)
-    ///
-    /// 把内存 Session 对象的全部字段一次性写回。`last_active_at` 由 SQLite `unixepoch()`
-    /// 在 UPDATE 语句内自动刷新——不改动 `persist(&Session)` 签名、不改动调用点,
-    /// DB 与内存对象在下次 `get` / `list_all` 读 DB 时自然对齐。
-    ///
-    /// 消息已在产生时经 `insert_message` 落库,本方法只同步元数据。
-    pub async fn update(&self, session: &Session) -> Result<(), SessionError> {
-        sqlx::query(
-            "UPDATE sessions SET
-                ended_at = ?2, end_reason = ?3,
-                message_count = ?4, tool_call_count = ?5,
-                total_prompt_tokens = ?6, total_completion_tokens = ?7,
-                total_reasoning_tokens = ?8, total_cached_tokens = ?9,
-                total_cost = ?10, title = ?11, system_prompt = ?12,
-                compression_count = ?13, last_compacted_seq = ?14, parent_session_id = ?15,
-                last_active_at = unixepoch()
-             WHERE id = ?1",
-        )
-        .bind(session.id.as_str())
-        .bind(session.ended_at)
-        .bind(session.end_reason.as_deref())
-        .bind(session.message_count)
-        .bind(session.tool_call_count)
-        .bind(session.total_prompt_tokens)
-        .bind(session.total_completion_tokens)
-        .bind(session.total_reasoning_tokens)
-        .bind(session.total_cached_tokens)
-        .bind(session.total_cost)
-        .bind(session.title.as_deref())
-        .bind(session.system_prompt.as_deref())
-        .bind(session.compression_count)
-        .bind(session.last_compacted_seq)
-        .bind(session.parent_session_id.as_deref())
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
     }
 
     /// 删除会话(cascade 删该会话的全部消息 + session 行)
@@ -184,8 +147,10 @@ impl super::SessionStore {
     // ── 单字段局部更新 ─────────────────────────────────────────
     //
     // 以下三个方法都只 UPDATE sessions 表的某个字段,不动其他字段、不动 messages 表。
-    // 它们服务于"只改一个字段且拿不到完整内存对象"的场景,与全量 `update` 互补,
-    // 避免并发更新间的字段覆盖。三者结构对称:校验 session 存在 → 单字段 UPDATE → 提交。
+    // 它们服务于"只改一个字段"的离散场景(title 异步生成 / 压缩后重建 prompt / 收尾)。
+    // session 的计数字段不在此处——由 insert_message 事务内原子自增维护;
+    // 压缩元数据(compression_count / last_compacted_seq)由 compaction / rollback
+    // 模块的局部 UPDATE 维护。DB 唯一数据源,无全量写,杜绝字段覆盖。
 
     /// 更新 session 的 system_prompt(压缩后重建系统提示词用)
     ///
@@ -395,14 +360,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_update_syncs_metadata() {
+    async fn store_metadata_syncs_through_insert_and_compaction() {
+        // session 的元数据字段不再由全量 update 写回,而是由 insert_message / mark_compaction
+        // 各自在事务内维护。本测试验证这两条路径写入的元数据经 get 读回无丢失。
         let store = temp_store().await;
-        let mut session = Session::new(None, None, None);
+        let session = Session::new(None, None, None);
         store.create(&session).await.unwrap();
 
-        session.total_prompt_tokens = 12345;
-        session.compression_count = 2;
-        store.update(&session).await.unwrap();
+        // total_prompt_tokens 由 assistant 消息(带 prompt_tokens)经 insert_message 事务累加
+        let mut msg = fuyao_api::Message::assistant(None);
+        msg.prompt_tokens = 12345;
+        store.insert_message(&session.id, &mut msg).await.unwrap();
+
+        // compression_count 由 mark_compaction 写入的压缩边界条数决定
+        store
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                crate::store::compaction::CompressionReason::Auto,
+            )
+            .await
+            .unwrap();
+        store
+            .mark_compaction(
+                &session.id,
+                "摘要2".to_string(),
+                crate::store::compaction::CompressionReason::Auto,
+            )
+            .await
+            .unwrap();
 
         let loaded = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(loaded.total_prompt_tokens, 12345);
@@ -485,21 +471,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_update_refreshes_last_active_at() {
+    async fn insert_message_refreshes_last_active_at() {
+        // last_active_at 现在由 insert_message 事务内的 unixepoch() 刷新,
+        // 不再走全量 update。本测试验证插入一条消息后 last_active_at 推进。
         let store = temp_store().await;
-        let mut session = Session::new(None, None, None);
+        let session = Session::new(None, None, None);
         store.create(&session).await.unwrap();
-        let created_active = session.last_active_at;
+        let created_active = store
+            .get(&session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_active_at;
 
         // sleep 确保 unixepoch() 推进(SQLite unixepoch 精度为秒)
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        session.message_count = 5;
-        store.update(&session).await.unwrap();
+        let mut msg = fuyao_api::Message::user("新消息".to_string());
+        store.insert_message(&session.id, &mut msg).await.unwrap();
 
         let loaded = store.get(&session.id).await.unwrap().unwrap();
         assert!(
             loaded.last_active_at > created_active,
-            "update 后 last_active_at 应晚于创建初值：{} > {}",
+            "insert_message 后 last_active_at 应晚于创建初值：{} > {}",
             loaded.last_active_at,
             created_active
         );
@@ -518,10 +511,14 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].title.as_deref(), Some("新会话"));
 
+        // 给老会话插入一条消息刷新 last_active_at(insert_message 事务内
+        // 设 last_active_at = unixepoch()),使其重新成为最近活动的会话
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let mut old_loaded = store.get(&old_session.id).await.unwrap().unwrap();
-        old_loaded.message_count = 1;
-        store.update(&old_loaded).await.unwrap();
+        let mut msg = fuyao_api::Message::user("继续老会话".to_string());
+        store
+            .insert_message(&old_session.id, &mut msg)
+            .await
+            .unwrap();
 
         let list2 = store.list_all(None, 10, 0).await.unwrap();
         assert_eq!(list2[0].title.as_deref(), Some("老会话"));
@@ -540,7 +537,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_session_id_persists_and_roundtrips() {
+    async fn parent_session_id_persists_through_message_inserts() {
+        // parent_session_id 在 create 时持久化。本测试验证后续 insert_message
+        // 累加 message_count 时,不会影响 parent_session_id 字段(新架构下 session
+        // 字段由各自的单字段/局部 UPDATE 维护,不再有全量覆盖路径)。
         let store = temp_store().await;
         let parent = Session::new(None, Some("父会话".to_string()), None);
         store.create(&parent).await.unwrap();
@@ -555,9 +555,11 @@ mod tests {
             Some(parent.id.as_str())
         );
 
-        let mut modified = loaded;
-        modified.message_count = 5;
-        store.update(&modified).await.unwrap();
+        // insert_message 事务内累加 message_count,不触碰 parent_session_id
+        for _ in 0..5 {
+            let mut msg = fuyao_api::Message::user("对话".to_string());
+            store.insert_message(&child.id, &mut msg).await.unwrap();
+        }
         let reloaded = store.get(&child.id).await.unwrap().unwrap();
         assert_eq!(
             reloaded.parent_session_id.as_deref(),

@@ -10,11 +10,11 @@
 //!   ① pending 全部倒进 guide ② guide 全部消费注入 messages → 都空才结束 turn。
 //!
 //! 中断：两段 select!——流式期间、工具执行期间。idle 段在 run_session 外层。
-//! 中断时保存部分结果（发增量事件），落库，结束本轮。
+//! 中断时保存部分结果（发增量事件），经 emit_to_history 即时落库每条消息，结束本轮。
 //!
 //! shutdown：两段 select! 各有 `biased` 优先的 shutdown 分支（优先于 interrupt），
-//! 命中后走与 interrupt 完全对称的四步链（emit_interrupt_event → classify →
-//! handle_interrupt → persist），把已累积的部分结果落库后立即 return。
+//! 命中后走与 interrupt 完全对称的三步链（emit_interrupt_event → classify →
+//! handle_interrupt），把已累积的部分结果经 emit_to_history 落库后立即 return。
 //! retry.rs 的退避 sleep 也监听 shutdown_token，收到信号立即冒泡 Cancelled
 //! 让本层 shutdown 分支接管。这样 shutdown 不再依赖 10s abort 兜底。
 
@@ -38,7 +38,7 @@ use fuyao_api::message::output::{
     AssistantMessage, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, TitleMessage, TitlePayload,
 };
-use fuyao_api::{Message, MessageRole, ModelConfig, Session};
+use fuyao_api::{Message, MessageRole, ModelConfig};
 use fuyao_provider::Provider;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
@@ -92,42 +92,44 @@ pub(crate) enum TurnOutcome {
     Failed,
 }
 
-/// 运行一轮 ReAct（user messages 已由 run_session 主循环注入 session.messages）
+/// 运行一轮 ReAct（user messages 已由 run_session 主循环经 inject_messages 注入 DB）
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
 /// `rx_control` 为控制通道接收端，ReAct loop 顶部间隙检查点消费它——取到任意 StopTurn
-/// 命令（手动压缩 / 回退）则 persist + return，打断 ReAct 链让命令快速生效。
+/// 命令（手动压缩 / 回退）则立即 return，打断 ReAct 链让命令快速生效（命令自身的 DB
+/// 写已在 handle_control 内完成，无需额外落库）。
 ///
 /// 返回 [`TurnOutcome`]：主循环据此决定是否继续消费队列。非 `Completed` 的退出都意味着
 /// 「队列剩余不该继续跑」，主循环应跳过 consume 落 select! 等用户新消息恢复。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
-    session: &mut Session,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     rx_control: &mut Receiver<fuyao_api::ControlCommand>,
     mut model_config: ModelConfig,
 ) -> TurnOutcome {
     // 解析本轮 model_id（含 None → [models.default] 兜底）+ 从 registry 查 Provider 实例
-    // 任一失败：发 Error 事件 + 落库 + 结束本轮（配置错误，永久不可恢复）
+    // 任一失败：发 Error 事件 + 结束本轮（配置错误，永久不可恢复）
     //
-    // is_child 按 session.parent_session_id 判定：子 session 的工具列表过滤掉
-    // child_invisible 的工具（递归防护——子 session 看不到派生类工具）
-    let is_child = session.parent_session_id.is_some();
-    let resolved: ResolvedModel =
-        match resolve_model(&model_config, &ctx.tools, is_child, &ctx.definition.tools) {
-            Ok(r) => r,
-            Err(msg) => {
-                tracing::warn!(
-                    session_id = ctx.emitter.session_id(),
-                    cause = %msg,
-                    "模型解析失败（model_id 无效或未配置 [models.default]）"
-                );
-                emit_config_error(ctx, &msg).await;
-                persist(ctx.emitter.session_id(), session, &ctx.store).await;
-                return TurnOutcome::Failed;
-            }
-        };
+    // is_child 取自 ctx（创建时由 session 行的 parent_session_id 定死）：子 session 的
+    // 工具列表过滤掉 child_invisible 的工具（递归防护——子 session 看不到派生类工具）
+    let resolved: ResolvedModel = match resolve_model(
+        &model_config,
+        &ctx.tools,
+        ctx.is_child,
+        &ctx.definition.tools,
+    ) {
+        Ok(r) => r,
+        Err(msg) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %msg,
+                "模型解析失败（model_id 无效或未配置 [models.default]）"
+            );
+            emit_config_error(ctx, &msg).await;
+            return TurnOutcome::Failed;
+        }
+    };
     // 写回物化：把 resolved 真值落进 model_config（本 turn 两个 handler 立即读到 Some）
     // + 共享 session_params（后续 turn 免解析 + 用户可观测实际所用模型）。
     // 不写回的代价：DB assistant 消息 model_id=NULL / 费用漏算 / 标题生成回退读不到 model_id。
@@ -152,7 +154,6 @@ pub(crate) async fn run_turn(
                 "Provider 实例未找到"
             );
             emit_config_error(ctx, &msg).await;
-            persist(ctx.emitter.session_id(), session, &ctx.store).await;
             return TurnOutcome::Failed;
         }
     };
@@ -174,8 +175,8 @@ pub(crate) async fn run_turn(
         //
         // 忠实执行：while try_recv 逐条 FIFO 排空，不做同批去重 / 合并（引擎是忠实执行器）。
         // 取到命令先问它的 turn_directive（命令自带，固有属性），任一条 StopTurn 即标记停止。
-        // 全排空后若有任意 StopTurn → persist + return，打断 ReAct 链交还控制权；
-        // 通道空 / 全是 Continue → 继续 ReAct。
+        // 全排空后若有任意 StopTurn → 立即 return（命令的 DB 写已在 handle_control 内完成），
+        // 打断 ReAct 链交还控制权；通道空 / 全是 Continue → 继续 ReAct。
         //
         // stop_turn 标志的必要性：while try_recv 可能一次取到多条命令，必须遍历完才能判断
         // 「有没有出现过 StopTurn」，不用标志循环结束后无法回溯。
@@ -184,10 +185,9 @@ pub(crate) async fn run_turn(
             if matches!(cmd.turn_directive(), TurnDirective::StopTurn) {
                 stop_turn = true;
             }
-            handle_control(ctx, session, cmd).await;
+            handle_control(ctx, cmd).await;
         }
         if stop_turn {
-            persist(ctx.emitter.session_id(), session, &ctx.store).await;
             return TurnOutcome::HaltedByCommand;
         }
 
@@ -196,13 +196,8 @@ pub(crate) async fn run_turn(
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));
         // 本轮的 ChatRequest（重试间复用同一份——一次 LLM 调用内 DB 历史不变）
         // 消息已不在内存，每次构造时从 DB 查可见窗口（动态拼接，按 keep_tokens 截近期）
-        let request = build_chat_request(
-            ctx.store.as_ref(),
-            ctx.emitter.session_id(),
-            session.system_prompt.as_deref(),
-            keep_tokens,
-        )
-        .await;
+        let request =
+            build_chat_request(ctx.store.as_ref(), ctx.emitter.session_id(), keep_tokens).await;
 
         // 中断点①：流式期间（含重试 sleep 期间——select! drop future 即取消 sleep）
         // run_stream_with_retry 内部按错误类型自动重试，发 OutputEvent::Retry 给 UI。
@@ -224,8 +219,7 @@ pub(crate) async fn run_turn(
                         let s = state.lock().unwrap_or_else(|e| e.into_inner());
                         classify(&s)
                     };
-                    handle_interrupt(&state, kind, &payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref(), session).await;
-                    persist(ctx.emitter.session_id(), session, &ctx.store).await;
+                    handle_interrupt(&state, kind, &payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref()).await;
                     return TurnOutcome::Interrupted;
                 }
                 result = &mut retry_fut => result,
@@ -237,8 +231,7 @@ pub(crate) async fn run_turn(
                             let s = state.lock().unwrap_or_else(|e| e.into_inner());
                             classify(&s)
                         };
-                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref(), session).await;
-                        persist(ctx.emitter.session_id(), session, &ctx.store).await;
+                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref()).await;
                         return TurnOutcome::Interrupted;
                     }
                     // 中断通道关闭：忽略，继续等流式
@@ -251,13 +244,12 @@ pub(crate) async fn run_turn(
             Ok(result) => {
                 if result.tool_calls.is_empty() {
                     // 无工具调用：最终回复
-                    handle_final_reply(ctx, session, &result, &model_config).await;
+                    handle_final_reply(ctx, &result, &model_config).await;
                     return TurnOutcome::Completed;
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
                     // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
-                    let halted =
-                        handle_tool_calls(ctx, session, rx_interrupt, &result, &model_config).await;
+                    let halted = handle_tool_calls(ctx, rx_interrupt, &result, &model_config).await;
                     if halted {
                         return TurnOutcome::Interrupted;
                     }
@@ -279,7 +271,6 @@ pub(crate) async fn run_turn(
                     },
                 });
                 crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event, None).await;
-                persist(ctx.emitter.session_id(), session, &ctx.store).await;
                 return TurnOutcome::Failed;
             }
         }
@@ -305,16 +296,11 @@ async fn emit_config_error(ctx: &SessionCtx, message: &str) {
 ///
 /// 固定顺序：① pending 全部倒进 guide ② guide 全部消费注入 messages。
 /// 都空 → turn 结束；有 → continue 回 run_turn 顶部再调一轮 LLM。
-async fn handle_final_reply(
-    ctx: &SessionCtx,
-    session: &mut Session,
-    result: &StreamResult,
-    model_config: &ModelConfig,
-) {
+async fn handle_final_reply(ctx: &SessionCtx, result: &StreamResult, model_config: &ModelConfig) {
     // 回传本轮真实 usage 给主循环（pre-turn 压缩触发判定用）
     *ctx.last_usage.lock().await = Some(result.usage.clone());
 
-    // 经 emit_to_history：拦截 → 闭包构造 Message（填 token + cost）→ 自动累积 session.total_* → 落 DB → 发送事件
+    // 经 emit_to_history：拦截 → 闭包构造 Message（填 token + cost）→ 落 DB（事务内一并累加 sessions 计数/费用）→ 发送事件
     // 拦截不改 usage（token 是模型给的客观值），计费用原始 result.usage。
     let model_id = model_config.model_id.as_deref();
     let usage = result.usage.clone();
@@ -327,7 +313,6 @@ async fn handle_final_reply(
         &ctx.emitter,
         &ctx.hooks,
         ctx.store.as_ref(),
-        session,
         event,
         |ev| match ev {
             OutputEvent::Assistant(m) => {
@@ -349,11 +334,10 @@ async fn handle_final_reply(
     queue::drain_pending_to_guide(&ctx.guide, &ctx.pending);
     let msgs = queue::consume_all_guide(&ctx.guide);
     if msgs.is_empty() {
-        // guide 和 pending 都空：落库，turn 结束
-        persist(ctx.emitter.session_id(), session, &ctx.store).await;
+        // guide 和 pending 都空：turn 结束（消息已在 emit_to_history 事务内即时落库）
     } else {
         // 有消息：全部注入（每条经 emit_to_history 拦截→落 DB→发送→观察），回 run_turn 顶部再调一轮 LLM
-        queue::inject_messages(ctx, session, msgs).await;
+        queue::inject_messages(ctx, msgs).await;
     }
 }
 
@@ -487,7 +471,6 @@ pub(super) async fn maybe_spawn_title_generation(ctx: &SessionCtx, is_child: boo
 /// 中断时 channel 里剩余结果也清空 push，保证不丢。
 async fn handle_tool_calls(
     ctx: &SessionCtx,
-    session: &mut Session,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
@@ -529,7 +512,6 @@ async fn handle_tool_calls(
         &ctx.emitter,
         &ctx.hooks,
         ctx.store.as_ref(),
-        session,
         event,
         |ev| match ev {
             OutputEvent::Assistant(m) => {
@@ -566,7 +548,7 @@ async fn handle_tool_calls(
     if effective_result.tool_calls.is_empty() {
         let msgs = queue::consume_all_guide(&ctx.guide);
         if !msgs.is_empty() {
-            queue::inject_messages(ctx, session, msgs).await;
+            queue::inject_messages(ctx, msgs).await;
         }
         return false;
     }
@@ -602,13 +584,12 @@ async fn handle_tool_calls(
             _ = ctx.shutdown_token.cancelled() => {
                 // 清空 channel 把已完成的 push 进 messages（不丢已完成结果）
                 while let Ok(r) = result_rx.try_recv() {
-                    push_tool_result_to_history(ctx, session, r).await;
+                    push_tool_result_to_history(ctx, r).await;
                 }
                 emit_interrupt_and_complete_tool_results(
-                    ctx, session, &effective_result.tool_calls,
+                    ctx, &effective_result.tool_calls,
                     &shutdown_interrupt_payload(),
                 ).await;
-                persist(ctx.emitter.session_id(), session, &ctx.store).await;
                 return true;
             }
             cmd = rx_interrupt.recv() => {
@@ -618,25 +599,24 @@ async fn handle_tool_calls(
                 // 收到 Interrupt 或通道关闭（None）：清空 channel 把已完成的 push 进 messages
                 // 用 try_recv 非阻塞清空（exec_fut 可能还在跑，recv 会阻塞）
                 while let Ok(r) = result_rx.try_recv() {
-                    push_tool_result_to_history(ctx, session, r).await;
+                    push_tool_result_to_history(ctx, r).await;
                 }
                 if let Some(ref interrupt_msg) = cmd {
                     emit_interrupt_and_complete_tool_results(
-                        ctx, session, &effective_result.tool_calls,
+                        ctx, &effective_result.tool_calls,
                         &interrupt_msg.payload,
                     ).await;
                 }
-                persist(ctx.emitter.session_id(), session, &ctx.store).await;
                 return true;
             }
             Some(r) = result_rx.recv() => {
                 // 完成一个：立即走 emit_to_history（拦截 → push messages → 发送事件）
-                push_tool_result_to_history(ctx, session, r).await;
+                push_tool_result_to_history(ctx, r).await;
             }
             _ = &mut exec_fut => {
                 // execute_tools 完成：清空 channel 里剩余的（防丢，理论已空）
                 while let Ok(r) = result_rx.try_recv() {
-                    push_tool_result_to_history(ctx, session, r).await;
+                    push_tool_result_to_history(ctx, r).await;
                 }
                 break;
             }
@@ -646,21 +626,10 @@ async fn handle_tool_calls(
     // 步骤4：消费时机①——一批工具全部完成后、发回 AI 前，只看 guide（pending 不动）
     let msgs = queue::consume_all_guide(&ctx.guide);
     if !msgs.is_empty() {
-        queue::inject_messages(ctx, session, msgs).await;
+        queue::inject_messages(ctx, msgs).await;
     }
     // 回 run_turn 顶部：带 guide 消息（若有）+ 工具结果再调 LLM
     false
-}
-
-/// 落库（边界时刻调用）
-///
-/// 消息已在产生时经 emit_to_history → insert_message 落库，本函数只同步 sessions
-/// 表的元数据（统计字段、ended_at 等）。message_count 由 emit_to_history 维护
-/// 内存计数器，update 时自然同步到 DB。
-async fn persist(session_id: &str, session: &Session, store: &Arc<fuyao_session::SessionStore>) {
-    if let Err(e) = store.update(session).await {
-        tracing::warn!(session_id = session_id, cause = %e, "session 元数据落库失败");
-    }
 }
 
 /// 构建中断式 ToolResult 事件
@@ -684,11 +653,7 @@ fn make_interrupt_tool_result_event(
 ///
 /// 工具完成时立即调用：拦截 → `insert_message` 落 DB（Message::tool_result）→ 发送事件 → 观察。
 /// 保证「拦截→存储→发送」三者一致；中断时已完成的也不丢。
-async fn push_tool_result_to_history(
-    ctx: &SessionCtx,
-    session: &mut Session,
-    result: tool_exec::ToolExecResult,
-) {
+async fn push_tool_result_to_history(ctx: &SessionCtx, result: tool_exec::ToolExecResult) {
     let event = OutputEvent::ToolResult(fuyao_api::message::output::ToolResultMessage {
         base: EventBase::default(),
         payload: fuyao_api::message::output::ToolResultPayload {
@@ -697,22 +662,17 @@ async fn push_tool_result_to_history(
             content: result.content,
         },
     });
-    push_tool_result_event_to_history(ctx, session, event).await;
+    push_tool_result_event_to_history(ctx, event).await;
 }
 
 /// 把预构造的 ToolResult 事件经 emit_to_history 单条落 DB
 ///
 /// 用于中断补发：事件由调用方构造（content 标记中断原因），拦截后落 DB（Message::tool_result）。
-async fn push_tool_result_event_to_history(
-    ctx: &SessionCtx,
-    session: &mut Session,
-    event: OutputEvent,
-) {
+async fn push_tool_result_event_to_history(ctx: &SessionCtx, event: OutputEvent) {
     let _ = crate::dispatch::emit_to_history(
         &ctx.emitter,
         &ctx.hooks,
         ctx.store.as_ref(),
-        session,
         event,
         |ev| match ev {
             OutputEvent::ToolResult(m) => Some(Message::tool_result(
@@ -735,7 +695,6 @@ async fn push_tool_result_event_to_history(
 /// effective 中不在 answered 集合的 tool_call 视为未完成，逐个补发中断式 ToolResult。
 async fn emit_interrupt_and_complete_tool_results(
     ctx: &SessionCtx,
-    session: &mut Session,
     effective_tool_calls: &[fuyao_provider::ToolCallData],
     payload: &OutputInterruptPayload,
 ) {
@@ -781,7 +740,7 @@ async fn emit_interrupt_and_complete_tool_results(
                 &payload.source,
                 &payload.reason,
             );
-            push_tool_result_event_to_history(ctx, session, ev).await;
+            push_tool_result_event_to_history(ctx, ev).await;
         }
     }
 }

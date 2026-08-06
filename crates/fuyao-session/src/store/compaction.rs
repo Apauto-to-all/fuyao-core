@@ -236,14 +236,15 @@ mod tests {
         assert_eq!(source_visible.len(), 4);
 
         // 构造子 session(复制源系统提示词 + 标记 parent_session_id)
-        // message_count 只计普通消息(排除 compaction 边界,与 count_messages 语义一致)
+        // message_count 不预设:从 0 起算,下方逐条 insert_message 复制消息时,
+        // 事务内会按 kind 原子累加(普通消息 +1,compaction 边界不计),复制完成后
+        // DB 里的 message_count 自然对齐复制的普通消息条数(新架构:DB 唯一数据源)。
         let non_compaction_count = source_visible
             .iter()
             .filter(|m| matches!(m.kind, MessageKind::Message))
             .count();
         let mut child = fuyao_api::Session::new(None, None, parent.system_prompt.clone());
         child.parent_session_id = Some(parent.id.clone());
-        child.message_count = non_compaction_count as i64;
         store.create(&child).await.unwrap();
 
         // 逐条复制可见消息

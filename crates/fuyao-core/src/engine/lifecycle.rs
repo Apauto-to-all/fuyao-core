@@ -47,8 +47,14 @@ impl Engine {
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去，不在入口拆包——压缩重建 prompt 等运行时场景
         // 仍需 agent_config，贯穿到 SessionCtx 留存，将来加字段只动 SessionCtx 一处
+        // is_child 从新建 session 行的 parent_session_id 派生（新建恒为 None → false）
         let (handle, rx_event) = self
-            .assemble_session(session_id.clone(), session, params, definition)
+            .assemble_session(
+                session_id.clone(),
+                session.parent_session_id.is_some(),
+                params,
+                definition,
+            )
             .await;
         self.sessions
             .lock()
@@ -85,7 +91,8 @@ impl Engine {
 
         // 加载完整 Agent 定义（创建时定死语义：恢复时按同一 agent_config 重新加载，
         // per-session 持有供工具过滤）。usage 按恢复 session 的 parent 判定。
-        let usage = if session.parent_session_id.is_some() {
+        let is_child = session.parent_session_id.is_some();
+        let usage = if is_child {
             fuyao_prompt::PromptUsage::Subagent
         } else {
             fuyao_prompt::PromptUsage::Primary
@@ -96,7 +103,7 @@ impl Engine {
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去（与 create_session 对称）
         let (handle, rx_event) = self
-            .assemble_session(id.clone(), session, params, definition)
+            .assemble_session(id.clone(), is_child, params, definition)
             .await;
         self.sessions.lock().await.insert(id.clone(), handle);
 
@@ -157,8 +164,9 @@ impl Engine {
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表
         // SessionParams 整体传下去（与 create_session / resume_session 对称）
+        // fork 出的是独立 session（parent=None）→ is_child=false
         let (handle, rx_event) = self
-            .assemble_session(new_session_id.clone(), new_session, params, definition)
+            .assemble_session(new_session_id.clone(), false, params, definition)
             .await;
         self.sessions
             .lock()
@@ -245,8 +253,9 @@ impl Engine {
         let new_session_id = new_session.id.clone();
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表（与 create_session 对称）
+        // create_child_session 产出的恒为子任务（parent_session_id 非空）→ is_child=true
         let (handle, rx_event) = self
-            .assemble_session(new_session_id.clone(), new_session, params, definition)
+            .assemble_session(new_session_id.clone(), true, params, definition)
             .await;
         self.sessions
             .lock()
@@ -300,16 +309,12 @@ impl Engine {
             .await?;
 
         // 3. 构造新 session：系统提示词复制源值，parent_session_id 由调用方决定
-        //    message_count 对齐复制的**普通消息**条数（排除 compaction 边界，
-        //    与 emit_to_history / count_messages 的计数语义一致——mark_compaction 不 bump 该计数）
-        let message_count = visible
-            .iter()
-            .filter(|m| matches!(m.kind, MessageKind::Message))
-            .count() as i64;
+        //    计数字段（message_count 等）从 0 起算——下方逐条 insert_message 复制消息时，
+        //    事务内会按消息 kind/role 原子累加（普通消息 +1 message_count，role=Tool +1 tool_call_count），
+        //    复制完成后 DB 里的计数值自然对齐复制的消息条数。
         let mut new_session =
             Session::new(source.workspace.clone(), None, source.system_prompt.clone());
         new_session.parent_session_id = parent_session_id;
-        new_session.message_count = message_count;
 
         // 4. 落库新 session 元数据行（先建行，满足 messages.session_id 外键约束）
         self.store.create(&new_session).await?;
@@ -317,6 +322,7 @@ impl Engine {
         // 5. 逐条复制可见消息到新 session（clone 后强制 seq=0，insert_message 分配新 seq）
         //    与压缩 apply 的 copy-to-new-seq 模式一致：不包外层事务，单条失败即返回 Err
         //    （此时新 session 行已落库但未装配登记，为 DB 中的孤立行，不影响引擎调度）
+        //    每条 insert_message 事务内同时累加 sessions 计数——复制完全等于"重新产生这些消息"
         for msg in &visible {
             let mut clone = msg.clone();
             clone.seq = 0;
@@ -340,7 +346,7 @@ impl Engine {
     async fn assemble_session(
         &self,
         session_id: SessionId,
-        session: Session,
+        is_child: bool,
         session_params: SessionParams,
         definition: fuyao_api::AgentDefinition,
     ) -> (SessionHandle, mpsc::UnboundedReceiver<OutputEvent>) {
@@ -400,7 +406,7 @@ impl Engine {
             rx_plugin,
             rx_control,
             shutdown_token.clone(),
-            session,
+            is_child,
             Arc::clone(&self.store),
             Arc::clone(&self.providers),
             Arc::clone(&self.tools),

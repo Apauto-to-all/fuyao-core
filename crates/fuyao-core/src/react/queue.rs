@@ -15,7 +15,7 @@ use super::SessionCtx;
 use crate::dispatch;
 use crate::engine::types::SharedQueue;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
-use fuyao_api::{ImageContent, Message, OutputEvent, Session};
+use fuyao_api::{ImageContent, Message, OutputEvent};
 
 /// 一次性取出 guide 全部消息（非阻塞，drain 清空队列）
 pub(crate) fn consume_all_guide(guide: &SharedQueue) -> Vec<OutputUserMessage> {
@@ -50,11 +50,7 @@ pub(crate) fn drain_pending_to_guide(guide: &SharedQueue, pending: &SharedQueue)
 /// **图片降级决策在落库入口**：消费时按 session 模型能力判断一次——
 /// 模型不支持图像输入则图不落库、content 附加占位文本。此后所有读库路径
 /// （主对话请求 / 上下文压缩 / 标题生成）看到的都是降级后的形态，全链路一致。
-pub(crate) async fn inject_messages(
-    ctx: &SessionCtx,
-    session: &mut Session,
-    msgs: Vec<OutputUserMessage>,
-) {
+pub(crate) async fn inject_messages(ctx: &SessionCtx, msgs: Vec<OutputUserMessage>) {
     // 会话模型配置（现读快照）+ 图片能力判定
     let supports_images = {
         let params = ctx.session_params.lock().await;
@@ -74,7 +70,7 @@ pub(crate) async fn inject_messages(
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::warn!(
-                        session_id = %session.id,
+                        session_id = %ctx.emitter.session_id(),
                         image_count = total,
                         cause = %e,
                         "图片节流任务异常，全部按失败处理"
@@ -89,7 +85,6 @@ pub(crate) async fn inject_messages(
             &ctx.emitter,
             &ctx.hooks,
             ctx.store.as_ref(),
-            session,
             event,
             move |ev| user_msg_from_event(ev, supports_images, kept, failed),
         )

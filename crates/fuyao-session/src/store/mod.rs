@@ -5,15 +5,17 @@
 //!
 //! 模块组织（按职责分文件，各文件单一职责）：
 //! - [`row`]：sessions / messages 表的行映射（DB 行 ↔ 领域类型）
-//! - [`session`]：sessions 表的全部操作——CRUD + 单字段局部更新
-//!   （update_system_prompt / update_title / end_session）
-//! - [`message`]：messages 表的全部操作——写入（insert）/ 计数（count）/
-//!   查询（load_full_history 全量审计 / list_messages_before 游标分页浏览）
-//! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason）
+//! - [`session`]：sessions 表的全部操作——生命周期读写（create/get/delete/list）+
+//!   单字段局部更新（update_system_prompt / update_title / end_session）
+//! - [`message`]：messages 表的全部操作——写入（insert，事务内同时累加 sessions
+//!   计数 / 费用）/ 计数（count）/ 查询（load_full_history 全量审计 /
+//!   list_messages_before 游标分页浏览）
+//! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason，局部 UPDATE
+//!   sessions 的 compression_count / last_compacted_seq）
 //! - [`visible_window`]：给 LLM 的可见窗口动态拼接（压缩感知，摘要 + keep_recent + 新消息）。
 //!   与 [`message`] 的「给人看的」查询路径正交
-//! - [`rollback`]：对话回退（删目标 seq 之后消息 + 重算 count 类与压缩元数据，
-//!   保护消费类字段不动）
+//! - [`rollback`]：对话回退（删目标 seq 之后消息 + 局部 UPDATE 重算 count 类与
+//!   压缩元数据，保护消费类字段不动）
 
 pub(crate) mod compaction;
 mod message;

@@ -195,7 +195,7 @@ impl super::SessionStore {
         .await?;
 
         // 6. 局部 UPDATE sessions：只写回 4 个重算字段，token/cost 原值不动
-        //    （不走全量 update(&Session)，避免把内存对象的消费类字段一并盖回）
+        //    （局部 UPDATE 是 session 表的唯一写范式——DB 单一数据源，无全量写）
         sqlx::query(
             "UPDATE sessions SET
                 message_count = ?2, tool_call_count = ?3,
@@ -288,10 +288,10 @@ mod tests {
         let u2 = insert_user(&store, &session.id, "u2").await; // seq 3
         insert_assistant(&store, &session.id, "a2").await; // seq 4
 
-        // 模拟 dispatch 层累加的 message_count（真实场景由 react 层 persist）
-        let mut sess = store.get(&session.id).await.unwrap().unwrap();
-        sess.message_count = 4;
-        store.update(&sess).await.unwrap();
+        // 4 条普通消息经 insert_message 事务累加,message_count 已为 4
+        // (无需手动设置——新架构下 message_count 由 insert_message 维护)
+        let before = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(before.message_count, 4);
 
         let result = store.rollback_to(&session.id, u2).await.unwrap();
 
@@ -534,22 +534,21 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_preserves_token_and_cost_fields() {
-        // 回退只改消息列表，不抹消费账：token/cost 原值保留
+        // 回退只改消息列表,不抹消费账:token/cost 原值保留。
+        // 消费类字段现由 insert_message 事务内累加(assistant 消息贡献 token/cost),
+        // 这里插入一条带消费的 assistant 消息构造真实消费,再回退删它,验证账本不动。
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
 
         let u1 = insert_user(&store, &session.id, "u1").await; // seq 1
-        insert_assistant(&store, &session.id, "a1").await; // seq 2
-
-        // 注入消费类字段（模拟历史真实消费）
-        let mut sess = store.get(&session.id).await.unwrap().unwrap();
-        sess.total_prompt_tokens = 12345;
-        sess.total_completion_tokens = 678;
-        sess.total_reasoning_tokens = 100;
-        sess.total_cached_tokens = 200;
-        sess.total_cost = 0.05;
-        store.update(&sess).await.unwrap();
+        let mut a1 = Message::assistant(None);
+        a1.prompt_tokens = 12345;
+        a1.completion_tokens = 678;
+        a1.reasoning_tokens = 100;
+        a1.cached_tokens = 200;
+        a1.cost = 0.05;
+        store.insert_message(&session.id, &mut a1).await.unwrap(); // seq 2
 
         let result = store.rollback_to(&session.id, u1).await.unwrap();
 

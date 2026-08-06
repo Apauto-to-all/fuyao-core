@@ -72,12 +72,16 @@ async fn build_forked_session_pure_fork_parent_is_none() {
     assert!(new.parent_session_id.is_none());
     // system_prompt 复制源值
     assert_eq!(new.system_prompt.as_deref(), Some("源系统提示词"));
-    // message_count 对齐普通消息条数（2 条，排除 compaction 边界）
-    assert_eq!(new.message_count, 2);
 
-    // 落库后读回一致：parent None + 可见消息复制到位
+    // 落库后读回一致：parent None + 可见消息复制到位 + 计数对齐
+    // message_count 由 insert_message 事务内累加进 sessions 表，
+    // 内存返回值不回读——一律从 DB 行验证
     let loaded = engine.store.get(&new.id).await.unwrap().unwrap();
     assert!(loaded.parent_session_id.is_none());
+    assert_eq!(
+        loaded.message_count, 2,
+        "DB message_count 应对齐复制消息条数"
+    );
     let visible = engine
         .store
         .load_visible_messages(&new.id, usize::MAX)

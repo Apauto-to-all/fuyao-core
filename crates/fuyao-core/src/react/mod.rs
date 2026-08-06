@@ -42,9 +42,7 @@ use fuyao_api::message::output::{
     CompressionReason, CompressionStartedPayload, PluginMessage as OutputPluginMessage,
     RollbackMessage,
 };
-use fuyao_api::{
-    AgentDefinition, CompressionConfig, ControlCommand, EventBase, Session, SessionParams,
-};
+use fuyao_api::{AgentDefinition, CompressionConfig, ControlCommand, EventBase, SessionParams};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{ProviderRegistry, StreamUsage};
 use std::sync::Arc;
@@ -105,6 +103,15 @@ pub(crate) struct SessionCtx {
     /// 便于透传到 [`crate::tool_exec::execute_single`] 构造的 ToolCallContext。
     /// `Option` 让测试场景可传 `None`（避免 `Weak::<dyn Trait>::new()` 的 Sized 限制）。
     pub subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
+    /// 本 session 是否为子任务 session（`parent_session_id` 非空）
+    ///
+    /// 创建时定死、整 session 不变（来自 DB session 行的 `parent_session_id`）。
+    /// 用途：`resolve_model` 据此过滤子 session 不可见的工具（递归防护）、
+    /// 标题生成与压缩的子 session 豁免判定。
+    ///
+    /// 取代旧的"内存 `session.parent_session_id` 现读"——DB 唯一数据源后，
+    /// session 不再常驻内存，此标记提升为 ctx 的不可变字段。
+    pub is_child: bool,
 }
 
 /// session 的独立执行流
@@ -132,7 +139,7 @@ pub(crate) async fn run_session(
     mut rx_plugin: Receiver<OutputPluginMessage>,
     mut rx_control: Receiver<ControlCommand>,
     shutdown_token: CancellationToken,
-    mut session: Session,
+    is_child: bool,
     store: Arc<fuyao_session::SessionStore>,
     providers: Arc<ProviderRegistry>,
     tools: Arc<ToolRegistry>,
@@ -143,9 +150,10 @@ pub(crate) async fn run_session(
     tx_event: UnboundedSender<OutputEvent>,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
 ) {
-    tracing::info!(session_id = %session_id, "session 执行流启动");
+    tracing::info!(session_id = %session_id, is_child = is_child, "session 执行流启动");
 
     let ctx = SessionCtx {
+        is_child,
         store,
         providers,
         tools,
@@ -216,7 +224,7 @@ pub(crate) async fn run_session(
         // 忠实执行：每条命令各跑一次，不做同批次去重 / 合并——引擎是忠实执行器，不解释意图
         //（去重是上层职责，见 AGENTS.md「引擎是忠实执行器」）。
         while let Ok(cmd) = rx_control.try_recv() {
-            handle_control(&ctx, &mut session, cmd).await;
+            handle_control(&ctx, cmd).await;
         }
         // 消费许可：上次 turn 非 Completed（被命令停 / 中断 / 失败）→ 跳过 consume，
         // guide/pending 剩余原样保留，直接落 select! 等待用户新消息恢复
@@ -233,7 +241,7 @@ pub(crate) async fn run_session(
                 // === 上下文压缩检查（pre-turn）===
                 // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库
                 // 失败 log warn 跳过本次压缩，主流程继续
-                run_pre_turn_compression(&ctx, &mut session).await;
+                run_pre_turn_compression(&ctx).await;
 
                 // shutdown 检查（pre-turn 后）：避免压缩后又开新 turn
                 // shutdown_token 在 run_pre_turn_compression 期间被 cancel 的情况下，
@@ -241,9 +249,8 @@ pub(crate) async fn run_session(
                 if ctx.shutdown_token.is_cancelled() {
                     tracing::info!(
                         session_id = %ctx.emitter.session_id(),
-                        "session 收到 shutdown 信号，正在落库退出"
+                        "session 收到 shutdown 信号，退出"
                     );
-                    let _ = ctx.store.update(&session).await;
                     break;
                 }
 
@@ -254,22 +261,15 @@ pub(crate) async fn run_session(
                     p.model_config.clone()
                 };
                 // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
-                queue::inject_messages(&ctx, &mut session, msgs).await;
+                queue::inject_messages(&ctx, msgs).await;
                 // 首轮 user 消息落库后立即触发标题生成（fire-and-forget，不等 AI 回复）：
                 // 在 run_turn 之前判定，解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤。
                 // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
-                let is_child = session.parent_session_id.is_some();
-                turn::maybe_spawn_title_generation(&ctx, is_child).await;
+                turn::maybe_spawn_title_generation(&ctx, ctx.is_child).await;
                 // run_turn 自包含跑完整个队列直到空、或被控制命令/中断打断 → return TurnOutcome。
                 // outcome 决定下一轮 loop 顶部的消费许可：非 Completed 则跳过 consume 等恢复。
-                outcome = turn::run_turn(
-                    &ctx,
-                    &mut session,
-                    &mut rx_interrupt,
-                    &mut rx_control,
-                    model_config,
-                )
-                .await;
+                outcome =
+                    turn::run_turn(&ctx, &mut rx_interrupt, &mut rx_control, model_config).await;
             }
         }
         // === 等待（无条件）===
@@ -287,16 +287,8 @@ pub(crate) async fn run_session(
             _ = ctx.shutdown_token.cancelled() => {
                 tracing::info!(
                     session_id = %ctx.emitter.session_id(),
-                    "session 收到 shutdown 信号，正在落库退出"
+                    "session 收到 shutdown 信号，退出"
                 );
-                // 落库保护 in-flight 状态（失败仅 warn，不阻塞关闭）
-                if let Err(e) = ctx.store.update(&session).await {
-                    tracing::warn!(
-                        session_id = %ctx.emitter.session_id(),
-                        cause = %e,
-                        "shutdown 落库失败，session 状态可能丢失最近一条未持久化的消息"
-                    );
-                }
                 break;
             }
             Some(inbound) = rx_inbound.recv() => {
@@ -313,7 +305,7 @@ pub(crate) async fn run_session(
             Some(cmd) = rx_control.recv() => {
                 // idle 时控制命令到达：执行（同 task 串行消费，天然互斥）。
                 // select! 结束后回顶部 drain 取其余
-                handle_control(&ctx, &mut session, cmd).await;
+                handle_control(&ctx, cmd).await;
             }
         }
     }
@@ -338,8 +330,8 @@ struct CompressionModel {
 /// 的决策；且压缩需额外调一次摘要 LLM，对一次性子代理在成本与质量上均不划算。
 /// 仅自动触发路径（[`run_pre_turn_compression`]）使用此豁免——引擎替用户挡不划算的压缩；
 /// 手动触发（[`run_manual_compression`]）不豁免：用户显式要对子会话压缩是用户的选择，照做。
-fn compression_exempt(ctx: &SessionCtx, session: &Session) -> bool {
-    session.parent_session_id.is_some() && ctx.compression_config.skip_child
+fn compression_exempt(ctx: &SessionCtx) -> bool {
+    ctx.is_child && ctx.compression_config.skip_child
 }
 
 /// 解析压缩执行所需的模型信息（model_id + 思考配置 + provider + 上下文长度）
@@ -425,8 +417,8 @@ async fn resolve_compression_model(ctx: &SessionCtx) -> Option<CompressionModel>
 ///
 /// 在主循环注入新消息前、调 LLM 前，根据上一轮真实 usage 判定要不要压缩。
 /// 触发条件满足时调 [`run_compression`]（reason = auto）。手动触发见 [`run_manual_compression`]。
-async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
-    if compression_exempt(ctx, session) {
+async fn run_pre_turn_compression(ctx: &SessionCtx) {
+    if compression_exempt(ctx) {
         return;
     }
 
@@ -451,14 +443,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
         return;
     }
 
-    run_compression(
-        ctx,
-        session,
-        CompressionReason::Auto,
-        usage.prompt_tokens,
-        &model,
-    )
-    .await;
+    run_compression(ctx, CompressionReason::Auto, usage.prompt_tokens, &model).await;
 }
 
 /// 手动触发上下文压缩（控制通道 Compress 命令的处理）
@@ -468,7 +453,7 @@ async fn run_pre_turn_compression(ctx: &SessionCtx, session: &mut Session) {
 /// ② 不适用子会话豁免——用户显式要对子会话压缩是用户的选择，引擎照做，
 ///    子代理失真风险由用户自担（自动压缩替用户挡不划算的压缩，手动不挡）。
 /// 触发原因标记为 manual。
-async fn run_manual_compression(ctx: &SessionCtx, session: &mut Session) {
+async fn run_manual_compression(ctx: &SessionCtx) {
     let model = match resolve_compression_model(ctx).await {
         Some(m) => m,
         None => return,
@@ -483,14 +468,7 @@ async fn run_manual_compression(ctx: &SessionCtx, session: &mut Session) {
         .map(|u| u.prompt_tokens)
         .unwrap_or(0);
 
-    run_compression(
-        ctx,
-        session,
-        CompressionReason::Manual,
-        prompt_tokens,
-        &model,
-    )
-    .await;
+    run_compression(ctx, CompressionReason::Manual, prompt_tokens, &model).await;
 }
 
 /// 执行一次上下文压缩（「怎么压」的执行体）
@@ -508,7 +486,6 @@ async fn run_manual_compression(ctx: &SessionCtx, session: &mut Session) {
 /// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
 async fn run_compression(
     ctx: &SessionCtx,
-    session: &mut Session,
     reason: CompressionReason,
     prompt_tokens: u32,
     model: &CompressionModel,
@@ -545,7 +522,7 @@ async fn run_compression(
         .effective_keep_tokens(model.context_length);
     let visible_messages = match ctx
         .store
-        .load_visible_messages(session.id.as_str(), keep_tokens)
+        .load_visible_messages(ctx.emitter.session_id(), keep_tokens)
         .await
     {
         Ok(m) => m,
@@ -601,12 +578,32 @@ async fn run_compression(
         }
     });
 
+    // system_prompt 从 DB 现读（压缩重建后已落库，这里读到的是最新值）
+    let system_prompt: Option<String> = match ctx.store.get(ctx.emitter.session_id()).await {
+        Ok(Some(s)) => s.system_prompt,
+        Ok(None) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                "压缩时 session 行不存在，system_prompt 取空"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "压缩时读 system_prompt 失败，按空继续"
+            );
+            None
+        }
+    };
+
     // summary 与 Delta 消费者并发跑；summary 完成后 on_delta（含 delta_tx）drop，
     // Delta 消费者 recv 返回 None 自然退出
     let summary = tokio::select! {
         biased;
         s = fuyao_session::generate_summary(
-            session.system_prompt.as_deref(),
+            system_prompt.as_deref(),
             &visible_messages,
             &model.provider,
             &model.model_id,
@@ -643,7 +640,7 @@ async fn run_compression(
             // definition 创建时定死不应变（前缀缓存红线），复用 ctx.definition 零加载
             // 用途按 parent_session_id 推断：子 session（子代理）用 Subagent 校验，
             // 主 session / fork 用 Primary。与创建时的用途保持一致。
-            let usage = if session.parent_session_id.is_some() {
+            let usage = if ctx.is_child {
                 fuyao_prompt::PromptUsage::Subagent
             } else {
                 fuyao_prompt::PromptUsage::Primary
@@ -651,9 +648,9 @@ async fn run_compression(
             let new_prompt =
                 fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.definition, usage);
 
-            // 落库新 system_prompt。失败时仅 warn 跳过：compaction 边界已落库，
-            // system_prompt 内存更新照常进行——下轮请求已经会用新 prompt，
-            // DB 字段下次 update session 时会自然同步
+            // 落库新 system_prompt（单字段 UPDATE，DB 唯一数据源）。
+            // 失败时仅 warn 跳过：compaction 边界已落库，下轮请求 build_chat_request
+            // 从 DB 读到的仍是旧 prompt——影响有限，不阻塞压缩流程
             if let Err(e) = ctx
                 .store
                 .update_system_prompt(ctx.emitter.session_id(), &new_prompt)
@@ -662,12 +659,9 @@ async fn run_compression(
                 tracing::warn!(
                     session_id = ctx.emitter.session_id(),
                     cause = %e,
-                    "system_prompt 落库失败，仅更新内存"
+                    "system_prompt 落库失败，下轮请求仍用旧 prompt"
                 );
             }
-
-            // 写回内存 session 的 system_prompt（messages 不在内存，无需重建）
-            session.system_prompt = Some(new_prompt);
 
             // 发 Compression Ended 事件：apply 落库成功后，让前端移除"压缩中"状态、展示摘要
             dispatch::dispatch(
@@ -728,10 +722,10 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
 /// 三处调用（同一 task 串行消费，天然互斥）：
 /// - 主循环顶部 drain 与 idle select! 臂（turn 边界）
 /// - run_turn 内 ReAct loop 顶部间隙检查点
-async fn handle_control(ctx: &SessionCtx, session: &mut Session, cmd: ControlCommand) {
+async fn handle_control(ctx: &SessionCtx, cmd: ControlCommand) {
     match cmd {
-        ControlCommand::Compress => run_manual_compression(ctx, session).await,
-        ControlCommand::Rollback { target_seq } => run_rollback(ctx, session, target_seq).await,
+        ControlCommand::Compress => run_manual_compression(ctx).await,
+        ControlCommand::Rollback { target_seq } => run_rollback(ctx, target_seq).await,
     }
 }
 
@@ -741,17 +735,17 @@ async fn handle_control(ctx: &SessionCtx, session: &mut Session, cmd: ControlCom
 /// 复用 store 层 [`fuyao_session::SessionStore::rollback_to`] 的单事务原子执行体
 /// （删目标 seq 之后的所有消息 + 重算 count 类字段 + 局部 UPDATE sessions）。
 ///
-/// 三步：
-/// 1. 调 `rollback_to`（内部已校验目标 role/kind，非法目标事务回滚、DB 不变）
-/// 2. 就地刷新内存 session 的 4 个状态字段——task 后续循环用的就是这份内存对象，
-///    不刷新的话下一轮 turn 结束 persist 会把旧 count 写回 DB，盖掉回退后的重算值
-/// 3. 发 `OutputEvent::Rollback` 事件（经 dispatch 管道：拦截 → 发送 → 观察），
+/// 两步：
+/// 1. 调 `rollback_to`（内部已校验目标 role/kind，非法目标事务回滚、DB 不变；
+///    重算的 count 类字段已在事务内局部 UPDATE 写回 sessions 表——DB 唯一数据源，
+///    无需内存刷新）
+/// 2. 发 `OutputEvent::Rollback` 事件（经 dispatch 管道：拦截 → 发送 → 观察），
 ///    前端据此显示「已回退 N 条」通知 + 把目标用户消息填输入框
 ///
 /// 失败处理：`rollback_to` 返回错误时（目标不存在 / 非法目标 / session 不存在），
 /// 发 `OutputEvent::Error` 让前端感知，不 panic、不影响 task 后续运行（turn 边界语义：
 /// 回退失败等价于没回退，task 继续按原状态跑）。
-async fn run_rollback(ctx: &SessionCtx, session: &mut Session, target_seq: i64) {
+async fn run_rollback(ctx: &SessionCtx, target_seq: i64) {
     let payload = match ctx
         .store
         .rollback_to(ctx.emitter.session_id(), target_seq)
@@ -782,12 +776,8 @@ async fn run_rollback(ctx: &SessionCtx, session: &mut Session, target_seq: i64) 
         }
     };
 
-    // 就地刷新内存 session 的 4 个状态字段，避免后续 persist 写回旧值盖掉重算结果。
-    // 消费类字段（token / cost）不动——rollback_to 内部本就保留原值，内存对象也无需改。
-    session.message_count = payload.message_count;
-    session.tool_call_count = payload.tool_call_count;
-    session.last_compacted_seq = payload.last_compacted_seq;
-    session.compression_count = payload.compression_count;
+    // rollback_to 事务内已把重算的 count 类字段局部 UPDATE 写回 sessions 表，
+    // DB 是唯一数据源——无需内存刷新（下轮 build_chat_request 等读路径均从 DB 取）。
 
     tracing::info!(
         session_id = ctx.emitter.session_id(),
