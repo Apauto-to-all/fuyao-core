@@ -28,7 +28,7 @@ pub fn normalize_workspace(workspace: &Option<PathBuf>) -> Option<String> {
 }
 
 /// 会话
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     /// 会话唯一标识
     pub id: String,
@@ -128,7 +128,8 @@ impl Session {
 ///
 /// `kind='compaction'` 的消息是上下文压缩产生的边界点，其 `content` 字段
 /// 存摘要正文，模型可见窗口以此为下界过滤。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MessageKind {
     /// 普通消息（user / assistant / system / tool）
     #[default]
@@ -248,7 +249,7 @@ impl ImageContent {
 }
 
 /// 消息（持久化单元）
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     /// 消息 ID
     pub id: Option<i64>,
