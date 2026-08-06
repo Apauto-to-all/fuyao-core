@@ -140,6 +140,14 @@ pub fn get_config() -> Arc<FuyaoConfig> {
         .unwrap_or_else(|| Arc::new(FuyaoConfig::default()))
 }
 
+/// 全局配置是否已注入
+///
+/// 供装配流程判断是否需要 set（多 engine 场景：首个 engine set 后，后续 engine
+/// 跳过重复 set，共享同一份进程级配置）。
+pub fn is_config_set() -> bool {
+    CONFIG.get().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

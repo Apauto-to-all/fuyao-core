@@ -20,7 +20,9 @@
 //! ```
 
 use crate::logging::LogGuard;
-use fuyao_api::{AgentPaths, EngineParams, FuyaoConfig, load_config, load_env, set_config};
+use fuyao_api::{
+    AgentPaths, EngineParams, FuyaoConfig, is_config_set, load_config, load_env, set_config,
+};
 use fuyao_provider::ProviderRegistry;
 use fuyao_provider::{agent_paths_cache_key, register_model, register_provider};
 use std::sync::Arc;
@@ -79,9 +81,17 @@ pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError>
 
     // 2. 加载配置（一次）：注入全局只读句柄，供所有模块 get_config 读取；
     //    同时复用于 Provider/Model 注册，避免重复加载。
+    //
+    //    全局配置是进程级单例（OnceLock）：多 engine 场景下第二次 init_engine 不重复
+    //    注入——首个 engine 装配时设的配置全进程共享。检测已设则跳过 set，避免
+    //    set_config 的 panic（该 panic 是外部直接重复调用的防线，init_engine 内幂等）。
     let config = load_config(agent_paths).map_err(|e| InitError::ConfigError(e.to_string()))?;
     if let Some(ref cfg) = config {
-        set_config(Arc::new(cfg.clone()));
+        if is_config_set() {
+            tracing::debug!("全局配置已注入，多 engine 装配跳过重复 set_config");
+        } else {
+            set_config(Arc::new(cfg.clone()));
+        }
     }
 
     // 3. 初始化日志：配置加载后 subscriber 尽早接管，guard 随返回值传出供 AppContext 持有。
