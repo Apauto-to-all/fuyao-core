@@ -34,13 +34,14 @@ impl Engine {
         // 构建系统提示词（Agent 配置决定人格）
         let system_prompt = build_system_prompt(&self.params.agent_paths, &definition, usage);
 
-        // 创建 Session（8 位 UUID）。工作目录来自 agent_paths.workspace，创建时定死，
+        // 创建 Session（8 位 id）。工作目录来自 agent_paths.workspace，创建时定死，
         // 经 normalize_workspace 统一分隔符为正斜杠（跨平台形态一致，按项目过滤匹配稳定）。
         let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
-        let session = Session::new(workspace, None, Some(system_prompt));
+        let mut session = Session::new(workspace, None, Some(system_prompt));
 
-        // 落库元数据（消息产生时由 emit_to_history 单条 insert_message 落库）
-        self.store.create(&session).await?;
+        // 落库元数据（消息产生时由 emit_to_history 单条 insert_message 落库）。
+        // id 随机生成，主键冲突时由 create_with_retry 重新生成重试。
+        self.store.create_with_retry(&mut session).await?;
 
         let session_id = session.id.clone();
 
@@ -233,7 +234,7 @@ impl Engine {
                 let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
                 let mut s = Session::new(workspace, None, Some(system_prompt));
                 s.parent_session_id = Some(parent_session_id.clone());
-                self.store.create(&s).await?;
+                self.store.create_with_retry(&mut s).await?;
                 (s, definition)
             }
             ChildSessionSource::Fork(ref source_id) => {
@@ -316,8 +317,9 @@ impl Engine {
             Session::new(source.workspace.clone(), None, source.system_prompt.clone());
         new_session.parent_session_id = parent_session_id;
 
-        // 4. 落库新 session 元数据行（先建行，满足 messages.session_id 外键约束）
-        self.store.create(&new_session).await?;
+        // 4. 落库新 session 元数据行（先建行，满足 messages.session_id 外键约束）。
+        //    id 随机生成，主键冲突时由 create_with_retry 重新生成重试。
+        self.store.create_with_retry(&mut new_session).await?;
 
         // 5. 逐条复制可见消息到新 session（clone 后强制 seq=0，insert_message 分配新 seq）
         //    与压缩 apply 的 copy-to-new-seq 模式一致：不包外层事务，单条失败即返回 Err

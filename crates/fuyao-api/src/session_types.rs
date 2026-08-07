@@ -85,7 +85,7 @@ pub struct Session {
 }
 
 impl Session {
-    /// 创建新会话，自动生成 8 位 UUID
+    /// 创建新会话，自动生成 8 位 id
     ///
     /// `workspace` 为工作目录绝对路径（创建时定死，来自引擎的 `agent_paths.workspace`），
     /// 无工作目录时传 `None`。`last_active_at` 初始化为当前时间（等于 `started_at`）。
@@ -94,15 +94,9 @@ impl Session {
         title: Option<String>,
         system_prompt: Option<String>,
     ) -> Self {
-        let id = uuid::Uuid::new_v4()
-            .to_string()
-            .split('-')
-            .next()
-            .unwrap_or("unknown")
-            .to_string();
         let now = current_timestamp();
         Self {
-            id,
+            id: generate_id(),
             title: title.or_else(|| Some("新会话".to_string())),
             system_prompt,
             message_count: 0,
@@ -122,6 +116,27 @@ impl Session {
             workspace,
         }
     }
+
+    /// 重新生成 id（主键冲突重试专用）
+    ///
+    /// id 由随机生成，与既有行碰撞时（概率极低）由 store 层的 `create_with_retry`
+    /// 调本方法换一个新 id 重试落库。不改动其它字段。
+    pub fn regenerate_id(&mut self) {
+        self.id = generate_id();
+    }
+}
+
+/// 生成 8 位会话 id：取 UUID v4 第一段（8 个十六进制字符，32 bit 熵）
+///
+/// 个人单用户场景下碰撞概率可忽略；DB 主键约束兜底，碰撞时上层重试（见
+/// `SessionStore::create_with_retry`）。
+fn generate_id() -> String {
+    uuid::Uuid::new_v4()
+        .to_string()
+        .split('-')
+        .next()
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 /// 消息类型（区分普通消息与压缩边界消息）
@@ -391,6 +406,17 @@ mod tests {
         let session = Session::new(None, None, None);
         assert_eq!(session.id.len(), 8);
         assert_eq!(session.title, Some("新会话".to_string()));
+    }
+
+    #[test]
+    fn regenerate_id_produces_new_8_char_id() {
+        // 重试专用：regenerate_id 应换一个新 id，长度仍为 8，其它字段不变
+        let mut session = Session::new(None, Some("标题".into()), None);
+        let old_id = session.id.clone();
+        session.regenerate_id();
+        assert_eq!(session.id.len(), 8);
+        assert_ne!(session.id, old_id, "regenerate_id 必须产生不同的 id");
+        assert_eq!(session.title.as_deref(), Some("标题"), "其它字段不应被改动");
     }
 
     #[test]
