@@ -101,14 +101,26 @@ impl App {
         Ok(id)
     }
 
-    /// 恢复对话（rx 进 fan_out）
+    /// 恢复对话（幂等：已挂载则零成本直返，未挂载才读 DB 装配）
     ///
-    /// 镜像 [`Engine::resume_session`]。
+    /// 幂等短路：若该 session 的 forwarder 已在跑（`forward_tasks` 命中），说明 session
+    /// 已挂载、事件流已通向 fan_out——直接返回 id，不读 DB、不重新装配、不重建
+    /// forwarder。这使得「每次发送前先 resume」成为零成本操作：首条消息时挂载，后续
+    /// 命中短路瞬间返回。
+    ///
+    /// 未挂载（重启后 / 跨进程）才走 [`Engine::resume_session`]：读 DB 取 session
+    /// 元数据 → 装配 task + 通道 → 返 rx → 经 [`register_forwarder`] 接进 fan_out。
+    ///
+    /// session id 不在数据库 → [`EngineError::SessionNotFound`]（由 Engine 层返回）。
     pub async fn resume_session(
         &self,
         id: &SessionId,
         params: SessionParams,
     ) -> Result<SessionId, EngineError> {
+        // 幂等短路：forwarder 已在跑 → session 已挂载、事件流已通 → 零成本直返
+        if self.forward_tasks.lock().await.contains_key(id) {
+            return Ok(id.clone());
+        }
         let (id, rx) = self.engine.resume_session(id, params).await?;
         self.register_forwarder(id.clone(), rx).await;
         Ok(id)

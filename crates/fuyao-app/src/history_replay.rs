@@ -134,14 +134,16 @@ fn parse_tool_call(v: &serde_json::Value) -> Option<fuyao_api::message::output::
 
 /// 历史消息列表 → 事件流（seq 正序，旧 → 新）
 ///
-/// 接收「seq 倒序」（存储默认查询顺序，最新在前）的 [`Message`] 列表，逐条投影后
-/// 翻成正序，使历史回放流与实时流时序一致（旧消息在前、新消息在后）。
+/// 接收「seq 倒序」（存储默认查询顺序，最新在前）的 [`Message`] 列表，反向遍历投影
+/// 得正序（旧在前、新在后），使历史回放流与实时流时序一致。
+///
+/// 游标分页标准模式：存储层 `ORDER BY seq DESC`（倒序取数利于游标定位边界），业务层
+/// 翻成正序返回——用户看对话是旧→新。`.iter().rev()` 反向遍历 DESC 输入即得 ASC，
+/// 一次到位，不再额外翻转。
 ///
 /// `system` 消息投影为 `None` 会被跳过，故返回长度可能小于输入。
 pub(crate) fn messages_to_events(messages: Vec<Message>) -> Vec<OutputEvent> {
-    let mut events: Vec<_> = messages.iter().rev().filter_map(message_to_event).collect();
-    events.reverse();
-    events
+    messages.iter().rev().filter_map(message_to_event).collect()
 }
 
 #[cfg(test)]
@@ -399,7 +401,9 @@ mod tests {
 
     #[test]
     fn messages_to_events_reverses_desc_to_asc() {
-        // 存储默认 seq 倒序（最新在前）；批量投影应翻成正序（旧在前）
+        // 存储默认 seq 倒序（最新在前）；批量投影应翻成正序（旧在前）。
+        // 用 seq 合成的 base.id（hist-{seq}）断言真实顺序——两端类型相同也能区分，
+        // 避免此前「User→Assistant→User 类型序列翻不翻转都成立」的无效断言。
         let messages = vec![
             make_msg(MessageRole::User, 3, &|m| {
                 m.content = Some("三".into());
@@ -413,11 +417,17 @@ mod tests {
         ];
 
         let events = messages_to_events(messages);
-        // 正序：seq 1 → 2 → 3
         assert_eq!(events.len(), 3);
-        assert!(matches!(events[0], OutputEvent::User(_)));
-        assert!(matches!(events[1], OutputEvent::Assistant(_)));
-        assert!(matches!(events[2], OutputEvent::User(_)));
+        // 正序：seq 1 → 2 → 3，用 base.id 锁死顺序
+        let seqs: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                OutputEvent::User(m) => m.base.id.as_str(),
+                OutputEvent::Assistant(m) => m.base.id.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(seqs, vec!["hist-1", "hist-2", "hist-3"]);
     }
 
     #[test]
