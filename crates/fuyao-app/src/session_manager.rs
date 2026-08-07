@@ -14,8 +14,6 @@
 
 use std::sync::Arc;
 
-use fuyao_api::OutputEvent;
-use fuyao_api::{Message, Session};
 use fuyao_session::SessionStore;
 
 use crate::history_replay;
@@ -55,19 +53,18 @@ impl SessionManager {
         workspace_filter: Option<&str>,
         limit: i64,
         offset: i64,
-    ) -> Result<Vec<Session>, fuyao_session::SessionError> {
-        self.store.list_all(workspace_filter, limit, offset).await
-    }
-
-    /// 会话总数（可选按工作目录过滤）
-    ///
-    /// 配合 [`list_sessions`](Self::list_sessions) 的分页，供上层计算总页数。
-    /// `workspace_filter` 须与 `list_sessions` 传的一致，否则总数与列表对不上。
-    pub async fn session_count(
-        &self,
-        workspace_filter: Option<&str>,
-    ) -> Result<i64, fuyao_session::SessionError> {
-        self.store.count_with_filter(workspace_filter).await
+    ) -> Result<fuyao_api::SessionPage, fuyao_session::SessionError> {
+        // items 与 total 是两条独立查询（list + count），同一 workspace_filter。
+        // 极端情况下两次查询之间有新会话插入会致二者差一两条——对「列表分页给 UI 算页数」
+        // 是可接受的弱一致（过时的 1-2 条不影响翻页体验）。
+        let items = self.store.list_all(workspace_filter, limit, offset).await?;
+        let total = self.store.count_with_filter(workspace_filter).await?;
+        Ok(fuyao_api::SessionPage {
+            items,
+            total,
+            limit,
+            offset,
+        })
     }
 
     // ── 消息查询 ───────────────────────────────────────────────
@@ -91,7 +88,9 @@ impl SessionManager {
     /// - `before_seq = None`：从最新一条开始（第一页）
     /// - `before_seq = Some(N)`：取 `seq < N` 的更早一页，锚点本身不含
     ///
-    /// 「有没有下一页」用返回条数 == `limit` 判断，不提供总数。
+    /// 返回 [`MessagePage`](fuyao_api::MessagePage) 信封：`has_more` 判是否还有更早页，
+    /// `next_cursor` 给翻页锚点（本页最旧消息的 seq，直接回传作下次 `before_seq`）。
+    /// 游标分页不提供总数——消息是持续追加的流，total 会在新消息到达时过时、误导前端。
     ///
     /// # 参数
     ///
@@ -108,11 +107,26 @@ impl SessionManager {
         session_id: &str,
         before_seq: Option<i64>,
         limit: Option<i64>,
-    ) -> Result<Vec<Message>, fuyao_session::SessionError> {
+    ) -> Result<fuyao_api::MessagePage, fuyao_session::SessionError> {
         let limit = limit.unwrap_or(Self::DEFAULT_MESSAGE_PAGE_SIZE).max(1);
-        self.store
+        let messages = self
+            .store
             .list_messages_before(session_id, before_seq, limit)
-            .await
+            .await?;
+
+        // has_more 由「本页条数 == limit」推导（满页才可能还有更多）。
+        // next_cursor 取 messages（seq 倒序）末条——即本页最旧一条的 seq，作下次 before_seq。
+        let has_more = messages.len() as i64 == limit;
+        let next_cursor = if has_more {
+            messages.last().map(|m| m.seq)
+        } else {
+            None
+        };
+        Ok(fuyao_api::MessagePage {
+            items: messages,
+            has_more,
+            next_cursor,
+        })
     }
 
     /// 历史消息投影成事件流（历史回放，seq 正序）
@@ -122,6 +136,10 @@ impl SessionManager {
     /// 渲染逻辑，无需区分数据来源。转换由 [`history_replay`] 承担（含 tool_calls 嵌套 →
     /// 扁平的逆向、seq 倒序翻正序），详见该模块。
     ///
+    /// 返回 [`EventPage`](fuyao_api::EventPage) 信封：`has_more` / `next_cursor` 直接复用
+    /// [`list_messages`](Self::list_messages) 的推导（同源同游标），仅把 `items` 投影成
+    /// `events`。游标分页不提供总数——消息是持续追加的流，total 会在新消息到达时过时。
+    ///
     /// # 参数
     /// 同 [`list_messages`](Self::list_messages)。
     pub async fn list_events(
@@ -129,8 +147,247 @@ impl SessionManager {
         session_id: &str,
         before_seq: Option<i64>,
         limit: Option<i64>,
-    ) -> Result<Vec<OutputEvent>, fuyao_session::SessionError> {
-        let messages = self.list_messages(session_id, before_seq, limit).await?;
-        Ok(history_replay::messages_to_events(messages))
+    ) -> Result<fuyao_api::EventPage, fuyao_session::SessionError> {
+        // 复用 list_messages 的取数 + 游标推导，避免两处重复实现 limit/has_more/cursor 逻辑。
+        let page = self.list_messages(session_id, before_seq, limit).await?;
+        let events = history_replay::messages_to_events(page.items);
+        Ok(fuyao_api::EventPage {
+            events,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fuyao_api::{Message, Session};
+
+    /// 构造临时 SessionManager（隔离的临时目录 + 临时 store）
+    async fn temp_manager() -> SessionManager {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let db_path = dir.path().join("test.db");
+        // forget 让目录留到进程结束（SessionManager 跨 await 持有 store，dir 必须存活）
+        std::mem::forget(dir);
+        let store = Arc::new(SessionStore::new(db_path).await.expect("创建存储失败"));
+        SessionManager::new(store)
+    }
+
+    /// 创建一个带 workspace 的 session 并落库
+    async fn seed_session(manager: &SessionManager, workspace: Option<&str>) -> String {
+        let mut session = Session::new(workspace.map(str::to_string), None, None);
+        manager.store.create_with_retry(&mut session).await.unwrap();
+        session.id
+    }
+
+    /// 给 session 追加一条 user 消息并落库
+    async fn seed_user_message(manager: &SessionManager, session_id: &str, content: &str) {
+        let mut msg = Message::user(content.to_string());
+        manager
+            .store
+            .insert_message(session_id, &mut msg)
+            .await
+            .unwrap();
+    }
+
+    // ===== SessionPage：OFFSET 分页 + total =====
+
+    #[tokio::test]
+    async fn list_sessions_returns_page_with_total_and_echo_params() {
+        let manager = temp_manager().await;
+        for i in 0..3 {
+            seed_session(&manager, Some("/proj-a")).await;
+            let _ = i;
+        }
+        seed_session(&manager, Some("/proj-b")).await;
+
+        // 第一页：limit=2, offset=0 → 2 条，total=4（全部）
+        let page = manager.list_sessions(None, 2, 0).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total, 4, "total 应为过滤前的全部会话数");
+        assert_eq!(page.limit, 2);
+        assert_eq!(page.offset, 0);
+    }
+
+    #[tokio::test]
+    async fn list_sessions_total_respects_workspace_filter() {
+        let manager = temp_manager().await;
+        for _ in 0..2 {
+            seed_session(&manager, Some("/proj-a")).await;
+        }
+        seed_session(&manager, Some("/proj-b")).await;
+        seed_session(&manager, None).await;
+
+        // workspace 过滤：/proj-a 有 2 条，total=2
+        let page = manager.list_sessions(Some("/proj-a"), 10, 0).await.unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.total, 2, "total 应与 workspace 过滤后的条数一致");
+        // 无 workspace 的会话不在 /proj-a 过滤范围内
+        assert!(
+            page.items
+                .iter()
+                .all(|s| s.workspace.as_deref() == Some("/proj-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sessions_offset_advances_pages() {
+        let manager = temp_manager().await;
+        for _ in 0..3 {
+            seed_session(&manager, None).await;
+        }
+
+        let p1 = manager.list_sessions(None, 2, 0).await.unwrap();
+        let p2 = manager.list_sessions(None, 2, 2).await.unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert_eq!(p2.items.len(), 1, "第三页只剩 1 条");
+        // 两页 id 不重叠
+        let p1_ids: Vec<&str> = p1.items.iter().map(|s| s.id.as_str()).collect();
+        let p2_ids: Vec<&str> = p2.items.iter().map(|s| s.id.as_str()).collect();
+        assert!(p1_ids.iter().all(|id| !p2_ids.contains(id)));
+    }
+
+    // ===== MessagePage：游标分页 + has_more / next_cursor =====
+
+    #[tokio::test]
+    async fn list_messages_first_page_has_more_and_cursor() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        // 插 3 条消息，limit=2 → 首页 2 条，has_more=true
+        for i in 1..=3 {
+            seed_user_message(&manager, &sid, &format!("msg{i}")).await;
+        }
+
+        let page = manager.list_messages(&sid, None, Some(2)).await.unwrap();
+        assert_eq!(page.items.len(), 2, "首页应满 2 条");
+        assert!(page.has_more, "还有更早消息，has_more 应为 true");
+        // items 按 seq 倒序（新→旧）：取最新 2 条 = seq3、seq2
+        assert_eq!(page.items[0].seq, 3);
+        assert_eq!(page.items[1].seq, 2);
+        // next_cursor = 本页最旧条 seq（末条）= 2，作下次 before_seq
+        assert_eq!(page.next_cursor, Some(2));
+    }
+
+    #[tokio::test]
+    async fn list_messages_next_cursor_drives_next_page() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        for i in 1..=3 {
+            seed_user_message(&manager, &sid, &format!("msg{i}")).await;
+        }
+
+        // 第一页取最新 2 条（seq3, seq2），next_cursor=2
+        let p1 = manager.list_messages(&sid, None, Some(2)).await.unwrap();
+        assert_eq!(p1.next_cursor, Some(2));
+
+        // 用 next_cursor 翻第二页（seq<2 → seq1）
+        let p2 = manager
+            .list_messages(&sid, p1.next_cursor, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 1, "第二页只剩 seq1 一条");
+        assert_eq!(p2.items[0].seq, 1);
+        assert!(!p2.has_more, "到底了，has_more 应为 false");
+        assert_eq!(p2.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_messages_last_page_has_no_more() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        for i in 1..=3 {
+            seed_user_message(&manager, &sid, &format!("msg{i}")).await;
+        }
+
+        // 第一页满 2 条（seq3、seq2），has_more=true，cursor=2
+        let p1 = manager.list_messages(&sid, None, Some(2)).await.unwrap();
+        assert_eq!(p1.items.len(), 2);
+        assert!(p1.has_more);
+        assert_eq!(p1.next_cursor, Some(2));
+
+        // 翻第二页（seq<2 → seq1，仅 1 条 < limit）→ 真正到底，has_more=false
+        let p2 = manager
+            .list_messages(&sid, p1.next_cursor, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(p2.items.len(), 1, "第二页只剩 seq1");
+        assert!(!p2.has_more, "不足一页，确无更多");
+        assert_eq!(p2.next_cursor, None);
+    }
+
+    // ===== EventPage：游标分页 + has_more / next_cursor =====
+
+    #[tokio::test]
+    async fn list_events_first_page_has_more_and_cursor() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        // 插 3 条消息，limit=2 → 首页 2 条，has_more=true
+        for i in 1..=3 {
+            seed_user_message(&manager, &sid, &format!("msg{i}")).await;
+        }
+
+        let page = manager.list_events(&sid, None, Some(2)).await.unwrap();
+        assert_eq!(page.events.len(), 2, "首页应满 2 条");
+        assert!(page.has_more, "还有更早消息，has_more 应为 true");
+        // next_cursor = 本页最旧消息的 seq（首页取 seq3、seq2，最旧为 seq2）
+        assert_eq!(page.next_cursor, Some(2));
+    }
+
+    #[tokio::test]
+    async fn list_events_next_cursor_drives_next_page() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        for i in 1..=3 {
+            seed_user_message(&manager, &sid, &format!("msg{i}")).await;
+        }
+
+        // 第一页取最新 2 条（seq3、seq2），next_cursor=2
+        let p1 = manager.list_events(&sid, None, Some(2)).await.unwrap();
+        assert_eq!(p1.next_cursor, Some(2));
+
+        // 用 next_cursor 翻第二页（seq<2 → seq1）
+        let p2 = manager
+            .list_events(&sid, p1.next_cursor, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(p2.events.len(), 1, "第二页只剩 seq1 一条");
+        assert!(!p2.has_more, "到底了，has_more 应为 false");
+        assert_eq!(p2.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_events_last_page_has_no_more() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        for i in 1..=3 {
+            seed_user_message(&manager, &sid, &format!("msg{i}")).await;
+        }
+
+        // 第一页满 2 条（seq3、seq2），has_more=true，cursor=2
+        let p1 = manager.list_events(&sid, None, Some(2)).await.unwrap();
+        assert_eq!(p1.events.len(), 2);
+        assert!(p1.has_more);
+        assert_eq!(p1.next_cursor, Some(2));
+
+        // 翻第二页（seq<2 → seq1，仅 1 条 < limit）→ 真正到底，has_more=false
+        let p2 = manager
+            .list_events(&sid, p1.next_cursor, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(p2.events.len(), 1, "第二页只剩 seq1");
+        assert!(!p2.has_more, "不足一页，确无更多");
+        assert_eq!(p2.next_cursor, None);
+    }
+
+    #[tokio::test]
+    async fn list_events_empty_session_returns_empty_page() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+
+        let page = manager.list_events(&sid, None, Some(10)).await.unwrap();
+        assert!(page.events.is_empty());
+        assert!(!page.has_more);
+        assert_eq!(page.next_cursor, None);
     }
 }

@@ -15,6 +15,7 @@ mod control;
 mod error;
 mod mcp_types;
 pub mod message;
+mod pagination;
 mod paths;
 mod prompt_types;
 mod provider;
@@ -39,6 +40,7 @@ pub use message::{
     EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginSource,
     SystemSource, UserMessageMode, UserMessageSource,
 };
+pub use pagination::{EventPage, MessagePage, SessionPage};
 pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
     get_workspace_root,
