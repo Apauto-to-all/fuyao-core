@@ -14,8 +14,11 @@
 
 use std::sync::Arc;
 
+use fuyao_api::OutputEvent;
 use fuyao_api::{Message, Session};
 use fuyao_session::SessionStore;
+
+use crate::history_replay;
 
 /// 会话管理器：持有会话存储句柄，对外提供会话 / 消息的查询接口
 ///
@@ -110,5 +113,24 @@ impl SessionManager {
         self.store
             .list_messages_before(session_id, before_seq, limit)
             .await
+    }
+
+    /// 历史消息投影成事件流（历史回放，seq 正序）
+    ///
+    /// 与 [`list_messages`](Self::list_messages) 同源取数（同游标、同分页），但把存储
+    /// [`Message`] 投影成与实时流同构的 [`OutputEvent`]——前端历史回放与实时流共用一套
+    /// 渲染逻辑，无需区分数据来源。转换由 [`history_replay`] 承担（含 tool_calls 嵌套 →
+    /// 扁平的逆向、seq 倒序翻正序），详见该模块。
+    ///
+    /// # 参数
+    /// 同 [`list_messages`](Self::list_messages)。
+    pub async fn list_events(
+        &self,
+        session_id: &str,
+        before_seq: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Vec<OutputEvent>, fuyao_session::SessionError> {
+        let messages = self.list_messages(session_id, before_seq, limit).await?;
+        Ok(history_replay::messages_to_events(messages))
     }
 }

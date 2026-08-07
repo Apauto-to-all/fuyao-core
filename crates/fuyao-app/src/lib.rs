@@ -11,6 +11,7 @@
 //! `ToolRegistry` 一次性注入（启动引擎时装配）。
 
 mod app;
+mod history_replay;
 mod init;
 mod logging;
 mod mcp;
