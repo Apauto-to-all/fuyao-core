@@ -126,7 +126,7 @@ mod tests {
             base: EventBase::default(),
         });
         match &event {
-            InputEvent::Compress(req) => assert!(!req.base.id.is_empty()),
+            InputEvent::Compress(req) => assert!(req.base.seq.is_none()),
             _ => panic!("应为 Compress 变体"),
         }
     }
@@ -158,7 +158,7 @@ mod tests {
         let json = serde_json::to_string(&event).expect("序列化失败");
         let de: InputEvent = serde_json::from_str(&json).expect("反序列化失败");
         match de {
-            InputEvent::Compress(req) => assert!(!req.base.id.is_empty()),
+            InputEvent::Compress(req) => assert!(req.base.seq.is_none()),
             _ => panic!("反序列化后应为 Compress 变体"),
         }
     }
@@ -171,7 +171,7 @@ mod tests {
         });
         match &event {
             InputEvent::Rollback(req) => {
-                assert!(!req.base.id.is_empty());
+                assert!(req.base.seq.is_none());
                 assert_eq!(req.payload.target_seq, 9);
             }
             _ => panic!("应为 Rollback 变体"),

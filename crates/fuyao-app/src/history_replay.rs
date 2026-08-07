@@ -30,15 +30,16 @@ use fuyao_api::{Message, MessageRole};
 
 /// 单条历史 Message → OutputEvent
 ///
-/// 按 [`MessageRole`] 分流到 User / Assistant / ToolResult；`system` 无对应事件变体，
+/// 按 [`MessageRole`] 分流到 User / Assistant / ToolResult；`system` 无对应事件变体,
 /// 返回 `None`（系统提示是构造而非对话内容，不进历史回放流）。
 ///
-/// `base` 复刻原消息的 timestamp / session_id，仅 id 合成稳定串 `hist-{seq}`——
-/// 历史消息无原始 OutputEvent 的 UUID，但 seq 在会话内唯一，足以作渲染 key。
+/// `base` 复刻原消息的 timestamp / session_id，并把 seq 直接填入——历史回放与实时事件
+/// 同构：进历史事件落库后 seq 同样填进 base.seq（见 emit_to_history），前端拿到同一
+/// 来源的 seq，游标分页据此连续定位，无需区分实时 / 历史。
 fn message_to_event(msg: &Message) -> Option<OutputEvent> {
-    // base 复刻原消息时间戳与会话标识；id 用 seq 合成稳定串供前端作渲染 key
+    // base 复刻原消息时间戳与会话标识；seq 直接填入，与实时事件同源同构
     let base = EventBase {
-        id: format!("hist-{}", msg.seq),
+        seq: Some(msg.seq),
         timestamp: msg.timestamp,
         session_id: Some(msg.session_id.clone()),
     };
@@ -196,8 +197,8 @@ mod tests {
         // base 复刻原消息时间戳与会话标识
         assert!((base.timestamp - 1.0).abs() < f64::EPSILON);
         assert_eq!(base.session_id.as_deref(), Some("sess-1"));
-        // id 用 seq 合成稳定串
-        assert_eq!(base.id, "hist-1");
+        // seq 直接来自 Message，与实时事件同源
+        assert_eq!(base.seq, Some(1));
     }
 
     #[test]
@@ -373,7 +374,7 @@ mod tests {
         assert_eq!(payload.tool_call_id, "call_1");
         assert_eq!(payload.tool_name, "get_weather");
         assert_eq!(payload.content, "sunny");
-        assert_eq!(base.id, "hist-9");
+        assert_eq!(base.seq, Some(9));
     }
 
     #[test]
@@ -402,7 +403,7 @@ mod tests {
     #[test]
     fn messages_to_events_reverses_desc_to_asc() {
         // 存储默认 seq 倒序（最新在前）；批量投影应翻成正序（旧在前）。
-        // 用 seq 合成的 base.id（hist-{seq}）断言真实顺序——两端类型相同也能区分，
+        // 用 base.seq 断言真实顺序——两端类型相同也能区分，
         // 避免此前「User→Assistant→User 类型序列翻不翻转都成立」的无效断言。
         let messages = vec![
             make_msg(MessageRole::User, 3, &|m| {
@@ -418,16 +419,16 @@ mod tests {
 
         let events = messages_to_events(messages);
         assert_eq!(events.len(), 3);
-        // 正序：seq 1 → 2 → 3，用 base.id 锁死顺序
-        let seqs: Vec<&str> = events
+        // 正序：seq 1 → 2 → 3，用 base.seq 锁死顺序
+        let seqs: Vec<Option<i64>> = events
             .iter()
             .map(|e| match e {
-                OutputEvent::User(m) => m.base.id.as_str(),
-                OutputEvent::Assistant(m) => m.base.id.as_str(),
-                _ => "",
+                OutputEvent::User(m) => m.base.seq,
+                OutputEvent::Assistant(m) => m.base.seq,
+                _ => None,
             })
             .collect();
-        assert_eq!(seqs, vec!["hist-1", "hist-2", "hist-3"]);
+        assert_eq!(seqs, vec![Some(1), Some(2), Some(3)]);
     }
 
     #[test]

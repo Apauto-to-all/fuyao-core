@@ -13,7 +13,7 @@ use crate::message::EventBase;
 /// 携带 `base`（事件元信息 + session_id 全程标签）和 `payload`（新标题文本）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TitleMessage {
-    /// 事件元信息（id/timestamp/session_id）
+    /// 事件元信息（seq/timestamp/session_id）
     pub base: EventBase,
     /// 标题载荷
     pub payload: TitlePayload,
@@ -62,7 +62,7 @@ mod tests {
         };
         let cloned = msg.clone();
         assert_eq!(cloned.payload.title, "原始");
-        assert_eq!(cloned.base.id, msg.base.id);
+        assert_eq!(cloned.base.seq, msg.base.seq);
     }
 
     #[test]

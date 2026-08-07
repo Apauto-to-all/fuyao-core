@@ -15,7 +15,7 @@ use crate::message::EventBase;
 /// 由 [`InputEvent::Rollback`] 携带。业务字段在 [`RollbackPayload`]（回退目标 seq）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RollbackRequest {
-    /// 事件元信息（id/timestamp）
+    /// 事件元信息（seq/timestamp）
     pub base: EventBase,
     /// 回退载荷
     pub payload: RollbackPayload,
@@ -49,7 +49,7 @@ mod tests {
             base: EventBase::default(),
             payload: RollbackPayload { target_seq: 9 },
         };
-        assert!(!req.base.id.is_empty());
+        assert!(req.base.seq.is_none());
         assert_eq!(req.payload.target_seq, 9);
     }
 
@@ -61,7 +61,7 @@ mod tests {
         };
         let cloned = req.clone();
         assert_eq!(req.payload.target_seq, cloned.payload.target_seq);
-        assert_eq!(req.base.id, cloned.base.id);
+        assert_eq!(req.base.seq, cloned.base.seq);
     }
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
         };
         let json = serde_json::to_string(&req).expect("序列化失败");
         let de: RollbackRequest = serde_json::from_str(&json).expect("反序列化失败");
-        assert_eq!(de.base.id, req.base.id);
+        assert_eq!(de.base.seq, req.base.seq);
         assert_eq!(de.payload.target_seq, 15);
     }
 }

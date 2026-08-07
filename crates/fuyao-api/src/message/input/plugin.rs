@@ -31,7 +31,7 @@ pub struct PluginEventSource {
 /// 注：与 `output::PluginMessage` 字段当前完全一致，但故意独立定义、不共享类型（见方案第八节）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginMessage {
-    /// 事件元信息（id/timestamp）
+    /// 事件元信息（seq/timestamp）
     pub base: EventBase,
     /// 插件事件载荷
     pub payload: PluginPayload,
@@ -87,7 +87,7 @@ mod tests {
                 message: None,
             },
         };
-        assert!(!msg.base.id.is_empty());
+        assert!(msg.base.seq.is_none());
         assert_eq!(msg.payload.data.unwrap()["percent"], 50);
     }
 }

@@ -25,7 +25,7 @@ use crate::message::output::UserPayload;
 /// 携带 `base`（事件元信息 + session_id 全程标签）和 `payload`（回退结果）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RollbackMessage {
-    /// 事件元信息（id/timestamp/session_id）
+    /// 事件元信息（seq/timestamp/session_id）
     pub base: EventBase,
     /// 回退载荷
     pub payload: RollbackPayload,
@@ -157,7 +157,7 @@ mod tests {
         };
         let cloned = msg.clone();
         assert_eq!(cloned.payload.target_seq, msg.payload.target_seq);
-        assert_eq!(cloned.base.id, msg.base.id);
+        assert_eq!(cloned.base.seq, msg.base.seq);
     }
 
     #[test]

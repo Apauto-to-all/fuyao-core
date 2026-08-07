@@ -8,7 +8,7 @@ use crate::message::UserMessageMode;
 /// 队列快照条目（一条用户消息的只读视图）
 #[derive(Debug, Clone)]
 pub struct QueueSnapshotItem {
-    /// 消息 ID（与 InputEvent::User.base.id 对应）
+    /// 队列内消息标识（入队时分配，用于 UI 区分队列中的不同条目）
     pub id: String,
     /// 内容前 N 个字符的预览（N 由引擎决定，通常 30）
     pub content_preview: String,

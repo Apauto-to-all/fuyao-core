@@ -99,7 +99,7 @@ pub(crate) async fn emit_to_history(
     msg_from_event: impl FnOnce(&OutputEvent) -> Option<Message>,
 ) -> Option<OutputEvent> {
     // 1. 拦截
-    let intercepted = intercept(emitter, hooks, event).await?;
+    let mut intercepted = intercept(emitter, hooks, event).await?;
 
     // 2. 用拦截后事件构造 Message 后落 DB。
     //    sessions 表的计数 / 费用累加由 insert_message 事务内原子完成（单一数据源，
@@ -115,6 +115,10 @@ pub(crate) async fn emit_to_history(
                 role = msg.role.as_str(),
                 "消息落库失败（已丢弃，不影响 turn 推进）"
             );
+        } else {
+            // 落库成功：seq 已回填到 msg，反写进事件 base，使实时事件与历史回放同构。
+            // 前端游标分页据此连续定位，实时 / 历史 id 不再分裂。
+            intercepted.base_mut().seq = Some(msg.seq);
         }
     }
 

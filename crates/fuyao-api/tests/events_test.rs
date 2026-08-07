@@ -24,25 +24,29 @@ use fuyao_api::{EventBase, ThinkingType};
 use rstest::rstest;
 
 // ---------------------------------------------------------------------------
-// EventBase：动态字段（UUID/时间戳）的契约
+// EventBase：动态字段（seq/时间戳）的契约
 // ---------------------------------------------------------------------------
 
 #[test]
-fn event_base_default_generates_valid_uuid() {
+fn event_base_default_seq_is_none() {
     let base = EventBase::default();
 
-    // UUID v4 字符串形态：36 字符，含 4 个连字符
-    assert_eq!(base.id.len(), 36, "UUID 应为 36 字符");
-    assert_eq!(base.id.matches('-').count(), 4, "UUID 应含 4 个连字符");
+    // 默认 seq 为 None：纯实时事件无 seq，落库后由调用方回填
+    assert!(base.seq.is_none(), "默认 seq 应为 None");
     // 时间戳为正数（Unix 秒）
     assert!(base.timestamp > 0.0, "时间戳应为正数");
 }
 
 #[test]
-fn event_base_default_generates_unique_ids() {
-    let a = EventBase::default();
-    let b = EventBase::default();
-    assert_ne!(a.id, b.id, "两次 default 的 id 必须不同");
+fn event_base_seq_round_trip() {
+    // seq = Some 时序列化 / 反序列化往返一致
+    let base = EventBase {
+        seq: Some(123),
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&base).expect("序列化失败");
+    let restored: EventBase = serde_json::from_str(&json).expect("反序列化失败");
+    assert_eq!(restored.seq, Some(123));
 }
 
 #[test]

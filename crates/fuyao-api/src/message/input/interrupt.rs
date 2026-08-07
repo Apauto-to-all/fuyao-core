@@ -30,7 +30,7 @@ pub enum InterruptSource {
 /// 注：与 `output::InterruptMessage` 字段当前完全一致，但故意独立定义、不共享类型（见方案第八节）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InterruptMessage {
-    /// 事件元信息（id/timestamp）
+    /// 事件元信息（seq/timestamp）
     pub base: EventBase,
     /// 中断载荷
     pub payload: InterruptPayload,
@@ -87,7 +87,7 @@ mod tests {
                 source: InterruptSource::Shutdown,
             },
         };
-        assert!(!msg.base.id.is_empty());
+        assert!(msg.base.seq.is_none());
         assert_eq!(msg.payload.reason, "测试");
     }
 

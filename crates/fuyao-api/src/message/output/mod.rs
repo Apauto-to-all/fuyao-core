@@ -86,6 +86,30 @@ pub enum OutputEvent {
     Rollback(RollbackMessage),
 }
 
+impl OutputEvent {
+    /// 可变借用事件的 base（落库后回填 seq 用）
+    ///
+    /// 进历史事件经 `emit_to_history` 落库后，seq 已回填到 [`crate::Message`]，
+    /// 调用方据此把 seq 写进事件 base，使实时事件与历史回放同构。
+    pub fn base_mut(&mut self) -> &mut crate::message::EventBase {
+        match self {
+            OutputEvent::Chunk(m) => &mut m.base,
+            OutputEvent::User(m) => &mut m.base,
+            OutputEvent::ToolCall(m) => &mut m.base,
+            OutputEvent::ToolResult(m) => &mut m.base,
+            OutputEvent::Assistant(m) => &mut m.base,
+            OutputEvent::Interrupt(m) => &mut m.base,
+            OutputEvent::Error(m) => &mut m.base,
+            OutputEvent::Plugin(m) => &mut m.base,
+            OutputEvent::Compression(m) => &mut m.base,
+            OutputEvent::Title(m) => &mut m.base,
+            OutputEvent::Retry(m) => &mut m.base,
+            OutputEvent::ChildSession(m) => &mut m.base,
+            OutputEvent::Rollback(m) => &mut m.base,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,7 +12,7 @@ use crate::message::EventBase;
 /// 「现在就压」一个意图，触发参数（模型、上下文长度等）由引擎在执行时按 session 配置现解析。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompressRequest {
-    /// 事件元信息（id/timestamp）
+    /// 事件元信息（seq/timestamp）
     pub base: EventBase,
 }
 
@@ -25,7 +25,8 @@ mod tests {
         let req = CompressRequest {
             base: EventBase::default(),
         };
-        assert!(!req.base.id.is_empty());
+        // 压缩请求是控制类事件，不进历史，seq 默认 None
+        assert!(req.base.seq.is_none());
     }
 
     #[test]
@@ -35,6 +36,6 @@ mod tests {
         };
         let json = serde_json::to_string(&req).expect("序列化失败");
         let de: CompressRequest = serde_json::from_str(&json).expect("反序列化失败");
-        assert_eq!(de.base.id, req.base.id);
+        assert_eq!(de.base.seq, req.base.seq);
     }
 }

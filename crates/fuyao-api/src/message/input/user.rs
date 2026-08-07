@@ -80,7 +80,7 @@ impl Default for UserMessageSource {
 /// 理由：输入（用户发送）与输出（引擎回显）语义本质不同，未来会分化，当前一致只是初期特例。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UserMessage {
-    /// 事件元信息（id/timestamp）
+    /// 事件元信息（seq/timestamp）
     pub base: crate::message::EventBase,
     /// 消息载荷
     pub payload: UserPayload,
@@ -179,7 +179,7 @@ mod tests {
                 source: UserMessageSource::User,
             },
         };
-        assert!(!msg.base.id.is_empty());
+        assert!(msg.base.seq.is_none());
         assert_eq!(msg.payload.content, "你好");
     }
 
@@ -218,7 +218,7 @@ mod tests {
         let json = serde_json::to_string(&msg).expect("序列化失败");
         let de: UserMessage = serde_json::from_str(&json).expect("反序列化失败");
         assert_eq!(de.payload.content, "序列化测试");
-        assert_eq!(de.base.id, msg.base.id);
+        assert_eq!(de.base.seq, msg.base.seq);
     }
 
     #[test]

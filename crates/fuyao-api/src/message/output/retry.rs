@@ -17,7 +17,7 @@ use crate::message::EventBase;
 /// 携带 `base`（事件元信息 + session_id 全程标签）和 `payload`（重试详情）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RetryMessage {
-    /// 事件元信息（id/timestamp/session_id）
+    /// 事件元信息（seq/timestamp/session_id）
     pub base: EventBase,
     /// 重试载荷
     pub payload: RetryPayload,
@@ -88,7 +88,7 @@ mod tests {
         };
         let cloned = msg.clone();
         assert_eq!(cloned.payload.attempt, msg.payload.attempt);
-        assert_eq!(cloned.base.id, msg.base.id);
+        assert_eq!(cloned.base.seq, msg.base.seq);
     }
 
     #[test]
