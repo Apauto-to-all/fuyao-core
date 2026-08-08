@@ -19,21 +19,15 @@
 //!   拦截→存储→消费三者一致。消息产生即落库（事件级落库），不进任何内存数组——
 //!   单个 session 内存占用恒定（不随历史增长）。
 //! - 不进历史的纯事件（Chunk/Error/Compression/Interrupt 通知等）用 [`dispatch`]，process 传 None
-//! - 工具调用需要拿拦截结果回灌时，用 [`dispatch_intercept`] 单独拦截
-
-mod deliver;
-mod intercept;
+//! - 工具调用需要拿拦截结果回灌时，用 [`intercept`] 单独拦截
 
 use crate::emit::Emitter;
 use fuyao_api::Message;
 use fuyao_api::message::OutputEvent;
-use fuyao_hooks::SharedHooks;
+use fuyao_hooks::{InterceptResult, SharedHooks};
 use fuyao_session::SessionStore;
 use std::future::Future;
 use std::pin::Pin;
-
-pub(crate) use deliver::deliver;
-pub(crate) use intercept::intercept;
 
 /// 处理回调类型（拦截后、发送前执行的不阻塞动作）
 ///
@@ -41,6 +35,68 @@ pub(crate) use intercept::intercept;
 /// 耗时动作（工具执行）不放在这里——它们在管道外批量进行。
 pub(crate) type ProcessFn =
     Box<dyn FnOnce(&OutputEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+// ===== 管道各段：intercept / deliver =====
+
+/// 执行拦截钩子
+///
+/// 返回 `Some(event)` 表示 Pass（事件可能被插件修改）；
+/// 返回 `None` 表示 Block，调用方应丢弃该事件。
+///
+/// 锁仅在拦截期间持有，不跨 await 边界（拦截是同步调用）。
+pub(crate) async fn intercept(
+    _emitter: &Emitter,
+    hooks: &SharedHooks,
+    event: OutputEvent,
+) -> Option<OutputEvent> {
+    let hooks = hooks.lock().await;
+    match hooks.hook_output_intercept(&event) {
+        InterceptResult::Pass(modified) => Some(modified),
+        InterceptResult::Block(reason) => {
+            tracing::warn!(
+                hook = "output_intercept",
+                block = true,
+                reason = %reason,
+                "事件被拦截钩子丢弃"
+            );
+            None
+        }
+    }
+}
+
+/// 发送事件到出口通道 + 触发观察钩子
+///
+/// 顺序：先 `Emitter::emit`（盖 session_id + tx.send），后 `hook_output_observe`。
+/// 发送与观察各自独立拿锁，不持锁跨 tx.send（比归档更安全，避免死锁）。
+///
+/// observe 钩子按注册顺序串行执行，单个 panic 或超时不阻塞后续（见 HooksRegistry）。
+///
+/// 暴露为 `pub(crate)` 供工具调用等分离式场景在拦截 + 处理后单独调用。
+///
+/// 返回原 event（move 进来再还回去）——`emit` 按值消费 event，本函数在 emit 前
+/// 先 clone 一份给 observe 用，emit 完成后把这份 clone 还给调用方，让调用方
+/// （如 `emit_to_history`）不必再为返回值单独 clone 一次。
+pub(crate) async fn deliver(
+    emitter: &Emitter,
+    hooks: &SharedHooks,
+    event: OutputEvent,
+) -> OutputEvent {
+    // observe 需要拿到与发送一致的事件，先 clone 一份留给 observe；
+    // 这份 clone 同时也是返回值——emit 之后 event 已 move，observe_event 是唯一剩余副本
+    let observe_event = event.clone();
+
+    // 先发送（Emitter 负责：盖 session_id 标签 + 推到出口通道）
+    // 出站通道无界，emit 同步返回——但本函数仍保留 async 因 observe hook 可能跨 await
+    emitter.emit(event);
+
+    // 再观察（独立拿锁，不持锁跨 tx.send）
+    let hooks = hooks.lock().await;
+    hooks.hook_output_observe(observe_event.clone()).await;
+
+    observe_event
+}
+
+// ===== 完整管道入口 =====
 
 /// 完整管道：拦截 → 处理 → 发送 → 观察
 ///
@@ -129,18 +185,6 @@ pub(crate) async fn emit_to_history(
     Some(delivered)
 }
 
-/// 仅拦截（不含处理/发送/观察），返回拦截后事件
-///
-/// 用于 User 入站等需要拿拦截后 payload 做后续动作（入队用拦截后 content）
-/// 但不直接落库的场景（落库时机由队列消费决定，经 `emit_to_history` 走完整管道）。
-pub(crate) async fn dispatch_intercept(
-    emitter: &Emitter,
-    hooks: &SharedHooks,
-    event: OutputEvent,
-) -> Option<OutputEvent> {
-    intercept(emitter, hooks, event).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,8 +236,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_intercept_returns_modified_event() {
-        // 拦截器修改 content：dispatch_intercept 返回修改后的事件
+    async fn intercept_returns_modified_event() {
+        // 拦截器修改 content：intercept 返回修改后的事件
         let (emitter, hooks, _rx) = make_emitter_hooks();
         {
             let mut reg = hooks.lock().await;
@@ -213,7 +257,7 @@ mod tests {
             );
         }
 
-        let result = dispatch_intercept(&emitter, &hooks, make_assistant_event("hi")).await;
+        let result = intercept(&emitter, &hooks, make_assistant_event("hi")).await;
         match result {
             Some(OutputEvent::Assistant(m)) => {
                 assert_eq!(m.payload.content.as_deref(), Some("HI"));
@@ -223,7 +267,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_intercept_returns_none_on_block() {
+    async fn intercept_returns_none_on_block() {
         // 拦截器 Block：返回 None，事件被丢弃
         let (emitter, hooks, _rx) = make_emitter_hooks();
         {
@@ -234,7 +278,7 @@ mod tests {
             );
         }
 
-        let result = dispatch_intercept(&emitter, &hooks, make_assistant_event("hi")).await;
+        let result = intercept(&emitter, &hooks, make_assistant_event("hi")).await;
         assert!(result.is_none(), "Block 应返回 None");
     }
 

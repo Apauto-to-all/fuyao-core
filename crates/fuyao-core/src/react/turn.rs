@@ -483,8 +483,7 @@ async fn handle_tool_calls(
         Vec::with_capacity(result.tool_calls.len());
     for tc in &result.tool_calls {
         let event = tool_call_data_to_event(tc);
-        if let Some(intercepted) =
-            crate::dispatch::dispatch_intercept(&ctx.emitter, &ctx.hooks, event).await
+        if let Some(intercepted) = crate::dispatch::intercept(&ctx.emitter, &ctx.hooks, event).await
         {
             // 拦截 Pass：发送（含观察），并从拦截后的 payload 提取工具调用数据回灌
             crate::dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted.clone()).await;
