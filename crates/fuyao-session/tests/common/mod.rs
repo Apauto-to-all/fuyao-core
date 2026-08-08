@@ -136,7 +136,10 @@ impl Provider for FakeTitleProvider {
                 finish_reason: FinishReason::Stop,
             }),
             // chat_content=None 模拟 LLM 调用失败（触发 maybe_generate_title 回退/放弃）
-            None => Err(StreamError::ApiError("模拟标题生成失败".into())),
+            None => Err(StreamError::ApiError {
+                status: None,
+                message: "模拟标题生成失败".into(),
+            }),
         }
     }
 }

@@ -339,7 +339,7 @@ async fn stream_chat_returns_api_error_on_500() {
     let provider = mock_provider(&server);
     let result = collect_stream_events(provider, simple_request("hi")).await;
     assert!(
-        matches!(result, Err(StreamError::ApiError(_))),
+        matches!(result, Err(StreamError::ApiError { .. })),
         "500 应映射为 ApiError"
     );
 }

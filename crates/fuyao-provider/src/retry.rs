@@ -6,20 +6,17 @@ use fuyao_api::get_config;
 /// 判断错误是否可重试
 ///
 /// 可重试：RateLimit、Timeout、Connection、5xx ApiError
-/// 不可重试：AuthError、StreamParseError、ContextOverflow、4xx ApiError、Cancelled
+/// 不可重试：AuthError、StreamParseError、ContextOverflow、4xx ApiError、Cancelled、
+///          无状态码的 ApiError（协议层异常，非 HTTP 错误）
 pub fn is_retryable(e: &StreamError) -> bool {
     match e {
         StreamError::RateLimit { .. } | StreamError::Timeout | StreamError::Connection(_) => true,
-        StreamError::ApiError(msg) => {
-            // 消息格式："HTTP {code}: {body}"
-            // 提取首个 3 位数字作为状态码，避免 body 中恰好包含 "500" 等导致 4xx 误判
-            let digits: String = msg
-                .chars()
-                .skip_while(|c| !c.is_ascii_digit())
-                .take(3)
-                .collect();
-            matches!(digits.as_str(), "500" | "502" | "503" | "504" | "529")
+        StreamError::ApiError {
+            status: Some(code), ..
+        } => {
+            matches!(code, 500 | 502 | 503 | 504 | 529)
         }
+        StreamError::ApiError { status: None, .. } => false,
         // ContextOverflow 不重试，应触发压缩
         // Cancelled 不重试（非错误，由 shutdown 流程触发，冒泡给上层走中断路径）
         StreamError::ContextOverflow
@@ -85,10 +82,14 @@ pub fn backoff_duration(retry: u32, error: &StreamError) -> std::time::Duration 
         .initial_delay_ms
         .saturating_mul(2u64.saturating_pow(retry - 1));
 
-    // 有响应头的错误（RateLimit、5xx ApiError）→ 上限 ~24.8天
+    // 有响应头的错误（RateLimit、带 HTTP 状态码的 ApiError）→ 上限 ~24.8天
     let has_headers = matches!(
         error,
-        StreamError::RateLimit { .. } | StreamError::ApiError(_)
+        StreamError::RateLimit { .. }
+            | StreamError::ApiError {
+                status: Some(_),
+                ..
+            }
     );
 
     if has_headers {
@@ -125,53 +126,51 @@ mod tests {
 
     #[test]
     fn is_retryable_5xx_api_error() {
-        assert!(is_retryable(&StreamError::ApiError(
-            "500 Internal Server Error".to_string()
-        )));
-        assert!(is_retryable(&StreamError::ApiError(
-            "502 Bad Gateway".to_string()
-        )));
-        assert!(is_retryable(&StreamError::ApiError(
-            "503 Service Unavailable".to_string()
-        )));
-        assert!(is_retryable(&StreamError::ApiError(
-            "504 Gateway Timeout".to_string()
-        )));
-        assert!(is_retryable(&StreamError::ApiError(
-            "529 Overloaded".to_string()
-        )));
+        assert!(is_retryable(&StreamError::ApiError {
+            status: Some(500),
+            message: "HTTP 500: Internal Server Error".to_string()
+        }));
+        assert!(is_retryable(&StreamError::ApiError {
+            status: Some(502),
+            message: "HTTP 502: Bad Gateway".to_string()
+        }));
+        assert!(is_retryable(&StreamError::ApiError {
+            status: Some(503),
+            message: "HTTP 503: Service Unavailable".to_string()
+        }));
+        assert!(is_retryable(&StreamError::ApiError {
+            status: Some(504),
+            message: "HTTP 504: Gateway Timeout".to_string()
+        }));
+        assert!(is_retryable(&StreamError::ApiError {
+            status: Some(529),
+            message: "HTTP 529: Overloaded".to_string()
+        }));
     }
 
     #[test]
     fn is_not_retryable_4xx_api_error() {
-        assert!(!is_retryable(&StreamError::ApiError(
-            "400 Bad Request".to_string()
-        )));
-        assert!(!is_retryable(&StreamError::ApiError(
-            "401 Unauthorized".to_string()
-        )));
-        assert!(!is_retryable(&StreamError::ApiError(
-            "404 Not Found".to_string()
-        )));
+        assert!(!is_retryable(&StreamError::ApiError {
+            status: Some(400),
+            message: "HTTP 400: Bad Request".to_string()
+        }));
+        assert!(!is_retryable(&StreamError::ApiError {
+            status: Some(401),
+            message: "HTTP 401: Unauthorized".to_string()
+        }));
+        assert!(!is_retryable(&StreamError::ApiError {
+            status: Some(404),
+            message: "HTTP 404: Not Found".to_string()
+        }));
     }
 
     #[test]
-    fn is_retryable_5xx_with_http_prefix() {
-        // 生产环境消息格式："HTTP {code}: {body}"
-        assert!(is_retryable(&StreamError::ApiError(
-            "HTTP 500: Internal Server Error".to_string()
-        )));
-        assert!(is_retryable(&StreamError::ApiError(
-            "HTTP 503: Service Unavailable".to_string()
-        )));
-    }
-
-    #[test]
-    fn is_not_retryable_4xx_with_5xx_in_body() {
-        // 状态码是 400 但 body 中包含 "500"，不应误判为可重试
-        assert!(!is_retryable(&StreamError::ApiError(
-            "HTTP 400: Error processing 500 items".to_string()
-        )));
+    fn is_not_retryable_api_error_without_status() {
+        // 协议层异常（无 HTTP 状态码）不可重试
+        assert!(!is_retryable(&StreamError::ApiError {
+            status: None,
+            message: "响应中无 choice".to_string()
+        }));
     }
 
     #[test]
@@ -277,8 +276,11 @@ mod tests {
 
     #[test]
     fn backoff_duration_5xx_api_error_has_headers() {
-        // 5xx ApiError 有响应头 → 上限 ~24.8天
-        let error = StreamError::ApiError("503 Service Unavailable".to_string());
+        // 5xx ApiError（带 HTTP 状态码）有响应头 → 上限 ~24.8天
+        let error = StreamError::ApiError {
+            status: Some(503),
+            message: "HTTP 503: Service Unavailable".to_string(),
+        };
         assert_eq!(
             backoff_duration(5, &error),
             std::time::Duration::from_millis(32000)

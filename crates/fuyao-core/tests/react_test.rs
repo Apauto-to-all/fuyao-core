@@ -293,7 +293,10 @@ async fn retry_no_retry_after_first_chunk() {
             _model: &str,
             _options: StreamOptions,
         ) -> Result<ChatResponse, StreamError> {
-            Err(StreamError::ApiError("mock: chat 不支持".to_string()))
+            Err(StreamError::ApiError {
+                status: None,
+                message: "mock: chat 不支持".to_string(),
+            })
         }
     }
 
@@ -374,7 +377,10 @@ async fn retry_emits_multiple_retry_events_under_persistent_error() {
             _model: &str,
             _options: StreamOptions,
         ) -> Result<ChatResponse, StreamError> {
-            Err(StreamError::ApiError("mock: chat 不支持".to_string()))
+            Err(StreamError::ApiError {
+                status: None,
+                message: "mock: chat 不支持".to_string(),
+            })
         }
     }
 

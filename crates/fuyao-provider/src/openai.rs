@@ -314,7 +314,10 @@ impl OpenAIProvider {
                 {
                     return StreamError::ContextOverflow;
                 }
-                StreamError::ApiError(format!("HTTP {status_code}: {body}"))
+                StreamError::ApiError {
+                    status: Some(status_code),
+                    message: format!("HTTP {status_code}: {body}"),
+                }
             }
         }
     }
@@ -754,11 +757,15 @@ impl Provider for OpenAIProvider {
             .map_err(|e| StreamError::StreamParseError(format!("非流式响应 JSON 解析失败: {e}")))?;
 
         // 提取第一个 choice
-        let choice = api_response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| StreamError::ApiError("响应中无 choice".to_string()))?;
+        let choice =
+            api_response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| StreamError::ApiError {
+                    status: None,
+                    message: "响应中无 choice".to_string(),
+                })?;
 
         // 解析 finish_reason
         let finish_reason = match choice.finish_reason.as_deref() {
@@ -1407,7 +1414,13 @@ mod tests {
     #[test]
     fn classify_http_error_generic() {
         let err = OpenAIProvider::classify_http_error(500, "internal server error");
-        assert!(matches!(err, StreamError::ApiError(_)));
+        assert!(matches!(
+            err,
+            StreamError::ApiError {
+                status: Some(500),
+                ..
+            }
+        ));
     }
 
     #[test]

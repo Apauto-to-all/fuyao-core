@@ -167,8 +167,14 @@ pub trait Provider: Send + Sync {
 /// 流式错误
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
-    #[error("API 请求失败: {0}")]
-    ApiError(String),
+    #[error("API 请求失败: {message}")]
+    ApiError {
+        /// HTTP 状态码。供程序精确判断可重试性。
+        /// 协议层异常（HTTP 200 但响应体异常）无对应状态码，为 None。
+        status: Option<u16>,
+        /// 人类可读错误描述（含 "HTTP {code}: " 前缀时与 status 对应），供日志/错误事件展示。
+        message: String,
+    },
     #[error("流式响应解析失败: {0}")]
     StreamParseError(String),
     #[error("连接超时")]

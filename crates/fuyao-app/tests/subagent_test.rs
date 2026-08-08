@@ -86,7 +86,10 @@ impl Provider for ScriptedProvider {
         _model: &str,
         _options: StreamOptions,
     ) -> Result<ChatResponse, StreamError> {
-        Err(StreamError::ApiError("mock: chat 不支持".into()))
+        Err(StreamError::ApiError {
+            status: None,
+            message: "mock: chat 不支持".into(),
+        })
     }
 }
 
