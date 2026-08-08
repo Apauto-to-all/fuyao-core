@@ -19,6 +19,9 @@ pub struct EditReplaceResult {
     /// 警告信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// 错误信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// 补丁模式结果

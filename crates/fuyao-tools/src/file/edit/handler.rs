@@ -15,7 +15,6 @@
 
 use crate::common::{self, resolve_path};
 use crate::file::edit::backend::{apply_replace, apply_v4a_patch};
-use crate::file::edit::types::{EditPatchResult, EditReplaceResult};
 use serde_json::Value;
 use std::path::Path;
 
@@ -86,16 +85,8 @@ fn patch_replace_handler(args: &Value, ctx: &fuyao_api::ToolCallContext) -> Stri
         return common::tool_error_with(err);
     }
 
-    let result_json = EditReplaceResult {
-        success: true,
-        path: result.path,
-        matches: result.matches,
-        diff: result.diff,
-        strategy: result.strategy,
-        warning: result.warning,
-    };
-
-    common::tool_result(serde_json::to_value(result_json).unwrap_or_default())
+    // 成功路径：result.error 必为 None，由 skip_serializing_if 自动省略
+    common::tool_result(serde_json::to_value(&result).unwrap_or_default())
 }
 
 /// patch 模式处理器
@@ -117,17 +108,7 @@ fn patch_v4a_handler(args: &Value, ctx: &fuyao_api::ToolCallContext) -> String {
     let ws_path = workspace.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     let result = apply_v4a_patch(patch_content, &ws_path, &task_id);
 
-    let result_json = EditPatchResult {
-        success: result.success,
-        files_modified: result.files_modified,
-        files_created: result.files_created,
-        files_deleted: result.files_deleted,
-        diff: result.diff,
-        warning: result.warning,
-        error: result.error,
-    };
-
-    common::tool_result(serde_json::to_value(result_json).unwrap_or_default())
+    common::tool_result(serde_json::to_value(&result).unwrap_or_default())
 }
 
 /// edit 工具入口，根据 mode 参数分发到 replace 或 patch 处理器
@@ -146,7 +127,7 @@ pub fn edit_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::file::edit::types::{EditPatchResult, EditReplaceResult};
 
     #[test]
     fn edit_replace_result_serializes_all_fields() {
@@ -157,6 +138,7 @@ mod tests {
             diff: "--- a\n+++ b".to_string(),
             strategy: None,
             warning: None,
+            error: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["success"], true);
@@ -176,6 +158,7 @@ mod tests {
             diff: "".to_string(),
             strategy: Some("fuzzy".to_string()),
             warning: Some("模糊匹配".to_string()),
+            error: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["strategy"], "fuzzy");

@@ -21,32 +21,11 @@ use crate::file::edit::patch::{OperationType, PatchOperation, parse_v4a_patch};
 use crate::file::edit::textutil::{
     detect_line_ending, join_bom, normalize_line_endings, split_bom, trim_common_indent,
 };
+use crate::file::edit::types::{EditPatchResult, EditReplaceResult};
 use crate::file::safety::check_sensitive_path;
 use crate::file::tracker::{check_file_staleness, update_read_timestamp};
 use similar::TextDiff;
 use std::path::Path;
-
-/// 替换操作结果
-pub struct EditReplaceResult {
-    pub success: bool,
-    pub path: String,
-    pub matches: usize,
-    pub strategy: Option<String>,
-    pub diff: String,
-    pub warning: Option<String>,
-    pub error: Option<String>,
-}
-
-/// V4A 补丁结果
-pub struct EditPatchResult {
-    pub success: bool,
-    pub files_modified: Vec<String>,
-    pub files_created: Vec<String>,
-    pub files_deleted: Vec<String>,
-    pub diff: String,
-    pub warning: Option<String>,
-    pub error: Option<String>,
-}
 
 /// 应用替换操作
 ///
