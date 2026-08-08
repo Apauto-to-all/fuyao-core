@@ -5,15 +5,21 @@
 use fuyao_api::{LINKED_SUBDIRS, SkillDefinition};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// frontmatter 分隔解析正则
+///
+/// 模式为编译期常量，提升为进程级静态量只编译一次，避免每次解析 SKILL.md 重复编译。
+static FRONTMATTER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?s)^---\s*\n(.*?)\n?---\s*\n(.*)$").expect("无效的 frontmatter 正则")
+});
 
 /// 解析 SKILL.md 内容
 ///
 /// 解析 frontmatter（--- 分隔的 YAML 头部）和 body。
 /// 缺失字段用空字符串填充，后续在 loader 中处理 fallback。
 pub fn parse_skill_frontmatter(content: &str) -> SkillDefinition {
-    let pattern = regex::Regex::new(r"(?s)^---\s*\n(.*?)\n?---\s*\n(.*)$").unwrap();
-
-    let (frontmatter, body) = if let Some(caps) = pattern.captures(content) {
+    let (frontmatter, body) = if let Some(caps) = FRONTMATTER_RE.captures(content) {
         let fm_str = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let body = caps
             .get(2)

@@ -8,6 +8,14 @@ use fuyao_api::AgentPaths;
 use fuyao_api::{AgentDefinition, AgentMode};
 use regex::Regex;
 use std::path::Path;
+use std::sync::LazyLock;
+
+/// frontmatter 分隔解析正则
+///
+/// 模式为编译期常量，提升为进程级静态量只编译一次，避免每次解析定义文件重复编译。
+static FRONTMATTER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)^---\s*\n(.*?)\n?---\s*\n(.*)$").expect("无效的 frontmatter 正则")
+});
 
 /// 从定义文件（`agents/*.md`）加载 Agent 定义
 ///
@@ -137,9 +145,7 @@ pub fn load_agent_definition_from_agent_paths(
 ///
 /// 返回 `(metadata_dict, body_content)`，如果没有 frontmatter 返回空 HashMap。
 fn parse_frontmatter(content: &str) -> (serde_yaml::Mapping, String) {
-    let pattern = Regex::new(r"(?s)^---\s*\n(.*?)\n?---\s*\n(.*)$").unwrap();
-
-    if let Some(caps) = pattern.captures(content) {
+    if let Some(caps) = FRONTMATTER_RE.captures(content) {
         let fm_str = caps.get(1).map(|m| m.as_str()).unwrap_or("");
         let body = caps
             .get(2)

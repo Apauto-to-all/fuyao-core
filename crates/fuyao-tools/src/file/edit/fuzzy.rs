@@ -29,7 +29,13 @@
 
 use regex::Regex;
 use similar::TextDiff;
+use std::sync::LazyLock;
 use unicode_normalization::UnicodeNormalization;
+
+/// 策略 4 用的连续空白归一化正则
+///
+/// 模式为编译期常量，提升为进程级静态量只编译一次，避免每次模糊匹配重复编译。
+static WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").expect("无效的空白正则"));
 
 /// 一次匹配：原始 content 中的字节偏移与匹配段的字节长度
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,8 +338,7 @@ fn strategy_line_trimmed(content: &str, pattern: &str) -> Vec<Match> {
 ///
 /// 将多个空格/制表符合并为单个空格，适用于格式化差异。
 fn strategy_whitespace_normalized(content: &str, pattern: &str) -> Vec<Match> {
-    let ws_re = Regex::new(r"[ \t]+").unwrap();
-    let normalize = |s: &str| ws_re.replace_all(s, " ").to_string();
+    let normalize = |s: &str| WS_RE.replace_all(s, " ").to_string();
 
     let content_normalized = normalize(content);
     let pattern_normalized = normalize(pattern);

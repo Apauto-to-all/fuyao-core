@@ -25,6 +25,27 @@
 //! - **Move**: 移动/重命名文件
 
 use regex::Regex;
+use std::sync::LazyLock;
+
+/// V4A 补丁解析用到的全部正则
+///
+/// 五条模式均为编译期常量字面量，聚合为进程级静态量只编译一次，
+/// 避免每次 `parse_v4a_patch` 调用都重复编译。
+struct PatchRegexes {
+    update: Regex,
+    add: Regex,
+    delete: Regex,
+    mv: Regex,
+    hint: Regex,
+}
+
+static RES: LazyLock<PatchRegexes> = LazyLock::new(|| PatchRegexes {
+    update: Regex::new(r"^\*\*\*\s*Update\s+File:\s*(.+)").expect("无效 Update 正则"),
+    add: Regex::new(r"^\*\*\*\s*Add\s+File:\s*(.+)").expect("无效 Add 正则"),
+    delete: Regex::new(r"^\*\*\*\s*Delete\s+File:\s*(.+)").expect("无效 Delete 正则"),
+    mv: Regex::new(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)").expect("无效 Move 正则"),
+    hint: Regex::new(r"^@@\s*(.+?)\s*@@").expect("无效 hint 正则"),
+});
 
 /// 补丁操作类型
 #[derive(Debug, Clone, PartialEq)]
@@ -91,17 +112,11 @@ pub fn parse_v4a_patch(patch_content: &str) -> (Vec<PatchOperation>, Option<Stri
         None => lines.len(),
     };
 
-    let update_re = Regex::new(r"^\*\*\*\s*Update\s+File:\s*(.+)").unwrap();
-    let add_re = Regex::new(r"^\*\*\*\s*Add\s+File:\s*(.+)").unwrap();
-    let delete_re = Regex::new(r"^\*\*\*\s*Delete\s+File:\s*(.+)").unwrap();
-    let move_re = Regex::new(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)").unwrap();
-    let hint_re = Regex::new(r"^@@\s*(.+?)\s*@@").unwrap();
-
     let mut current_op: Option<PatchOperation> = None;
     let mut current_hunk: Option<Hunk> = None;
 
     for line in lines.iter().take(end).skip(start) {
-        if let Some(caps) = update_re.captures(line) {
+        if let Some(caps) = RES.update.captures(line) {
             if let Some(op) = current_op.take() {
                 current_op = Some(finalize_op(op, &mut current_hunk));
                 operations.push(current_op.take().unwrap());
@@ -113,7 +128,7 @@ pub fn parse_v4a_patch(patch_content: &str) -> (Vec<PatchOperation>, Option<Stri
                 hunks: Vec::new(),
             });
             current_hunk = None;
-        } else if let Some(caps) = add_re.captures(line) {
+        } else if let Some(caps) = RES.add.captures(line) {
             if let Some(op) = current_op.take() {
                 current_op = Some(finalize_op(op, &mut current_hunk));
                 operations.push(current_op.take().unwrap());
@@ -128,7 +143,7 @@ pub fn parse_v4a_patch(patch_content: &str) -> (Vec<PatchOperation>, Option<Stri
                 context_hint: None,
                 lines: Vec::new(),
             });
-        } else if let Some(caps) = delete_re.captures(line) {
+        } else if let Some(caps) = RES.delete.captures(line) {
             if let Some(op) = current_op.take() {
                 current_op = Some(finalize_op(op, &mut current_hunk));
                 operations.push(current_op.take().unwrap());
@@ -142,7 +157,7 @@ pub fn parse_v4a_patch(patch_content: &str) -> (Vec<PatchOperation>, Option<Stri
             operations.push(current_op.take().unwrap());
             current_op = None;
             current_hunk = None;
-        } else if let Some(caps) = move_re.captures(line) {
+        } else if let Some(caps) = RES.mv.captures(line) {
             if let Some(op) = current_op.take() {
                 current_op = Some(finalize_op(op, &mut current_hunk));
                 operations.push(current_op.take().unwrap());
@@ -164,7 +179,7 @@ pub fn parse_v4a_patch(patch_content: &str) -> (Vec<PatchOperation>, Option<Stri
                 {
                     op.hunks.push(hunk);
                 }
-                let hint = hint_re.captures(line).map(|caps| caps[1].to_string());
+                let hint = RES.hint.captures(line).map(|caps| caps[1].to_string());
                 current_hunk = Some(Hunk {
                     context_hint: hint,
                     lines: Vec::new(),

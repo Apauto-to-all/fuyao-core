@@ -3,8 +3,33 @@
 //! 环境变量过滤、错误信息脱敏、Schema 标准化。
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use regex::Regex;
+
+/// 错误脱敏与名称归一化用到的正则
+///
+/// 两条模式均为编译期常量字面量，聚合为进程级静态量只编译一次，
+/// 避免每次 `sanitize_error` / `sanitize_mcp_name_component` 调用都重复编译。
+struct SanitizeRegexes {
+    cred: Regex,
+    ident: Regex,
+}
+
+static RES: LazyLock<SanitizeRegexes> = LazyLock::new(|| SanitizeRegexes {
+    cred: Regex::new(concat!(
+        r"(?i)(?:ghp_[A-Za-z0-9_]{1,255}",
+        r"|sk-[A-Za-z0-9_]{1,255}",
+        r"|Bearer\s+\S+",
+        r"|token=[^\s&,;]{1,255}",
+        r"|key=[^\s&,;]{1,255}",
+        r"|API_KEY=[^\s&,;]{1,255}",
+        r"|password=[^\s&,;]{1,255}",
+        r"|secret=[^\s&,;]{1,255})",
+    ))
+    .expect("凭证脱敏正则编译失败"),
+    ident: Regex::new(r"[^A-Za-z0-9_]").expect("标识符正则编译失败"),
+});
 
 /// 安全的环境变量 key 集合
 const SAFE_ENV_KEYS: &[&str] = &[
@@ -53,27 +78,14 @@ pub fn build_safe_env(user_env: Option<&HashMap<String, String>>) -> HashMap<Str
 ///
 /// 替换常见的 token、key、password 等敏感信息为 `[REDACTED]`。
 pub fn sanitize_error(text: &str) -> String {
-    let pattern = Regex::new(concat!(
-        r"(?i)(?:ghp_[A-Za-z0-9_]{1,255}",
-        r"|sk-[A-Za-z0-9_]{1,255}",
-        r"|Bearer\s+\S+",
-        r"|token=[^\s&,;]{1,255}",
-        r"|key=[^\s&,;]{1,255}",
-        r"|API_KEY=[^\s&,;]{1,255}",
-        r"|password=[^\s&,;]{1,255}",
-        r"|secret=[^\s&,;]{1,255})",
-    ))
-    .expect("正则表达式编译失败");
-
-    pattern.replace_all(text, "[REDACTED]").into_owned()
+    RES.cred.replace_all(text, "[REDACTED]").into_owned()
 }
 
 /// 将 MCP 名称组件转为安全的标识符
 ///
 /// 连字符、点号等非字母数字字符替换为下划线。
 pub fn sanitize_mcp_name_component(value: &str) -> String {
-    let re = Regex::new(r"[^A-Za-z0-9_]").expect("正则表达式编译失败");
-    re.replace_all(value, "_").into_owned()
+    RES.ident.replace_all(value, "_").into_owned()
 }
 
 /// 完整版 Schema 标准化
