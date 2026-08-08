@@ -607,7 +607,16 @@ async fn run_compression(
     let _ = (&mut delta_consumer).await;
 
     // 落地层：写 compaction 边界消息（不复制 keep_recent——可见窗口在读取侧动态拼接）
-    match fuyao_session::apply(&summary, ctx.emitter.session_id(), ctx.store.as_ref()).await {
+    // reason 透传给 mark_compaction，保证 DB 审计列（tool_name）与 Started/Ended 事件 reason 一致
+    match ctx
+        .store
+        .mark_compaction(
+            ctx.emitter.session_id(),
+            summary.content.clone(),
+            reason.into(),
+        )
+        .await
+    {
         Ok(new_seq) => {
             // 重建 system_prompt：build_system_prompt 纯本地拼接（不调 LLM），
             // 保证旧 system 中残留的动态内容（如"基于刚才的 X 错误继续排查"）在

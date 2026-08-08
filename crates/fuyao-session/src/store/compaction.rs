@@ -36,6 +36,18 @@ impl CompressionReason {
     }
 }
 
+/// 从事件层枚举转换：事件层 `fuyao_api::message::output::CompressionReason` 与本持久层枚举同构，
+/// 由消费方（fuyao-core）在落库时 `.into()` 转换，保证 DB 审计列与 Started/Ended 事件 reason 一致
+impl From<fuyao_api::message::output::CompressionReason> for CompressionReason {
+    fn from(reason: fuyao_api::message::output::CompressionReason) -> Self {
+        match reason {
+            fuyao_api::message::output::CompressionReason::Auto => Self::Auto,
+            fuyao_api::message::output::CompressionReason::Manual => Self::Manual,
+            fuyao_api::message::output::CompressionReason::Overflow => Self::Overflow,
+        }
+    }
+}
+
 impl super::SessionStore {
     /// 标记一次压缩完成
     ///
