@@ -65,7 +65,7 @@ rmcp = { version = "1", features = [
 ] }
 # 日志依赖
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 tracing-appender = "0.2"
 # 图片入站节流（normalize：解码/缩放/编码）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }

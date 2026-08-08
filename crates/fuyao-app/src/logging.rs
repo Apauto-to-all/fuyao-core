@@ -11,7 +11,15 @@ use std::io;
 use fuyao_api::{AgentPaths, LogRotation, LoggingConfig};
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_appender::rolling::RollingFileAppender;
-use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, layer::SubscriberExt};
+use tracing_subscriber::{
+    EnvFilter, Layer, Registry, fmt, fmt::time::ChronoLocal, layer::SubscriberExt,
+};
+
+/// core 引擎专属日志文件名前缀（滚动 appender 用）
+///
+/// 与应用壳 fuyao-code 的 `fuyao-code` 前缀对称：core 独立运行/测试时用本前缀，
+/// 集成到 fuyao-code 时全局 subscriber 由 code 接管，日志统一落 `fuyao-code.log`。
+const LOG_FILE_PREFIX: &str = "fuyao-core";
 
 /// 日志 guard —— 持有 non-blocking 文件写入器的工作线程句柄
 ///
@@ -44,6 +52,9 @@ pub fn init_logging(config: &LoggingConfig, agent_paths: &AgentPaths) -> LogGuar
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
 
+    // 本地时区计时器：用用户当地时区显示日志时间（替代默认的 UTC SystemTime）
+    let timer = ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string());
+
     let mut file_guard: Option<WorkerGuard> = None;
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
 
@@ -55,6 +66,7 @@ pub fn init_logging(config: &LoggingConfig, agent_paths: &AgentPaths) -> LogGuar
                 fmt::layer()
                     .with_writer(writer)
                     .with_ansi(false) // 文件不要 ANSI 颜色码
+                    .with_timer(timer.clone())
                     .with_filter(filter.clone()),
             ));
         }
@@ -70,6 +82,7 @@ pub fn init_logging(config: &LoggingConfig, agent_paths: &AgentPaths) -> LogGuar
             fmt::layer()
                 .with_writer(io::stderr)
                 .with_ansi(true)
+                .with_timer(timer)
                 .with_filter(filter),
         ));
     }
@@ -92,7 +105,7 @@ fn make_file_writer(
 
     let appender = RollingFileAppender::builder()
         .rotation(to_appender_rotation(rotation))
-        .filename_prefix("fuyao")
+        .filename_prefix(LOG_FILE_PREFIX)
         .filename_suffix("log")
         .build(&dir)
         .map_err(io::Error::other)?;
