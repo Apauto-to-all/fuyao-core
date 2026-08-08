@@ -29,6 +29,9 @@ mod todo;
 mod visible_window;
 mod window;
 
+// 回退结果的领域类型对外导出（供消费方 fuyao-core 投影成 wire 载荷）
+pub use rollback::RollbackResult;
+
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};
 use sqlx::SqlitePool;

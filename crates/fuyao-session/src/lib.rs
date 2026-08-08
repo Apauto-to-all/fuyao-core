@@ -26,5 +26,5 @@ mod title_generator;
 pub use compressor::{apply, generate_summary, should_compress};
 pub use cost::{calculate_cost, fill_message_cost};
 pub use error::SessionError;
-pub use store::SessionStore;
+pub use store::{RollbackResult, SessionStore};
 pub use title_generator::maybe_generate_title;

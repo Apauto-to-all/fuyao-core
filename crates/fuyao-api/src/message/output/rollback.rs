@@ -8,16 +8,13 @@
 //! 事件经统一消息处理管道（dispatch）发送：可被 output_intercept 钩子拦截改写，
 //! 也会触发 output_observe 钩子（如审计日志）。
 //!
-//! # payload 的双重消费者
+//! # 载荷来源
 //!
-//! `RollbackPayload` 既是输出事件的载荷，也是 store 层 `rollback_to` 的返回类型——
-//! 一处定义，store 产出（单事务内重算好全部字段）+ engine 包装成 `RollbackMessage`
-//! 发出，两端复用。回退发起方（如活跃 session 回退的 `handle_control` 分支）还可
-//! 拿 payload 里的状态刷新字段就地刷新内存 session 对象，避免后续 persist 全量写回时
-//! 把旧值盖回去。
+//! 持久化层（`fuyao_session::RollbackResult`）只陈述回退的领域事实；本 payload 是
+//! 它的 wire 投影——由回退发起方（`fuyao-core` 的 `run_rollback`）按「目标消息将作为
+//! 新 guide 重新发送」补上 `mode`/`source`，包装成 `RollbackMessage`（补 envelope）发出。
 
 use crate::message::EventBase;
-use crate::message::input::{UserMessageMode, UserMessageSource};
 use crate::message::output::UserPayload;
 
 /// 对话回退事件 envelope
@@ -80,24 +77,6 @@ pub struct RollbackPayload {
     pub last_compacted_seq: Option<i64>,
     /// 重算后的压缩次数（刷内存 session 用）
     pub compression_count: i32,
-}
-
-impl RollbackPayload {
-    /// 从目标 user 消息构造填输入框用的 `UserPayload`
-    ///
-    /// 供 store 层构造返回值用——回退后用户重新编辑发送时，它就是一条新的 guide 消息，
-    /// 故 mode 取 `Guide`、source 取 `User`（原消息的 mode/source 语义已不适用）。
-    pub fn user_payload_from(
-        content: Option<String>,
-        images: Vec<crate::ImageContent>,
-    ) -> UserPayload {
-        UserPayload {
-            content: content.unwrap_or_default(),
-            images,
-            mode: UserMessageMode::Guide,
-            source: UserMessageSource::User,
-        }
-    }
 }
 
 #[cfg(test)]

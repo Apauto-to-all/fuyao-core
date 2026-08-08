@@ -31,15 +31,64 @@
 //!
 //! # 单事务原子
 //!
-//! 全部步骤在一个 SQLite 事务内完成，避免中途失败留下脏状态。返回 [`RollbackPayload`]，
-//! 供回退发起方（如活跃 session 回退的 `handle_control` 分支）就地刷新内存 session 对象，
-//! 无需从 DB 重新 load；回退发起方把 payload 包装成 `RollbackMessage`（补 envelope）
-//! 经统一消息管道发出，即为对外的 `OutputEvent::Rollback`。
+//! 全部步骤在一个 SQLite 事务内完成，避免中途失败留下脏状态。返回 [`RollbackResult`]——
+//! 持久化层只陈述「删了什么、重算成什么」的领域事实；把它投影成对外事件载荷
+//! （`RollbackPayload` + `UserPayload`，含 mode/source 等应用语义）是消费方
+//! （如活跃 session 回退的 `handle_control` → `run_rollback`）的职责。
 
 use super::row::MessageRow;
 use crate::error::SessionError;
+use fuyao_api::Message;
 use fuyao_api::MessageKind;
-use fuyao_api::message::output::RollbackPayload;
+
+/// 回退执行结果（领域类型）
+///
+/// 单事务原子执行后产出。持久化层只负责陈述事实——「目标锚点」「删除计数」「目标消息本体」
+/// 「重算后的状态字段」——不含任何 wire 投影语义（如 `mode`/`source`）。
+///
+/// # 投影约定
+///
+/// 消费方（`fuyao-core` 的回退发起路径）据此投影成对外事件载荷：
+/// - 7 个标量字段 1:1 拷贝进 `RollbackPayload`
+/// - `target_message: Option<Message>` → `Option<UserPayload>`：取 content/images，
+///   按「回退后目标消息将作为新 guide 重新发送」补 `mode=Guide` / `source=User`
+///
+/// 这种领域结果与 wire 载荷的分层，使持久化层不依赖任何 output 事件类型——依赖方向保持
+/// `fuyao-session → fuyao-api(domain: Message)`，正向。
+#[derive(Debug, Clone)]
+pub struct RollbackResult {
+    /// 回退到的目标 seq（位置锚点）
+    ///
+    /// 回退后它是当前最新消息的 seq。上层据此定位「现在在哪」，后续一切操作
+    /// （可见窗口、继续对话）都以它为起点。
+    pub target_seq: i64,
+    /// 删除的「用户消息数 + 压缩消息数」
+    ///
+    /// 界面通知用——「已回退 N 条消息」对用户有意义的口径是「撤了几轮对话 + 撤了几次压缩」，
+    /// 不含附属的 assistant / tool 响应。
+    pub deleted_count: i64,
+    /// 删除的全部消息数（含 assistant / tool）
+    ///
+    /// 审计 / 前端备用。回退会删目标 seq 之后的所有消息（含中间态），总数与
+    /// `deleted_count` 的差就是被一并清理的 assistant / tool 消息数。
+    pub deleted_total: i64,
+    /// 目标消息本体（完整领域形态）
+    ///
+    /// - 目标是 user 消息 → `Some`，含 content + images（消费方据此填输入框）
+    /// - 目标是 compaction 消息 → `None`，压缩摘要不填输入框
+    pub target_message: Option<Message>,
+    /// 重算后的消息总数
+    pub message_count: i64,
+    /// 重算后的工具调用总数
+    pub tool_call_count: i64,
+    /// 重算后的最新压缩边界 seq
+    ///
+    /// 回退跨压缩边界时会变：若删掉了所有 compaction 消息，置 `None`（从未压缩）；
+    /// 否则落到剩余消息里最新一条 compaction 消息的 seq。
+    pub last_compacted_seq: Option<i64>,
+    /// 重算后的压缩次数
+    pub compression_count: i32,
+}
 
 impl super::SessionStore {
     /// 把会话回退到目标消息（删目标 seq 之后的所有消息 + 重算 count 类与压缩元数据）
@@ -57,9 +106,9 @@ impl super::SessionStore {
     /// - `target_seq`:回退目标消息的 seq（目标本身保留，删它之后的）
     ///
     /// # 返回
-    /// [`RollbackPayload`]，含锚点 seq、删除计数（界面通知用）、目标消息本体
-    /// （user→Some 填输入框 / compaction→None）、重算后的 4 个状态字段（刷内存用）。
-    /// 回退发起方把 payload 包装成 `RollbackMessage`（补 envelope）发出，即为
+    /// [`RollbackResult`]，含锚点 seq、删除计数（界面通知用）、目标消息本体
+    /// （user→Some 含 content+images / compaction→None）、重算后的 4 个状态字段。
+    /// 消费方据此投影成 `RollbackMessage`（补 envelope + wire 投影）发出，即为
     /// `OutputEvent::Rollback`。
     ///
     /// # 错误
@@ -69,7 +118,7 @@ impl super::SessionStore {
         &self,
         session_id: &str,
         target_seq: i64,
-    ) -> Result<RollbackPayload, SessionError> {
+    ) -> Result<RollbackResult, SessionError> {
         let mut tx = self.pool.begin().await?;
 
         // 1. 校验 session 存在（避免给不存在的 session 操作）
@@ -111,29 +160,13 @@ impl super::SessionStore {
             )));
         }
 
-        // 目标是 user 消息：构造完整的 UserPayload 供前端填输入框（content + images 整体）
-        // 目标是 compaction 消息：不填输入框，target_message 置 None
-        let target_message: Option<fuyao_api::message::output::UserPayload> =
-            if is_user {
-                // images 在 DB 存 JSON 数组（[{mime_type, data}]），反序列化回 Vec
-                let images = target_row
-                .images
-                .as_deref()
-                .and_then(|s| match serde_json::from_str::<Vec<fuyao_api::ImageContent>>(s) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        tracing::warn!(cause = %e, "target images 反序列化失败，按空列表处理");
-                        None
-                    }
-                })
-                .unwrap_or_default();
-                Some(RollbackPayload::user_payload_from(
-                    target_row.content,
-                    images,
-                ))
-            } else {
-                None
-            };
+        // 目标消息本体（领域形态）：user → Some（含 content+images，复用 MessageRow 转换，
+        // images 反序列化由 row 层统一负责）；compaction → None（摘要不填输入框）
+        let target_message: Option<Message> = if is_user {
+            Some(target_row.into())
+        } else {
+            None
+        };
 
         // 3. 统计待删范围（seq > target）的分类计数
         //    deleted_count = user 消息数 + compaction 消息数（界面通知口径，不含 assistant/tool）
@@ -223,7 +256,7 @@ impl super::SessionStore {
             "对话已回退到目标消息"
         );
 
-        Ok(RollbackPayload {
+        Ok(RollbackResult {
             target_seq,
             deleted_count,
             deleted_total,
@@ -306,7 +339,11 @@ mod tests {
             .target_message
             .as_ref()
             .expect("user 目标应有 target_message");
-        assert_eq!(target.content, "u2", "user 目标 → content = u2");
+        assert_eq!(
+            target.content.as_deref(),
+            Some("u2"),
+            "user 目标 → content = u2"
+        );
         assert!(target.images.is_empty());
 
         // message_count 重算：剩余 u1, a1, u2 → 4 条里 3 条是 message kind
@@ -587,7 +624,7 @@ mod tests {
             .target_message
             .as_ref()
             .expect("user 目标应有 target_message");
-        assert_eq!(target.content, "u1");
+        assert_eq!(target.content.as_deref(), Some("u1"));
         assert!(target.images.is_empty());
     }
 
@@ -613,7 +650,7 @@ mod tests {
             .target_message
             .as_ref()
             .expect("user 目标应有 target_message");
-        assert_eq!(target.content, "看图");
+        assert_eq!(target.content.as_deref(), Some("看图"));
         assert_eq!(target.images, vec![img], "images 应完整保留");
     }
 }
