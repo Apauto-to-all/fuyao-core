@@ -17,6 +17,20 @@ fn test_paths() -> AgentPaths {
     AgentPaths::default()
 }
 
+/// 构造测试用 ToolExecCtx（默认无 subagent_ops / todo_store，event_forwarder 取 emitter 派生）
+fn test_ctx(tools: Arc<ToolRegistry>) -> ToolExecCtx {
+    let emitter = test_emitter();
+    ToolExecCtx {
+        tools,
+        agent_paths: test_paths(),
+        event_forwarder: Some(emitter.tx_clone()),
+        emitter,
+        cancel: CancellationToken::new(),
+        subagent_ops: None,
+        todo_store: None,
+    }
+}
+
 /// 构造一个 handler 恒返回固定串的工具条目
 fn fixed_result_tool(name: &str, result: &str) -> ToolEntry {
     let result = result.to_string();
@@ -85,18 +99,9 @@ async fn collect_results(
 #[tokio::test]
 async fn execute_single_unknown_tool() {
     let tools = Arc::new(ToolRegistryBuilder::default().build());
+    let ctx = test_ctx(tools);
     let tc = make_tool_call("1", "unknown_tool", "{}");
-    let result = execute_single(
-        &tc,
-        &tools,
-        &test_paths(),
-        "s1",
-        &CancellationToken::new(),
-        None,
-        None,
-        None,
-    )
-    .await;
+    let result = execute_single(&tc, &ctx).await;
     assert_eq!(result.tool_name, "unknown_tool");
     assert!(result.content.contains("未知工具"));
 }
@@ -108,18 +113,9 @@ async fn execute_single_known_tool() {
             .register(fixed_result_tool("test_tool", "tool result"))
             .build(),
     );
+    let ctx = test_ctx(tools);
     let tc = make_tool_call("1", "test_tool", r#"{"key":"value"}"#);
-    let result = execute_single(
-        &tc,
-        &tools,
-        &test_paths(),
-        "s1",
-        &CancellationToken::new(),
-        None,
-        None,
-        None,
-    )
-    .await;
+    let result = execute_single(&tc, &ctx).await;
     assert_eq!(result.content, "tool result");
 }
 
@@ -133,21 +129,11 @@ async fn single_call_goes_sequential() {
             .register(echo_name_tool("read"))
             .build(),
     );
-    let emitter = test_emitter();
+    let ctx = test_ctx(tools);
     let calls = vec![make_tool_call("1", "read", r#"{"name":"a"}"#)];
     let (tx, mut rx) = mpsc::channel(8);
 
-    execute_tools(
-        &calls,
-        &tools,
-        &test_paths(),
-        &emitter,
-        &tx,
-        &CancellationToken::new(),
-        None,
-        None,
-    )
-    .await;
+    execute_tools(&calls, &tx, &ctx).await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     assert_eq!(results.len(), 1);
@@ -162,24 +148,14 @@ async fn never_parallel_tool_goes_sequential() {
             .register(echo_name_tool("bash"))
             .build(),
     );
-    let emitter = test_emitter();
+    let ctx = test_ctx(tools);
     let calls = vec![
         make_tool_call("1", "bash", r#"{"name":"a"}"#),
         make_tool_call("2", "bash", r#"{"name":"b"}"#),
     ];
     let (tx, mut rx) = mpsc::channel(8);
 
-    execute_tools(
-        &calls,
-        &tools,
-        &test_paths(),
-        &emitter,
-        &tx,
-        &CancellationToken::new(),
-        None,
-        None,
-    )
-    .await;
+    execute_tools(&calls, &tx, &ctx).await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     // 串行：结果按提交序
@@ -199,7 +175,7 @@ async fn parallel_executes_all() {
             .register(echo_name_tool("grep"))
             .build(),
     );
-    let emitter = test_emitter();
+    let ctx = test_ctx(tools);
     let calls = vec![
         make_tool_call("1", "glob", r#"{"name":"a"}"#),
         make_tool_call("2", "grep", r#"{"name":"b"}"#),
@@ -207,17 +183,7 @@ async fn parallel_executes_all() {
     ];
     let (tx, mut rx) = mpsc::channel(16);
 
-    execute_tools(
-        &calls,
-        &tools,
-        &test_paths(),
-        &emitter,
-        &tx,
-        &CancellationToken::new(),
-        None,
-        None,
-    )
-    .await;
+    execute_tools(&calls, &tx, &ctx).await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     assert_eq!(results.len(), 3);
@@ -235,7 +201,7 @@ async fn parallel_respects_max_concurrent() {
             .register(echo_name_tool("glob"))
             .build(),
     );
-    let emitter = test_emitter();
+    let ctx = test_ctx(tools);
     let calls: Vec<_> = (0..10)
         .map(|i| make_tool_call(&i.to_string(), "glob", &format!(r#"{{"name":"{i}"}}"#)))
         .collect();
@@ -245,19 +211,7 @@ async fn parallel_respects_max_concurrent() {
         max_concurrent: 1,
         ..Default::default()
     };
-    execute_parallel(
-        &calls,
-        &tools,
-        &test_paths(),
-        &emitter,
-        &tx,
-        &config,
-        &CancellationToken::new(),
-        None,
-        None,
-        None,
-    )
-    .await;
+    execute_parallel(&calls, &tx, &ctx, &config).await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
 
     assert_eq!(results.len(), 10);
@@ -271,7 +225,7 @@ async fn parallel_notify_count_matches_calls() {
             .register(echo_name_tool("glob"))
             .build(),
     );
-    let emitter = test_emitter();
+    let ctx = test_ctx(tools);
     let calls = vec![
         make_tool_call("1", "glob", r#"{"name":"a"}"#),
         make_tool_call("2", "glob", r#"{"name":"b"}"#),
@@ -280,17 +234,7 @@ async fn parallel_notify_count_matches_calls() {
     let expected = calls.len();
     let (tx, mut rx) = mpsc::channel(expected);
 
-    execute_tools(
-        &calls,
-        &tools,
-        &test_paths(),
-        &emitter,
-        &tx,
-        &CancellationToken::new(),
-        None,
-        None,
-    )
-    .await;
+    execute_tools(&calls, &tx, &ctx).await;
     let results = collect_results(&tx, &mut rx, expected).await;
 
     assert_eq!(results.len(), expected, "通知次数应等于工具调用数");

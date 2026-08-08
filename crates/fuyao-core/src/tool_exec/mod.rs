@@ -29,11 +29,11 @@ mod parallel;
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::{CancellationToken, TodoStoreOps, ToolCallContext};
+use fuyao_api::{CancellationToken, SubagentOps, TodoStoreOps, ToolCallContext};
 use fuyao_provider::ToolCallData;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::Semaphore;
-use tokio::sync::mpsc::{Sender, UnboundedSender};
+use tokio::sync::mpsc::Sender;
 use tokio::task::JoinSet;
 
 /// 单个工具执行的结果
@@ -46,6 +46,44 @@ pub(crate) struct ToolExecResult {
     pub content: String,
 }
 
+/// 工具执行上下文（session 级注入句柄聚合）
+///
+/// 聚合单次 `execute_tools` 调用期间不变的 6 个注入句柄，避免
+/// `execute_tools → execute_parallel/sequential → execute_single` 三层
+/// 穿透同一组参数包（此前 4 处 `#[allow(too_many_arguments)]` 的根因）。
+///
+/// 设计与 [`crate::react::SessionCtx`] 一脉相承——后者聚合 turn 级依赖，
+/// 本结构聚合工具执行级依赖。区别在于：本结构是 **owned + Clone**，
+/// 因为 `execute_parallel` 要 spawn `'static` task，每个 task 各持一份克隆。
+/// 其中 `Weak` / `Arc` / `UnboundedSender` / `Emitter` 均廉价可克隆。
+///
+/// **不在本结构中的逐次参数**：
+/// - `tool_calls: &[ToolCallData]`——业务数据，每次调用不同，仍作 `execute_tools` 参数
+/// - `result_tx: &Sender<ToolExecResult>`——每次调用新建的 mpsc，仍作参数
+/// - `config: &ToolRunnerConfig`——仅并行路径用，在 `execute_tools` 入口读一次即用
+#[derive(Clone)]
+pub(crate) struct ToolExecCtx {
+    /// 工具注册表（引擎级共享，session 间不变）
+    /// 字段值克隆廉价，spawn 并行 task 时整结构 clone 一份
+    pub tools: Arc<ToolRegistry>,
+    /// 当前 session 的 Agent 三层目录身份证明
+    pub agent_paths: fuyao_api::AgentPaths,
+    /// 当前 session 的事件发射器（`execute_single` 取 `session_id()` 构造 `ToolCallContext`）
+    pub emitter: Emitter,
+    /// 本次工具批次的中断信号（每次 `execute_tools` 由调用方 `child_token()` 派生）
+    pub cancel: CancellationToken,
+    /// 引擎派生子 session 的能力弱引用（注入工具 ctx，子代理类工具用）
+    pub subagent_ops: Option<Weak<dyn SubagentOps>>,
+    /// 父 session 出站通道的直送克隆（不盖 session_id 标签）
+    ///
+    /// emitter 的派生物：构造 ctx 时由 `emitter.tx_clone()` 生成一次，
+    /// `execute_single` 直接塞进 `ToolCallContext`。子事件已自带 child session_id，
+    /// 不能被父 emitter 的 stamp 覆盖，故用 raw sender。
+    pub event_forwarder: Option<tokio::sync::mpsc::UnboundedSender<OutputEvent>>,
+    /// 任务列表存储能力强引用（注入工具 ctx，todo 工具用）
+    pub todo_store: Option<Arc<dyn TodoStoreOps>>,
+}
+
 /// 执行一批工具调用（智能调度：能并行则并行，否则串行）
 ///
 /// 空批次直接返回。否则读 `[tools.runner]` 配置，`should_parallelize` 判定走并行还是串行。
@@ -54,24 +92,17 @@ pub(crate) struct ToolExecResult {
 ///
 /// 工具事件（ToolResult OutputEvent）的 emit 与拦截不在本模块做——归调用方统一处理，
 /// 保证「拦截 → 存储 → 消费」三者数据一致。
-#[allow(clippy::too_many_arguments)]
+///
+/// 注入句柄聚合在 `ctx`（[`ToolExecCtx`]）中；`tool_calls` 是业务数据、
+/// `result_tx` 是每次新建的 mpsc，二者随调用变化，故保留为独立参数。
 pub(crate) async fn execute_tools(
     tool_calls: &[ToolCallData],
-    tools: &Arc<ToolRegistry>,
-    agent_paths: &fuyao_api::AgentPaths,
-    emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
-    cancel: &CancellationToken,
-    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
-    todo_store: Option<Arc<dyn TodoStoreOps>>,
+    ctx: &ToolExecCtx,
 ) {
     if tool_calls.is_empty() {
         return;
     }
-
-    // 父 session 出站通道的直送克隆：供子代理类工具把子 session 的中间事件转发过来
-    // （绕过 emitter.emit 的 stamp_session_id——子事件已自带 child session_id 标签）
-    let event_forwarder = Some(emitter.tx_clone());
 
     // 工具并发策略从全局配置读取（`[tools.runner]`），运行期只读
     let config = fuyao_api::get_config().tools.runner.clone();
@@ -87,37 +118,14 @@ pub(crate) async fn execute_tools(
 
     if parallel::should_parallelize(&call_infos, &config) {
         tracing::info!(
-            session_id = emitter.session_id(),
+            session_id = ctx.emitter.session_id(),
             count = tool_calls.len(),
             max_concurrent = config.max_concurrent,
             "工具批次并行执行"
         );
-        execute_parallel(
-            tool_calls,
-            tools,
-            agent_paths,
-            emitter,
-            result_tx,
-            &config,
-            cancel,
-            subagent_ops,
-            event_forwarder,
-            todo_store,
-        )
-        .await
+        execute_parallel(tool_calls, result_tx, ctx, &config).await
     } else {
-        execute_sequential(
-            tool_calls,
-            tools,
-            agent_paths,
-            emitter,
-            result_tx,
-            cancel,
-            subagent_ops,
-            event_forwarder,
-            todo_store,
-        )
-        .await
+        execute_sequential(tool_calls, result_tx, ctx).await
     }
 }
 
@@ -125,36 +133,17 @@ pub(crate) async fn execute_tools(
 ///
 /// 逐个查注册表 → 调 handler → 立即通过 `result_tx` 通知调用方。
 /// 完成一个通知一个，不等全部跑完。
-#[allow(clippy::too_many_arguments)]
 async fn execute_sequential(
     tool_calls: &[ToolCallData],
-    tools: &Arc<ToolRegistry>,
-    agent_paths: &fuyao_api::AgentPaths,
-    emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
-    cancel: &CancellationToken,
-    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
-    event_forwarder: Option<UnboundedSender<OutputEvent>>,
-    todo_store: Option<Arc<dyn TodoStoreOps>>,
+    ctx: &ToolExecCtx,
 ) {
-    let session_id = emitter.session_id().to_string();
-
     for tc in tool_calls {
-        let result = execute_single(
-            tc,
-            tools,
-            agent_paths,
-            &session_id,
-            cancel,
-            subagent_ops.clone(),
-            event_forwarder.clone(),
-            todo_store.clone(),
-        )
-        .await;
+        let result = execute_single(tc, ctx).await;
         // 完成一个通知一个：调用方据此立即走 emit_to_history
         if result_tx.send(result).await.is_err() {
             tracing::warn!(
-                session_id = emitter.session_id(),
+                session_id = ctx.emitter.session_id(),
                 "result_tx 已关闭，工具结果丢弃"
             );
             return;
@@ -169,48 +158,25 @@ async fn execute_sequential(
 ///   （UX 上调用方立即走 emit_to_history，UI 先看到先完成的工具结果）。
 /// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误日志，不连坐兄弟任务。
 ///   JoinSet drop 时自动 abort 所有未完成任务（中断取消语义由调用方的 select! drop 触发）。
-#[allow(clippy::too_many_arguments)]
 async fn execute_parallel(
     tool_calls: &[ToolCallData],
-    tools: &Arc<ToolRegistry>,
-    agent_paths: &fuyao_api::AgentPaths,
-    emitter: &Emitter,
     result_tx: &Sender<ToolExecResult>,
+    ctx: &ToolExecCtx,
     config: &fuyao_api::ToolRunnerConfig,
-    cancel: &CancellationToken,
-    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
-    event_forwarder: Option<UnboundedSender<OutputEvent>>,
-    todo_store: Option<Arc<dyn TodoStoreOps>>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
-    let session_id = emitter.session_id().to_string();
     let mut join_set: JoinSet<ToolExecResult> = JoinSet::new();
 
     for tc in tool_calls {
         let tc = tc.clone();
-        let tools = tools.clone(); // Arc clone，廉价，多并行 task 共享同一注册表
-        let agent_paths = agent_paths.clone(); // AgentPaths 已 Clone
-        let session_id = session_id.clone();
         let semaphore = semaphore.clone();
-        let cancel = cancel.clone(); // CancellationToken clone 廉价（Arc 共享），进 task 供 handler 监听
-        let subagent_ops = subagent_ops.clone(); // Option<Weak> clone 廉价
-        let event_forwarder = event_forwarder.clone(); // Option<Sender> clone 廉价
-        let todo_store = todo_store.clone(); // Option<Arc> clone 廉价
+        // ctx 各字段均为廉价 Clone（Arc/Weak/UnboundedSender/Emitter），每个并行 task 持一份
+        let ctx = ctx.clone();
 
         join_set.spawn(async move {
             // 获取许可：限制同一批次内同时运行的工具数（session 局部，不影响其他 session）
             let _permit = semaphore.acquire().await;
-            execute_single(
-                &tc,
-                &tools,
-                &agent_paths,
-                &session_id,
-                &cancel,
-                subagent_ops,
-                event_forwarder,
-                todo_store,
-            )
-            .await
+            execute_single(&tc, &ctx).await
         });
     }
 
@@ -220,7 +186,7 @@ async fn execute_parallel(
             Ok(result) => {
                 if result_tx.send(result).await.is_err() {
                     tracing::warn!(
-                        session_id = emitter.session_id(),
+                        session_id = ctx.emitter.session_id(),
                         "result_tx 已关闭，剩余工具结果丢弃"
                     );
                     return;
@@ -229,7 +195,7 @@ async fn execute_parallel(
             Err(join_err) => {
                 // task panic / 被取消：不连坐兄弟任务，降级为错误日志
                 tracing::error!(
-                    session_id = emitter.session_id(),
+                    session_id = ctx.emitter.session_id(),
                     cause = %join_err,
                     "工具执行 task 异常"
                 );
@@ -243,23 +209,13 @@ async fn execute_parallel(
 /// 查注册表拿 handler → 解析参数 → 构建 `ToolCallContext` → 调 handler。
 /// 容错：未知工具返回提示字符串；参数解析失败用 `Value::Null`。
 ///
-/// 串行与并行共用本函数。`tools` 收 `&Arc<ToolRegistry>` 便于并行 task clone Arc。
-/// `cancel` 是本次工具批次的中断信号，调 handler 时 clone 传入供其监听。
-#[allow(clippy::too_many_arguments)]
-async fn execute_single(
-    tc: &ToolCallData,
-    tools: &Arc<ToolRegistry>,
-    agent_paths: &fuyao_api::AgentPaths,
-    session_id: &str,
-    cancel: &CancellationToken,
-    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
-    event_forwarder: Option<UnboundedSender<OutputEvent>>,
-    todo_store: Option<Arc<dyn TodoStoreOps>>,
-) -> ToolExecResult {
+/// 串行与并行共用本函数。注入句柄全部从 `ctx`（[`ToolExecCtx`]）取：
+/// `session_id` 取 `ctx.emitter.session_id()`，`event_forwarder` 取 `ctx.event_forwarder`。
+async fn execute_single(tc: &ToolCallData, ctx: &ToolExecCtx) -> ToolExecResult {
     let tool_name = tc.name.clone();
     let tool_call_id = tc.id.clone();
 
-    let Some(entry) = tools.get(&tool_name) else {
+    let Some(entry) = ctx.tools.get(&tool_name) else {
         // 未知工具：容错降级，返回明确提示而非报错
         tracing::warn!(tool_name = %tool_name, "未知工具");
         return ToolExecResult {
@@ -275,20 +231,20 @@ async fn execute_single(
         serde_json::Value::Null
     });
 
-    // 构建上下文：注入 session_id + agent_paths + tool_call_id + subagent_ops + event_forwarder + todo_store
+    // 构建工具上下文：注入 session_id + agent_paths + tool_call_id + subagent_ops + event_forwarder + todo_store
     // （工具据此识别会话、子代理类工具据此 upgrade 派生子 session + 转发子事件、
     //  todo 工具据此读写任务列表——其余工具按需取用）
-    let ctx = ToolCallContext {
-        session_id: Some(session_id.to_string()),
-        agent_paths: Some(agent_paths.clone()),
+    let tool_ctx = ToolCallContext {
+        session_id: Some(ctx.emitter.session_id().to_string()),
+        agent_paths: Some(ctx.agent_paths.clone()),
         tool_call_id: Some(tool_call_id.clone()),
-        subagent_ops,
-        event_forwarder,
-        todo_store,
+        subagent_ops: ctx.subagent_ops.clone(),
+        event_forwarder: ctx.event_forwarder.clone(),
+        todo_store: ctx.todo_store.clone(),
     };
 
     let started = std::time::Instant::now();
-    let content = (entry.handler)(args, ctx, cancel.clone()).await;
+    let content = (entry.handler)(args, tool_ctx, ctx.cancel.clone()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     tracing::info!(tool_name = %tool_name, elapsed_ms, "工具执行完成");
