@@ -18,12 +18,16 @@ pub struct AssistantMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AssistantPayload {
     /// 消息内容
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// 推理内容
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     /// 工具调用列表（复用 ToolCallPayload，裸 payload 无 envelope）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallPayload>>,
     /// 完成原因：stop、tool_calls、length、content_filter
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
     /// 输出令牌数
     pub completion_tokens: i64,

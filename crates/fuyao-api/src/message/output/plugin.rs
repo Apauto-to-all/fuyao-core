@@ -24,10 +24,13 @@ pub struct PluginPayload {
     /// 事件类型（插件自定义字符串标识）
     pub event_type: String,
     /// 事件数据（任意 JSON，core 不解析透传）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
     /// 错误信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// 提醒信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
 

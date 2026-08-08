@@ -33,8 +33,10 @@ pub struct Session {
     /// 会话唯一标识
     pub id: String,
     /// 会话标题
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// 系统提示词
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     /// 消息总数
     pub message_count: i64,
@@ -53,12 +55,15 @@ pub struct Session {
     /// 开始时间戳
     pub started_at: f64,
     /// 结束时间戳
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<f64>,
     /// 结束原因
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_reason: Option<String>,
     /// 被压缩过的次数（每次 mark_compaction +1，用于精度降级提示）
     pub compression_count: i32,
     /// 最近一次压缩边界消息的 seq（NULL = 从未压缩）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compacted_seq: Option<i64>,
     /// 通用子任务标记（非 fork 专属）：
     /// - `None` = 主 session（用户对话，`create_session` / `resume_session` 产出）
@@ -68,11 +73,13 @@ pub struct Session {
     /// 「fork 旧的」来的，只要它是子任务就带 `parent_session_id`。
     ///
     /// 与历史「链式分裂压缩方案」的同名字段无任何关系——该方案已废弃，此处仅作通用子任务标记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// 工作目录绝对路径（创建会话时定死，不再变化）
     ///
     /// 来源：引擎创建会话时的 `agent_paths.workspace`。无工作目录（纯 global 层运行）时为 `None`。
     /// 用途：session 列表查询按项目过滤——同一 agent（同一 db）下不同工作目录的会话靠此字段区分。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
     /// 最近活动时间（Unix 秒浮点）
     ///

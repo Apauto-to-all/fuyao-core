@@ -66,7 +66,7 @@ pub struct RollbackPayload {
     ///
     /// - 目标是 user 消息 → `Some`，前端把 content + images 填入输入框供重新编辑 / 发送
     /// - 目标是 compaction 消息 → `None`，压缩摘要是助手产出，不填输入框
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_message: Option<UserPayload>,
     /// 重算后的消息总数（刷内存 session 用）
     pub message_count: i64,
@@ -76,6 +76,7 @@ pub struct RollbackPayload {
     ///
     /// 回退跨压缩边界时会变：若删掉了所有 compaction 消息，置 `None`（从未压缩）；
     /// 否则落到剩余消息里最新一条 compaction 消息的 seq。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compacted_seq: Option<i64>,
     /// 重算后的压缩次数（刷内存 session 用）
     pub compression_count: i32,

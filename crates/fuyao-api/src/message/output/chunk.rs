@@ -20,8 +20,10 @@ pub struct ChunkMessage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkPayload {
     /// 文本内容片段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// 推理内容片段
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }
 

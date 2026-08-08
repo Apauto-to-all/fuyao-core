@@ -62,8 +62,10 @@ pub struct CompressionStartedPayload {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompressionDeltaPayload {
     /// 摘要正文片段（增量）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// 思考内容片段（增量）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 }
 
