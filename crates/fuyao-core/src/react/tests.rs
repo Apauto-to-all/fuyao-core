@@ -239,7 +239,7 @@ fn echo_registry() -> Arc<ToolRegistry> {
         let s = args.to_string();
         Box::pin(async move { format!("echo:{s}") })
     });
-    let entry = crate::ToolEntry {
+    let entry = fuyao_api::ToolEntry {
         definition: fuyao_api::ToolDefinition::new("echo", "回显参数"),
         handler,
         child_invisible: false,
@@ -1183,7 +1183,7 @@ async fn interrupt_during_tool_execution() {
         })
     });
     let tools = ToolRegistry::builder()
-        .register(crate::ToolEntry {
+        .register(fuyao_api::ToolEntry {
             definition: fuyao_api::ToolDefinition::new("blocking_tool", "阻塞测试工具"),
             handler: blocking_handler,
             child_invisible: false,
@@ -1348,7 +1348,7 @@ async fn shutdown_during_tool_execution() {
         })
     });
     let tools = ToolRegistry::builder()
-        .register(crate::ToolEntry {
+        .register(fuyao_api::ToolEntry {
             definition: fuyao_api::ToolDefinition::new("blocking_tool", "阻塞测试工具"),
             handler: blocking_handler,
             child_invisible: false,

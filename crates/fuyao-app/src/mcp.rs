@@ -1,14 +1,14 @@
 //! MCP 工具收集
 //!
-//! 从 `[mcp_servers]` 配置启动 MCP server，把发现的工具转换成引擎可注入的
-//! `fuyao_core::ToolEntry`。返回 MCPManager（调用方持有保活，否则连接断开）+ 工具列表。
+//! 从 `[mcp_servers]` 配置启动 MCP server，把发现的工具收集成 `fuyao_api::ToolEntry`。
+//! 返回 MCPManager（调用方持有保活，否则连接断开）+ 工具列表。
 //!
 //! 工具收集发生在 `Engine::new` 之前——MCP 工具与内置工具一起注入 `ToolRegistry`。
 
 use std::sync::Arc;
 
+use fuyao_api::ToolEntry;
 use fuyao_api::get_config;
-use fuyao_core::ToolEntry;
 use fuyao_mcp::MCPManager;
 
 /// 收集 MCP 工具
@@ -40,7 +40,7 @@ pub async fn collect_mcp_tools() -> Option<(Arc<MCPManager>, Vec<ToolEntry>)> {
     }
 
     // MCPManager 已用强类型 ToolDefinition 持有 schema，get_tool_entries 序列化为 Value 返回；
-    // 此处反序列化回 ToolDefinition 再包成引擎 ToolEntry（handler 直接复用 MCP 生成的 ToolFn）
+    // 此处反序列化回 ToolDefinition 再包成 ToolEntry（handler 直接复用 MCP 生成的 ToolFn）
     let mut entries = Vec::new();
     for (name, schema_value, handler) in manager.get_tool_entries().await {
         let definition = match serde_json::from_value::<fuyao_api::ToolDefinition>(schema_value) {

@@ -7,8 +7,8 @@
 //! 测试只验证 `result_tx` 收到的 ToolExecResult。
 
 use super::*;
-use crate::tool_registry::{ToolEntry, ToolRegistryBuilder};
-use fuyao_api::{AgentPaths, CancellationToken, ToolDefinition, ToolFn};
+use crate::tool_registry::ToolRegistryBuilder;
+use fuyao_api::{AgentPaths, CancellationToken, ToolDefinition, ToolEntry, ToolFn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 

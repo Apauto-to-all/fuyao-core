@@ -13,4 +13,4 @@ mod terminal;
 mod todo;
 mod web;
 
-pub use registry::{ToolEntry, all_tool_names, all_tools, get_tool};
+pub use registry::{all_tool_names, all_tools, get_tool};

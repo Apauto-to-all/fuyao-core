@@ -14,7 +14,7 @@ mod redirect;
 mod safety;
 mod types;
 
-use crate::registry::ToolEntry;
+use fuyao_api::ToolEntry;
 use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters};
 use handler::webfetch_handler;
 use std::collections::HashMap;

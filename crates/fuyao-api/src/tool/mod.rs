@@ -2,6 +2,7 @@
 //!
 //! 定义工具系统相关的类型，遵循 OpenAI Function Calling 规范。
 //! - `definition`: 工具定义（ToolDefinition、ToolSchema、ToolParameters、ToolParameterProperty）
+//! - `entry`: 工具条目（ToolEntry = schema + handler + 可见性元数据）
 //! - `result`: 工具执行结果（ToolResult）
 //! - `func`: 工具执行器函数类型（ToolFn）
 //! - `context`: 工具调用上下文（ToolCallContext）
@@ -9,12 +10,14 @@
 
 pub mod context;
 pub mod definition;
+pub mod entry;
 pub mod func;
 pub mod ops;
 pub mod result;
 
 pub use context::ToolCallContext;
 pub use definition::{ToolDefinition, ToolParameterProperty, ToolParameters, ToolSchema};
+pub use entry::ToolEntry;
 pub use func::ToolFn;
 pub use ops::{ChildSessionSource, SubagentOps, TodoStoreOps};
 pub use result::ToolResult;

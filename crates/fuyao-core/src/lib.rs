@@ -27,7 +27,7 @@ pub use engine::{Engine, SessionId};
 // ChildSessionSource 由 fuyao-api 定义并导出；这里重导出让上层从 fuyao-core 一处拿
 pub use error::EngineError;
 pub use fuyao_api::ChildSessionSource;
-pub use tool_registry::{ToolEntry, ToolRegistry, ToolRegistryBuilder};
+pub use tool_registry::{ToolRegistry, ToolRegistryBuilder};
 
 /// 插件相关类型的便捷重导出
 ///

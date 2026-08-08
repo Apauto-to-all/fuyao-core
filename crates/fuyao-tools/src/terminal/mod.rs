@@ -28,8 +28,8 @@ mod safety;
 mod shell;
 mod types;
 
-use crate::registry::ToolEntry;
 use bash::bash_impl;
+use fuyao_api::ToolEntry;
 use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters};
 use std::collections::HashMap;
 

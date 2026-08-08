@@ -11,7 +11,7 @@ mod types;
 
 use std::collections::HashMap;
 
-use crate::registry::ToolEntry;
+use fuyao_api::ToolEntry;
 use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters, ToolSchema};
 use handler::subagent_handler;
 

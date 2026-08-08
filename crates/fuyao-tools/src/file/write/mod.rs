@@ -5,7 +5,7 @@
 mod handler;
 pub mod types;
 
-use crate::registry::ToolEntry;
+use fuyao_api::ToolEntry;
 use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters};
 use handler::write_file_impl;
 use serde_json::Value;
