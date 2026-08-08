@@ -17,8 +17,6 @@
 //!
 //! 多次压缩正确性:每条 `kind='compaction'` 消息都是天然的不可逾越边界——
 //! 向前切遇到上一条摘要即停,不捞回已被更早摘要覆盖的旧消息。
-//!
-//! 详见设计文档 `docs/开发/设计文档/01.2-压缩可见窗口动态拼接思路.md`。
 
 use super::row::MessageRow;
 use super::window::select_recent;

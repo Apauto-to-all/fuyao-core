@@ -54,8 +54,8 @@ pub struct AgentConfig {
 /// 引擎启动时提供，目前装 [`AgentPaths`]（agent 三层目录的身份证明）。
 /// 后续要加新字段直接往里塞，不改函数签名、不动调用方。
 ///
-/// 设计文档「动作一·启动引擎」的入参：引擎用 agent_paths 找到并打开数据库，
-/// 把数据库访问能力作为引擎级共享，所有 Session 共享同一个库。
+/// 启动引擎的入参：引擎用 agent_paths 找到并打开数据库，把数据库访问能力作为
+/// 引擎级共享，所有 Session 共享同一个库。
 #[derive(Debug, Clone)]
 pub struct EngineParams {
     /// Agent 三层目录的身份证明，默认使用全局层

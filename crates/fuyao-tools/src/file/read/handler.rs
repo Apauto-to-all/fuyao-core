@@ -221,7 +221,7 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return common::tool_error(&format!("无权限读取文件: {path}"));
         }
-        // 对齐 Python UnicodeDecodeError：区分 UTF-8 编码错误和其他 IO 错误
+        // 区分 UTF-8 编码错误（InvalidData）和其他 IO 错误：编码错误给用户明确的修复提示
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
             return common::tool_error(&format!(
                 "文件编码无法解析: {path}。文件可能包含非 UTF-8 字节，请用二进制编辑器查看。"

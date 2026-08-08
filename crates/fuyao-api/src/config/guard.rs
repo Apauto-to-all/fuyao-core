@@ -7,7 +7,7 @@ use serde::Deserialize;
 
 /// 循环检测配置
 ///
-/// 各字段默认值与原 `fuyao-guard/src/loop_guard/config.rs` 的硬编码逐一对应。
+/// 各字段默认值与循环检测插件的硬编码默认值一致（迁移自原硬编码，集中到此可配置化）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LoopGuardConfig {

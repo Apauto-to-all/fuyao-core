@@ -48,7 +48,7 @@ pub use types::SessionId;
 /// break 前会走中断路径落库（保护 in-flight 状态）——通常毫秒级完成。
 /// 所有 task **并发退出**（用 JoinSet 同时 await），共享 10 秒总预算：
 /// 到点仍未退出的 task 统一 abort（JoinSet drop 自动 abort 所有未完成 task）。
-/// 这是设计文档「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
+/// 作为「显式关闭 + 等待退出 + 强制中止兜底」三层保障中的总超时兜底。
 const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 引擎

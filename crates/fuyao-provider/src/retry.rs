@@ -28,10 +28,10 @@ pub fn is_retryable(e: &StreamError) -> bool {
 
 /// 退避时长参数（从全局配置 `get_config().llm.retry` 读取）
 ///
-/// 对应原硬编码常量：
-/// - `initial_delay_ms`：原 `RETRY_INITIAL_DELAY=2000`
-/// - `max_delay_ms`：无响应头场景上限，原 `RETRY_MAX_DELAY_NO_HEADERS=30000`
-/// - `max_delay_with_headers_ms`：有响应头场景上限，原 `RETRY_MAX_DELAY=2_147_483_647`
+/// 字段含义：
+/// - `initial_delay_ms`：首次重试前的等待毫秒数（默认 2000）
+/// - `max_delay_ms`：无 Retry-After 响应头场景下的退避上限（默认 30000）
+/// - `max_delay_with_headers_ms`：有 Retry-After 响应头场景下的退避上限（默认 i64::MAX）
 struct BackoffParams {
     initial_delay_ms: u64,
     max_delay_ms: u64,

@@ -47,8 +47,8 @@ pub async fn temp_store() -> SessionStore {
 
 /// 用原子计数器生成全局唯一的 agent_id，隔离 MODEL_CACHE / PROVIDER_CACHE
 ///
-/// 范式参考 fuyao-provider/tests/registry_test.rs：全局注册表用 agent_paths_key 作 HashMap key，
-/// 测试间用唯一 agent_id 避免串扰。调用方测完应 clear_cache 收尾。
+/// 全局注册表用 agent_paths_key 作 HashMap key，测试间用唯一 agent_id 避免串扰。
+/// 调用方测完应 clear_cache 收尾。
 pub fn unique_paths(tag: &str) -> AgentPaths {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -9,7 +9,6 @@
 //! - fill_message_cost 端到端：填 token + 算 cost 一步到位
 //!
 //! 全局状态规避：用唯一 agent_id 隔离 MODEL_CACHE，测完 clear_cache 收尾。
-//! 范式参考 fuyao-provider/tests/registry_test.rs。
 
 mod common;
 

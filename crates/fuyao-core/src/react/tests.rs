@@ -1817,9 +1817,8 @@ async fn intercept_block_skips_final_assistant_in_history() {
 
 /// 用户消息经 inject_messages 时走 emit_to_history：插件可在**消费时刻**拦截改写。
 ///
-/// 这是任务 4（01.3 文档）的核心修复验证：拦截/push/发送三时机对齐在消费时刻，
-/// 与 assistant / tool_result 完全对称。修复前 inject_messages 是裸 push，插件
-/// 无法在 user 消息进历史时介入（拦截裂缝）。
+/// 验证拦截/push/发送三时机对齐在消费时刻，与 assistant / tool_result 完全对称。
+/// 修复前 inject_messages 是裸 push，插件无法在 user 消息进历史时介入（拦截裂缝）。
 #[tokio::test]
 async fn inject_messages_intercepts_user_at_consume_time() {
     let (tx_event, _rx_event) = mpsc::unbounded_channel::<OutputEvent>();

@@ -1,16 +1,21 @@
-//! 会话管理门面：会话与消息的查询接口
+//! 会话管理门面：会话检索 / 浏览 / 元数据编辑的接口
 //!
-//! 与 [`crate::App`]（运行时交互门面）平级正交，专司「会话的检索与浏览」：
+//! 与 [`crate::App`]（运行时交互门面）平级正交：
 //! - [`crate::App`] 管对话的进行（create / send / recv）
-//! - [`SessionManager`] 管会话的检索与浏览（列会话 / 查历史）
+//! - [`SessionManager`] 管会话的检索 / 浏览 / 手动编辑（列会话 / 查历史 / 改标题）
 //!
 //! 两者共享同一份 [`fuyao_session::SessionStore`]（由装配层 [`crate::start`] 注入
-//! `Arc` 克隆），各取所需：Engine 写（LLM 流程落库）、SessionManager 读（查询 / 浏览）。
-//! 通讯方式为直接异步方法调用——查询是纯存储读、不涉及 LLM、不需要流式产出，
+//! `Arc` 克隆），各取所需：Engine 写（LLM 流程落库、自动标题生成）、SessionManager
+//! 读查询 + 补引擎不做的「用户 / 应用手动编辑」写（如手改标题）。
+//! 通讯方式为直接异步方法调用——纯存储操作、不涉及 LLM、不需要流式产出，
 //! 与 `App::create_session` 返 `SessionId` 同属「管理型同步方法」，不走消息总线。
 //!
-//! # 设计依据
-//! 详见 `docs/开发/设计文档/01-会话查询接口设计.md`。
+//! # 写能力边界
+//!
+//! 本门面只暴露**适合外部编辑**的字段。引擎内核的自动写（create / 压缩后重建
+//! system_prompt / 标题异步生成 / end_session）是其 ReAct 循环与 session task
+//! 生命周期的内生产物，不在此暴露——外部插手会破坏一致性。
+//!
 
 use std::sync::Arc;
 
@@ -18,11 +23,11 @@ use fuyao_session::SessionStore;
 
 use crate::history_replay;
 
-/// 会话管理器：持有会话存储句柄，对外提供会话 / 消息的查询接口
+/// 会话管理器：持有会话存储句柄，对外提供会话检索 / 浏览 / 元数据编辑接口
 ///
 /// 与 [`App`](crate::App) 平级正交：
 /// - [`App`](crate::App) 管「对话的进行」（create / send / recv）
-/// - `SessionManager` 管「会话的检索与浏览」（列会话 / 查历史）
+/// - `SessionManager` 管「会话的检索 / 浏览 / 手动编辑」（列会话 / 查历史 / 改标题）
 ///
 /// 两者共享同一份 `SessionStore`（Arc 克隆，零拷贝共享连接池）。
 pub struct SessionManager {
@@ -65,6 +70,28 @@ impl SessionManager {
             limit,
             offset,
         })
+    }
+
+    // ── 会话元数据编辑（面向二次开发应用）──────────────────────
+
+    /// 更新会话标题
+    ///
+    /// 供二次开发应用手动改名（如 TUI 里用户重命名会话、CLI 批量改标题）。与引擎的
+    /// 自动标题生成（`react/turn.rs` fire-and-forget spawn）正交：引擎只产出默认标题，
+    /// 本方法供应用 / 用户覆盖；两者最终都落同一个单字段 UPDATE，最后一个写生效，单字段原子。
+    ///
+    /// 透传 [`SessionStore::update_title`](fuyao_session::SessionStore::update_title)：
+    /// EXISTS 校验后单字段 UPDATE，不动其他字段、不动 messages 表。
+    ///
+    /// # 返回
+    /// - `Ok(())`：标题已更新
+    /// - `Err(SessionError::NotFound)`：session_id 在数据库中不存在
+    pub async fn update_title(
+        &self,
+        session_id: &str,
+        new_title: &str,
+    ) -> Result<(), fuyao_session::SessionError> {
+        self.store.update_title(session_id, new_title).await
     }
 
     // ── 会话删除 ───────────────────────────────────────────────
@@ -406,6 +433,49 @@ mod tests {
         assert!(page.events.is_empty());
         assert!(!page.has_more);
         assert_eq!(page.next_cursor, None);
+    }
+
+    // ===== update_title：透传 store.update_title（单字段 UPDATE，与引擎自动生成正交）=====
+
+    #[tokio::test]
+    async fn update_title_succeeds_and_persists() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+
+        manager.update_title(&sid, "Rust 异步讨论").await.unwrap();
+
+        let loaded = manager.store.get(&sid).await.unwrap().unwrap();
+        assert_eq!(loaded.title.as_deref(), Some("Rust 异步讨论"));
+        // 单字段 UPDATE 不触碰计数字段
+        assert_eq!(loaded.compression_count, 0);
+        assert!(loaded.last_compacted_seq.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_title_errors_on_missing_session() {
+        let manager = temp_manager().await;
+
+        let result = manager.update_title("nonexistent", "标题").await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            fuyao_session::SessionError::NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_title_overrides_engine_generated_default() {
+        // seed_session 产出默认标题 "新会话"（Session::new 的兜底值），手改后验证覆盖
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+
+        let before = manager.store.get(&sid).await.unwrap().unwrap();
+        assert_eq!(before.title.as_deref(), Some("新会话"));
+
+        manager.update_title(&sid, "用户自定义标题").await.unwrap();
+
+        let after = manager.store.get(&sid).await.unwrap().unwrap();
+        assert_eq!(after.title.as_deref(), Some("用户自定义标题"));
     }
 
     // ===== delete_session：透传 store.delete（cascade 删 todos + messages + sessions）=====
