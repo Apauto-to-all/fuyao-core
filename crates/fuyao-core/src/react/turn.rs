@@ -13,10 +13,10 @@
 //! 中断时保存部分结果（发增量事件），经 emit_to_history 即时落库每条消息，结束本轮。
 //!
 //! shutdown：两段 select! 各有 `biased` 优先的 shutdown 分支（优先于 interrupt），
-//! 命中后走与 interrupt 完全对称的三步链（emit_interrupt_event → classify →
-//! handle_interrupt），把已累积的部分结果经 emit_to_history 落库后立即 return。
-//! retry.rs 的退避 sleep 也监听 shutdown_token，收到信号立即冒泡 Cancelled
-//! 让本层 shutdown 分支接管。这样 shutdown 不再依赖 10s abort 兜底。
+//! 命中后与 interrupt 共用同一条三步链（`handle_stream_interrupt`：
+//! emit_interrupt_event → classify → handle_interrupt），把已累积的部分结果经
+//! emit_to_history 落库后立即 return。retry.rs 的退避 sleep 也监听 shutdown_token，
+//! 收到信号立即冒泡 Cancelled 让本层 shutdown 分支接管。这样 shutdown 不再依赖 10s abort 兜底。
 
 use super::SessionCtx;
 use super::builders::{
@@ -47,12 +47,44 @@ use tokio::sync::mpsc::Receiver;
 /// 构造 shutdown 中断 payload（供两段 select! 的 shutdown 分支复用）
 ///
 /// shutdown 中断语义：source=Shutdown / reason="引擎关闭"。
-/// 走与用户中断完全相同的 emit_interrupt_event + handle_interrupt 路径，
+/// 作为 `handle_stream_interrupt` 的入参，与 interrupt 共用同一条三步链，
 /// 让 UI 收到标准 Interrupt 事件，DB 记录能区分「引擎关闭中断」vs「用户主动中断」。
 ///
 /// 内核内部产生的中断载荷本就是 output 侧类型，直接构造。
 fn shutdown_interrupt_payload() -> OutputInterruptPayload {
     OutputInterruptPayload::new("引擎关闭", InterruptSource::Shutdown)
+}
+
+/// 流式期间中断处理：发通知 + 补增量结果落库（shutdown 与 interrupt 共用同一条三步链）
+///
+/// 三步链：emit_interrupt_event → classify → handle_interrupt。
+/// 调用方负责判定命中哪种信号（shutdown token / interrupt 通道），并把对应的
+/// payload 传入——本函数不关心信号来源，只忠实执行"通知 + 补增量"。
+///
+/// 与工具执行期间的中断处理 `emit_interrupt_and_complete_tool_results` 对仗：
+/// 两者覆盖两段 select! 的中断语义，形成"流式 vs 工具执行"一对中断处理器。
+///
+/// 锁安全沿用 interrupt 模块约定：先 lock 取 TurnState 做 classify，block scope
+/// 结束自动释放（不跨 await 持锁）；handle_interrupt 内部再独立 lock + clone。
+async fn handle_stream_interrupt(
+    ctx: &SessionCtx,
+    state: &SharedTurnState,
+    payload: &OutputInterruptPayload,
+) {
+    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
+    let kind = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        classify(&s)
+    };
+    handle_interrupt(
+        state,
+        kind,
+        payload,
+        &ctx.emitter,
+        &ctx.hooks,
+        ctx.store.as_ref(),
+    )
+    .await;
 }
 
 /// 把解析出的 model_id + 思考参数物化进 ModelConfig
@@ -215,25 +247,14 @@ pub(crate) async fn run_turn(
                 biased;
                 // shutdown 优先（高于 interrupt）：立即落库退出，不等流式结束
                 _ = ctx.shutdown_token.cancelled() => {
-                    let payload = shutdown_interrupt_payload();
-                    emit_interrupt_event(&payload, &ctx.emitter, &ctx.hooks).await;
-                    let kind = {
-                        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                        classify(&s)
-                    };
-                    handle_interrupt(&state, kind, &payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref()).await;
+                    handle_stream_interrupt(ctx, &state, &shutdown_interrupt_payload()).await;
                     return TurnOutcome::Interrupted;
                 }
                 result = &mut retry_fut => result,
                 // 中断通道独立：此处只会收到 Interrupt
                 interrupt_msg = rx_interrupt.recv() => {
                     if let Some(interrupt_msg) = interrupt_msg {
-                        emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
-                        let kind = {
-                            let s = state.lock().unwrap_or_else(|e| e.into_inner());
-                            classify(&s)
-                        };
-                        handle_interrupt(&state, kind, &interrupt_msg.payload, &ctx.emitter, &ctx.hooks, ctx.store.as_ref()).await;
+                        handle_stream_interrupt(ctx, &state, &interrupt_msg.payload).await;
                         return TurnOutcome::Interrupted;
                     }
                     // 中断通道关闭：忽略，继续等流式
