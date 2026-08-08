@@ -4,9 +4,9 @@
 //! 不出现在工具 Schema 中，LLM 无法访问。
 
 use crate::AgentPaths;
-use crate::tool::ops::SubagentOps;
+use crate::tool::ops::{SubagentOps, TodoStoreOps};
 use std::path::{Path, PathBuf};
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -21,6 +21,8 @@ use crate::message::OutputEvent;
 ///   handler upgrade 后调 [`SubagentOps`] 方法；普通工具忽略此字段）
 /// - `event_forwarder`：父 session 出站通道的直送克隆（不盖 session_id 标签），
 ///   子代理类工具把子 session 的中间事件转发过来，让前端在父流里看到子代理实时进度
+/// - `todo_store`：读写任务列表的存储能力强引用（仅 todo 工具用，
+///   handler 直接调 [`TodoStoreOps`] 方法；普通工具忽略此字段）
 ///
 /// 不出现在工具 Schema 中，LLM 无法访问。
 #[derive(Clone, Default)]
@@ -52,6 +54,15 @@ pub struct ToolCallContext {
     /// 不能被父 emitter 的 stamp_session_id 覆盖。所以这里是 raw sender，
     /// 调用方用 `tx.send(ev)` 而非 `emitter.emit(ev)`。
     pub event_forwarder: Option<UnboundedSender<OutputEvent>>,
+
+    /// 任务列表（todo）存储能力强引用（运行期注入）
+    ///
+    /// 普通工具不读此字段；todo 工具直接调 [`TodoStoreOps`] 方法读写
+    /// 当前 session 的任务列表。
+    ///
+    /// 用 `Arc`（而非子代理字段的 `Weak`）——任务列表存储是 `SessionStore`
+    /// 的能力，随引擎生命周期存活，没有「存储已关闭」的降级语义。
+    pub todo_store: Option<Arc<dyn TodoStoreOps>>,
 }
 
 impl std::fmt::Debug for ToolCallContext {
@@ -67,6 +78,10 @@ impl std::fmt::Debug for ToolCallContext {
             .field(
                 "event_forwarder",
                 &self.event_forwarder.as_ref().map(|_| "<Sender>"),
+            )
+            .field(
+                "todo_store",
+                &self.todo_store.as_ref().map(|_| "<TodoStoreOps>"),
             )
             .finish()
     }
@@ -107,6 +122,7 @@ impl ToolCallContext {
             tool_call_id: None,
             subagent_ops: None,
             event_forwarder: None,
+            todo_store: None,
         }
     }
 

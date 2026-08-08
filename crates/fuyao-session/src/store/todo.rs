@@ -1,76 +1,21 @@
-//! Todo 持久化存储
+//! todos 表 CRUD
 //!
-//! 工具层自带的 todo 存储，与 SessionStore 共用同一个 `sessions.db` 文件
-//! （SQLite WAL 模式下多个独立连接池同文件安全：读读并发、读写快照隔离、
-//! 写写靠 busy_timeout 串行）。
+//! 任务列表（todo）的全部操作归此：读取（按 sort_order 排序）、整体覆盖写入、
+//! 按 session_id 删除全部（会话删除时级联清理）。
 //!
-//! 不加外键约束——session_id 作为字符串软关联隔离数据，避免与 session 层
-//! schema 耦合（todos 表属工具层职责，session 层不维护它）。
+//! todos 表按 session_id 软关联会话——`session_id` 仅作字符串过滤键，不加外键约束，
+//! 数据隔离靠查询过滤。会话删除时由 [`super::SessionStore::delete`] 在同一事务内
+//! 显式删 todos 行，保证无残留。
 
-use fuyao_api::TodoItem;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
-use std::path::PathBuf;
-use std::time::Duration;
+use crate::error::SessionError;
+use fuyao_api::{TodoItem, TodoStoreOps};
+use sqlx::Row;
+use std::future::Future;
+use std::pin::Pin;
 
-/// todos 表 DDL
-const TODOS_SCHEMA_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS todos (
-    id          TEXT NOT NULL,
-    session_id  TEXT NOT NULL,
-    content     TEXT NOT NULL,
-    status      TEXT NOT NULL,
-    sort_order  INTEGER NOT NULL,
-    created_at  REAL NOT NULL,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (session_id, id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id, sort_order);
-"#;
-
-/// Todo 存储
-///
-/// 持有独立的 `SqlitePool`（指向 sessions.db），按 session_id 隔离各会话的 todo 列表。
-pub struct TodoStore {
-    pool: SqlitePool,
-}
-
-impl TodoStore {
-    /// 创建并初始化存储
-    ///
-    /// 打开 `db_path` 指向的 SQLite 库（与 SessionStore 同一个文件），
-    /// 建表后返回实例。连接参数（busy_timeout / max_connections）从全局配置
-    /// `get_config().session.storage` 读取，与 SessionStore 保持一致。
-    pub async fn new(db_path: PathBuf) -> Result<Self, sqlx::Error> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let storage = fuyao_api::get_config().session.storage.clone();
-
-        // synchronous=Normal：与 SessionStore 保持一致，WAL 下 commit 不强制 fsync，
-        // 避免与 SessionStore 的事务在 fsync 期间互相阻塞触发 database is locked。
-        let options = SqliteConnectOptions::new()
-            .filename(&db_path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(storage.busy_timeout_secs));
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(storage.max_connections)
-            .connect_with(options)
-            .await?;
-
-        sqlx::raw_sql(TODOS_SCHEMA_SQL).execute(&pool).await?;
-
-        Ok(Self { pool })
-    }
-
-    /// 读取指定 session 的 todo 列表
-    pub async fn read(&self, session_id: &str) -> Result<Vec<TodoItem>, sqlx::Error> {
+impl super::SessionStore {
+    /// 读取指定 session 的任务列表（按 sort_order 排序）
+    pub async fn read_todos(&self, session_id: &str) -> Result<Vec<TodoItem>, SessionError> {
         let rows = sqlx::query(
             "SELECT id, content, status FROM todos WHERE session_id = ?1 ORDER BY sort_order, created_at",
         )
@@ -90,14 +35,14 @@ impl TodoStore {
         Ok(items)
     }
 
-    /// 整体覆盖写入
+    /// 整体覆盖写入指定 session 的任务列表
     ///
     /// 先删除该 session 的全部 todo，再按传入顺序重新插入。
-    pub async fn write(
+    pub async fn write_todos(
         &self,
         session_id: &str,
         todos: Vec<TodoItem>,
-    ) -> Result<Vec<TodoItem>, sqlx::Error> {
+    ) -> Result<Vec<TodoItem>, SessionError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -127,27 +72,77 @@ impl TodoStore {
         }
 
         tx.commit().await?;
-        self.read(session_id).await
+        self.read_todos(session_id).await
+    }
+
+    /// 删除指定 session 的全部任务（会话删除级联清理用）
+    ///
+    /// 不对外暴露为查询能力，仅供 [`delete`](super::SessionStore::delete) 在事务内调用，
+    /// 保证删会话时任务列表无残留。
+    pub(super) async fn delete_todos_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+    ) -> Result<(), SessionError> {
+        sqlx::query("DELETE FROM todos WHERE session_id = ?1")
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+        Ok(())
+    }
+}
+
+/// 会话存储实现任务列表能力接口
+///
+/// `SessionStore` 是 `sessions.db` 的唯一 owner，任务列表表与会话表同居一个数据库，
+/// 故任务列表的读写能力直接由会话存储提供。经工具调用上下文（`ToolCallContext`）
+/// 注入到 todo 工具，工具层不再自建连接池。
+//
+// trait 方法返 `Pin<Box<dyn Future>>` 是 async fn in dyn trait 的标准写法，
+// 错误类型转 String 供调用方生成可读工具结果。
+#[allow(clippy::type_complexity)]
+impl TodoStoreOps for super::SessionStore {
+    fn read_todos<'a>(
+        &'a self,
+        session_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TodoItem>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            super::SessionStore::read_todos(self, session_id)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn write_todos<'a>(
+        &'a self,
+        session_id: &'a str,
+        todos: Vec<TodoItem>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<TodoItem>, String>> + Send + 'a>> {
+        Box::pin(async move {
+            super::SessionStore::write_todos(self, session_id, todos)
+                .await
+                .map_err(|e| e.to_string())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::SessionStore;
+    use fuyao_api::TodoItem;
 
-    /// 构造临时存储（独立临时目录，测试结束自动清理）
-    async fn temp_store() -> TodoStore {
+    /// 构造临时存储（独立临时目录）
+    async fn temp_store() -> SessionStore {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let db_path = dir.path().join("test.db");
-        // async 测试跨 await 持有路径，forget 让目录留到进程结束
+        // forget 让目录留到进程结束（async 测试里 SessionStore 跨 await 持有路径，dir 必须存活）
         std::mem::forget(dir);
-        TodoStore::new(db_path).await.expect("创建 TodoStore 失败")
+        SessionStore::new(db_path).await.expect("创建存储失败")
     }
 
     #[tokio::test]
-    async fn read_returns_empty_for_new_session() {
+    async fn read_todos_returns_empty_for_new_session() {
         let store = temp_store().await;
-        let items = store.read("sess_none").await.unwrap();
+        let items = store.read_todos("sess_none").await.unwrap();
         assert!(items.is_empty());
     }
 
@@ -167,22 +162,22 @@ mod tests {
             },
         ];
 
-        let result = store.write("sess_a", todos).await.unwrap();
+        let result = store.write_todos("sess_a", todos).await.unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].content, "任务1");
         assert_eq!(result[1].status, "completed");
 
         // 二次读取验证持久化
-        let again = store.read("sess_a").await.unwrap();
+        let again = store.read_todos("sess_a").await.unwrap();
         assert_eq!(again.len(), 2);
         assert_eq!(again[0].id, "1");
     }
 
     #[tokio::test]
-    async fn write_overwrites_previous() {
+    async fn write_todos_overwrites_previous() {
         let store = temp_store().await;
         store
-            .write(
+            .write_todos(
                 "sess_b",
                 vec![TodoItem {
                     id: "1".to_string(),
@@ -194,7 +189,7 @@ mod tests {
             .unwrap();
 
         let result = store
-            .write(
+            .write_todos(
                 "sess_b",
                 vec![TodoItem {
                     id: "2".to_string(),
@@ -210,10 +205,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sessions_isolated_by_session_id() {
+    async fn write_todos_isolated_by_session_id() {
         let store = temp_store().await;
         store
-            .write(
+            .write_todos(
                 "sess_x",
                 vec![TodoItem {
                     id: "1".to_string(),
@@ -224,7 +219,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .write(
+            .write_todos(
                 "sess_y",
                 vec![TodoItem {
                     id: "1".to_string(),
@@ -235,8 +230,8 @@ mod tests {
             .await
             .unwrap();
 
-        let x = store.read("sess_x").await.unwrap();
-        let y = store.read("sess_y").await.unwrap();
+        let x = store.read_todos("sess_x").await.unwrap();
+        let y = store.read_todos("sess_y").await.unwrap();
         assert_eq!(x[0].content, "x 任务");
         assert_eq!(y[0].content, "y 任务");
     }

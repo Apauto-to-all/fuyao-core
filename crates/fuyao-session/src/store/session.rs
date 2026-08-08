@@ -112,16 +112,27 @@ impl super::SessionStore {
         Ok(row.map(Session::from))
     }
 
-    /// 删除会话(cascade 删该会话的全部消息 + session 行)
+    /// 删除会话(cascade 删该会话的全部消息 + 任务列表 + session 行)
+    ///
+    /// 单事务内删 todos + messages + sessions，三者要么全删要么全留——避免出现
+    /// 「消息删了、session 行还在」或「session 删了、任务列表孤儿」的不一致窗口。
+    /// 返回 `true` = 删到了 session 行；`false` = session 不存在（此时 todos /
+    /// messages 即便有残留也会被一并清掉）。
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
+        let mut tx = self.pool.begin().await?;
+
+        // 先清任务列表 + 消息（删 session 行前清，避免 session 行不存在时仍残留）
+        Self::delete_todos_in_tx(&mut tx, session_id).await?;
         sqlx::query("DELETE FROM messages WHERE session_id = ?1")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         let result = sqlx::query("DELETE FROM sessions WHERE id = ?1")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -368,6 +379,45 @@ mod tests {
         let deleted = store.delete(&session.id).await.unwrap();
         assert!(deleted);
         assert!(store.get(&session.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn store_delete_cascades_messages_and_todos() {
+        // delete 单事务级联删 todos + messages + sessions，删后三类数据全无残留
+        let store = temp_store().await;
+        let session = Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        // 塞一条消息 + 一个任务
+        let mut msg = fuyao_api::Message::user("对话".to_string());
+        store.insert_message(&session.id, &mut msg).await.unwrap();
+        store
+            .write_todos(
+                &session.id,
+                vec![fuyao_api::TodoItem {
+                    id: "1".to_string(),
+                    content: "任务".to_string(),
+                    status: "pending".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.read_todos(&session.id).await.unwrap().len(),
+            1,
+            "删除前应有 1 条任务"
+        );
+
+        // 删会话 → todos / messages / sessions 全清
+        let deleted = store.delete(&session.id).await.unwrap();
+        assert!(deleted);
+        assert!(store.get(&session.id).await.unwrap().is_none());
+        assert!(
+            store.read_todos(&session.id).await.unwrap().is_empty(),
+            "删会话后任务列表应清空，无孤儿"
+        );
+        // messages 表该 session 的行也清空（count 全量查）
+        assert_eq!(store.count().await.unwrap(), 0);
     }
 
     #[tokio::test]

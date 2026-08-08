@@ -5,7 +5,6 @@
 //! - 传了 todos → 整体覆盖写入
 
 mod handler;
-pub mod store;
 mod types;
 
 use crate::registry::ToolEntry;

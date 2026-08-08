@@ -565,6 +565,9 @@ async fn handle_tool_calls(
     // 派生 child_token：shutdown 时 parent→child 自动传播；interrupt 分支显式 cancel。
     // handler 据此优雅收尾长任务（杀子进程等），不监听的靠 abort 兜底（双保险）
     let cancel = ctx.shutdown_token.child_token();
+    // 任务列表存储能力：会话存储实现了 TodoStoreOps，coerce 成 trait object 注入工具 ctx。
+    // todo 工具据此读写当前 session 的任务列表，不再自建连接池。
+    let todo_store: std::sync::Arc<dyn fuyao_api::TodoStoreOps> = ctx.store.clone();
     let exec_fut = tool_exec::execute_tools(
         &tool_calls_for_exec,
         &ctx.tools,
@@ -573,6 +576,7 @@ async fn handle_tool_calls(
         &result_tx,
         &cancel,
         ctx.subagent_ops.clone(),
+        Some(todo_store),
     );
     tokio::pin!(exec_fut);
 

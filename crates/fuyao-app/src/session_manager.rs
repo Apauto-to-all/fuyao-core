@@ -67,6 +67,23 @@ impl SessionManager {
         })
     }
 
+    // ── 会话删除 ───────────────────────────────────────────────
+
+    /// 删除会话（cascade 删消息 + 任务列表 + 会话行）
+    ///
+    /// 透传 [`SessionStore::delete`](fuyao_session::SessionStore::delete)：单事务内删
+    /// todos + messages + sessions，三者要么全删要么全留。
+    ///
+    /// # 返回
+    /// - `Ok(true)`：会话存在并已删除
+    /// - `Ok(false)`：会话不存在（无 session 行被删，但该 id 的残留 todos / messages 仍被清理）
+    pub async fn delete_session(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, fuyao_session::SessionError> {
+        self.store.delete(session_id).await
+    }
+
     // ── 消息查询 ───────────────────────────────────────────────
 
     /// 默认分页大小（每页消息条数）
@@ -389,5 +406,69 @@ mod tests {
         assert!(page.events.is_empty());
         assert!(!page.has_more);
         assert_eq!(page.next_cursor, None);
+    }
+
+    // ===== delete_session：透传 store.delete（cascade 删 todos + messages + sessions）=====
+
+    #[tokio::test]
+    async fn delete_session_returns_true_and_removes_session() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        seed_user_message(&manager, &sid, "对话").await;
+
+        // 删除前会话存在且有消息
+        let before = manager.list_messages(&sid, None, Some(10)).await.unwrap();
+        assert_eq!(before.items.len(), 1);
+
+        let deleted = manager.delete_session(&sid).await.unwrap();
+        assert!(deleted, "存在的会话应返回 true");
+
+        // 删除后会话在列表中消失
+        let after = manager.list_sessions(None, 100, 0).await.unwrap();
+        assert!(
+            after.items.iter().all(|s| s.id != sid),
+            "删除后列表不应再包含该会话"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_returns_false_for_nonexistent() {
+        let manager = temp_manager().await;
+
+        // 不存在的会话 id：返回 false（不报错）
+        let deleted = manager.delete_session("nonexistent").await.unwrap();
+        assert!(!deleted, "不存在的会话应返回 false");
+    }
+
+    #[tokio::test]
+    async fn delete_session_cascades_todos_no_orphans() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+
+        // 写一条任务（经 store 的 todo 能力，验证删除级联无残留）
+        manager
+            .store
+            .write_todos(
+                &sid,
+                vec![fuyao_api::TodoItem {
+                    id: "1".to_string(),
+                    content: "任务".to_string(),
+                    status: "pending".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.store.read_todos(&sid).await.unwrap().len(),
+            1,
+            "删除前应有 1 条任务"
+        );
+
+        // 删会话 → 任务列表随之清空，无孤儿
+        assert!(manager.delete_session(&sid).await.unwrap());
+        assert!(
+            manager.store.read_todos(&sid).await.unwrap().is_empty(),
+            "删会话后任务列表应清空"
+        );
     }
 }

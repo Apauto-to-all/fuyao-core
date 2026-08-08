@@ -9,7 +9,6 @@ fuyao-prompt = { path = "../fuyao-prompt" }
 fuyao-skills = { path = "../fuyao-skills" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { workspace = true }
 tokio = { workspace = true }
 regex = { workspace = true }
 fancy-regex = { workspace = true }

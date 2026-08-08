@@ -29,7 +29,7 @@ mod parallel;
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::{CancellationToken, ToolCallContext};
+use fuyao_api::{CancellationToken, TodoStoreOps, ToolCallContext};
 use fuyao_provider::ToolCallData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -54,6 +54,7 @@ pub(crate) struct ToolExecResult {
 ///
 /// 工具事件（ToolResult OutputEvent）的 emit 与拦截不在本模块做——归调用方统一处理，
 /// 保证「拦截 → 存储 → 消费」三者数据一致。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_tools(
     tool_calls: &[ToolCallData],
     tools: &Arc<ToolRegistry>,
@@ -62,6 +63,7 @@ pub(crate) async fn execute_tools(
     result_tx: &Sender<ToolExecResult>,
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
+    todo_store: Option<Arc<dyn TodoStoreOps>>,
 ) {
     if tool_calls.is_empty() {
         return;
@@ -100,6 +102,7 @@ pub(crate) async fn execute_tools(
             cancel,
             subagent_ops,
             event_forwarder,
+            todo_store,
         )
         .await
     } else {
@@ -112,6 +115,7 @@ pub(crate) async fn execute_tools(
             cancel,
             subagent_ops,
             event_forwarder,
+            todo_store,
         )
         .await
     }
@@ -131,6 +135,7 @@ async fn execute_sequential(
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
     event_forwarder: Option<UnboundedSender<OutputEvent>>,
+    todo_store: Option<Arc<dyn TodoStoreOps>>,
 ) {
     let session_id = emitter.session_id().to_string();
 
@@ -143,6 +148,7 @@ async fn execute_sequential(
             cancel,
             subagent_ops.clone(),
             event_forwarder.clone(),
+            todo_store.clone(),
         )
         .await;
         // 完成一个通知一个：调用方据此立即走 emit_to_history
@@ -174,6 +180,7 @@ async fn execute_parallel(
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
     event_forwarder: Option<UnboundedSender<OutputEvent>>,
+    todo_store: Option<Arc<dyn TodoStoreOps>>,
 ) {
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent as usize));
     let session_id = emitter.session_id().to_string();
@@ -188,6 +195,7 @@ async fn execute_parallel(
         let cancel = cancel.clone(); // CancellationToken clone 廉价（Arc 共享），进 task 供 handler 监听
         let subagent_ops = subagent_ops.clone(); // Option<Weak> clone 廉价
         let event_forwarder = event_forwarder.clone(); // Option<Sender> clone 廉价
+        let todo_store = todo_store.clone(); // Option<Arc> clone 廉价
 
         join_set.spawn(async move {
             // 获取许可：限制同一批次内同时运行的工具数（session 局部，不影响其他 session）
@@ -200,6 +208,7 @@ async fn execute_parallel(
                 &cancel,
                 subagent_ops,
                 event_forwarder,
+                todo_store,
             )
             .await
         });
@@ -236,6 +245,7 @@ async fn execute_parallel(
 ///
 /// 串行与并行共用本函数。`tools` 收 `&Arc<ToolRegistry>` 便于并行 task clone Arc。
 /// `cancel` 是本次工具批次的中断信号，调 handler 时 clone 传入供其监听。
+#[allow(clippy::too_many_arguments)]
 async fn execute_single(
     tc: &ToolCallData,
     tools: &Arc<ToolRegistry>,
@@ -244,6 +254,7 @@ async fn execute_single(
     cancel: &CancellationToken,
     subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
     event_forwarder: Option<UnboundedSender<OutputEvent>>,
+    todo_store: Option<Arc<dyn TodoStoreOps>>,
 ) -> ToolExecResult {
     let tool_name = tc.name.clone();
     let tool_call_id = tc.id.clone();
@@ -264,15 +275,16 @@ async fn execute_single(
         serde_json::Value::Null
     });
 
-    // 构建上下文：注入 session_id + agent_paths + tool_call_id + subagent_ops + event_forwarder
-    // （工具据此识别会话、子代理类工具还据此 upgrade 拿引擎能力派生子 session、
-    //  转发子 session 中间事件到父 session 出站通道）
+    // 构建上下文：注入 session_id + agent_paths + tool_call_id + subagent_ops + event_forwarder + todo_store
+    // （工具据此识别会话、子代理类工具据此 upgrade 派生子 session + 转发子事件、
+    //  todo 工具据此读写任务列表——其余工具按需取用）
     let ctx = ToolCallContext {
         session_id: Some(session_id.to_string()),
         agent_paths: Some(agent_paths.clone()),
         tool_call_id: Some(tool_call_id.clone()),
         subagent_ops,
         event_forwarder,
+        todo_store,
     };
 
     let started = std::time::Instant::now();

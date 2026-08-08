@@ -16,12 +16,14 @@
 //!   与 [`message`] 的「给人看的」查询路径正交
 //! - [`rollback`]：对话回退（删目标 seq 之后消息 + 局部 UPDATE 重算 count 类与
 //!   压缩元数据，保护消费类字段不动）
+//! - [`todo`]：todos 表的读写 + 级联删除（任务列表 CRUD）
 
 pub(crate) mod compaction;
 mod message;
 mod rollback;
 mod row;
 mod session;
+mod todo;
 mod visible_window;
 
 use crate::error::SessionError;

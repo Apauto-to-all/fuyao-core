@@ -175,6 +175,7 @@ mod tests {
             tool_call_id: None,
             subagent_ops: None,
             event_forwarder: None,
+            todo_store: None,
         }
     }
 

@@ -1,7 +1,7 @@
 //! SQLite DDL + 版本管理
 //!
-//! 当前含 sessions + messages 两张表。
-//! todos 表属工具层（fuyao-tools）职责，后续由该 crate 自带 schema，不在此处维护。
+//! 当前含 sessions + messages + todos 三张表。todos 表存任务列表，按 session_id
+//! 软关联会话（不加外键约束——隔离数据，session_id 仅作字符串过滤键）。
 //!
 //! v2 改动（上下文压缩地基）：
 //! - sessions 加 `compression_count` + `last_compacted_seq`（压缩边界元数据）
@@ -81,4 +81,17 @@ CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at D
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_session_kind_seq ON messages(session_id, kind, seq);
+
+CREATE TABLE IF NOT EXISTS todos (
+    id          TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL,
+    created_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL,
+    PRIMARY KEY (session_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id, sort_order);
 "#;

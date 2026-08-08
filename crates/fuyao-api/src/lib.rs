@@ -56,6 +56,6 @@ pub use session_types::{
 };
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{
-    CancellationToken, ChildSessionSource, SubagentOps, ToolCallContext, ToolDefinition, ToolFn,
-    ToolParameterProperty, ToolParameters, ToolResult, ToolSchema,
+    CancellationToken, ChildSessionSource, SubagentOps, TodoStoreOps, ToolCallContext,
+    ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters, ToolResult, ToolSchema,
 };

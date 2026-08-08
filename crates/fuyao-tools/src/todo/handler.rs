@@ -5,8 +5,9 @@
 //!
 //! 不传 todos 参数 = 读取当前列表，传了 = 整体覆盖写入。
 //! session_id 由 runner 通过 ToolCallContext 注入，不由 LLM 传递。
+//! 存储能力经 ctx.todo_store 注入（SessionStore 实现的 TodoStoreOps），
+//! 不再自建连接池。
 
-use super::store::TodoStore;
 use super::types::{TodoSummary, TodoWriteResult};
 use crate::common;
 use fuyao_api::{TodoItem, ToolCallContext};
@@ -53,27 +54,25 @@ pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
         }
     };
 
-    let agent_paths = match &ctx.agent_paths {
-        Some(paths) => paths,
+    let todos_data = args.get("todos");
+
+    // 参数校验优先于存储取用：todos 给了但非数组是输入错误，应在任何 I/O 前报
+    if todos_data.is_some_and(|t| t.as_array().is_none()) {
+        return common::tool_error("todos 必须是数组");
+    }
+
+    let store = match &ctx.todo_store {
+        Some(s) => s.clone(),
         None => {
-            return common::tool_error("TodoStore 需要 agent_paths，请检查 ToolCallContext 配置");
+            return common::tool_error(
+                "任务列表存储未注入（TodoStoreOps 不可用），请检查工具调用上下文配置",
+            );
         }
     };
 
-    let db_path = agent_paths.sessions_db_path();
-    let store = match TodoStore::new(db_path).await {
-        Ok(s) => s,
-        Err(e) => return common::tool_error(&format!("打开 TodoStore 失败: {e}")),
-    };
-
-    let todos_data = args.get("todos");
-
     let result_items = if let Some(todos) = todos_data {
-        // 整体覆盖写入
-        let arr = match todos.as_array() {
-            Some(arr) => arr,
-            None => return common::tool_error("todos 必须是数组"),
-        };
+        // 整体覆盖写入（数组校验已在上方完成）
+        let arr = todos.as_array().unwrap();
 
         let mut items: Vec<TodoItem> = Vec::new();
         for raw in arr {
@@ -113,13 +112,13 @@ pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
             });
         }
 
-        match store.write(session_id, items).await {
+        match store.write_todos(session_id, items).await {
             Ok(result) => result,
             Err(e) => return common::tool_error(&format!("写入 todo 失败: {e}")),
         }
     } else {
         // 读取
-        match store.read(session_id).await {
+        match store.read_todos(session_id).await {
             Ok(result) => result,
             Err(e) => return common::tool_error(&format!("读取 todo 失败: {e}")),
         }
@@ -209,26 +208,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn todo_handler_returns_error_without_agent_paths() {
+    async fn todo_handler_returns_error_without_todo_store() {
         let ctx = ToolCallContext {
             session_id: Some("test".to_string()),
-            agent_paths: None,
-            tool_call_id: None,
-            subagent_ops: None,
-            event_forwarder: None,
+            todo_store: None,
+            ..ToolCallContext::default()
         };
         let result = todo_handler(serde_json::json!({}), &ctx).await;
-        assert!(result.contains("agent_paths"));
+        assert!(result.contains("TodoStoreOps 不可用"));
     }
 
     #[tokio::test]
     async fn todo_handler_returns_error_for_non_array_todos() {
         let ctx = ToolCallContext {
             session_id: Some("test".to_string()),
-            agent_paths: Some(fuyao_api::AgentPaths::default()),
-            tool_call_id: None,
-            subagent_ops: None,
-            event_forwarder: None,
+            ..ToolCallContext::default()
         };
         let result = todo_handler(serde_json::json!({ "todos": "not_array" }), &ctx).await;
         assert!(result.contains("todos 必须是数组"));

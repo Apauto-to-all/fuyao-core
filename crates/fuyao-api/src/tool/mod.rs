@@ -5,7 +5,7 @@
 //! - `result`: 工具执行结果（ToolResult）
 //! - `func`: 工具执行器函数类型（ToolFn）
 //! - `context`: 工具调用上下文（ToolCallContext）
-//! - `ops`: 派生子 session 的最小能力接口（SubagentOps + ChildSessionSource）
+//! - `ops`: 运行期能力注入接口（SubagentOps + ChildSessionSource + TodoStoreOps）
 
 pub mod context;
 pub mod definition;
@@ -16,7 +16,7 @@ pub mod result;
 pub use context::ToolCallContext;
 pub use definition::{ToolDefinition, ToolParameterProperty, ToolParameters, ToolSchema};
 pub use func::ToolFn;
-pub use ops::{ChildSessionSource, SubagentOps};
+pub use ops::{ChildSessionSource, SubagentOps, TodoStoreOps};
 pub use result::ToolResult;
 
 // 取消令牌：工具 handler 据此响应中断 / shutdown，优雅收尾长任务
