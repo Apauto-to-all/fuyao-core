@@ -486,7 +486,7 @@ mod tests {
         let def = resolve_definition(&ctx, &config, crate::PromptUsage::Subagent);
         assert_eq!(def.tools.get("write"), Some(&false));
         assert_eq!(def.tools.get("bash"), Some(&false));
-        assert!(def.tools.get("read").is_none());
+        assert!(!def.tools.contains_key("read"));
 
         std::fs::remove_dir_all(&temp).ok();
     }

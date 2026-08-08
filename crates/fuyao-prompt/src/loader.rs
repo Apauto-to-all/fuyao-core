@@ -318,7 +318,7 @@ mod tests {
         // explore 只读收窄：禁用 write/edit，未列出的（read/glob/grep/bash/webfetch/...）默认启用
         assert_eq!(explore.tools.get("write"), Some(&false));
         assert_eq!(explore.tools.get("edit"), Some(&false));
-        assert!(explore.tools.get("read").is_none());
+        assert!(!explore.tools.contains_key("read"));
 
         let executor = load_builtin_definition("executor").unwrap();
         assert_eq!(executor.name, "executor");
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(def.tools.get("bash"), Some(&false));
         assert_eq!(def.tools.get("read"), Some(&true));
         // 未列出的工具不进 map（默认启用语义）
-        assert!(def.tools.get("grep").is_none());
+        assert!(!def.tools.contains_key("grep"));
     }
 
     #[test]
@@ -394,6 +394,6 @@ mod tests {
         assert_eq!(def.tools.len(), 2);
         assert_eq!(def.tools.get("write"), Some(&false));
         assert_eq!(def.tools.get("read"), Some(&true));
-        assert!(def.tools.get("bad").is_none());
+        assert!(!def.tools.contains_key("bad"));
     }
 }

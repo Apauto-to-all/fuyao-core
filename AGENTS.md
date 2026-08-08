@@ -113,13 +113,15 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 - 运行检查：`cargo check`（比 build 快，推荐开发时使用）
 - 运行测试：`cargo test`
 - 格式化代码：`cargo fmt`
-- 静态检查：`cargo clippy -- -D warnings`
+- 静态检查：`cargo clippy -- -D warnings`（仅生产代码，开发期快检）
+- 交付前全检：`cargo clippy --workspace --tests -- -D warnings`（含 `#[cfg(test)]` 测试代码，阶段性交付 / 提交前必跑）
 - 覆盖率：`cargo llvm-cov --fail-under-lines 80`
 - 创建各个 crate： `cargo init --lib crates/fuyao-xxx`       # lib crate
 
 #### 测试规范（Cargo）
 
 - **开发过程避免跑全量测试**：`cargo test --workspace`（尤其含集成测试）耗时长，**除非用户明确要求**，否则开发过程中不要主动运行。开发期验证优先用 `cargo check`（快）和 `cargo clippy -- -D warnings`（静态检查）；确需跑测试时，用 `cargo test -p <crate>` 限定单个 crate 或 `cargo test -p <crate> --lib` 只跑单元测试。完整测试仅在阶段性交付、提交前、或用户要求时运行。
+- **交付前 clippy 必含 `--tests`**：`cargo check` 和不带 `--tests` 的 `cargo clippy` 都**不编译 `#[cfg(test)]` 测试代码**，测试里的 clippy lint 与漏参 bug 只有加 `--tests` 才会暴露。阶段性交付 / 提交前，务必跑 `cargo clippy --workspace --tests -- -D warnings`。
 - 运行测试：`cargo test --workspace`（包含所有 crate 的测试）
 - 单元测试：在源文件内使用 `#[cfg(test)] mod tests { ... }`
 - 集成测试：放在 `tests/` 目录下，每个文件是独立的测试二进制

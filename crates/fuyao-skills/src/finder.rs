@@ -290,7 +290,10 @@ mod tests {
 
         // 截断点严格不超 4000，且是字符边界（UTF-8 合法，可重转 String）
         assert!(end <= 4000);
-        assert!(end % 3 == 0, "全中文内容，字符边界应是 3 的倍数：{end}");
+        assert!(
+            end.is_multiple_of(3),
+            "全中文内容，字符边界应是 3 的倍数：{end}"
+        );
         let _ = truncated.to_string(); // 不 panic 即合法 UTF-8
     }
 }
