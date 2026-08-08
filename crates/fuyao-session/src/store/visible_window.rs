@@ -21,7 +21,7 @@
 //! 详见设计文档 `docs/开发/设计文档/01.2-压缩可见窗口动态拼接思路.md`。
 
 use super::row::MessageRow;
-use crate::compressor::window::select_recent;
+use super::window::select_recent;
 use crate::error::SessionError;
 use fuyao_api::Message;
 

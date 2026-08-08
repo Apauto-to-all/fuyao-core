@@ -14,6 +14,8 @@
 //!   sessions 的 compression_count / last_compacted_seq）
 //! - [`visible_window`]：给 LLM 的可见窗口动态拼接（压缩感知，摘要 + keep_recent + 新消息）。
 //!   与 [`message`] 的「给人看的」查询路径正交
+//! - [`window`]：可见窗口的 keep_recent 切分算法（token 预算 + 整 turn 完整性扩展），
+//!   被 [`visible_window`] 消费
 //! - [`rollback`]：对话回退（删目标 seq 之后消息 + 局部 UPDATE 重算 count 类与
 //!   压缩元数据，保护消费类字段不动）
 //! - [`todo`]：todos 表的读写 + 级联删除（任务列表 CRUD）
@@ -25,6 +27,7 @@ mod row;
 mod session;
 mod todo;
 mod visible_window;
+mod window;
 
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};

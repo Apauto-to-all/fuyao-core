@@ -1,7 +1,8 @@
-//! 窗口算法：保留最近窗口的 token 预算切分 + 整 turn 完整性
+//! 可见窗口切分算法:保留近期窗口的 token 预算切分 + 整 turn 完整性扩展
 //!
-//! 仅用于决定 apply 时「保留多少近账」（keep_recent），不再参与摘要请求构造——
-//! 摘要请求把全部消息原样发给 LLM，不切窗口、不序列化，前缀缓存完整命中。
+//! 服务于读取侧 [`super::visible_window::load_visible_messages`] 的 keep_recent 切分——
+//! 从候选消息尾部向前按 token 预算累加,再扩大到整 turn 完整边界(不切断 assistant+tool_result 块)。
+//! 与压缩写侧([`crate::compressor`])正交:写侧只负责摘要生成与边界落库,不做窗口切分。
 
 use fuyao_api::{Message, MessageKind, MessageRole};
 
@@ -11,7 +12,7 @@ const CHARS_PER_TOKEN: usize = 4;
 /// 窗口切分结果
 #[derive(Debug)]
 pub struct Window<'a> {
-    /// 保留的近端窗口（apply 时原样留在可见消息流里）
+    /// 保留的近端窗口(读取侧拼进可见消息流)
     pub keep_recent: &'a [Message],
 }
 

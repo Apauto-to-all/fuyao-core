@@ -8,16 +8,17 @@
 //!
 //! 文件组织：
 //! - [`trigger`]：触发层（阈值检测）
-//! - [`window`]：窗口算法（保留 tail 的 token 预算切分 + 整 turn 完整性，读取侧可见窗口拼接用）
 //! - [`summary`]：执行层（构造 prompt + 调 provider + 失败处理）
 //! - [`prompt`]：摘要 system prompt + previous-summary 注入模板
 //! - [`apply`]：落地层（调 store.mark_compaction）
+//!
+//! 窗口切分算法已迁移至 [`crate::store::window`]（服务于读取侧的可见窗口拼接），
+//! 本模块只管压缩写侧，不参与窗口切分。
 
 pub mod apply;
 pub mod prompt;
 pub mod summary;
 pub mod trigger;
-pub mod window;
 
 pub use apply::apply;
 pub use summary::generate_summary;
