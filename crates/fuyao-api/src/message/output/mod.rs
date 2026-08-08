@@ -47,7 +47,10 @@ pub use plugin::{PluginMessage, PluginPayload};
 pub use retry::{RetryMessage, RetryPayload};
 pub use rollback::{RollbackMessage, RollbackPayload};
 pub use title::{TitleMessage, TitlePayload};
-pub use tool_call::{ToolCallMessage, ToolCallPayload};
+pub use tool_call::{
+    ToolCallMessage, ToolCallPayload, build_nested_tool_call, extract_id_name_pairs,
+    parse_nested_tool_call,
+};
 pub use tool_result::{ToolResultMessage, ToolResultPayload};
 pub use user_message::{UserMessage, UserPayload};
 

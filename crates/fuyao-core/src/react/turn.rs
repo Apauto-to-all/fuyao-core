@@ -37,7 +37,7 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{
     AssistantMessage, InterruptMessage as OutputInterruptMessage,
-    InterruptPayload as OutputInterruptPayload, TitleMessage, TitlePayload,
+    InterruptPayload as OutputInterruptPayload, TitleMessage, TitlePayload, build_nested_tool_call,
 };
 use fuyao_api::{Message, MessageRole, ModelConfig};
 use fuyao_provider::Provider;
@@ -538,16 +538,11 @@ async fn handle_tool_calls(
         |ev| match ev {
             OutputEvent::Assistant(m) => {
                 // tool_calls 字段以 effective_result.tool_calls（已拦截 ToolCall 事件）为准
+                // schema 构造集中到 build_nested_tool_call，此处不再硬编码字段名
                 let tool_calls_json: Vec<serde_json::Value> = effective_result
                     .tool_calls
                     .iter()
-                    .map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {"name": tc.name, "arguments": tc.arguments}
-                        })
-                    })
+                    .map(|tc| build_nested_tool_call(&tc.id, &tc.name, &tc.arguments))
                     .collect();
                 let mut msg = Message::assistant(m.payload.content.clone());
                 msg.reasoning = m.payload.reasoning.clone();

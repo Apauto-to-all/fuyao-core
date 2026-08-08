@@ -12,7 +12,9 @@
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
+use fuyao_api::message::output::{
+    AssistantPayload, ToolCallMessage, ToolCallPayload, extract_id_name_pairs,
+};
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_api::{AgentPaths, InputModality, MessageRole, ModelConfig, ThinkingType};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
@@ -118,11 +120,11 @@ pub(crate) async fn build_chat_request(
 
         // assistant 消息后：为缺结果的 tool_call 补 error tool_result
         if matches!(m.role, MessageRole::Assistant)
-            && let Some(tool_calls) = m.tool_calls.as_ref().and_then(|tc| tc.as_array())
+            && let Some(tool_calls) = m.tool_calls.as_ref()
         {
-            for tc in tool_calls {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if !id.is_empty() && !answered_ids.contains(id) {
+            // schema 解析集中到 extract_id_name_pairs，此处不再硬编码字段名
+            for (id, name) in extract_id_name_pairs(tool_calls) {
+                if !id.is_empty() && !answered_ids.contains(id.as_str()) {
                     // 缺结果：补 error tool_result
                     messages.push(ChatMessage {
                         role: MessageRole::Tool,
@@ -130,12 +132,8 @@ pub(crate) async fn build_chat_request(
                         images: vec![],
                         reasoning: None,
                         tool_calls: None,
-                        tool_call_id: Some(id.to_string()),
-                        tool_name: tc
-                            .get("function")
-                            .and_then(|f| f.get("name"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
+                        tool_call_id: Some(id),
+                        tool_name: Some(name),
                     });
                 }
             }

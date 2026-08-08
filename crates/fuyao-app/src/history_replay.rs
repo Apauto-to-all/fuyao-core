@@ -22,7 +22,7 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, OutputEvent, ToolResultMessage, ToolResultPayload,
-    UserMessage, UserPayload,
+    UserMessage, UserPayload, parse_nested_tool_call,
 };
 use fuyao_api::{Message, MessageRole};
 
@@ -84,51 +84,20 @@ fn message_to_event(msg: &Message) -> Option<OutputEvent> {
 
 /// OpenAI 嵌套 tool_calls → 扁平 ToolCallPayload 列表
 ///
-/// 落库形态（与 core 写库处一致）：
-/// ```json
-/// [{ "id": "call_1", "type": "function",
-///    "function": { "name": "search", "arguments": "{\"q\":\"rust\"}" } }]
-/// ```
-/// - `arguments` 是 **JSON 字符串**（OpenAI 协议原样），需 `from_str` 解析成对象赋给
-///   `tool_args`（[`ToolCallPayload::tool_args`] 是 `serde_json::Value`）；解析失败兜底成
-///   原字符串 Value，保证信息不丢。
-/// - `type: "function"` 是 OpenAI 协议标记，扁平形态不需要，丢弃。
+/// 单条嵌套 schema 的字段拆解集中到 [`parse_nested_tool_call`]（`fuyao_api`），
+/// 本函数只管「数组遍历 + 空结果归 None」的外层逻辑。
 ///
 /// 非数组 / 元素缺字段时跳过该元素（容错），不整体失败——单条工具调用损坏不应阻断整段历史。
 fn parse_tool_calls(
     tool_calls: Option<&serde_json::Value>,
 ) -> Option<Vec<fuyao_api::message::output::ToolCallPayload>> {
     let arr = tool_calls?.as_array()?;
-    let parsed: Vec<_> = arr.iter().filter_map(parse_tool_call).collect();
+    let parsed: Vec<_> = arr.iter().filter_map(parse_nested_tool_call).collect();
     if parsed.is_empty() {
         None
     } else {
         Some(parsed)
     }
-}
-
-/// 单条 OpenAI 嵌套 tool_call → 扁平 ToolCallPayload
-///
-/// 字段映射：`id → tool_call_id`、`function.name → tool_name`、
-/// `function.arguments(字符串) → tool_args(JSON Value)`。
-fn parse_tool_call(v: &serde_json::Value) -> Option<fuyao_api::message::output::ToolCallPayload> {
-    use fuyao_api::message::output::ToolCallPayload;
-
-    let id = v.get("id").and_then(|i| i.as_str())?;
-    let function = v.get("function")?;
-    let name = function.get("name").and_then(|n| n.as_str())?;
-    // arguments 是 JSON 字符串：解析失败兜底成原字符串 Value，信息不丢
-    let tool_args = function
-        .get("arguments")
-        .and_then(|a| a.as_str())
-        .map(|s| serde_json::from_str(s).unwrap_or_else(|_| serde_json::Value::String(s.into())))
-        .unwrap_or(serde_json::Value::Null);
-
-    Some(ToolCallPayload {
-        tool_call_id: id.into(),
-        tool_name: name.into(),
-        tool_args,
-    })
 }
 
 // ── 批量投影 ─────────────────────────────────────────────────

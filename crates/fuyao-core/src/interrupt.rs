@@ -24,6 +24,7 @@ use fuyao_api::Message;
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, ToolResultMessage, ToolResultPayload,
+    build_nested_tool_call,
 };
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
@@ -223,15 +224,10 @@ fn build_interrupted_assistant_msg(
 ) -> Option<Message> {
     match ev {
         OutputEvent::Assistant(m) => {
+            // schema 构造集中到 build_nested_tool_call，此处不再硬编码字段名
             let tool_calls_json: Vec<serde_json::Value> = valid_tool_calls
                 .iter()
-                .map(|tc| {
-                    serde_json::json!({
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": tc.arguments}
-                    })
-                })
+                .map(|tc| build_nested_tool_call(&tc.id, &tc.name, &tc.arguments))
                 .collect();
             let mut msg = Message::assistant(m.payload.content.clone());
             msg.reasoning = m.payload.reasoning.clone();
