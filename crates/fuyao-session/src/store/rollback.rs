@@ -149,8 +149,11 @@ impl super::SessionStore {
             )));
         };
 
-        // 目标合法性以 kind 为准：compaction 消息在 DB 里 role='assistant'（由 mark_compaction
-        // 硬编码），靠 role 判压缩会判错。合法目标 = user 消息 或 compaction 消息
+        // 目标合法性判定：role 管对话角色，kind 管消息类型标记，两者正交。
+        // 合法回退目标 = user 消息（role 判定） 或 compaction 消息（kind 判定）。
+        // compaction 消息的 role 是 assistant（摘要由助手产出，以 assistant 身份
+        // 参与对话流），但它是压缩边界这一事实只由 kind 表达——故 compaction
+        // 一律靠 kind 识别，与 role 无关。
         let is_user = target_row.role == "user";
         let is_compaction = target_row.kind == MessageKind::Compaction.as_str();
         if !is_user && !is_compaction {

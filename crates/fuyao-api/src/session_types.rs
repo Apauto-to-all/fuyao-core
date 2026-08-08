@@ -196,7 +196,7 @@ pub enum MessageRole {
     Assistant,
     /// 工具结果消息
     Tool,
-    /// 系统消息（含压缩边界消息，后者靠 `kind=Compaction` 区分）
+    /// 系统消息（操作者高权限指令，对应 [`Message::system`] 构造）
     System,
 }
 
@@ -364,20 +364,6 @@ impl Message {
             role: MessageRole::System,
             content: Some(content),
             timestamp: current_timestamp(),
-            ..Self::default()
-        }
-    }
-
-    /// 创建压缩边界消息（上下文压缩专用）
-    ///
-    /// `content` = 摘要正文（Markdown）；`role=System` 避免与 user/assistant
-    /// 流混淆，`kind=Compaction` 是真正的类型标记（DB 列 + 业务识别都靠它）。
-    pub fn compaction(summary: String) -> Self {
-        Self {
-            role: MessageRole::System,
-            content: Some(summary),
-            timestamp: current_timestamp(),
-            kind: MessageKind::Compaction,
             ..Self::default()
         }
     }
@@ -606,14 +592,6 @@ mod tests {
         let msg = Message::default();
         assert_eq!(msg.kind, MessageKind::Message);
         assert_eq!(msg.seq, 0);
-    }
-
-    #[test]
-    fn message_compaction_marks_kind() {
-        let msg = Message::compaction("## 目标\n- 测试".to_string());
-        assert_eq!(msg.kind, MessageKind::Compaction);
-        assert_eq!(msg.role, MessageRole::System);
-        assert_eq!(msg.content.as_deref(), Some("## 目标\n- 测试"));
     }
 
     #[test]
