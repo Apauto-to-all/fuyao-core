@@ -25,6 +25,10 @@ use std::collections::HashMap;
 /// 喂给 `provider.stream_chat`。`model_id` 是完整 `"provider_id/model_id"` 串，
 /// 供调用方写回 session（见 turn.rs 物化逻辑）+ 落进 assistant 消息 + 喂费用计算。
 /// 三者从 `ModelConfig.model_id` 拆分而来——model_id=None 时回退 `[models.default]`。
+///
+/// `context_length` 一并解析进来——主对话 keep_tokens 预算、压缩阈值门、中断补发
+/// 三处消费点原本各自内联 `get_model(id).map(context).unwrap_or(fallback)` 片段，
+/// 收进本字段后调用方直接读 `resolved.context_length`，口径天然一致。
 #[derive(Debug)]
 pub(crate) struct ResolvedModel {
     /// 完整模型 ID（`"provider_id/model_id"` 形，写回 session / 落库 / 计费用）
@@ -35,6 +39,10 @@ pub(crate) struct ResolvedModel {
     pub model: String,
     /// 流式选项（思考参数已合并：显式 session 优先，default 兜底）
     pub options: StreamOptions,
+    /// 模型上下文长度（查 `model.limit.context`，查不到取 `fallback_context`）
+    ///
+    /// keep_tokens 预算、压缩阈值门等各消费点共用一份，避免散算漂移。
+    pub context_length: u32,
 }
 
 /// 从 DB 加载可见消息凑 ChatRequest
@@ -172,6 +180,21 @@ pub(crate) fn model_supports_images(model_config: &ModelConfig, agent_paths: &Ag
         .unwrap_or(false)
 }
 
+/// 解析模型上下文长度：查 `model.limit.context`，查不到取 `fallback`
+///
+/// 集中此片段，供 [`resolve_model`]（首轮解析）与压缩侧 / 中断补发侧等独立调用点共用，
+/// 避免 `get_model(id).map(context).unwrap_or(fallback)` 散在多处各自漂移。
+/// `get_model` 查全局静态缓存（非 IO），本函数保持纯计算。
+pub(crate) fn resolve_context_length(
+    model_id: &str,
+    agent_paths: &AgentPaths,
+    fallback: u32,
+) -> u32 {
+    fuyao_provider::get_model(model_id, agent_paths)
+        .map(|m| m.limit.context)
+        .unwrap_or(fallback)
+}
+
 /// 从 ModelConfig 解析本轮模型信息
 ///
 /// model_id 解析顺序：
@@ -191,6 +214,9 @@ pub(crate) fn model_supports_images(model_config: &ModelConfig, agent_paths: &Ag
 /// 结果进 `options`，调用方（turn.rs）据此写回 session 物化（见写回逻辑），保证
 /// DB 消息 / 费用 / 标题三处消费点都能读到实际生效值。
 ///
+/// `context_length` 一并由 [`resolve_context_length`] 算出填进返回值——调用方不再
+/// 各自内联该片段。传入 `fallback_context`（压缩配置里的 `fallback_context`）作兜底。
+///
 /// 工具定义按 `is_child`（递归防护）+ `definition_tools`（定义层收窄）双重过滤后序列化，
 /// 两者取交集。
 ///
@@ -201,6 +227,8 @@ pub(crate) fn resolve_model(
     tools: &ToolRegistry,
     is_child: bool,
     definition_tools: &HashMap<String, bool>,
+    agent_paths: &AgentPaths,
+    fallback_context: u32,
 ) -> Result<ResolvedModel, String> {
     // 1. 确定 model_id 字符串 + 2. 取思考参数（两步合一，避免借用逃逸临时 get_config()）
     //
@@ -267,11 +295,15 @@ pub(crate) fn resolve_model(
         reasoning_effort,
     };
 
+    // 5. context_length 与主对话 keep_tokens 预算、压缩阈值门共用一份（集中此处解析）
+    let context_length = resolve_context_length(&model_id, agent_paths, fallback_context);
+
     Ok(ResolvedModel {
         model_id,
         provider_id,
         model,
         options,
+        context_length,
     })
 }
 
@@ -521,8 +553,15 @@ mod tests {
     fn resolve_model_explicit_id_splits_provider_and_model() {
         let tools = empty_registry();
         let params = params_with_model(Some("DeepSeek/deepseek-v4-flash"));
-        let r = resolve_model(&params, &tools, false, &HashMap::new())
-            .expect("显式 model_id 应解析成功");
+        let r = resolve_model(
+            &params,
+            &tools,
+            false,
+            &HashMap::new(),
+            &AgentPaths::default(),
+            64000,
+        )
+        .expect("显式 model_id 应解析成功");
         // provider_id 小写化
         assert_eq!(r.provider_id, "deepseek");
         // model 保持原样
@@ -540,7 +579,15 @@ mod tests {
             thinking_type: Some(fuyao_api::ThinkingType::Enabled),
             reasoning_effort: Some("high".to_string()),
         };
-        let r = resolve_model(&params, &tools, false, &HashMap::new()).expect("解析应成功");
+        let r = resolve_model(
+            &params,
+            &tools,
+            false,
+            &HashMap::new(),
+            &AgentPaths::default(),
+            64000,
+        )
+        .expect("解析应成功");
         assert_eq!(
             r.options.thinking_type,
             Some(fuyao_api::ThinkingType::Enabled)
@@ -553,8 +600,15 @@ mod tests {
         // 默认状态：未 set_config，get_config 返回 default（models.default = None）
         let tools = empty_registry();
         let params = params_with_model(None);
-        let err = resolve_model(&params, &tools, false, &HashMap::new())
-            .expect_err("无 default 应返回 Err");
+        let err = resolve_model(
+            &params,
+            &tools,
+            false,
+            &HashMap::new(),
+            &AgentPaths::default(),
+            64000,
+        )
+        .expect_err("无 default 应返回 Err");
         assert!(err.contains("未指定模型"), "错误信息应明确：{err}");
         assert!(
             err.contains("[models.default]"),
@@ -566,8 +620,15 @@ mod tests {
     fn resolve_model_invalid_format_no_slash_returns_err() {
         let tools = empty_registry();
         let params = params_with_model(Some("invalid-no-slash"));
-        let err =
-            resolve_model(&params, &tools, false, &HashMap::new()).expect_err("格式错误应返回 Err");
+        let err = resolve_model(
+            &params,
+            &tools,
+            false,
+            &HashMap::new(),
+            &AgentPaths::default(),
+            64000,
+        )
+        .expect_err("格式错误应返回 Err");
         assert!(err.contains("格式错误"), "错误信息应明确：{err}");
     }
 
@@ -576,9 +637,25 @@ mod tests {
         let tools = empty_registry();
         // "/model" — provider 空
         let params = params_with_model(Some("/model"));
-        resolve_model(&params, &tools, false, &HashMap::new()).expect_err("provider 空应报错");
+        resolve_model(
+            &params,
+            &tools,
+            false,
+            &HashMap::new(),
+            &AgentPaths::default(),
+            64000,
+        )
+        .expect_err("provider 空应报错");
         // "provider/" — model 空
         let params = params_with_model(Some("provider/"));
-        resolve_model(&params, &tools, false, &HashMap::new()).expect_err("model 空应报错");
+        resolve_model(
+            &params,
+            &tools,
+            false,
+            &HashMap::new(),
+            &AgentPaths::default(),
+            64000,
+        )
+        .expect_err("model 空应报错");
     }
 }

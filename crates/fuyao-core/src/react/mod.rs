@@ -313,16 +313,6 @@ pub(crate) async fn run_session(
 
 /// 压缩执行依赖的解析结果（model_id / 思考配置 / provider / 上下文长度）
 ///
-/// 由 [`resolve_compression_model`] 一次性解析，供 [`run_compression`] 直接消费——
-/// 把「该不该压」（阈值门）与「怎么压」（执行体）解耦，自动 / 手动两条触发路径共用执行体。
-struct CompressionModel {
-    model_id: String,
-    thinking_type: Option<fuyao_api::ThinkingType>,
-    reasoning_effort: Option<String>,
-    provider: std::sync::Arc<dyn fuyao_provider::Provider>,
-    context_length: u32,
-}
-
 /// 子代理 session 的压缩豁免判定（可配置，`[session.compression] skip_child` 默认 true）
 ///
 /// 子代理以 Fresh 模式派生、只回传最终回复文本给父 Agent，自身完整历史留在子 session 内。
@@ -334,83 +324,52 @@ fn compression_exempt(ctx: &SessionCtx) -> bool {
     ctx.is_child && ctx.compression_config.skip_child
 }
 
-/// 解析压缩执行所需的模型信息（model_id + 思考配置 + provider + 上下文长度）
+/// 解析压缩执行所需的模型信息
 ///
 /// **前缀缓存红线**：压缩必须用主对话这一轮的同一个 Provider/endpoint，否则原样发的请求
-/// 会因 endpoint 切换导致前缀缓存失效。model_id 解析顺序与 turn.rs::resolve_model 一致：
-///   1. SessionParams.model_config.model_id = Some(...) → 用它（整 session 共享一份，现读）
-///   2. None → 读 [models.default] 兜底（含其 thinking，与 model_id 同源取）
-///   3. 都没有 → 返回 None（warn 记录原因）
+/// 会因 endpoint 切换导致前缀缓存失效。
+///
+/// model_id / thinking / context_length 解析统一走 [`builders::resolve_model`]（与主对话
+/// `run_turn` 同一份逻辑，避免散算漂移）；provider 实例是压缩路径专属步骤——
+/// [`builders::resolve_model`] 故意不查 registry（保持纯构造边界），故在此单独取。
 ///
 /// 注：写回逻辑（turn.rs）已在首轮后把 model_id + thinking 物化进 session_params，
 /// 正常运行期这里读到的都是 Some。None→default 分支仅首轮前 / 未物化时兜底。
-async fn resolve_compression_model(ctx: &SessionCtx) -> Option<CompressionModel> {
-    let (model_id, thinking_type, reasoning_effort) = {
-        let p = ctx.session_params.lock().await;
-        let mc = &p.model_config;
-        match mc.model_id.as_deref() {
-            Some(id) => (
-                id.to_string(),
-                mc.thinking_type.clone(),
-                mc.reasoning_effort.clone(),
-            ),
-            None => match fuyao_api::get_config()
-                .models
-                .default
-                .as_ref()
-                .filter(|r| !r.model.is_empty())
-            {
-                Some(r) => (
-                    r.model.clone(),
-                    r.thinking_type.clone(),
-                    r.reasoning_effort.clone(),
-                ),
-                None => {
-                    tracing::warn!(
-                        session_id = ctx.emitter.session_id(),
-                        "压缩跳过：本轮主模型未指定且未配置 [models.default]"
-                    );
-                    return None;
-                }
-            },
-        }
-    };
-
-    // 拆 provider_id → 从 registry 取 Provider 实例（与主对话 stream_chat 同一个）
-    let provider_id = match model_id.split_once('/') {
-        Some((p, _)) if !p.is_empty() => p.to_lowercase(),
-        _ => {
-            tracing::warn!(
-                session_id = ctx.emitter.session_id(),
-                model_id = %model_id,
-                "压缩跳过：model_id 格式错误"
-            );
-            return None;
-        }
-    };
-    let provider = match ctx.providers.get(&provider_id) {
-        Some(p) => p,
-        None => {
-            tracing::warn!(
-                session_id = ctx.emitter.session_id(),
-                provider_id = %provider_id,
-                "压缩跳过：Provider 实例未注册"
-            );
-            return None;
-        }
-    };
-
-    let context_length = fuyao_provider::get_model(&model_id, &ctx.agent_paths)
-        .map(|m| m.limit.context)
-        .unwrap_or(ctx.compression_config.fallback_context);
-
-    Some(CompressionModel {
-        model_id,
-        thinking_type,
-        reasoning_effort,
-        provider,
-        context_length,
+async fn resolve_compression_model(
+    ctx: &SessionCtx,
+) -> Option<(
+    builders::ResolvedModel,
+    std::sync::Arc<dyn fuyao_provider::Provider>,
+)> {
+    let model_config = ctx.session_params.lock().await.model_config.clone();
+    let resolved = builders::resolve_model(
+        &model_config,
+        &ctx.tools,
+        ctx.is_child,
+        &ctx.definition.tools,
+        &ctx.agent_paths,
+        ctx.compression_config.fallback_context,
+    )
+    .map_err(|msg| {
+        tracing::warn!(
+            session_id = ctx.emitter.session_id(),
+            cause = %msg,
+            "压缩跳过：模型解析失败（model_id 无效或未配置 [models.default]）"
+        );
+        msg
     })
+    .ok()?;
+
+    let provider = ctx.providers.get(&resolved.provider_id).or_else(|| {
+        tracing::warn!(
+            session_id = ctx.emitter.session_id(),
+            provider_id = %resolved.provider_id,
+            "压缩跳过：Provider 实例未注册"
+        );
+        None
+    })?;
+
+    Some((resolved, provider))
 }
 
 /// Pre-turn 自动上下文压缩检查（「该不该压」的阈值门）
@@ -428,8 +387,8 @@ async fn run_pre_turn_compression(ctx: &SessionCtx) {
         None => return,
     };
 
-    let model = match resolve_compression_model(ctx).await {
-        Some(m) => m,
+    let (model, provider) = match resolve_compression_model(ctx).await {
+        Some(v) => v,
         None => return,
     };
 
@@ -443,7 +402,14 @@ async fn run_pre_turn_compression(ctx: &SessionCtx) {
         return;
     }
 
-    run_compression(ctx, CompressionReason::Auto, usage.prompt_tokens, &model).await;
+    run_compression(
+        ctx,
+        CompressionReason::Auto,
+        usage.prompt_tokens,
+        &model,
+        &provider,
+    )
+    .await;
 }
 
 /// 手动触发上下文压缩（控制通道 Compress 命令的处理）
@@ -454,8 +420,8 @@ async fn run_pre_turn_compression(ctx: &SessionCtx) {
 ///    子代理失真风险由用户自担（自动压缩替用户挡不划算的压缩，手动不挡）。
 /// 触发原因标记为 manual。
 async fn run_manual_compression(ctx: &SessionCtx) {
-    let model = match resolve_compression_model(ctx).await {
-        Some(m) => m,
+    let (model, provider) = match resolve_compression_model(ctx).await {
+        Some(v) => v,
         None => return,
     };
 
@@ -468,7 +434,14 @@ async fn run_manual_compression(ctx: &SessionCtx) {
         .map(|u| u.prompt_tokens)
         .unwrap_or(0);
 
-    run_compression(ctx, CompressionReason::Manual, prompt_tokens, &model).await;
+    run_compression(
+        ctx,
+        CompressionReason::Manual,
+        prompt_tokens,
+        &model,
+        &provider,
+    )
+    .await;
 }
 
 /// 执行一次上下文压缩（「怎么压」的执行体）
@@ -488,7 +461,8 @@ async fn run_compression(
     ctx: &SessionCtx,
     reason: CompressionReason,
     prompt_tokens: u32,
-    model: &CompressionModel,
+    model: &builders::ResolvedModel,
+    provider: &std::sync::Arc<dyn fuyao_provider::Provider>,
 ) {
     tracing::info!(
         session_id = ctx.emitter.session_id(),
@@ -547,8 +521,8 @@ async fn run_compression(
 
     // 构造压缩用 options：复用 session 思考配置（tools 由 generate_summary 内部强制清空）
     let compression_options = fuyao_provider::StreamOptions {
-        thinking_type: model.thinking_type.clone(),
-        reasoning_effort: model.reasoning_effort.clone(),
+        thinking_type: model.options.thinking_type.clone(),
+        reasoning_effort: model.options.reasoning_effort.clone(),
         ..fuyao_provider::StreamOptions::default()
     };
 
@@ -605,7 +579,7 @@ async fn run_compression(
         s = fuyao_session::generate_summary(
             system_prompt.as_deref(),
             &visible_messages,
-            &model.provider,
+            provider,
             &model.model_id,
             compression_options,
             &mut on_delta,

@@ -21,7 +21,8 @@
 use super::SessionCtx;
 use super::builders::{
     ResolvedModel, assistant_msg_to_payload, assistant_with_tool_calls_to_payload,
-    build_chat_request, resolve_model, tool_call_data_to_event, tool_call_event_to_data,
+    build_chat_request, resolve_context_length, resolve_model, tool_call_data_to_event,
+    tool_call_event_to_data,
 };
 use super::handle_control;
 use crate::interrupt::{
@@ -118,6 +119,8 @@ pub(crate) async fn run_turn(
         &ctx.tools,
         ctx.is_child,
         &ctx.definition.tools,
+        &ctx.agent_paths,
+        ctx.compression_config.fallback_context,
     ) {
         Ok(r) => r,
         Err(msg) => {
@@ -161,11 +164,10 @@ pub(crate) async fn run_turn(
     let options = resolved.options.clone();
 
     // 可见窗口的 keep_recent token 预算：按当前模型上下文比例算（与压缩侧同口径）
-    // context_length 解析与 resolve_compression_model 一致：查不到回退 fallback_context
-    let context_length = fuyao_provider::get_model(&resolved.model_id, &ctx.agent_paths)
-        .map(|m| m.limit.context)
-        .unwrap_or(ctx.compression_config.fallback_context);
-    let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
+    // context_length 已由 resolve_model 一并解析（resolved.context_length），无需散算
+    let keep_tokens = ctx
+        .compression_config
+        .effective_keep_tokens(resolved.context_length);
 
     loop {
         // === 控制通道间隙检查点 ===
@@ -705,14 +707,18 @@ async fn emit_interrupt_and_complete_tool_results(
     emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 
     // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
-    // keep_tokens 与主对话同口径（effective_keep_tokens 按 context_length 算）
+    // keep_tokens 与主对话同口径（effective_keep_tokens 按 context_length 算）。
+    // 本路径在 run_turn 之外、无 resolved 在手，且语义故意不读 [models.default]：
+    // model_id = None（首轮前未物化）时直接 fallback。复用 resolve_context_length 纯函数，
+    // 传入 model_id（None → 空串，get_model 必然查不到 → fallback，语义等价）。
     let context_length = {
         let p = ctx.session_params.lock().await;
-        p.model_config
-            .model_id
-            .as_deref()
-            .and_then(|id| fuyao_provider::get_model(id, &ctx.agent_paths).map(|m| m.limit.context))
-            .unwrap_or(ctx.compression_config.fallback_context)
+        let model_id = p.model_config.model_id.as_deref().unwrap_or("");
+        resolve_context_length(
+            model_id,
+            &ctx.agent_paths,
+            ctx.compression_config.fallback_context,
+        )
     };
     let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
     let answered: std::collections::HashSet<String> = match ctx
@@ -771,6 +777,7 @@ mod tests {
                 reasoning_effort: effort.map(String::from),
                 ..StreamOptions::default()
             },
+            context_length: 64000,
         }
     }
 
