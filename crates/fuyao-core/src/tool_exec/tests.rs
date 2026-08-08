@@ -94,6 +94,7 @@ async fn execute_single_unknown_tool() {
         &CancellationToken::new(),
         None,
         None,
+        None,
     )
     .await;
     assert_eq!(result.tool_name, "unknown_tool");
@@ -114,6 +115,7 @@ async fn execute_single_known_tool() {
         &test_paths(),
         "s1",
         &CancellationToken::new(),
+        None,
         None,
         None,
     )
@@ -142,6 +144,7 @@ async fn single_call_goes_sequential() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
         None,
     )
     .await;
@@ -173,6 +176,7 @@ async fn never_parallel_tool_goes_sequential() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
         None,
     )
     .await;
@@ -210,6 +214,7 @@ async fn parallel_executes_all() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
         None,
     )
     .await;
@@ -250,6 +255,7 @@ async fn parallel_respects_max_concurrent() {
         &CancellationToken::new(),
         None,
         None,
+        None,
     )
     .await;
     let results = collect_results(&tx, &mut rx, calls.len()).await;
@@ -281,6 +287,7 @@ async fn parallel_notify_count_matches_calls() {
         &emitter,
         &tx,
         &CancellationToken::new(),
+        None,
         None,
     )
     .await;

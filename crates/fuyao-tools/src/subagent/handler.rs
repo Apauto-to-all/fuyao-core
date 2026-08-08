@@ -287,8 +287,10 @@ mod tests {
     async fn returns_error_when_subagent_type_invalid() {
         // subagent_type 不在可用列表（默认仅内置 explore/executor）
         // → 校验失败，返错误 + 可用列表，不进入 SubagentOps 路径
-        let mut ctx = ToolCallContext::default();
-        ctx.agent_paths = Some(fuyao_api::AgentPaths::default());
+        let ctx = ToolCallContext {
+            agent_paths: Some(fuyao_api::AgentPaths::default()),
+            ..ToolCallContext::default()
+        };
         let result = subagent_handler(
             serde_json::json!({
                 "subagent_type": "nonexistent_type",
