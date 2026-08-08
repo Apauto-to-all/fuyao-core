@@ -1,7 +1,8 @@
-//! API Key 解析器
+//! Provider 字段解析器
 //!
-//! 从 Provider 配置或环境变量获取 API Key。
+//! 从 Provider 配置或环境变量获取 API Key、base_url，以及解析模型 ID 字符串。
 
+use crate::error::ProviderError;
 use crate::registry::get_provider;
 use fuyao_api::AgentPaths;
 
@@ -51,6 +52,28 @@ pub fn resolve_api_key(provider_id: &str, agent_paths: &AgentPaths) -> Option<St
 pub fn get_base_url(provider_id: &str, agent_paths: &AgentPaths) -> Option<String> {
     let provider = get_provider(provider_id, agent_paths)?;
     provider.options.base_url.clone()
+}
+
+/// 解析模型 ID
+///
+/// 将 "provider_id/model_id" 格式拆分为 (provider_id, model_id) 元组。
+/// provider_id 会转为小写，model_id 保持原样。
+///
+/// # Arguments
+/// * `model_id` - 模型 ID（如 "aliyun/qwen3.6-plus"）
+///
+/// # Returns
+/// (provider_id, model_id) 元组；格式错误返回 [`ProviderError::InvalidModelId`]
+pub fn parse_model_id(model_id: &str) -> Result<(String, String), ProviderError> {
+    let stripped = model_id.trim();
+    if stripped.contains('/') {
+        let parts: Vec<&str> = stripped.splitn(2, '/').collect();
+        let provider_id = parts[0].trim().to_lowercase();
+        let model_id = parts[1].trim();
+        Ok((provider_id, model_id.to_string()))
+    } else {
+        Err(ProviderError::InvalidModelId(model_id.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -205,5 +228,29 @@ mod tests {
         assert!(result.is_none());
 
         clear_cache(&paths);
+    }
+
+    #[test]
+    fn parse_model_id_valid() {
+        let (provider, model) = parse_model_id("aliyun/qwen3.6-plus").unwrap();
+        assert_eq!(provider, "aliyun");
+        assert_eq!(model, "qwen3.6-plus");
+    }
+
+    #[test]
+    fn parse_model_id_with_spaces() {
+        let (provider, model) = parse_model_id(" Aliyun / Qwen3 ").unwrap();
+        assert_eq!(provider, "aliyun");
+        assert_eq!(model, "Qwen3");
+    }
+
+    #[test]
+    fn parse_model_id_invalid_no_slash() {
+        let result = parse_model_id("qwen3");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ProviderError::InvalidModelId(_)
+        ));
     }
 }
