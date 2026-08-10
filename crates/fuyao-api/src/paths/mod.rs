@@ -6,6 +6,7 @@
 //! - 三层目录架构的基础路径函数
 //! - 分层路径结构（LayeredPaths）
 //! - 工具并行策略（路径冲突检测）
+//! - 工作目录路径归一化
 //!
 //! 三层目录架构：
 //! - Layer 1: 全局层 (`~/.fuyao/`)
@@ -16,6 +17,7 @@
 
 mod global;
 mod layered;
+mod normalize;
 mod workspace;
 
 pub use layered::LayeredPaths;
@@ -25,3 +27,6 @@ pub use global::{get_fuyao_agents_dir, get_fuyao_home};
 
 // 工作目录层路径
 pub use workspace::{get_agent_root, get_workspace_agents_dir, get_workspace_root};
+
+// 工作目录路径归一化
+pub use normalize::{normalize_workspace, normalize_workspace_str};

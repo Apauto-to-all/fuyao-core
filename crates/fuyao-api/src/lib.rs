@@ -43,7 +43,7 @@ pub use message::{
 pub use pagination::{EventPage, MessagePage, SessionPage};
 pub use paths::{
     LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
-    get_workspace_root,
+    get_workspace_root, normalize_workspace, normalize_workspace_str,
 };
 pub use prompt_types::{AgentDefinition, AgentMode};
 pub use provider::{
@@ -51,9 +51,7 @@ pub use provider::{
     Provider, ProviderOptions, ThinkingType,
 };
 pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
-pub use session_types::{
-    ImageContent, Message, MessageKind, MessageRole, Session, TodoItem, normalize_workspace,
-};
+pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{
     CancellationToken, ChildSessionSource, SubagentOps, TodoStoreOps, ToolCallContext,

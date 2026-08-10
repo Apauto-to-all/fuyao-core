@@ -2,7 +2,6 @@
 //!
 //! Session、Message、TodoItem 类型。
 
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn current_timestamp() -> f64 {
@@ -10,21 +9,6 @@ fn current_timestamp() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs_f64()
-}
-
-/// 把工作目录路径归一化为持久化形态：统一分隔符为正斜杠 `/`
-///
-/// Windows 下 `current_dir()` 返回反斜杠路径（如 `C:\a\b`），直接 `to_string_lossy`
-/// 存入 DB 会引入反斜杠（escape 字符，跨平台展示 / 日志归一化时处理麻烦）。
-/// 统一换成正斜杠后，同一项目无论在 Windows 还是 Unix 下，workspace 字符串形态一致，
-/// 按项目过滤（`workspace = ?`）的匹配结果稳定。
-///
-/// 不做 `canonicalize`（解析符号链接 / 要求路径存在）——那会改变用户对路径的预期、
-/// 且路径不存在时会失败，对「展示 + 按项目过滤」不友好。
-pub fn normalize_workspace(workspace: &Option<PathBuf>) -> Option<String> {
-    workspace
-        .as_ref()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
 }
 
 /// 会话
@@ -442,36 +426,6 @@ mod tests {
     fn session_new_workspace_none_when_absent() {
         let session = Session::new(None, None, None);
         assert!(session.workspace.is_none());
-    }
-
-    #[test]
-    fn normalize_workspace_none_when_workspace_absent() {
-        // workspace=None → workspace=None
-        assert_eq!(normalize_workspace(&None), None);
-    }
-
-    #[test]
-    fn normalize_workspace_converts_backslashes_to_forward() {
-        // Windows 反斜杠路径 → 统一为正斜杠（跨平台形态一致）
-        let ws = Some(PathBuf::from(r"C:\Users\TF\proj"));
-        assert_eq!(
-            normalize_workspace(&ws).as_deref(),
-            Some("C:/Users/TF/proj")
-        );
-    }
-
-    #[test]
-    fn normalize_workspace_keeps_forward_slashes_unchanged() {
-        // Unix 正斜杠路径 → 原样保留
-        let ws = Some(PathBuf::from("/home/u/proj"));
-        assert_eq!(normalize_workspace(&ws).as_deref(), Some("/home/u/proj"));
-    }
-
-    #[test]
-    fn normalize_workspace_mixed_separators() {
-        // 混用分隔符（Windows 下手写配置可能出现）→ 统一为正斜杠
-        let ws = Some(PathBuf::from(r"C:\a/b\c"));
-        assert_eq!(normalize_workspace(&ws).as_deref(), Some("C:/a/b/c"));
     }
 
     #[test]
