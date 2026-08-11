@@ -2077,7 +2077,7 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     preload_user(&h, "第四段对话内容").await;
     // last_usage 为 None（harness 默认）——自动压缩会早退，手动压缩必须照常执行
 
-    run_manual_compression(&h.ctx).await;
+    super::compression::run_manual_compression(&h.ctx).await;
 
     let events = collect_events(&mut h.rx_event).await;
 
