@@ -93,12 +93,11 @@ pub(crate) async fn run_stream_with_retry(
 
         // request 在重试间不变（一次 LLM 调用内 session.messages 不变）——直接 clone
         let result = stream::run_stream_session(
+            ctx,
             request.clone(),
             model,
             options.clone(),
             provider,
-            &ctx.emitter,
-            &ctx.hooks,
             &mut decoder,
             state,
         )

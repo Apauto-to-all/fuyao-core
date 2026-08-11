@@ -14,6 +14,7 @@
 //! rx 用于消费该 session 的产出事件（per-session 通道化）。
 
 use super::*;
+use crate::emit::Emitter;
 
 impl Engine {
     /// 创建对话（动作二）
@@ -398,27 +399,34 @@ impl Engine {
             )
             .await;
 
-        // spawn 执行流 task（多传 tx_event 参数）
-        let task = tokio::spawn(react::run_session(
-            session_id.clone(),
-            Arc::clone(&guide),
-            Arc::clone(&pending),
-            rx_inbound,
-            rx_interrupt,
-            rx_plugin,
-            rx_control,
-            shutdown_token.clone(),
+        // 装配 SessionCtx（会话级共享依赖的 owned 视图）+ SessionRx（入站通道集合）。
+        // 此前 run_session 接 18 个位置参数、入口内部再打包成 SessionCtx——调用方拆包、
+        // 入口打包的两份参数表需手动同步（签名顺序与字面量顺序还不一致）。现收敛为调用方
+        // 一次性构造 ctx + rx，入口降到两参数，消除双份参数表的漂移风险。
+        let ctx = react::SessionCtx {
             is_child,
-            Arc::clone(&self.store),
-            Arc::clone(&self.providers),
-            Arc::clone(&self.tools),
+            store: Arc::clone(&self.store),
+            providers: Arc::clone(&self.providers),
+            tools: Arc::clone(&self.tools),
             hooks,
-            self.params.agent_paths.clone(),
+            agent_paths: self.params.agent_paths.clone(),
             definition,
-            Arc::clone(&session_params),
-            tx_event,
-            Some(self.subagent_ops_weak()),
-        ));
+            session_params: Arc::clone(&session_params),
+            emitter: Emitter::new(tx_event, session_id.clone()),
+            guide: Arc::clone(&guide),
+            pending: Arc::clone(&pending),
+            last_usage: Arc::new(Mutex::new(None)),
+            compression_config: fuyao_api::get_config().session.compression.clone(),
+            shutdown_token: shutdown_token.clone(),
+            subagent_ops: Some(self.subagent_ops_weak()),
+        };
+        let rx = react::SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            plugin: rx_plugin,
+            control: rx_control,
+        };
+        let task = tokio::spawn(react::run_session(ctx, rx));
 
         (
             SessionHandle {

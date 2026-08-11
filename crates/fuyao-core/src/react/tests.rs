@@ -401,6 +401,41 @@ async fn make_harness_full(
     }
 }
 
+/// 构造 run_session 测试用 SessionCtx（生产 assemble_session 的测试镜像）
+///
+/// run_session 收敛为 (ctx, rx) 后，run_session 级测试不再手搓 18 个位置参数——
+/// 调用方一次性构造 ctx（此处）+ SessionRx（各测试自行建通道）。默认 tools / hooks /
+/// definition / compression_config；各测试按需对 store / guide / pending 传 Arc::clone
+/// 以便 spawn 后仍可访问。shutdown_token 显式传入——需在 spawn 后 cancel 的测试
+/// 传同一个 token，cancel 才能真正抵达 session（不再有失效 cancel 的隐患）。
+fn make_run_session_ctx(
+    store: Arc<fuyao_session::SessionStore>,
+    providers: Arc<fuyao_provider::ProviderRegistry>,
+    session_id: &str,
+    tx_event: mpsc::UnboundedSender<OutputEvent>,
+    guide: SharedQueue,
+    pending: SharedQueue,
+    shutdown_token: CancellationToken,
+) -> SessionCtx {
+    SessionCtx {
+        is_child: false,
+        store,
+        providers,
+        tools: Arc::new(ToolRegistry::builder().build()),
+        hooks: empty_hooks(),
+        agent_paths: fuyao_api::AgentPaths::default(),
+        definition: fuyao_api::AgentDefinition::default(),
+        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        emitter: Emitter::new(tx_event, session_id.to_string()),
+        guide,
+        pending,
+        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
+        compression_config: fuyao_api::CompressionConfig::default(),
+        shutdown_token,
+        subagent_ops: None,
+    }
+}
+
 /// 收集所有产出事件（直到通道暂时无数据）
 async fn collect_events(rx: &mut mpsc::UnboundedReceiver<OutputEvent>) -> Vec<OutputEvent> {
     let mut events = Vec::new();
@@ -712,25 +747,23 @@ async fn pending_consumed_when_task_idle() {
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
     ));
-    let task = tokio::spawn(run_session(
-        "test_session".to_string(),
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        rx_inbound,
-        rx_interrupt,
-        rx_plugin,
-        rx_control,
-        tokio_util::sync::CancellationToken::new(),
-        false,
+    let ctx = make_run_session_ctx(
         Arc::clone(&store),
         providers,
-        Arc::new(ToolRegistry::builder().build()),
-        empty_hooks(),
-        fuyao_api::AgentPaths::default(),
-        fuyao_api::AgentDefinition::default(),
-        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        "test_session",
         tx_event,
-        None,
+        Arc::clone(&guide),
+        Arc::clone(&pending),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            plugin: rx_plugin,
+            control: rx_control,
+        },
     ));
 
     // 模拟 send：经入站通道发一条 Pending 消息（过管道入 pending 队列）
@@ -801,25 +834,23 @@ async fn turn_restart_on_new_inbound_after_drained() {
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
     ));
-    let task = tokio::spawn(run_session(
-        "test_session".to_string(),
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        rx_inbound,
-        rx_interrupt,
-        rx_plugin,
-        rx_control,
-        tokio_util::sync::CancellationToken::new(),
-        false,
+    let ctx = make_run_session_ctx(
         Arc::clone(&store),
         providers,
-        Arc::new(ToolRegistry::builder().build()),
-        empty_hooks(),
-        fuyao_api::AgentPaths::default(),
-        fuyao_api::AgentDefinition::default(),
-        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        "test_session",
         tx_event,
-        None,
+        Arc::clone(&guide),
+        Arc::clone(&pending),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            plugin: rx_plugin,
+            control: rx_control,
+        },
     ));
 
     // 第一条消息 → 第一个 turn → 收到「回复1」
@@ -894,25 +925,23 @@ async fn plugin_message_routes_through_dispatch() {
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
     ));
-    let task = tokio::spawn(run_session(
-        "plugin_session".to_string(),
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        rx_inbound,
-        rx_interrupt,
-        rx_plugin,
-        rx_control,
-        tokio_util::sync::CancellationToken::new(),
-        false,
+    let ctx = make_run_session_ctx(
         Arc::clone(&store),
         providers,
-        Arc::new(ToolRegistry::builder().build()),
-        empty_hooks(),
-        fuyao_api::AgentPaths::default(),
-        fuyao_api::AgentDefinition::default(),
-        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        "plugin_session",
         tx_event,
-        None,
+        Arc::clone(&guide),
+        Arc::clone(&pending),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            plugin: rx_plugin,
+            control: rx_control,
+        },
     ));
 
     // 模拟 Engine::send 入口转化后送入 tx_plugin 通道的 output 侧 PluginMessage
@@ -1003,25 +1032,25 @@ async fn plugin_forwards_during_active_turn() {
         "test", provider,
     ));
     let shutdown_token = tokio_util::sync::CancellationToken::new();
-    let task = tokio::spawn(run_session(
-        "plugin_active".to_string(),
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        rx_inbound,
-        rx_interrupt,
-        rx_plugin,
-        rx_control,
-        tokio_util::sync::CancellationToken::new(),
-        false,
+    let ctx = make_run_session_ctx(
         Arc::clone(&store),
         providers,
-        Arc::new(ToolRegistry::builder().build()),
-        empty_hooks(),
-        fuyao_api::AgentPaths::default(),
-        fuyao_api::AgentDefinition::default(),
-        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        "plugin_active",
         tx_event,
-        None,
+        Arc::clone(&guide),
+        Arc::clone(&pending),
+        // 传 clone：ctx.shutdown_token 与下方 cancel 用的 shutdown_token 联动，
+        // cancel 才能真正抵达 session 让挂起的 turn 经 shutdown 分支退出。
+        shutdown_token.clone(),
+    );
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            plugin: rx_plugin,
+            control: rx_control,
+        },
     ));
 
     // 喂一个 TextDelta：run_session 进 turn，流式消费后挂起在第二个事件上（turn 活跃）

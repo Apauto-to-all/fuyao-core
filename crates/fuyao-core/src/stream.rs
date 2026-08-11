@@ -8,9 +8,8 @@
 //! 由调用方决定是重试（发 OutputEvent::Retry）还是终止（发 OutputEvent::Error）。
 
 use crate::dispatch;
-use crate::emit::Emitter;
 use crate::interrupt::SharedTurnState;
-use fuyao_hooks::SharedHooks;
+use crate::react::SessionCtx;
 use fuyao_provider::{
     BoxStream, ChatRequest, Provider, StreamAggregator, StreamError, StreamEvent, StreamOptions,
     StreamUsage, ToolCallData,
@@ -38,14 +37,12 @@ pub(crate) struct StreamResult {
 ///
 /// 中断靠外层 select! drop 本函数的 future——本函数自身不知道被中断，
 /// `state` 保留中断时刻的部分结果供中断分支读取。
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_stream_session(
+    ctx: &SessionCtx,
     request: ChatRequest,
     model: &str,
     options: StreamOptions,
     provider: &Arc<dyn Provider>,
-    emitter: &Emitter,
-    hooks: &SharedHooks,
     decoder: &mut StreamAggregator,
     state: &SharedTurnState,
 ) -> Result<StreamResult, StreamError> {
@@ -69,7 +66,7 @@ pub(crate) async fn run_stream_session(
                 // 解码成 OutputEvent 并经管道发出（拦截 → 发送 → 观察）
                 let output_events = decoder.process(event);
                 for ev in output_events {
-                    dispatch::dispatch(emitter, hooks, ev).await;
+                    dispatch::dispatch(&ctx.emitter, &ctx.hooks, ev).await;
                 }
 
                 // 同步共享状态（block scope 锁，不跨 await）
@@ -77,7 +74,7 @@ pub(crate) async fn run_stream_session(
             }
             Err(e) => {
                 // 错误冒泡到调用方（RetryRunner / turn.rs），由调用方决定重试还是发 Error
-                tracing::warn!(session_id = emitter.session_id(), cause = %e, "LLM 流式调用失败");
+                tracing::warn!(session_id = ctx.emitter.session_id(), cause = %e, "LLM 流式调用失败");
                 return Err(e);
             }
         }

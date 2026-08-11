@@ -45,7 +45,7 @@ use fuyao_hooks::SharedHooks;
 use fuyao_provider::{ProviderRegistry, StreamUsage};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::sync::mpsc::{Receiver, UnboundedSender};
+use tokio::sync::mpsc::Receiver;
 use tokio_util::sync::CancellationToken;
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
@@ -112,6 +112,26 @@ pub(crate) struct SessionCtx {
     pub is_child: bool,
 }
 
+/// session 执行流的入站通道集合
+///
+/// 聚合喂给 session task 的四条接收端，由 Engine 的 assemble_session 一次性构造、
+/// 整个 task 期间由 run_session 独占消费：plugin 接收端 move 进独立转发 task，
+/// inbound / interrupt / control 在主循环 select! 与 run_turn 间 `&mut` 借用。
+///
+/// 与 [`SessionCtx`]（共享依赖视图）正交：ctx 是所有 turn 复用的只读依赖，rx 是本 task
+/// 独占消费的入站通道——两者一并构成 [`run_session`] 的全部入参，取代原先 18 个位置
+/// 参数（调用方拆包、入口再打包成 ctx 的两份需手动同步的参数表）。
+pub(crate) struct SessionRx {
+    /// 入站用户消息（经管道分流入 guide / pending 队列）
+    pub inbound: Receiver<OutputUserMessage>,
+    /// 中断信号（idle 段与流式 / 工具执行段的中断点）
+    pub interrupt: Receiver<OutputInterruptMessage>,
+    /// 插件通知（独立转发 task 消费，不阻塞主循环 turn）
+    pub plugin: Receiver<OutputPluginMessage>,
+    /// 控制命令（手动压缩 / 回退等 B 类信号，turn 边界消费）
+    pub control: Receiver<ControlCommand>,
+}
+
 /// session 的独立执行流
 ///
 /// 消费 guide 队列驱动 ReAct 循环；guide 空时 select! 等待入站消息（过管道入队）
@@ -127,46 +147,21 @@ pub(crate) struct SessionCtx {
 /// 只需在 `SessionCtx` 多存一个值，中间函数签名不动。
 ///
 /// 多 session 并发时工具共享（引擎级 `ToolRegistry`）、人格隔离（各自 SessionParams），互不干扰。
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_session(
-    session_id: String,
-    guide: SharedQueue,
-    pending: SharedQueue,
-    mut rx_inbound: Receiver<OutputUserMessage>,
-    mut rx_interrupt: Receiver<OutputInterruptMessage>,
-    mut rx_plugin: Receiver<OutputPluginMessage>,
-    mut rx_control: Receiver<ControlCommand>,
-    shutdown_token: CancellationToken,
-    is_child: bool,
-    store: Arc<fuyao_session::SessionStore>,
-    providers: Arc<ProviderRegistry>,
-    tools: Arc<ToolRegistry>,
-    hooks: SharedHooks,
-    agent_paths: fuyao_api::AgentPaths,
-    definition: AgentDefinition,
-    session_params: Arc<Mutex<SessionParams>>,
-    tx_event: UnboundedSender<OutputEvent>,
-    subagent_ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
-) {
-    tracing::info!(session_id = %session_id, is_child = is_child, "session 执行流启动");
+pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
+    tracing::info!(
+        session_id = %ctx.emitter.session_id(),
+        is_child = ctx.is_child,
+        "session 执行流启动"
+    );
 
-    let ctx = SessionCtx {
-        is_child,
-        store,
-        providers,
-        tools,
-        hooks,
-        agent_paths,
-        definition,
-        session_params,
-        emitter: Emitter::new(tx_event, session_id.clone()),
-        guide,
-        pending,
-        last_usage: Arc::new(Mutex::new(None)),
-        compression_config: fuyao_api::get_config().session.compression.clone(),
-        shutdown_token: shutdown_token.clone(),
-        subagent_ops,
-    };
+    // 拆出入站四通道：plugin 接收端 move 进独立转发 task，inbound / interrupt / control
+    // 在主循环 select! 与 run_turn 间 &mut 借用。四个绑定均 mut——recv/try_recv 需 &mut self。
+    let SessionRx {
+        inbound: mut rx_inbound,
+        interrupt: mut rx_interrupt,
+        plugin: mut rx_plugin,
+        control: mut rx_control,
+    } = rx;
 
     // Plugin 转发独立 task：通知一到就转发，不阻塞在主循环的 turn 上
     //
