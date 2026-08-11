@@ -8,7 +8,6 @@ mod openai;
 mod provider;
 mod registry;
 mod resolver;
-mod retry;
 mod stream_decoder;
 
 pub use error::ProviderError;
@@ -22,5 +21,4 @@ pub use registry::{
     list_providers, register_model, register_provider,
 };
 pub use resolver::{get_base_url, parse_model_id, resolve_api_key};
-pub use retry::{backoff_duration, is_retryable};
 pub use stream_decoder::StreamDecoder;

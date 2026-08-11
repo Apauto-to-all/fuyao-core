@@ -122,14 +122,7 @@ impl super::SessionStore {
         let mut tx = self.pool.begin().await?;
 
         // 1. 校验 session 存在（避免给不存在的 session 操作）
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !exists {
-            return Err(SessionError::NotFound(session_id.to_string()));
-        }
+        super::session::require_session(&mut tx, session_id).await?;
 
         // 2. 取目标消息本身（提取 content/images 填输入框 + 拿 role/kind 校验）
         let target_row = sqlx::query_as::<_, MessageRow>(

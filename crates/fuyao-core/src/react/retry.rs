@@ -48,9 +48,7 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{RetryMessage, RetryPayload};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::{
-    Provider, StreamDecoder, StreamError, StreamOptions, backoff_duration, is_retryable,
-};
+use fuyao_provider::{Provider, StreamDecoder, StreamError, StreamOptions};
 use std::sync::Arc;
 
 /// 驱动一次完整的「LLM 调用 + 重试」过程
@@ -116,12 +114,12 @@ pub(crate) async fn run_stream_with_retry(
                 };
 
                 // 三种停止重试的情形：首 chunk 后 / 严重错误 / 次数耗尽
-                if has_started || !is_retryable(&e) || attempt > max_retries {
+                if has_started || !e.is_retryable() || attempt > max_retries {
                     return Err(e);
                 }
 
                 // 可恢复错误：发 Retry 事件 → sleep 退避 → 重试
-                let wait = backoff_duration(attempt, &e);
+                let wait = e.backoff_duration(attempt);
                 emit_retry_event(
                     &ctx.emitter,
                     &ctx.hooks,

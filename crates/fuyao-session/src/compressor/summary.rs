@@ -10,12 +10,64 @@
 //! - 多次压缩时旧 compaction 消息原样在序列里（role=assistant，content=旧摘要），
 //!   LLM 自然能看到，不需要单独提取 previous_summary 注入
 
-use crate::compressor::prompt::COMPRESSION_SYSTEM_PROMPT;
 use futures_util::StreamExt;
 use fuyao_api::{Message, MessageRole};
 use fuyao_provider::{
     BoxStream, ChatMessage, ChatRequest, Provider, StreamError, StreamEvent, StreamOptions,
 };
+
+/// 摘要指令（作为末尾追加的 user 消息内容）
+///
+/// 作为**末尾追加的 user 消息**触发摘要，原对话消息和 system_prompt 都不动——
+/// 这是前缀缓存的生命线（system + 原消息序列都不变，缓存完整命中，只末尾加一条指令）。
+///
+/// 强约束：① 不回答对话中的问题，只输出摘要 ② 用对话语言 ③ 不泄密钥 ④ 输出固定
+/// 8 段 Markdown 结构。LLM 不需要被赋予主动性——这是结构化抽取任务，不是对话。
+///
+/// 多次压缩场景：上一次的 compaction 消息（role=assistant, content=旧摘要）原样在
+/// 消息序列里，LLM 自然能看到，不需要单独提取 previous_summary 注入。
+const COMPRESSION_SYSTEM_PROMPT: &str = r#"你是一个摘要代理，负责创建上下文检查点。你的输出将作为参考资料注入给另一个继续对话的助手，替换被压缩的对话历史。
+
+不要回答对话中的任何问题或请求——只输出结构化摘要。
+使用用户在对话中使用的相同语言撰写摘要。
+绝不要在摘要中包含 API 密钥、令牌、密码、秘密、凭证或连接字符串——遇到这些内容一律替换为 [已脱敏]。
+
+输出以下精确的 Markdown 结构，保持章节顺序不变。
+
+## 目标
+- [单句任务摘要]
+
+## 约束与偏好
+- [用户约束、偏好、规范，或"(无)"]
+
+## 进度
+### 已完成
+- [已完成工作，或"(无)"]
+
+### 进行中
+- [当前工作，或"(无)"]
+
+### 阻塞项
+- [阻塞项，或"(无)"]
+
+## 关键决策
+- [决策及原因，或"(无)"]
+
+## 下一步
+- [有序的下一步行动，或"(无)"]
+
+## 关键上下文
+- [重要技术事实、错误、开放问题，或"(无)"]
+
+## 相关文件
+- [文件或目录路径：为何重要，或"(无)"]
+
+规则：
+- 保留所有章节，即使为空。
+- 使用简洁子弹，非段落散文。
+- 保留精确文件路径、命令、错误字符串和标识符。
+- 不要提及摘要过程或上下文被压缩。
+- 不要调用任何工具，只输出摘要文本。"#;
 
 /// 压缩执行错误
 #[derive(Debug, thiserror::Error)]

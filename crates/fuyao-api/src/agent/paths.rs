@@ -64,28 +64,12 @@ impl AgentPaths {
     }
     /// 配置文件分层路径（fuyao.toml）
     pub fn config_paths(&self) -> LayeredPaths {
-        LayeredPaths {
-            global_: Some(self.fuyao_home.join("fuyao.toml")),
-            agent: self.agent_root().map(|p| p.join("fuyao.toml")),
-            workspace: self
-                .workspace
-                .as_ref()
-                .map(|ws| get_workspace_root(ws).join("fuyao.toml")),
-            ..Default::default()
-        }
+        self.layered("fuyao.toml")
     }
 
     /// 环境变量文件分层路径（.env）
     pub fn env_paths(&self) -> LayeredPaths {
-        LayeredPaths {
-            global_: Some(self.fuyao_home.join(".env")),
-            agent: self.agent_root().map(|p| p.join(".env")),
-            workspace: self
-                .workspace
-                .as_ref()
-                .map(|ws| get_workspace_root(ws).join(".env")),
-            ..Default::default()
-        }
+        self.layered(".env")
     }
 
     /// Sessions 数据库分层路径
@@ -140,36 +124,14 @@ impl AgentPaths {
     /// 额外目录（extra_dirs）下的 `skills/` 子目录作为最低优先级来源，
     /// 用于支持插件等提供的 Skills。
     pub fn skills_paths(&self) -> LayeredPaths {
-        // 从每个额外目录解析 skills 子目录，存在的才加入
-        let extra: Vec<PathBuf> = self
-            .extra_dirs
-            .iter()
-            .map(|d| d.join("skills"))
-            .filter(|d| d.is_dir())
-            .collect();
-
-        LayeredPaths {
-            global_: Some(self.fuyao_home.join("skills")),
-            agent: self.agent_root().map(|p| p.join("skills")),
-            workspace: self
-                .workspace
-                .as_ref()
-                .map(|ws| get_workspace_root(ws).join("skills")),
-            extra,
-        }
+        let mut paths = self.layered("skills");
+        paths.extra = self.extra_dirs_with("skills");
+        paths
     }
 
     /// 插件分层路径
     pub fn plugins_paths(&self) -> LayeredPaths {
-        LayeredPaths {
-            global_: Some(self.fuyao_home.join("plugins")),
-            agent: self.agent_root().map(|p| p.join("plugins")),
-            workspace: self
-                .workspace
-                .as_ref()
-                .map(|ws| get_workspace_root(ws).join("plugins")),
-            ..Default::default()
-        }
+        self.layered("plugins")
     }
 
     /// Agent 定义文件分层路径（`agents/{name}.md`）
@@ -217,13 +179,6 @@ impl AgentPaths {
     ///
     /// 调用方用 `merge_exists()` 取所有存在的目录。
     pub fn agents_def_dirs(&self) -> LayeredPaths {
-        let extra: Vec<PathBuf> = self
-            .extra_dirs
-            .iter()
-            .map(|d| d.join("agents"))
-            .filter(|d| d.is_dir())
-            .collect();
-
         LayeredPaths {
             global_: Some(self.fuyao_home.join("agents")),
             agent: None,
@@ -231,7 +186,7 @@ impl AgentPaths {
                 .workspace
                 .as_ref()
                 .map(|ws| get_workspace_root(ws).join("agents")),
-            extra,
+            extra: self.extra_dirs_with("agents"),
         }
     }
 
@@ -245,22 +200,9 @@ impl AgentPaths {
     ///
     /// 调用方用 `merge_exists()` 取所有存在的目录，逐一扫描 `*.md`。
     pub fn instructions_paths(&self) -> LayeredPaths {
-        let extra: Vec<PathBuf> = self
-            .extra_dirs
-            .iter()
-            .map(|d| d.join("instructions"))
-            .filter(|d| d.is_dir())
-            .collect();
-
-        LayeredPaths {
-            global_: Some(self.fuyao_home.join("instructions")),
-            agent: self.agent_root().map(|p| p.join("instructions")),
-            workspace: self
-                .workspace
-                .as_ref()
-                .map(|ws| get_workspace_root(ws).join("instructions")),
-            extra,
-        }
+        let mut paths = self.layered("instructions");
+        paths.extra = self.extra_dirs_with("instructions");
+        paths
     }
 
     /// AGENTS.md 分层路径（项目上下文）
@@ -289,6 +231,42 @@ impl AgentPaths {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         format!("{agent_id}|{workspace}")
+    }
+
+    // ── 三层路径组装私有 helper ───────────────────────────────
+    //
+    // config / env / skills / plugins / instructions 等方法原本各自手写同一份
+    // 「fuyao_home + agent_root + get_workspace_root(workspace)」三层拼接，逻辑漂移
+    // 风险高（workspace 层固定走 `.fuyao/` 根即 get_workspace_root）。集中到这两处。
+
+    /// 三层（global / agent / workspace）路径组装：各层都 join 同一个子路径
+    ///
+    /// workspace 层固定经 [`get_workspace_root`]（`.fuyao/` 根）。不走此规则的方法
+    ///（如 [`Self::agents_md_paths`] 把 AGENTS.md 放在 workspace 根、
+    /// [`Self::sessions_db_paths`] 条件性 global、[`Self::agents_def_paths`] 不用
+    /// agent 层）保持各自 bespoke 实现——它们的差异是真实的，不该被强行统一。
+    fn layered(&self, sub: &str) -> LayeredPaths {
+        LayeredPaths {
+            global_: Some(self.fuyao_home.join(sub)),
+            agent: self.agent_root().map(|p| p.join(sub)),
+            workspace: self
+                .workspace
+                .as_ref()
+                .map(|ws| get_workspace_root(ws).join(sub)),
+            ..Default::default()
+        }
+    }
+
+    /// 额外目录（extra_dirs）下指定子目录中真实存在的目录
+    ///
+    /// skills / instructions / agents 定义目录共用：每个 extra_dir join 子目录名，
+    /// 仅保留存在的目录。文件型过滤（[`Self::agents_def_paths`] 按 is_file）不在此列。
+    fn extra_dirs_with(&self, sub: &str) -> Vec<PathBuf> {
+        self.extra_dirs
+            .iter()
+            .map(|d| d.join(sub))
+            .filter(|d| d.is_dir())
+            .collect()
     }
 }
 

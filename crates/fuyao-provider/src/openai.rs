@@ -259,32 +259,39 @@ impl OpenAIProvider {
         body
     }
 
-    /// 发送请求并处理 HTTP 错误
-    async fn send_request(
-        &self,
-        body: serde_json::Value,
-    ) -> Result<reqwest::Response, StreamError> {
-        let response = self
-            .client
+    /// 构造已带 url + auth + content-type 的 POST 请求构建器（未发送）
+    ///
+    /// 非流式 [`Provider::chat`] 与流式 [`Provider::stream_chat`] 两条发送路径共用，
+    /// 避免 auth header / content-type / url 装配逻辑两处复制。返回 owned
+    /// `RequestBuilder`——可在 `async_stream` 块**外**构造、块内再 send，无需跨越
+    /// yield 持有 `&self`（这正是 stream_chat 不能直接调 `&self` 异步方法的原因）。
+    fn post_builder(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
+        self.client
             .post(self.chat_url())
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    StreamError::Timeout
-                } else {
-                    StreamError::Connection(e.to_string())
-                }
-            })?;
+            .json(body)
+    }
+
+    /// 发送请求 + 错误分类（url/auth 装配之后的完整发送链路）
+    ///
+    /// 接收 [`Self::post_builder`] 产出的构建器，执行 send → 网络错误映射（timeout /
+    /// connection）→ HTTP 状态码校验 → [`Self::classify_http_error`]。两条发送路径
+    /// 共用此方法，消除原先 stream_chat 内联的「send + timeout 映射 + status 校验 +
+    /// classify」与 send_request 的复制。
+    async fn execute(builder: reqwest::RequestBuilder) -> Result<reqwest::Response, StreamError> {
+        let response = builder.send().await.map_err(|e| {
+            if e.is_timeout() {
+                StreamError::Timeout
+            } else {
+                StreamError::Connection(e.to_string())
+            }
+        })?;
 
         let status = response.status();
         if !status.is_success() {
             let status_code = status.as_u16();
             let body_text = response.text().await.unwrap_or_default();
-
             return Err(Self::classify_http_error(status_code, &body_text));
         }
 
@@ -635,39 +642,18 @@ impl Provider for OpenAIProvider {
         options: ProviderStreamOptions,
     ) -> BoxStream<Result<StreamEvent, StreamError>> {
         let body = self.build_request_body(request, model, &options, true);
-        let client = self.client.clone();
-        let url = self.chat_url();
-        let api_key = self.api_key.clone();
+        // 在 stream 块外构造请求构建器（owned，不持有 &self 跨越 yield）
+        let request_builder = self.post_builder(&body);
 
         let stream = async_stream::stream! {
-            // 发送流式请求
-            let response = match client
-                .post(&url)
-                .header("Authorization", format!("Bearer {api_key}"))
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
-            {
+            // 发送 + 网络错误映射 + 状态码校验 + 错误分类（与 chat() 共用 execute）
+            let response = match Self::execute(request_builder).await {
                 Ok(r) => r,
                 Err(e) => {
-                    if e.is_timeout() {
-                        yield Err(StreamError::Timeout);
-                    } else {
-                        yield Err(StreamError::Connection(e.to_string()));
-                    }
+                    yield Err(e);
                     return;
                 }
             };
-
-            // 检查 HTTP 状态码
-            let status = response.status();
-            if !status.is_success() {
-                let status_code = status.as_u16();
-                let body_text = response.text().await.unwrap_or_default();
-                yield Err(Self::classify_http_error(status_code, &body_text));
-                return;
-            }
 
             // 逐 chunk 消费 SSE 字节流
             let mut bytes_stream = response.bytes_stream();
@@ -746,7 +732,7 @@ impl Provider for OpenAIProvider {
     ) -> Result<ChatResponse, StreamError> {
         let started = std::time::Instant::now();
         let body = self.build_request_body(request, model, &options, false);
-        let response = self.send_request(body).await?;
+        let response = Self::execute(self.post_builder(&body)).await?;
 
         let response_text = response
             .text()

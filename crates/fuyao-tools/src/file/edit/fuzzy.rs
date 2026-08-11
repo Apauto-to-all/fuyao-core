@@ -47,6 +47,21 @@ struct Match(usize, usize);
 /// 偏移量锚定在行首或精确子串位置，天然是字符边界。
 type MatchStrategy = fn(&str, &str) -> Vec<Match>;
 
+/// 模糊查找替换的结果
+///
+/// 命名结构体替代原先的位置 4-tuple `(String, usize, Option<String>, Option<String>)`——
+/// 后两个 `Option<String>`（策略名 / 错误信息）类型相同、位置不可区分，调用方解构易错位。
+pub struct FuzzyOutcome {
+    /// 替换后的新内容（无匹配或出错时为原 content 副本）
+    pub content: String,
+    /// 实际发生的替换次数（无匹配或出错为 0）
+    pub replacements: usize,
+    /// 命中的策略名称（仅成功时有值）
+    pub strategy: Option<String>,
+    /// 错误信息（成功时为 None）
+    pub error: Option<String>,
+}
+
 /// 模糊查找并替换
 ///
 /// 使用多种策略尝试匹配，处理空白、缩进等差异。
@@ -54,29 +69,29 @@ type MatchStrategy = fn(&str, &str) -> Vec<Match>;
 ///
 /// # 返回
 ///
-/// `(新内容, 匹配数, 使用的策略名称, 错误信息)`
+/// [`FuzzyOutcome`]：新内容 / 替换次数 / 命中策略名 / 错误信息。
 pub fn fuzzy_find_and_replace(
     content: &str,
     old_string: &str,
     new_string: &str,
     replace_all: bool,
-) -> (String, usize, Option<String>, Option<String>) {
+) -> FuzzyOutcome {
     if old_string.is_empty() {
-        return (
-            content.to_string(),
-            0,
-            None,
-            Some("old_string 不能为空".to_string()),
-        );
+        return FuzzyOutcome {
+            content: content.to_string(),
+            replacements: 0,
+            strategy: None,
+            error: Some("old_string 不能为空".to_string()),
+        };
     }
 
     if old_string == new_string {
-        return (
-            content.to_string(),
-            0,
-            None,
-            Some("old_string 和 new_string 相同".to_string()),
-        );
+        return FuzzyOutcome {
+            content: content.to_string(),
+            replacements: 0,
+            strategy: None,
+            error: Some("old_string 和 new_string 相同".to_string()),
+        };
     }
 
     let strategies: Vec<(&str, MatchStrategy)> = vec![
@@ -96,15 +111,15 @@ pub fn fuzzy_find_and_replace(
 
         if !matches.is_empty() {
             if matches.len() > 1 && !replace_all {
-                return (
-                    content.to_string(),
-                    0,
-                    None,
-                    Some(format!(
+                return FuzzyOutcome {
+                    content: content.to_string(),
+                    replacements: 0,
+                    strategy: None,
+                    error: Some(format!(
                         "找到 {} 处匹配。请提供更多上下文使其唯一，或使用 replace_all=true。",
                         matches.len()
                     )),
-                );
+                };
             }
 
             // 护栏：宽容策略（尤以 block_anchor）可能圈出远大于 old_string 的匹配块，
@@ -114,35 +129,35 @@ pub fn fuzzy_find_and_replace(
             for &Match(start, len) in &matches {
                 let search = &content[start..start + len];
                 if is_disproportionate_match(search, old_string) {
-                    return (
-                        content.to_string(),
-                        0,
-                        None,
-                        Some(
+                    return FuzzyOutcome {
+                        content: content.to_string(),
+                        replacements: 0,
+                        strategy: None,
+                        error: Some(
                             "匹配范围远大于 old_string，可能匹配到无关内容。\
                              请重新读取文件，提供完整的 old_string 以精确匹配。"
                                 .to_string(),
                         ),
-                    );
+                    };
                 }
             }
 
             let new_content = apply_replacements(content, &matches, new_string);
-            return (
-                new_content,
-                matches.len(),
-                Some(strategy_name.to_string()),
-                None,
-            );
+            return FuzzyOutcome {
+                content: new_content,
+                replacements: matches.len(),
+                strategy: Some(strategy_name.to_string()),
+                error: None,
+            };
         }
     }
 
-    (
-        content.to_string(),
-        0,
-        None,
-        Some("未找到匹配的文本".to_string()),
-    )
+    FuzzyOutcome {
+        content: content.to_string(),
+        replacements: 0,
+        strategy: None,
+        error: Some("未找到匹配的文本".to_string()),
+    }
 }
 
 /// 判断实际匹配块是否远大于 old_string（防误改护栏）
@@ -741,8 +756,12 @@ mod tests {
     #[test]
     fn exact_match() {
         let content = "hello world\nfoo bar\n";
-        let (new_content, count, strategy, err) =
-            fuzzy_find_and_replace(content, "hello world", "hi world", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            strategy,
+            error: err,
+        } = fuzzy_find_and_replace(content, "hello world", "hi world", false);
         assert!(err.is_none());
         assert_eq!(count, 1);
         assert_eq!(strategy.as_deref(), Some("exact"));
@@ -752,21 +771,26 @@ mod tests {
     #[test]
     fn empty_old_string_error() {
         let content = "hello";
-        let (_, _, _, err) = fuzzy_find_and_replace(content, "", "new", false);
+        let FuzzyOutcome { error: err, .. } = fuzzy_find_and_replace(content, "", "new", false);
         assert!(err.is_some());
     }
 
     #[test]
     fn same_strings_error() {
         let content = "hello";
-        let (_, _, _, err) = fuzzy_find_and_replace(content, "hello", "hello", false);
+        let FuzzyOutcome { error: err, .. } =
+            fuzzy_find_and_replace(content, "hello", "hello", false);
         assert!(err.is_some());
     }
 
     #[test]
     fn multiple_matches_without_replace_all() {
         let content = "foo bar foo";
-        let (_, count, _, err) = fuzzy_find_and_replace(content, "foo", "baz", false);
+        let FuzzyOutcome {
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "foo", "baz", false);
         assert_eq!(count, 0);
         assert!(err.is_some());
         assert!(err.unwrap().contains("2 处匹配"));
@@ -775,7 +799,12 @@ mod tests {
     #[test]
     fn multiple_matches_with_replace_all() {
         let content = "foo bar foo";
-        let (new_content, count, _, err) = fuzzy_find_and_replace(content, "foo", "baz", true);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "foo", "baz", true);
         assert!(err.is_none());
         assert_eq!(count, 2);
         assert_eq!(new_content, "baz bar baz");
@@ -784,8 +813,12 @@ mod tests {
     #[test]
     fn newline_normalized_match() {
         let content = "hello\r\nworld\n";
-        let (new_content, count, strategy, err) =
-            fuzzy_find_and_replace(content, "hello\nworld", "hi\nworld", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            strategy,
+            error: err,
+        } = fuzzy_find_and_replace(content, "hello\nworld", "hi\nworld", false);
         assert!(err.is_none());
         assert_eq!(count, 1);
         assert_eq!(strategy.as_deref(), Some("newline_normalized"));
@@ -796,7 +829,12 @@ mod tests {
     fn indentation_flexible_match() {
         let content = "    fn main() {\n        let x = 1;\n    }";
         let pattern = "  fn main() {\n        let x = 1;\n  }";
-        let (new_content, count, strategy, err) = fuzzy_find_and_replace(
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            strategy,
+            error: err,
+        } = fuzzy_find_and_replace(
             content,
             pattern,
             "fn main() {\n        let x = 2;\n}",
@@ -814,7 +852,11 @@ mod tests {
     #[test]
     fn no_match_returns_error() {
         let content = "hello world";
-        let (_, count, _, err) = fuzzy_find_and_replace(content, "xyz", "abc", false);
+        let FuzzyOutcome {
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "xyz", "abc", false);
         assert_eq!(count, 0);
         assert!(err.is_some());
     }
@@ -826,8 +868,12 @@ mod tests {
     #[test]
     fn exact_match_multibyte_single_occurrence() {
         let content = "旧内容\n第二行\n";
-        let (new_content, count, _, err) =
-            fuzzy_find_and_replace(content, "旧内容", "新内容", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "旧内容", "新内容", false);
         assert!(err.is_none(), "单次替换不应报错：{err:?}");
         assert_eq!(count, 1);
         assert!(new_content.contains("新内容"));
@@ -837,7 +883,12 @@ mod tests {
     #[test]
     fn exact_match_multibyte_multiple_occurrences_replace_all() {
         let content = "你好世界\n你好朋友\n";
-        let (new_content, count, _, err) = fuzzy_find_and_replace(content, "你好", "您好", true);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "你好", "您好", true);
         assert!(err.is_none());
         assert_eq!(count, 2);
         assert_eq!(new_content, "您好世界\n您好朋友\n");
@@ -846,7 +897,11 @@ mod tests {
     #[test]
     fn exact_match_multibyte_multiple_without_replace_all_errors() {
         let content = "你好\n你好\n";
-        let (_, count, _, err) = fuzzy_find_and_replace(content, "你好", "您好", false);
+        let FuzzyOutcome {
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "你好", "您好", false);
         assert_eq!(count, 0);
         assert!(err.is_some());
         assert!(err.unwrap().contains("2 处匹配"));
@@ -856,7 +911,12 @@ mod tests {
     fn exact_match_mixed_ascii_and_multibyte() {
         // 混合 ASCII + 中文，验证边界推进在混合场景下正确
         let content = "fn 你好() {}\n你好世界\n";
-        let (new_content, count, _, err) = fuzzy_find_and_replace(content, "你好", "Hello", true);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "你好", "Hello", true);
         assert!(err.is_none());
         assert_eq!(count, 2);
         assert!(new_content.contains("fn Hello()"));
@@ -874,8 +934,12 @@ mod tests {
         // 复现 panic 的同类场景：content 用全角、old_string 用半角，
         // exact 不匹配 → 走 unicode_normalized（全角→半角归一化后匹配）→ 按行计算字节区间
         let content = "测试ＡＢＣ内容\n第二行\n";
-        let (new_content, count, strategy, err) =
-            fuzzy_find_and_replace(content, "ABC", "XYZ", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            strategy,
+            error: err,
+        } = fuzzy_find_and_replace(content, "ABC", "XYZ", false);
         assert!(err.is_none(), "全角→半角归一化不应报错：{err:?}");
         assert_eq!(count, 1);
         assert_eq!(strategy.as_deref(), Some("unicode_normalized"));
@@ -886,8 +950,12 @@ mod tests {
     fn newline_normalized_multibyte_no_panic() {
         // 换行收缩（\r\n → \n）：字节长度变化 + 多字节中文，验证不 panic 且替换正确
         let content = "你好\r\n世界\r\n";
-        let (new_content, count, _, err) =
-            fuzzy_find_and_replace(content, "你好\n世界", "HI\nWORLD", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "你好\n世界", "HI\nWORLD", false);
         assert!(err.is_none(), "换行归一化不应报错：{err:?}");
         assert_eq!(count, 1);
         assert!(new_content.contains("HI"));
@@ -898,8 +966,12 @@ mod tests {
     fn whitespace_normalized_multibyte_no_panic() {
         // 空白折叠（多空格 → 单空格）+ 多字节中文：验证不 panic
         let content = "你好     世界\n第二行\n";
-        let (new_content, count, _, err) =
-            fuzzy_find_and_replace(content, "你好 世界", "HI WORLD", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "你好 世界", "HI WORLD", false);
         assert!(err.is_none(), "空白归一化不应报错：{err:?}");
         assert_eq!(count, 1);
         assert!(new_content.contains("HI WORLD"));
@@ -909,8 +981,12 @@ mod tests {
     fn escape_normalized_multibyte_no_panic() {
         // 转义归一化（\\n → \n）+ 多字节中文：验证不 panic
         let content = "你好\\n世界\n第二行\n";
-        let (new_content, count, _, err) =
-            fuzzy_find_and_replace(content, "你好\n世界", "HI\nWORLD", false);
+        let FuzzyOutcome {
+            content: new_content,
+            replacements: count,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "你好\n世界", "HI\nWORLD", false);
         assert!(err.is_none(), "转义归一化不应报错：{err:?}");
         assert_eq!(count, 1);
         assert!(new_content.contains("HI"));
@@ -922,7 +998,11 @@ mod tests {
         // 直接验证归一化映射结果正确（不仅不 panic）：
         // 全角「ＡＢ」→ 半角「AB」，中间夹中文，替换为 ASCII
         let content = "前面ＡＢ中间文字";
-        let (new_content, _, _, err) = fuzzy_find_and_replace(content, "AB", "XY", false);
+        let FuzzyOutcome {
+            content: new_content,
+            error: err,
+            ..
+        } = fuzzy_find_and_replace(content, "AB", "XY", false);
         assert!(err.is_none());
         assert_eq!(new_content, "前面XY中间文字");
     }

@@ -256,7 +256,10 @@ fn build_tool_result_msg(ev: &OutputEvent) -> Option<Message> {
 ///
 /// 中断时工具未真正执行，用合成内容标记中断来源与原因，
 /// 让 LLM 下一轮能看到"这个工具调用被中断了"。
-fn make_interrupt_tool_result(
+///
+/// 中断式 ToolResult 的构造集中在此（turn.rs 在为未完成 tool_call 补发中断结果时复用，
+/// 不再各写一份相同的 `format!("[{source:?}][{reason}]")`）。
+pub(crate) fn make_interrupt_tool_result(
     tool_call_id: String,
     tool_name: String,
     source: &InterruptSource,

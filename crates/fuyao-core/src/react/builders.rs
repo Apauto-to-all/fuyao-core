@@ -305,40 +305,26 @@ pub(crate) fn resolve_model(
     })
 }
 
-/// 从流式结果构建 AssistantPayload（无工具调用，最终回复事件）
-pub(crate) fn assistant_msg_to_payload(result: &StreamResult) -> AssistantPayload {
-    AssistantPayload {
-        content: if result.text.is_empty() {
-            None
-        } else {
-            Some(result.text.clone())
-        },
-        reasoning: if result.reasoning.is_empty() {
-            None
-        } else {
-            Some(result.reasoning.clone())
-        },
-        tool_calls: None,
-        finish_reason: Some("stop".to_string()),
-        completion_tokens: result.usage.completion_tokens as i64,
-        prompt_tokens: result.usage.prompt_tokens as i64,
-        total_tokens: result.usage.total_tokens as i64,
-        reasoning_tokens: result.usage.completion_reasoning_tokens.unwrap_or(0) as i64,
-        cached_tokens: result.usage.prompt_cached_tokens.unwrap_or(0) as i64,
-    }
-}
-
-/// 从流式结果构建含 tool_calls 的 AssistantPayload（工具调用事件）
-pub(crate) fn assistant_with_tool_calls_to_payload(result: &StreamResult) -> AssistantPayload {
-    let tool_call_payloads: Vec<ToolCallPayload> = result
-        .tool_calls
-        .iter()
-        .map(|tc| ToolCallPayload {
-            tool_call_id: tc.id.clone(),
-            tool_name: tc.name.clone(),
-            tool_args: serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null),
-        })
-        .collect();
+/// 从流式结果构建 AssistantPayload
+///
+/// `result.tool_calls` 非空时构造工具调用 payload 并标记 `finish_reason="tool_calls"`，
+/// 否则 `finish_reason="stop"`。最终回复与工具调用两条路径的 content / reasoning /
+/// 五个 token 字段映射完全相同，原先复制在两个函数里；按 tool_calls 是否为空分叉即可。
+pub(crate) fn assistant_payload(result: &StreamResult) -> AssistantPayload {
+    let (tool_calls, finish_reason) = if result.tool_calls.is_empty() {
+        (None, "stop")
+    } else {
+        let payloads: Vec<ToolCallPayload> = result
+            .tool_calls
+            .iter()
+            .map(|tc| ToolCallPayload {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                tool_args: serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null),
+            })
+            .collect();
+        (Some(payloads), "tool_calls")
+    };
 
     AssistantPayload {
         content: if result.text.is_empty() {
@@ -351,8 +337,8 @@ pub(crate) fn assistant_with_tool_calls_to_payload(result: &StreamResult) -> Ass
         } else {
             Some(result.reasoning.clone())
         },
-        tool_calls: Some(tool_call_payloads),
-        finish_reason: Some("tool_calls".to_string()),
+        tool_calls,
+        finish_reason: Some(finish_reason.to_string()),
         completion_tokens: result.usage.completion_tokens as i64,
         prompt_tokens: result.usage.prompt_tokens as i64,
         total_tokens: result.usage.total_tokens as i64,

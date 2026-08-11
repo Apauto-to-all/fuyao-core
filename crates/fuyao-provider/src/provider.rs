@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::Stream;
-use fuyao_api::{MessageRole, ThinkingType};
+use fuyao_api::{MessageRole, ThinkingType, get_config};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
@@ -200,6 +200,111 @@ pub enum StreamError {
     Cancelled,
 }
 
+/// 退避时长参数（从全局配置 `get_config().llm.retry` 读取）
+///
+/// 字段含义：
+/// - `initial_delay_ms`：首次重试前的等待毫秒数（默认 2000）
+/// - `max_delay_ms`：无 Retry-After 响应头场景下的退避上限（默认 30000）
+/// - `max_delay_with_headers_ms`：有 Retry-After 响应头场景下的退避上限（默认 i64::MAX）
+struct BackoffParams {
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
+    max_delay_with_headers_ms: u64,
+}
+
+impl BackoffParams {
+    fn from_config() -> Self {
+        let r = &get_config().llm.retry;
+        Self {
+            initial_delay_ms: r.initial_delay_ms,
+            max_delay_ms: r.max_delay_ms,
+            max_delay_with_headers_ms: r.max_delay_with_headers_ms,
+        }
+    }
+}
+
+impl StreamError {
+    /// 是否可重试
+    ///
+    /// 可重试：RateLimit、Timeout、Connection、5xx ApiError（500/502/503/504/529）。
+    /// 不可重试：AuthError、StreamParseError、ContextOverflow、4xx ApiError、Cancelled、
+    ///          无状态码的 ApiError（协议层异常，非 HTTP 错误）。
+    ///
+    /// 重试策略与错误类型同处——`StreamError` 的字段形状本就为退避决策而设
+    ///（`RateLimit.retry_after_*`、`ApiError.status`），把策略挂回错误类型让数据与
+    /// 分支在同模块可一起改，消除原先错误字段在 provider.rs、策略在 retry.rs 的跨模块耦合。
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            StreamError::RateLimit { .. } | StreamError::Timeout | StreamError::Connection(_) => {
+                true
+            }
+            StreamError::ApiError {
+                status: Some(code), ..
+            } => matches!(code, 500 | 502 | 503 | 504 | 529),
+            StreamError::ApiError { status: None, .. } => false,
+            // ContextOverflow 不重试，应触发压缩
+            // Cancelled 不重试（非错误，由 shutdown 流程触发，冒泡给上层走中断路径）
+            StreamError::ContextOverflow
+            | StreamError::AuthError(_)
+            | StreamError::StreamParseError(_)
+            | StreamError::Cancelled => false,
+        }
+    }
+
+    /// 计算退避时长（双分支策略）
+    ///
+    /// 优先级：
+    /// 1. retry-after-ms 响应头
+    /// 2. retry-after 响应头
+    /// 3. 有响应头（RateLimit/5xx）→ 指数退避，上限 ~24.8天
+    /// 4. 无响应头（Timeout/Connection）→ 指数退避，上限 30s
+    pub fn backoff_duration(&self, retry: u32) -> std::time::Duration {
+        let p = BackoffParams::from_config();
+
+        // 优先级 1: retry-after-ms 响应头
+        if let StreamError::RateLimit {
+            retry_after_ms: Some(ms),
+            ..
+        } = self
+        {
+            return std::time::Duration::from_millis((*ms).min(p.max_delay_with_headers_ms));
+        }
+
+        // 优先级 2: retry-after 响应头（秒 → 毫秒）
+        if let StreamError::RateLimit {
+            retry_after_secs: Some(secs),
+            ..
+        } = self
+        {
+            return std::time::Duration::from_millis(
+                (secs * 1000).min(p.max_delay_with_headers_ms),
+            );
+        }
+
+        // 优先级 3 & 4: 指数退避
+        let base = p
+            .initial_delay_ms
+            .saturating_mul(2u64.saturating_pow(retry - 1));
+
+        // 有响应头的错误（RateLimit、带 HTTP 状态码的 ApiError）→ 上限 ~24.8天
+        let has_headers = matches!(
+            self,
+            StreamError::RateLimit { .. }
+                | StreamError::ApiError {
+                    status: Some(_),
+                    ..
+                }
+        );
+
+        if has_headers {
+            std::time::Duration::from_millis(base.min(p.max_delay_with_headers_ms))
+        } else {
+            // 无响应头的错误（Timeout、Connection）→ 上限 30s
+            std::time::Duration::from_millis(base.min(p.max_delay_ms))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +351,186 @@ mod tests {
         let reason = FinishReason::ToolCalls;
         let json = serde_json::to_string(&reason).unwrap();
         assert!(json.contains("\"tool_calls\""));
+    }
+
+    // ── StreamError 重试策略（is_retryable / backoff_duration）──────────────
+
+    #[test]
+    fn is_retryable_rate_limit() {
+        assert!(
+            StreamError::RateLimit {
+                retry_after_ms: None,
+                retry_after_secs: None
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn is_retryable_timeout() {
+        assert!(StreamError::Timeout.is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_connection() {
+        assert!(StreamError::Connection("refused".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn is_retryable_5xx_api_error() {
+        for code in [500, 502, 503, 504, 529] {
+            assert!(
+                StreamError::ApiError {
+                    status: Some(code),
+                    message: format!("HTTP {code}")
+                }
+                .is_retryable()
+            );
+        }
+    }
+
+    #[test]
+    fn is_not_retryable_4xx_api_error() {
+        for code in [400, 401, 404] {
+            assert!(
+                !StreamError::ApiError {
+                    status: Some(code),
+                    message: format!("HTTP {code}")
+                }
+                .is_retryable()
+            );
+        }
+    }
+
+    #[test]
+    fn is_not_retryable_api_error_without_status() {
+        // 协议层异常（无 HTTP 状态码）不可重试
+        assert!(
+            !StreamError::ApiError {
+                status: None,
+                message: "响应中无 choice".to_string()
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn is_not_retryable_auth_error() {
+        assert!(!StreamError::AuthError("invalid key".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_stream_parse_error() {
+        assert!(!StreamError::StreamParseError("invalid json".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_context_overflow() {
+        assert!(!StreamError::ContextOverflow.is_retryable());
+    }
+
+    #[test]
+    fn is_not_retryable_cancelled() {
+        // 取消不是错误（shutdown 触发），不应重试，应立即冒泡给上层走中断路径
+        assert!(!StreamError::Cancelled.is_retryable());
+    }
+
+    #[test]
+    fn backoff_duration_rate_limit_with_retry_after_ms() {
+        // 优先级1: retry-after-ms 响应头
+        let error = StreamError::RateLimit {
+            retry_after_ms: Some(5000),
+            retry_after_secs: None,
+        };
+        assert_eq!(
+            error.backoff_duration(1),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+
+    #[test]
+    fn backoff_duration_rate_limit_with_retry_after_secs() {
+        // 优先级2: retry-after 响应头（秒 → 毫秒）
+        let error = StreamError::RateLimit {
+            retry_after_ms: None,
+            retry_after_secs: Some(10),
+        };
+        assert_eq!(
+            error.backoff_duration(1),
+            std::time::Duration::from_millis(10000)
+        );
+    }
+
+    #[test]
+    fn backoff_duration_rate_limit_exponential() {
+        // 优先级3: 有响应头 → 指数退避，上限 ~24.8天
+        let error = StreamError::RateLimit {
+            retry_after_ms: None,
+            retry_after_secs: None,
+        };
+        assert_eq!(
+            error.backoff_duration(1),
+            std::time::Duration::from_millis(2000)
+        );
+        assert_eq!(
+            error.backoff_duration(5),
+            std::time::Duration::from_millis(32000)
+        );
+        // 第20次: 2000 * 2^19 = 1048576000ms ≈ 12天，未超上限
+        assert_eq!(
+            error.backoff_duration(20),
+            std::time::Duration::from_millis(1048576000)
+        );
+        // 第31次: 2000 * 2^30 = 2147483648000ms，超过上限 → 封顶
+        assert_eq!(
+            error.backoff_duration(31),
+            std::time::Duration::from_millis(2_147_483_647)
+        );
+    }
+
+    #[test]
+    fn backoff_duration_timeout_capped_at_30s() {
+        // 优先级4: 无响应头 → 上限 30s
+        let error = StreamError::Timeout;
+        assert_eq!(
+            error.backoff_duration(1),
+            std::time::Duration::from_millis(2000)
+        );
+        assert_eq!(
+            error.backoff_duration(5),
+            std::time::Duration::from_millis(30000) // 32s 被 30s 上限截断
+        );
+    }
+
+    #[test]
+    fn backoff_duration_connection_capped_at_30s() {
+        let error = StreamError::Connection("refused".to_string());
+        assert_eq!(
+            error.backoff_duration(5),
+            std::time::Duration::from_millis(30000)
+        );
+    }
+
+    #[test]
+    fn backoff_duration_5xx_api_error_has_headers() {
+        // 5xx ApiError（带 HTTP 状态码）有响应头 → 上限 ~24.8天
+        let error = StreamError::ApiError {
+            status: Some(503),
+            message: "HTTP 503: Service Unavailable".to_string(),
+        };
+        assert_eq!(
+            error.backoff_duration(5),
+            std::time::Duration::from_millis(32000)
+        );
+        // 第20次: 未超上限
+        assert_eq!(
+            error.backoff_duration(20),
+            std::time::Duration::from_millis(1048576000)
+        );
+        // 第31次: 超过上限 → 封顶
+        assert_eq!(
+            error.backoff_duration(31),
+            std::time::Duration::from_millis(2_147_483_647)
+        );
     }
 }

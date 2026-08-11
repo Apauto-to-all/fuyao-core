@@ -23,6 +23,26 @@ use fuyao_api::Session;
 /// 32 bit 熵下连续碰撞到这个次数的概率近乎零，命中即视为不可恢复故障向上抛错。
 const ID_CONFLICT_MAX_RETRIES: usize = 3;
 
+/// 校验 session 存在（事务内执行，复用调用方的事务连接）
+///
+/// 不存在返回 [`SessionError::NotFound`]。供 update_system_prompt / update_title /
+/// end_session（本模块）与 mark_compaction / rollback_to（兄弟模块）等写入路径复用——
+/// 避免给不存在的 session 写脏数据（孤儿消息 / 脏元数据）。每处原本内联同一份
+/// `SELECT EXISTS(...) → NotFound` 仪式，现集中到这一处。
+pub(super) async fn require_session(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+) -> Result<(), SessionError> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+        .bind(session_id)
+        .fetch_one(conn)
+        .await?;
+    if !exists {
+        return Err(SessionError::NotFound(session_id.to_string()));
+    }
+    Ok(())
+}
+
 impl super::SessionStore {
     // ── 生命周期读写（整行建 / 查 / 删 / 列）──────────────────────
 
@@ -215,14 +235,7 @@ impl super::SessionStore {
         let mut tx = self.pool.begin().await?;
 
         // 校验 session 存在(避免给不存在的 session 写脏数据)
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !exists {
-            return Err(SessionError::NotFound(session_id.to_string()));
-        }
+        require_session(&mut tx, session_id).await?;
 
         sqlx::query("UPDATE sessions SET system_prompt = ?2 WHERE id = ?1")
             .bind(session_id)
@@ -254,14 +267,7 @@ impl super::SessionStore {
     ) -> Result<(), SessionError> {
         let mut tx = self.pool.begin().await?;
 
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !exists {
-            return Err(SessionError::NotFound(session_id.to_string()));
-        }
+        require_session(&mut tx, session_id).await?;
 
         sqlx::query("UPDATE sessions SET title = ?2 WHERE id = ?1")
             .bind(session_id)
@@ -300,14 +306,7 @@ impl super::SessionStore {
     ) -> Result<(), SessionError> {
         let mut tx = self.pool.begin().await?;
 
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
-                .bind(session_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if !exists {
-            return Err(SessionError::NotFound(session_id.to_string()));
-        }
+        require_session(&mut tx, session_id).await?;
 
         // 秒级 f64 时间戳,与 started_at / ended_at 字段类型对齐
         let now = std::time::SystemTime::now()

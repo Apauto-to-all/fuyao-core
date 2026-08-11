@@ -9,13 +9,11 @@
 //!
 //! 文件组织：
 //! - [`trigger`]：触发层（阈值检测）
-//! - [`summary`]：执行层（构造 prompt + 调 provider + 失败处理）
-//! - [`prompt`]：摘要 system prompt + previous-summary 注入模板
+//! - [`summary`]：执行层（摘要 system prompt + 调 provider + 失败处理）
 //!
 //! 窗口切分算法已迁移至 [`crate::store::window`]（服务于读取侧的可见窗口拼接），
 //! 本模块只管压缩写侧，不参与窗口切分。
 
-pub mod prompt;
 pub mod summary;
 pub mod trigger;
 

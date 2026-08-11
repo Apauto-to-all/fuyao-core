@@ -94,15 +94,14 @@ pub fn apply_replace(
             // 检测原文件行尾风格，用于写入前把 new_content 转回该风格（保真）
             let ending = detect_line_ending(content);
 
-            let (new_content, match_count, strategy, error) =
-                fuzzy_find_and_replace(content, old_string, new_string, replace_all);
+            let outcome = fuzzy_find_and_replace(content, old_string, new_string, replace_all);
 
-            if error.is_some() {
-                return (String::new(), String::new(), 0, None, error);
+            if outcome.error.is_some() {
+                return (String::new(), String::new(), 0, None, outcome.error);
             }
 
             // 写入前保真：把 fuzzy 替换后的内容转回原文件行尾风格，并还原 BOM
-            let to_write = ending.apply(&new_content);
+            let to_write = ending.apply(&outcome.content);
             let to_write = join_bom(&to_write, has_bom);
 
             if let Err(e) = std::fs::write(file_path, to_write.as_bytes()) {
@@ -116,10 +115,10 @@ pub fn apply_replace(
             }
 
             (
-                new_content,
+                outcome.content,
                 content.to_string(),
-                match_count,
-                strategy,
+                outcome.replacements,
+                outcome.strategy,
                 None,
             )
         });
@@ -449,18 +448,20 @@ fn apply_update(op: &PatchOperation, workspace: &Path, task_id: &str) -> Result<
             let search_pattern = search_lines.join("\n");
             let replacement = replace_lines.join("\n");
 
-            let (updated, count, _, match_error) =
+            let outcome =
                 fuzzy_find_and_replace(&new_content, &search_pattern, &replacement, false);
 
-            if match_error.is_some() || count == 0 {
+            if outcome.error.is_some() || outcome.replacements == 0 {
                 hunk_errors.push(format!(
                     "hunk 上下文不匹配 - {}",
-                    match_error.unwrap_or_else(|| "未找到匹配内容".to_string())
+                    outcome
+                        .error
+                        .unwrap_or_else(|| "未找到匹配内容".to_string())
                 ));
                 continue;
             }
 
-            new_content = updated;
+            new_content = outcome.content;
         } else {
             // 无搜索行（纯加号）→ 纯插入模式
             let insert_text = replace_lines.join("\n");

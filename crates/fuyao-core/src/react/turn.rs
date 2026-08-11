@@ -20,9 +20,8 @@
 
 use super::SessionCtx;
 use super::builders::{
-    ResolvedModel, assistant_msg_to_payload, assistant_with_tool_calls_to_payload,
-    build_chat_request, resolve_context_length, resolve_model, tool_call_data_to_event,
-    tool_call_event_to_data,
+    ResolvedModel, assistant_payload, build_chat_request, resolve_context_length, resolve_model,
+    tool_call_data_to_event, tool_call_event_to_data,
 };
 use super::handle_control;
 use crate::interrupt::{
@@ -330,7 +329,7 @@ async fn handle_final_reply(ctx: &SessionCtx, result: &StreamResult, model_confi
     let agent_paths = ctx.agent_paths.clone();
     let event = OutputEvent::Assistant(AssistantMessage {
         base: EventBase::default(),
-        payload: assistant_msg_to_payload(result),
+        payload: assistant_payload(result),
     });
     let _ = crate::dispatch::emit_to_history(
         &ctx.emitter,
@@ -527,7 +526,7 @@ async fn handle_tool_calls(
     let agent_paths = ctx.agent_paths.clone();
     let event = OutputEvent::Assistant(AssistantMessage {
         base: EventBase::default(),
-        payload: assistant_with_tool_calls_to_payload(&effective_result),
+        payload: assistant_payload(&effective_result),
     });
     let _ = crate::dispatch::emit_to_history(
         &ctx.emitter,
@@ -655,23 +654,6 @@ async fn handle_tool_calls(
     false
 }
 
-/// 构建中断式 ToolResult 事件
-fn make_interrupt_tool_result_event(
-    tool_call_id: String,
-    tool_name: String,
-    source: &fuyao_api::InterruptSource,
-    reason: &str,
-) -> OutputEvent {
-    OutputEvent::ToolResult(fuyao_api::message::output::ToolResultMessage {
-        base: EventBase::default(),
-        payload: fuyao_api::message::output::ToolResultPayload {
-            tool_call_id,
-            tool_name,
-            content: format!("[{source:?}][{reason}]"),
-        },
-    })
-}
-
 /// 把工具执行结果经 emit_to_history 单条落 DB（拦截后构造 Message）
 ///
 /// 工具完成时立即调用：拦截 → `insert_message` 落 DB（Message::tool_result）→ 发送事件 → 观察。
@@ -761,7 +743,7 @@ async fn emit_interrupt_and_complete_tool_results(
     // 为 effective 中未完成的 tool_call 补发中断式 ToolResult（也走 emit_to_history）
     for tc in effective_tool_calls {
         if !answered.contains(&tc.id) {
-            let ev = make_interrupt_tool_result_event(
+            let ev = crate::interrupt::make_interrupt_tool_result(
                 tc.id.clone(),
                 tc.name.clone(),
                 &payload.source,
