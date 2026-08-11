@@ -583,17 +583,19 @@ async fn handle_tool_calls(
     // 任务列表存储能力：会话存储实现了 TodoStoreOps，coerce 成 trait object 注入工具 ctx。
     // todo 工具据此读写当前 session 的任务列表，不再自建连接池。
     let todo_store: std::sync::Arc<dyn fuyao_api::TodoStoreOps> = ctx.store.clone();
-    // 聚合工具执行级注入句柄：tools / agent_paths / emitter / cancel / subagent_ops /
-    // event_forwarder（emitter 派生）/ todo_store。tool_calls 与 result_tx 随调用变化，
-    // 仍作 execute_tools 的独立参数
+    // 聚合工具执行级注入句柄：tools / agent_paths / emitter / cancel + 能力聚合
+    // （subagent_ops / event_forwarder（emitter 派生）/ todo_store）。tool_calls 与
+    // result_tx 随调用变化，仍作 execute_tools 的独立参数
     let exec_ctx = tool_exec::ToolExecCtx {
         tools: ctx.tools.clone(),
         agent_paths: ctx.agent_paths.clone(),
         emitter: ctx.emitter.clone(),
         cancel: cancel.clone(),
-        subagent_ops: ctx.subagent_ops.clone(),
-        event_forwarder: Some(ctx.emitter.tx_clone()),
-        todo_store: Some(todo_store),
+        capabilities: fuyao_api::ToolCapabilities {
+            subagent_ops: ctx.subagent_ops.clone(),
+            event_forwarder: Some(ctx.emitter.tx_clone()),
+            todo_store: Some(todo_store),
+        },
     };
     let exec_fut = tool_exec::execute_tools(&tool_calls_for_exec, &result_tx, &exec_ctx);
     tokio::pin!(exec_fut);

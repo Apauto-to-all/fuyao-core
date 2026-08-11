@@ -21,4 +21,4 @@ pub use registry::{
     list_providers, register_model, register_provider,
 };
 pub use resolver::{get_base_url, parse_model_id, resolve_api_key};
-pub use stream_decoder::StreamDecoder;
+pub use stream_decoder::StreamAggregator;

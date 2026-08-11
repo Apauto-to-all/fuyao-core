@@ -48,12 +48,12 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{RetryMessage, RetryPayload};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::{Provider, StreamDecoder, StreamError, StreamOptions};
+use fuyao_provider::{Provider, StreamAggregator, StreamError, StreamOptions};
 use std::sync::Arc;
 
 /// 驱动一次完整的「LLM 调用 + 重试」过程
 ///
-/// 内部循环：每次都重建 `StreamDecoder`，调 [`stream::run_stream_session`]，
+/// 内部循环：每次都重建 `StreamAggregator`，调 [`stream::run_stream_session`]，
 /// 按错误类型决定是否重试。`request` 由调用方传入（已构建好的 `ChatRequest`，
 /// 每次 retry 复用同一份——本 session 的 messages 在一次 LLM 调用内不变）。
 ///
@@ -82,8 +82,8 @@ pub(crate) async fn run_stream_with_retry(
     loop {
         attempt += 1;
 
-        // 每次重试都重建 decoder + 清空 state（不携带上一次的部分结果）
-        let mut decoder = StreamDecoder::new();
+        // 每次重试都重建累加器 + 清空 state（不携带上一次的部分结果）
+        let mut decoder = StreamAggregator::new();
         {
             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
             s.text.clear();

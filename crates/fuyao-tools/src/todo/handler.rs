@@ -5,7 +5,7 @@
 //!
 //! 不传 todos 参数 = 读取当前列表，传了 = 整体覆盖写入。
 //! session_id 由 runner 通过 ToolCallContext 注入，不由 LLM 传递。
-//! 存储能力经 ctx.todo_store 注入（SessionStore 实现的 TodoStoreOps），
+//! 存储能力经 ctx.capabilities.todo_store 注入（SessionStore 实现的 TodoStoreOps），
 //! 不再自建连接池。
 
 use super::types::{TodoSummary, TodoWriteResult};
@@ -61,7 +61,7 @@ pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
         return common::tool_error("todos 必须是数组");
     }
 
-    let store = match &ctx.todo_store {
+    let store = match &ctx.capabilities.todo_store {
         Some(s) => s.clone(),
         None => {
             return common::tool_error(
@@ -211,7 +211,6 @@ mod tests {
     async fn todo_handler_returns_error_without_todo_store() {
         let ctx = ToolCallContext {
             session_id: Some("test".to_string()),
-            todo_store: None,
             ..ToolCallContext::default()
         };
         let result = todo_handler(serde_json::json!({}), &ctx).await;

@@ -6,7 +6,7 @@
 //! 3. 发 `ChildSession(Started)` 事件通知前端（携带 child_id 供渲染区开辟）
 //! 4. `send(child_id, UserMessage(prompt))`
 //! 5. 消费 rx：取 `Assistant(finish_reason=stop)` 的 content；中间事件经
-//!    `ctx.event_forwarder` 转发到父 session 出站通道（前端实时看子代理进度）
+//!    `ctx.capabilities.event_forwarder` 转发到父 session 出站通道（前端实时看子代理进度）
 //! 6. `end_session(child_id)`（一次性子 session，跑完即退）
 //! 7. 发 `ChildSession(Ended)` 事件通知前端关闭渲染区
 //! 8. 返 content 作为工具结果回喂父 ReAct
@@ -71,7 +71,7 @@ pub async fn subagent_handler(
     }
 
     // 3. upgrade SubagentOps（引擎弱引用 → 强引用）
-    let Some(ops_weak) = &ctx.subagent_ops else {
+    let Some(ops_weak) = &ctx.capabilities.subagent_ops else {
         return "❌ 子代理工具未注入引擎能力（SubagentOps 不可用）".to_string();
     };
     let Some(ops) = ops_weak.upgrade() else {
@@ -169,7 +169,7 @@ pub async fn subagent_handler(
                 // 其他事件（Chunk / ToolCall / ToolResult / 含 tool_calls 的 Assistant）：
                 // 经父 session 出站通道转发到 fan_out，前端按 child_id 实时渲染子代理进度。
                 // 事件 session_id 已是 child，不能被父 emitter 覆盖，所以直送 raw sender。
-                if let Some(tx) = &ctx.event_forwarder
+                if let Some(tx) = &ctx.capabilities.event_forwarder
                     && tx.send(ev).is_err()
                 {
                     tracing::warn!(
@@ -208,7 +208,7 @@ fn emit_child_session_event(
     state: ChildSessionState,
     description: &str,
 ) {
-    let Some(tx) = &ctx.event_forwarder else {
+    let Some(tx) = &ctx.capabilities.event_forwarder else {
         return; // 无 forwarder（如未注入）：不发，前端用 ToolResult 兜底
     };
     let parent_session_id = ctx.session_id.clone().unwrap_or_default();

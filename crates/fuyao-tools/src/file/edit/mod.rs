@@ -22,9 +22,9 @@ pub mod textutil;
 pub mod types;
 
 use fuyao_api::ToolEntry;
-use fuyao_api::{ToolDefinition, ToolFn, ToolParameterProperty, ToolParameters};
+use fuyao_api::{ToolDefinition, ToolFn};
 use handler::edit_impl;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 
 /// 注册 edit 工具
@@ -33,80 +33,21 @@ pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
         Box::pin(async move { edit_impl(args, &ctx) })
     });
 
-    let mut properties = HashMap::new();
-    properties.insert(
-        "mode".to_string(),
-        ToolParameterProperty {
-            kind: "string".to_string(),
-            description: "模式：replace（查找替换）或 patch（V4A 补丁）".to_string(),
-            default: Some(serde_json::json!("replace")),
-            enum_values: Some(vec!["replace".to_string(), "patch".to_string()]),
-            items: None,
-        },
-    );
-    properties.insert(
-        "path".to_string(),
-        ToolParameterProperty {
-            kind: "string".to_string(),
-            description: "文件路径（replace 模式必填）".to_string(),
-            default: None,
-            enum_values: None,
-            items: None,
-        },
-    );
-    properties.insert(
-        "old_string".to_string(),
-        ToolParameterProperty {
-            kind: "string".to_string(),
-            description: "要查找的文本（replace 模式必填）".to_string(),
-            default: None,
-            enum_values: None,
-            items: None,
-        },
-    );
-    properties.insert(
-        "new_string".to_string(),
-        ToolParameterProperty {
-            kind: "string".to_string(),
-            description: "替换文本（replace 模式必填）".to_string(),
-            default: None,
-            enum_values: None,
-            items: None,
-        },
-    );
-    properties.insert(
-        "replace_all".to_string(),
-        ToolParameterProperty {
-            kind: "boolean".to_string(),
-            description: "替换所有匹配（默认 false）".to_string(),
-            default: Some(serde_json::json!(false)),
-            enum_values: None,
-            items: None,
-        },
-    );
-    properties.insert(
-        "patch".to_string(),
-        ToolParameterProperty {
-            kind: "string".to_string(),
-            description: "V4A 格式补丁内容（patch 模式必填）".to_string(),
-            default: None,
-            enum_values: None,
-            items: None,
-        },
-    );
-
-    let definition = ToolDefinition {
-        kind: "function".to_string(),
-        function: fuyao_api::ToolSchema {
-            name: "edit".to_string(),
-            description: "文件补丁工具，支持两种模式：\nreplace 模式：查找并替换文本，使用模糊匹配处理空白差异。\npatch 模式：应用 V4A 格式多文件补丁。\n自动检测外部编辑并发出警告。".to_string(),
-            parameters: ToolParameters {
-                kind: "object".to_string(),
-                properties,
-                required: vec!["mode".to_string()],
-            },
-        },
-    };
+    let definition = ToolDefinition::builder(
+        "edit",
+        "文件补丁工具，支持两种模式：\nreplace 模式：查找并替换文本，使用模糊匹配处理空白差异。\npatch 模式：应用 V4A 格式多文件补丁。\n自动检测外部编辑并发出警告。",
+    )
+    .string("mode", "模式：replace（查找替换）或 patch（V4A 补丁）")
+    .enum_values(["replace", "patch"])
+    .default(json!("replace"))
+    .required()
+    .string("path", "文件路径（replace 模式必填）")
+    .string("old_string", "要查找的文本（replace 模式必填）")
+    .string("new_string", "替换文本（replace 模式必填）")
+    .boolean("replace_all", "替换所有匹配（默认 false）")
+    .default(json!(false))
+    .string("patch", "V4A 格式补丁内容（patch 模式必填）")
+    .build();
 
     map.insert(
         "edit",

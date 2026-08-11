@@ -173,9 +173,7 @@ mod tests {
             session_id: Some("test_session".to_string()),
             agent_paths: Some(AgentPaths::default()),
             tool_call_id: None,
-            subagent_ops: None,
-            event_forwarder: None,
-            todo_store: None,
+            capabilities: Default::default(),
         }
     }
 

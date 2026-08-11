@@ -436,7 +436,10 @@ async fn todowrite_isolated_by_session_id() {
             workspace: Some(ws.path().to_path_buf()),
             ..AgentPaths::default()
         }),
-        todo_store: Some(store.clone()),
+        capabilities: fuyao_api::ToolCapabilities {
+            todo_store: Some(store.clone()),
+            ..Default::default()
+        },
         ..ToolCallContext::default()
     };
     let ctx_a = mk_ctx("session_a");

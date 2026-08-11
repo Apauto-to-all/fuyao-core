@@ -59,7 +59,10 @@ pub async fn make_ctx_with_store(workspace: PathBuf) -> ToolCallContext {
             extra_dirs: Vec::new(),
             fuyao_home: std::env::temp_dir().join("fuyao_it_tools_home"),
         }),
-        todo_store: Some(store),
+        capabilities: fuyao_api::ToolCapabilities {
+            todo_store: Some(store),
+            ..Default::default()
+        },
         ..ToolCallContext::default()
     }
 }

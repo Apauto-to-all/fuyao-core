@@ -1,7 +1,10 @@
-//! 流式解码器
+//! 流式事件累加器
 //!
-//! 消费 StreamEvent，跟踪工具调用增量拼接，
-//! 输出 OutputEvent 给 Engine 推送到外部。
+//! 消费**已解码**的 [`StreamEvent`]（线解码在 [`crate::openai::sse`]），
+//! 跟踪工具调用增量拼接、累积 usage 统计，输出 [`OutputEvent`] 给 Engine 推送到外部。
+//!
+//! 与 [`crate::openai::sse`] 的职责边界：sse 做「SSE 文本 → StreamEvent」的线解码，
+//! 本模块做「StreamEvent → OutputEvent」的事件累加，两者正交、不重叠。
 
 use crate::{StreamEvent, StreamUsage};
 use fuyao_api::message::output::{ChunkMessage, ChunkPayload};
@@ -15,18 +18,19 @@ struct ToolUseState {
     args_buffer: String,
 }
 
-/// 流式解码器
+/// 流式事件累加器
 ///
-/// 消费 StreamEvent，跟踪工具调用增量拼接，
-/// 输出 OutputEvent 给 Engine 推送到外部。
-pub struct StreamDecoder {
+/// 消费**已解码**的 [`StreamEvent`]，跟踪工具调用增量拼接、累积 usage 统计，
+/// 输出 [`OutputEvent`] 给 Engine 推送到外部。线解码（SSE 文本 → StreamEvent）
+/// 由 [`crate::openai::sse`] 负责，与本模块正交。
+pub struct StreamAggregator {
     /// 工具调用状态（index → ToolUseState）
     tool_calls: std::collections::HashMap<usize, ToolUseState>,
     /// 累积使用统计
     usage: StreamUsage,
 }
 
-impl StreamDecoder {
+impl StreamAggregator {
     pub fn new() -> Self {
         Self {
             tool_calls: std::collections::HashMap::new(),
@@ -158,7 +162,7 @@ impl StreamDecoder {
     // TODO: 未来多轮复用解码器时添加 reset() 方法（清空 tool_calls + 重置 usage）
 }
 
-impl Default for StreamDecoder {
+impl Default for StreamAggregator {
     fn default() -> Self {
         Self::new()
     }
@@ -171,7 +175,7 @@ mod tests {
 
     #[test]
     fn text_delta_passes_through() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         let events = decoder.process(StreamEvent::TextDelta {
             content: "Hello".to_string(),
         });
@@ -183,7 +187,7 @@ mod tests {
 
     #[test]
     fn reasoning_delta_passes_through() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         let events = decoder.process(StreamEvent::ReasoningDelta {
             content: "思考中".to_string(),
         });
@@ -195,7 +199,7 @@ mod tests {
 
     #[test]
     fn tool_call_chunk_creates_state() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         let events = decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
             id: Some("call_1".to_string()),
@@ -210,7 +214,7 @@ mod tests {
 
     #[test]
     fn tool_call_chunk_incremental_id_name_args() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         // id 先到
         decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
@@ -241,8 +245,8 @@ mod tests {
 
     #[test]
     fn tool_call_chunk_empty_id_name_filtered() {
-        let mut decoder = StreamDecoder::new();
-        // 所有字段为空（被 openai.rs 过滤后不会有 chunk 到达，但防御性测试）
+        let mut decoder = StreamAggregator::new();
+        // 所有字段为空（被 sse 线解码过滤后不会有 chunk 到达，但防御性测试）
         decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
             id: None,
@@ -255,7 +259,7 @@ mod tests {
 
     #[test]
     fn done_does_not_emit_tool_call_events() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
             id: Some("call_1".to_string()),
@@ -275,7 +279,7 @@ mod tests {
 
     #[test]
     fn done_with_stop_emits_nothing() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         let events = decoder.process(StreamEvent::Done {
             usage: StreamUsage::default(),
             finish_reason: FinishReason::Stop,
@@ -285,7 +289,7 @@ mod tests {
 
     #[test]
     fn take_tool_calls_filters_invalid() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         // 有效
         decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
@@ -311,7 +315,7 @@ mod tests {
 
     #[test]
     fn reset_clears_all_state() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
             id: Some("call_1".to_string()),
@@ -329,15 +333,15 @@ mod tests {
 
     #[test]
     fn default_is_same_as_new() {
-        let mut d1 = StreamDecoder::new();
-        let mut d2 = StreamDecoder::default();
+        let mut d1 = StreamAggregator::new();
+        let mut d2 = StreamAggregator::default();
         assert!(d1.take_tool_calls().is_empty());
         assert!(d2.take_tool_calls().is_empty());
     }
 
     #[test]
     fn peek_tool_calls_returns_cloned_without_consuming() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
         decoder.process(StreamEvent::ToolCallChunk {
             index: 0,
             id: Some("call_1".to_string()),
@@ -359,7 +363,7 @@ mod tests {
 
     #[test]
     fn usage_merges_across_two_done_events() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
 
         // 第一个 Done：finish_reason=stop，usage 全零（尚未收到 usage chunk）
         decoder.process(StreamEvent::Done {
@@ -390,7 +394,7 @@ mod tests {
 
     #[test]
     fn usage_keeps_existing_nonzero_values() {
-        let mut decoder = StreamDecoder::new();
+        let mut decoder = StreamAggregator::new();
 
         // 第一个 Done 已有 usage
         decoder.process(StreamEvent::Done {

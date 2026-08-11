@@ -1,6 +1,6 @@
 //! LLM 流式会话
 //!
-//! 消费 provider 的 StreamEvent 流，经 StreamDecoder 解码成 OutputEvent 发出。
+//! 消费 provider 的 StreamEvent 流，经 StreamAggregator 累加成 OutputEvent 发出。
 //! 流结束后返回累积结果（含 tool_calls）。
 //!
 //! 失败处理：provider 报错时直接 `return Err(e)`——本模块只负责流式解码，
@@ -12,7 +12,7 @@ use crate::emit::Emitter;
 use crate::interrupt::SharedTurnState;
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::{
-    BoxStream, ChatRequest, Provider, StreamDecoder, StreamError, StreamEvent, StreamOptions,
+    BoxStream, ChatRequest, Provider, StreamAggregator, StreamError, StreamEvent, StreamOptions,
     StreamUsage, ToolCallData,
 };
 use std::sync::Arc;
@@ -46,7 +46,7 @@ pub(crate) async fn run_stream_session(
     provider: &Arc<dyn Provider>,
     emitter: &Emitter,
     hooks: &SharedHooks,
-    decoder: &mut StreamDecoder,
+    decoder: &mut StreamAggregator,
     state: &SharedTurnState,
 ) -> Result<StreamResult, StreamError> {
     let mut stream: BoxStream<Result<StreamEvent, StreamError>> =

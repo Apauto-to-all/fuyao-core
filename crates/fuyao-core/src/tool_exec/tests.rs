@@ -17,17 +17,20 @@ fn test_paths() -> AgentPaths {
     AgentPaths::default()
 }
 
-/// 构造测试用 ToolExecCtx（默认无 subagent_ops / todo_store，event_forwarder 取 emitter 派生）
+/// 构造测试用 ToolExecCtx（能力聚合内仅 event_forwarder 取 emitter 派生，其余为 None）
 fn test_ctx(tools: Arc<ToolRegistry>) -> ToolExecCtx {
     let emitter = test_emitter();
+    let forwarder = emitter.tx_clone();
     ToolExecCtx {
         tools,
         agent_paths: test_paths(),
-        event_forwarder: Some(emitter.tx_clone()),
         emitter,
         cancel: CancellationToken::new(),
-        subagent_ops: None,
-        todo_store: None,
+        capabilities: ToolCapabilities {
+            subagent_ops: None,
+            event_forwarder: Some(forwarder),
+            todo_store: None,
+        },
     }
 }
 

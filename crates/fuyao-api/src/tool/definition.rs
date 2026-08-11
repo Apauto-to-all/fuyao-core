@@ -108,6 +108,146 @@ impl ToolDefinition {
             },
         }
     }
+
+    /// 返回声明式构造器，用于链式描述参数（消除逐字段手搓 schema 字面量）
+    ///
+    /// 无参数工具用 [`new`](Self::new)；带参数工具用本方法：
+    /// ```no_run
+    /// # use fuyao_api::ToolDefinition;
+    /// # use serde_json::json;
+    /// ToolDefinition::builder("read", "读取文件")
+    ///     .string("path", "文件路径").required()
+    ///     .integer("limit", "最大行数").default(json!(500))
+    ///     .build();
+    /// ```
+    pub fn builder(
+        name: impl Into<String>,
+        description: impl Into<String>,
+    ) -> ToolDefinitionBuilder {
+        ToolDefinitionBuilder::new(name, description)
+    }
+}
+
+/// 工具定义构造器：声明式描述参数，消除逐字段手搓 [`ToolParameterProperty`] 字面量
+///
+/// 每个类型方法（[`string`](Self::string) / [`integer`](Self::integer) / ...）追加一个参数
+/// 并返回 `Self`；紧随其后的修饰方法（[`default`](Self::default) /
+/// [`enum_values`](Self::enum_values) / [`items`](Self::items) / [`required`](Self::required)）
+/// 作用于**最近追加**的那个参数。
+///
+/// 构造器契约：修饰方法必须在某个参数方法之后调用，否则 panic（编程错误，立即暴露）。
+pub struct ToolDefinitionBuilder {
+    def: ToolDefinition,
+    /// 最近追加的参数名，供修饰方法定位目标参数
+    last_param: Option<String>,
+}
+
+impl ToolDefinitionBuilder {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            def: ToolDefinition::new(name, description),
+            last_param: None,
+        }
+    }
+
+    /// 追加一个参数（显式指定类型 `kind`）
+    pub fn param(mut self, name: &str, kind: &str, description: impl Into<String>) -> Self {
+        self.def.function.parameters.properties.insert(
+            name.to_string(),
+            ToolParameterProperty {
+                kind: kind.to_string(),
+                description: description.into(),
+                default: None,
+                enum_values: None,
+                items: None,
+            },
+        );
+        self.last_param = Some(name.to_string());
+        self
+    }
+
+    /// 追加 string 类型参数
+    pub fn string(self, name: &str, description: impl Into<String>) -> Self {
+        self.param(name, "string", description)
+    }
+
+    /// 追加 integer 类型参数
+    pub fn integer(self, name: &str, description: impl Into<String>) -> Self {
+        self.param(name, "integer", description)
+    }
+
+    /// 追加 number 类型参数
+    pub fn number(self, name: &str, description: impl Into<String>) -> Self {
+        self.param(name, "number", description)
+    }
+
+    /// 追加 boolean 类型参数
+    pub fn boolean(self, name: &str, description: impl Into<String>) -> Self {
+        self.param(name, "boolean", description)
+    }
+
+    /// 追加 array 类型参数
+    pub fn array(self, name: &str, description: impl Into<String>) -> Self {
+        self.param(name, "array", description)
+    }
+
+    /// 给最近追加的参数设默认值
+    pub fn default(mut self, value: serde_json::Value) -> Self {
+        let name = self.last_param_name();
+        self.def
+            .function
+            .parameters
+            .properties
+            .get_mut(&name)
+            .expect("default 必须在 param/string/integer/... 之后调用")
+            .default = Some(value);
+        self
+    }
+
+    /// 给最近追加的参数设枚举值
+    pub fn enum_values(mut self, values: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        let name = self.last_param_name();
+        self.def
+            .function
+            .parameters
+            .properties
+            .get_mut(&name)
+            .expect("enum_values 必须在 param/string/integer/... 之后调用")
+            .enum_values = Some(values.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// 给最近追加的参数设数组元素类型（items，仅 array 参数用）
+    pub fn items(mut self, items: HashMap<String, serde_json::Value>) -> Self {
+        let name = self.last_param_name();
+        self.def
+            .function
+            .parameters
+            .properties
+            .get_mut(&name)
+            .expect("items 必须在 param/array 之后调用")
+            .items = Some(items);
+        self
+    }
+
+    /// 标记最近追加的参数为必填
+    pub fn required(mut self) -> Self {
+        let name = self.last_param_name();
+        self.def.function.parameters.required.push(name);
+        self
+    }
+
+    /// 构建工具定义
+    pub fn build(self) -> ToolDefinition {
+        self.def
+    }
+
+    /// 取最近追加的参数名（修饰方法定位目标用）
+    fn last_param_name(&self) -> String {
+        self.last_param
+            .clone()
+            .expect("default/enum_values/items/required 必须在 param/string/integer/... 之后调用")
+    }
 }
 
 #[cfg(test)]
@@ -173,5 +313,72 @@ mod tests {
             prop.enum_values.as_deref(),
             Some(&["a".to_string(), "b".to_string()][..])
         );
+    }
+
+    #[test]
+    fn builder_constructs_required_and_default_params() {
+        use serde_json::json;
+        let def = ToolDefinition::builder("read", "读取文件")
+            .string("path", "文件路径")
+            .required()
+            .integer("limit", "最大行数")
+            .default(json!(500))
+            .build();
+
+        assert_eq!(def.function.name, "read");
+        assert_eq!(def.function.parameters.required, vec!["path".to_string()]);
+        let path = def
+            .function
+            .parameters
+            .properties
+            .get("path")
+            .expect("path 参数应存在");
+        assert_eq!(path.kind, "string");
+        assert!(path.default.is_none());
+        let limit = def
+            .function
+            .parameters
+            .properties
+            .get("limit")
+            .expect("limit 参数应存在");
+        assert_eq!(limit.kind, "integer");
+        assert_eq!(limit.default, Some(json!(500)));
+    }
+
+    #[test]
+    fn builder_supports_enum_and_items() {
+        use serde_json::json;
+        use std::collections::HashMap;
+        let items = HashMap::from([
+            ("type".to_string(), json!("object")),
+            ("required".to_string(), json!(["id"])),
+        ]);
+        let def = ToolDefinition::builder("multi", "多模式工具")
+            .string("mode", "模式")
+            .enum_values(["replace", "patch"])
+            .default(json!("replace"))
+            .array("list", "列表")
+            .items(items)
+            .build();
+
+        let mode = def
+            .function
+            .parameters
+            .properties
+            .get("mode")
+            .expect("mode 参数应存在");
+        assert_eq!(
+            mode.enum_values.as_deref(),
+            Some(&["replace".to_string(), "patch".to_string()][..])
+        );
+        assert_eq!(mode.default, Some(json!("replace")));
+        let list = def
+            .function
+            .parameters
+            .properties
+            .get("list")
+            .expect("list 参数应存在");
+        assert_eq!(list.kind, "array");
+        assert!(list.items.is_some());
     }
 }

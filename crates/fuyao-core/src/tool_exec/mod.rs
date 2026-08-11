@@ -28,10 +28,9 @@ mod parallel;
 
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::message::OutputEvent;
-use fuyao_api::{CancellationToken, SubagentOps, TodoStoreOps, ToolCallContext};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolCapabilities};
 use fuyao_provider::ToolCallData;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinSet;
@@ -72,16 +71,11 @@ pub(crate) struct ToolExecCtx {
     pub emitter: Emitter,
     /// 本次工具批次的中断信号（每次 `execute_tools` 由调用方 `child_token()` 派生）
     pub cancel: CancellationToken,
-    /// 引擎派生子 session 的能力弱引用（注入工具 ctx，子代理类工具用）
-    pub subagent_ops: Option<Weak<dyn SubagentOps>>,
-    /// 父 session 出站通道的直送克隆（不盖 session_id 标签）
+    /// 运行期能力句柄聚合（子代理 / todo 工具用）
     ///
-    /// emitter 的派生物：构造 ctx 时由 `emitter.tx_clone()` 生成一次，
-    /// `execute_single` 直接塞进 `ToolCallContext`。子事件已自带 child session_id，
-    /// 不能被父 emitter 的 stamp 覆盖，故用 raw sender。
-    pub event_forwarder: Option<tokio::sync::mpsc::UnboundedSender<OutputEvent>>,
-    /// 任务列表存储能力强引用（注入工具 ctx，todo 工具用）
-    pub todo_store: Option<Arc<dyn TodoStoreOps>>,
+    /// `execute_single` 整体克隆塞进 `ToolCallContext.capabilities`。普通工具
+    /// 的能力字段为 `None`，仅子代理类 / todo 工具按需读取。
+    pub capabilities: ToolCapabilities,
 }
 
 /// 执行一批工具调用（智能调度：能并行则并行，否则串行）
@@ -210,7 +204,7 @@ async fn execute_parallel(
 /// 容错：未知工具返回提示字符串；参数解析失败用 `Value::Null`。
 ///
 /// 串行与并行共用本函数。注入句柄全部从 `ctx`（[`ToolExecCtx`]）取：
-/// `session_id` 取 `ctx.emitter.session_id()`，`event_forwarder` 取 `ctx.event_forwarder`。
+/// `session_id` 取 `ctx.emitter.session_id()`，能力句柄整体取 `ctx.capabilities`。
 async fn execute_single(tc: &ToolCallData, ctx: &ToolExecCtx) -> ToolExecResult {
     let tool_name = tc.name.clone();
     let tool_call_id = tc.id.clone();
@@ -231,16 +225,12 @@ async fn execute_single(tc: &ToolCallData, ctx: &ToolExecCtx) -> ToolExecResult 
         serde_json::Value::Null
     });
 
-    // 构建工具上下文：注入 session_id + agent_paths + tool_call_id + subagent_ops + event_forwarder + todo_store
-    // （工具据此识别会话、子代理类工具据此 upgrade 派生子 session + 转发子事件、
-    //  todo 工具据此读写任务列表——其余工具按需取用）
+    // 构建工具上下文：身份字段逐个注入，能力句柄整体克隆（普通工具能力为空，仅子代理 / todo 用）
     let tool_ctx = ToolCallContext {
         session_id: Some(ctx.emitter.session_id().to_string()),
         agent_paths: Some(ctx.agent_paths.clone()),
         tool_call_id: Some(tool_call_id.clone()),
-        subagent_ops: ctx.subagent_ops.clone(),
-        event_forwarder: ctx.event_forwarder.clone(),
-        todo_store: ctx.todo_store.clone(),
+        capabilities: ctx.capabilities.clone(),
     };
 
     let started = std::time::Instant::now();

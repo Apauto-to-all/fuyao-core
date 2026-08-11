@@ -15,8 +15,10 @@ pub mod func;
 pub mod ops;
 pub mod result;
 
-pub use context::ToolCallContext;
-pub use definition::{ToolDefinition, ToolParameterProperty, ToolParameters, ToolSchema};
+pub use context::{ToolCallContext, ToolCapabilities};
+pub use definition::{
+    ToolDefinition, ToolDefinitionBuilder, ToolParameterProperty, ToolParameters, ToolSchema,
+};
 pub use entry::ToolEntry;
 pub use func::ToolFn;
 pub use ops::{ChildSessionSource, SubagentOps, TodoStoreOps};
