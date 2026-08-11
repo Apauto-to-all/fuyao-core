@@ -3,6 +3,7 @@
 //! 检测流式文本内容的自相似度（重复），根据严重程度升级处理。
 
 use crate::loop_guard::detectors::detect_text_self_similarity;
+use crate::loop_guard::escalation;
 use crate::loop_guard::types::LoopSeverity;
 use fuyao_api::LoopGuardConfig;
 
@@ -100,26 +101,15 @@ impl TextLoopGuard {
         self.last_check_len = self.accumulated_text.len();
 
         if let Some(msg) = result {
-            let severity = self.escalate_text();
-            let should_interrupt = severity == LoopSeverity::Interrupt;
-            // 已中断 3 次以上，升级为终止
-            let (severity, _) = if should_interrupt && interrupt_count >= 3 {
-                (LoopSeverity::Abort, true)
-            } else {
-                (severity, should_interrupt)
-            };
-
-            // Interrupt 级别使用递增后的计数（与 Python 版一致：先递增再生成警告）
-            let effective_count = if matches!(severity, LoopSeverity::Interrupt) {
-                interrupt_count + 1
-            } else {
-                interrupt_count
-            };
-
+            let base = self.escalate_text();
+            let outcome = escalation::resolve(base, interrupt_count);
             Some(TextDetectResult {
-                severity,
-                message: if matches!(severity, LoopSeverity::Interrupt | LoopSeverity::Abort) {
-                    self.get_interrupt_warning(effective_count)
+                severity: outcome.severity,
+                message: if escalation::should_interrupt(outcome.severity) {
+                    escalation::interrupt_warning(
+                        escalation::DetectKind::Text,
+                        outcome.effective_count,
+                    )
                 } else {
                     msg
                 },
@@ -137,27 +127,13 @@ impl TextLoopGuard {
         self.current_phase = None;
     }
 
-    /// 文本重复升级逻辑
+    /// 文本重复升级逻辑（返回基础严重程度，Abort 升级由 escalation::resolve 统一处理）
     fn escalate_text(&mut self) -> LoopSeverity {
         self.text_escalation += 1;
         if self.text_escalation >= 2 {
             LoopSeverity::Interrupt
         } else {
             LoopSeverity::Warn
-        }
-    }
-
-    /// 根据中断次数生成升级警告
-    fn get_interrupt_warning(&self, interrupt_count: usize) -> String {
-        if interrupt_count >= 3 {
-            return "[循环检测] AI 在多次干预后仍持续输出重复内容，已彻底终止。请手动调整任务或重新开始。"
-                .to_string();
-        }
-
-        if interrupt_count == 1 {
-            "[循环检测] 你的输出内容在重复。请直接给出结论，不要再展开细节。".to_string()
-        } else {
-            "[循环检测] 你已多次输出重复内容。请立即停止重复，用一句话总结核心结果。".to_string()
         }
     }
 }

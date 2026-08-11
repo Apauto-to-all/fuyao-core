@@ -107,6 +107,44 @@ impl LoopGuardState {
         self.pending_severity = None;
     }
 
+    /// 应用高严重程度（Interrupt/Abort）的统一副作用
+    ///
+    /// - Abort：记 WARN、缓存 inject、发 loop_abort 通知、发中断信号
+    /// - Interrupt：记 INFO、递增 interrupt_count、发 loop_interrupt 通知、缓存 inject、
+    ///   发中断信号、发引导注入消息
+    ///
+    /// 返回 true 表示已处理（调用方据此跳过低 severity 的分支）。
+    /// 两条检测路径（chunk / tool_call）的高 severity 行为完全一致，集中于此消除重复。
+    fn apply_severe(&mut self, severity: LoopSeverity, message: &str) -> bool {
+        match severity {
+            LoopSeverity::Abort => {
+                tracing::warn!(
+                    interrupt_count = self.interrupt_count,
+                    message = %message,
+                    "循环检测触发终止 (Abort)"
+                );
+                self.pending_inject = message.to_string();
+                self.emit_plugin("loop_abort", message);
+                self.send_interrupt(message.to_string());
+                true
+            }
+            LoopSeverity::Interrupt => {
+                tracing::info!(
+                    interrupt_count = self.interrupt_count,
+                    message = %message,
+                    "循环检测触发中断 (Interrupt)"
+                );
+                self.interrupt_count += 1;
+                self.emit_plugin("loop_interrupt", message);
+                self.pending_inject = message.to_string();
+                self.send_interrupt(message.to_string());
+                self.send_inject_message(message.to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// 处理流式内容块（文本循环检测）
     pub fn handle_chunk(&mut self, chunk: &ChunkMessage) {
         let result = self.text_guard.handle_chunk(
@@ -117,32 +155,9 @@ impl LoopGuardState {
 
         if let Some(r) = result {
             self.pending_severity = Some(r.severity);
-            match r.severity {
-                LoopSeverity::Abort => {
-                    tracing::warn!(
-                        interrupt_count = self.interrupt_count,
-                        message = %r.message,
-                        "循环检测触发终止 (Abort)"
-                    );
-                    self.pending_inject = r.message.clone();
-                    self.emit_plugin("loop_abort", &r.message);
-                    self.send_interrupt(r.message);
-                }
-                LoopSeverity::Interrupt => {
-                    tracing::info!(
-                        interrupt_count = self.interrupt_count,
-                        message = %r.message,
-                        "循环检测触发中断 (Interrupt)"
-                    );
-                    self.interrupt_count += 1;
-                    self.emit_plugin("loop_interrupt", &r.message);
-                    self.pending_inject = r.message.clone();
-                    self.send_interrupt(r.message.clone());
-                    self.send_inject_message(r.message);
-                }
-                _ => {
-                    self.emit_plugin("loop_warn", &r.message);
-                }
+            // 高 severity 由 apply_severe 统一处理；Warn 仅通知（chunk 路径不缓存 pending_warn）
+            if !self.apply_severe(r.severity, &r.message) {
+                self.emit_plugin("loop_warn", &r.message);
             }
         }
     }
@@ -157,29 +172,11 @@ impl LoopGuardState {
 
         if let Some(r) = result {
             self.pending_severity = Some(r.severity);
+            if self.apply_severe(r.severity, &r.message) {
+                return;
+            }
+            // 低 severity：Inject 替换结果内容，Warn 追加警告
             match r.severity {
-                LoopSeverity::Abort => {
-                    tracing::warn!(
-                        interrupt_count = self.interrupt_count,
-                        message = %r.message,
-                        "循环检测触发终止 (Abort)"
-                    );
-                    self.pending_inject = r.message.clone();
-                    self.emit_plugin("loop_abort", &r.message);
-                    self.send_interrupt(r.message);
-                }
-                LoopSeverity::Interrupt => {
-                    tracing::info!(
-                        interrupt_count = self.interrupt_count,
-                        message = %r.message,
-                        "循环检测触发中断 (Interrupt)"
-                    );
-                    self.interrupt_count += 1;
-                    self.emit_plugin("loop_interrupt", &r.message);
-                    self.pending_inject = r.message.clone();
-                    self.send_interrupt(r.message.clone());
-                    self.send_inject_message(r.message);
-                }
                 LoopSeverity::Inject => {
                     self.emit_plugin("loop_inject", &r.message);
                     self.pending_inject = r.message;

@@ -6,8 +6,8 @@
 mod bridge;
 mod circuit_breaker;
 mod connection;
-mod constants;
 mod recovery;
+mod schema;
 mod security;
 
 use std::collections::HashMap;
@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use fuyao_api::MCPServerConfig;
 use tokio::sync::Mutex;
+
+use crate::circuit_breaker::CircuitBreaker;
 
 use connection::{MCPConnection, McpToolInfo};
 
@@ -66,6 +68,8 @@ pub struct MCPManager {
     registered_tools: Arc<Mutex<HashMap<String, RegisteredTool>>>,
     /// Server 配置映射
     configs: HashMap<String, MCPServerConfig>,
+    /// 熔断器（实例级状态，跨 manager 隔离）
+    breaker: Arc<CircuitBreaker>,
 }
 
 impl MCPManager {
@@ -75,6 +79,7 @@ impl MCPManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             registered_tools: Arc::new(Mutex::new(HashMap::new())),
             configs,
+            breaker: Arc::new(CircuitBreaker::new()),
         }
     }
 
@@ -218,6 +223,7 @@ impl MCPManager {
 
             let handler = bridge::make_tool_call_handler(
                 conn.clone(),
+                self.breaker.clone(),
                 tool.original_name.clone(),
                 tool.server_name.clone(),
                 timeout,
@@ -290,12 +296,7 @@ impl MCPManager {
 
         // 处理结果
         if result.is_error.unwrap_or(false) {
-            let error_text: String = result
-                .content
-                .iter()
-                .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
-                .collect::<Vec<&str>>()
-                .join("");
+            let error_text = bridge::extract_error_text(&result);
             tracing::warn!(
                 server = %server_name,
                 tool = %original_name,
@@ -307,29 +308,7 @@ impl MCPManager {
             )));
         }
 
-        // 提取文本内容
-        let parts: Vec<String> = result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-            .collect();
-        let text_result = parts.join("\n");
-
-        // 检查 structuredContent
-        let output = if let Some(structured) = &result.structured_content {
-            if !text_result.is_empty() {
-                serde_json::json!({
-                    "result": text_result,
-                    "structuredContent": structured
-                })
-            } else {
-                serde_json::json!({"result": structured})
-            }
-        } else {
-            serde_json::json!({"result": text_result})
-        };
-
-        Ok(output.to_string())
+        Ok(bridge::extract_call_output(&result))
     }
 
     /// 刷新工具列表
@@ -444,7 +423,7 @@ fn build_tool_schema_from_info(
     description: &str,
     input_schema: &serde_json::Value,
 ) -> fuyao_api::ToolDefinition {
-    let normalized = security::normalize_mcp_input_schema(input_schema);
+    let normalized = schema::normalize_mcp_input_schema(input_schema);
 
     let mut properties = HashMap::new();
     let mut required = Vec::new();

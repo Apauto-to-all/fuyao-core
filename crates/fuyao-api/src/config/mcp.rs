@@ -1,11 +1,11 @@
 //! MCP 全局 fallback 配置
 //!
-//! 迁移自 `fuyao-mcp/src/constants.rs` 的高频可调项。
-//! `LATEST_PROTOCOL_VERSION` 为协议固定值，不纳入配置。
+//! MCP 运行的高频可调参数（超时、重连、熔断等）的默认值集合，
+//! 通过 `[mcp]` 配置段覆盖。协议固定值不纳入配置。
 
 use serde::Deserialize;
 
-/// MCP 全局 fallback 配置（迁移自 `fuyao-mcp/src/constants.rs`）
+/// MCP 全局 fallback 配置
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct McpGlobalConfig {

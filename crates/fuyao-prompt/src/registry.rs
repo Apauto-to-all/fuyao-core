@@ -1,134 +1,33 @@
-//! Agent 注册表
+//! Agent 注册表（读 + 写）
 //!
 //! 扫描 fuyao-agents/ 目录（全局层 + 项目层），解析 system.md + fuyao.toml，
-//! 提供只读的 Agent 列举和查询能力。
+//! 提供 Agent 的列举、查询、创建与文件编辑能力。
 //!
-//! 不修改任何现有文件，纯读取层。
+//! 模块布局：
+//! - [`types`]：对外数据类型与错误（wire 形态）
+//! - [`naming`]：名称的文件系统安全校验
+//! - 本文件：AgentRegistry 主体（扫描 / 读取 / CRUD）+ 配置解析辅助
+
+mod naming;
+pub(crate) mod types;
+
+pub use types::{
+    AgentContent, AgentFile, AgentInfo, AgentSource, PagedAgents, RegistryError,
+    UpdateContentRequest,
+};
 
 use crate::default::DEFAULT_FUYAO_AGENT;
 use crate::loader::load_agent_definition;
-use fuyao_api::{AgentMode, get_workspace_agents_dir};
-use serde::{Deserialize, Serialize};
+use fuyao_api::get_workspace_agents_dir;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
-/// Agent 来源层
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "PascalCase")]
-pub enum AgentSource {
-    /// 全局层：~/.fuyao/fuyao-agents/
-    Global,
-    /// 项目层：{workspace}/.fuyao/fuyao-agents/
-    Workspace,
-}
-
-/// Agent 完整信息（列表与详情共用）
-///
-/// 合并原 AgentInfo（轻量）与 AgentDetail（完整）为单一结构。
-/// Rust 解析 md/toml 足够快，列表分页后单次返回量可控，
-/// 前端点击卡片展开可直接复用列表数据，无需详情接口。
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentInfo {
-    /// Agent 标识（带来源前缀）：`global/{文件夹名}` / `workspace/{文件夹名}` / `default`
-    pub id: String,
-    /// 显示名（system.md frontmatter）
-    pub name: String,
-    /// 能力描述（system.md frontmatter）
-    pub description: String,
-    /// 使用模式：主代理 / 子代理 / 全部（system.md frontmatter mode 字段）
-    pub mode: AgentMode,
-    /// 来源层
-    pub source: AgentSource,
-    /// 完整系统提示词（system.md body）
-    pub system_prompt: String,
-    /// 模型配置（fuyao.toml model 字段）
-    pub model: Option<String>,
-    /// 工具配置（fuyao.toml `[tools]` 表的 key 列表）
-    pub tools: Vec<String>,
-    /// MCP 服务器引用（fuyao.toml `[mcp_servers]` 表的 key 列表）
-    pub mcp_servers: Vec<String>,
-    /// Profile 列表（profiles/*.md 文件名，无 .md 后缀）
-    pub profiles: Vec<String>,
-}
-
-/// 分页响应
-#[derive(Debug, Clone, Serialize)]
-pub struct PagedAgents {
-    /// 当前页的 Agent 列表
-    pub items: Vec<AgentInfo>,
-    /// Agent 总数（过滤后）
-    pub total: usize,
-    /// 当前页码（从 1 开始）
-    pub page: usize,
-    /// 每页大小
-    pub size: usize,
-}
-
-/// Agent 文件内容读取响应（system.md + fuyao.toml 文本）
-#[derive(Debug, Clone, Serialize)]
-pub struct AgentContent {
-    /// system.md 文本，不存在为空串
-    pub system_md: String,
-    /// fuyao.toml 文本，不存在为空串
-    pub fuyao_toml: String,
-}
-
-/// 编辑的目标文件
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentFile {
-    /// system.md（角色定义）
-    SystemMd,
-    /// fuyao.toml（能力配置）
-    FuyaoToml,
-}
-
-impl AgentFile {
-    /// 返回对应的物理文件名
-    pub fn file_name(self) -> &'static str {
-        match self {
-            AgentFile::SystemMd => "system.md",
-            AgentFile::FuyaoToml => "fuyao.toml",
-        }
-    }
-}
-
-/// 文件编辑请求（单文件保存）
-#[derive(Debug, Clone, Deserialize)]
-pub struct UpdateContentRequest {
-    /// 编辑的目标文件
-    pub file: AgentFile,
-    /// 新的文件内容（原样覆盖写入）
-    pub content: String,
-}
-
-/// Agent 注册表错误
-#[derive(Debug, Error)]
-pub enum RegistryError {
-    /// Agent 名称非法（含路径穿越 / 系统非法字符 / 保留名等）
-    #[error("Agent 名称非法：{0}")]
-    InvalidName(String),
-    /// Agent 文件夹不存在
-    #[error("Agent 不存在：{0}")]
-    NotFound(String),
-    /// Agent 已存在（创建时同名冲突）
-    #[error("Agent 已存在：{0}")]
-    AlreadyExists(String),
-    /// 默认 Agent 禁止编辑或删除
-    #[error("默认 Agent 禁止编辑或删除")]
-    DefaultForbidden,
-    /// 未配置工作目录，无法操作项目层 Agent
-    #[error("未配置工作目录，无法操作项目层 Agent")]
-    WorkspaceMissing,
-    /// 文件读写失败
-    #[error("文件操作失败：{0}")]
-    Io(#[from] std::io::Error),
-}
+use naming::validate_name;
 
 /// Agent 注册表
 ///
 /// 扫描全局层和项目层的 fuyao-agents/ 目录，合并同名 Agent（项目层优先）。
+/// 同时承担创建 Agent 目录与编辑其文件的写操作（default Agent 受保护，禁止写）。
 pub struct AgentRegistry {
     /// 工作目录（用于扫描项目层 Agent）
     workspace: Option<PathBuf>,
@@ -529,75 +428,9 @@ fn read_file_or_empty(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
-/// 名称安全校验（作为文件夹名）
-///
-/// 拒绝：空串/纯空白、超长（>255）、含路径分隔符或 `..`、Windows 非法字符、
-/// Windows 保留名（CON/PRN/NUL/AUX/COM1-9/LPT1-9）、保留字 `default`。
-fn validate_name(name: &str) -> Result<(), RegistryError> {
-    if name.trim().is_empty() {
-        return Err(RegistryError::InvalidName("名称不能为空".to_string()));
-    }
-    if name.len() > 255 {
-        return Err(RegistryError::InvalidName(
-            "名称过长（超过 255 字符）".to_string(),
-        ));
-    }
-    // 路径分隔符 / 路径穿越
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        return Err(RegistryError::InvalidName(
-            "名称含非法路径字符（/ \\ 或 ..）".to_string(),
-        ));
-    }
-    // Windows 非法字符
-    if name
-        .chars()
-        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-    {
-        return Err(RegistryError::InvalidName(
-            "名称含 Windows 非法字符".to_string(),
-        ));
-    }
-    // Windows 保留名
-    if is_windows_reserved(name) {
-        return Err(RegistryError::InvalidName(
-            "名称为 Windows 保留名".to_string(),
-        ));
-    }
-    // 保留给默认 Agent
-    if name == "default" {
-        return Err(RegistryError::InvalidName("default 为保留名".to_string()));
-    }
-    Ok(())
-}
-
-/// 判断是否为 Windows 保留名（含带扩展名的情况，如 CON.txt）
-fn is_windows_reserved(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or(name).to_uppercase();
-    let core = stem.as_str();
-    matches!(core, "CON" | "PRN" | "NUL" | "AUX")
-        || core
-            .strip_prefix("COM")
-            .is_some_and(|s| matches!(s, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
-        || core
-            .strip_prefix("LPT")
-            .is_some_and(|s| matches!(s, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn agent_source_serializes_pascal_case() {
-        assert_eq!(
-            serde_json::to_string(&AgentSource::Global).unwrap(),
-            "\"Global\""
-        );
-        assert_eq!(
-            serde_json::to_string(&AgentSource::Workspace).unwrap(),
-            "\"Workspace\""
-        );
-    }
 
     #[test]
     fn registry_list_empty_no_panic() {
@@ -817,41 +650,6 @@ command = "node"
     }
 
     #[test]
-    fn validate_name_accepts_valid() {
-        assert!(validate_name("coder").is_ok());
-        assert!(validate_name("my-agent").is_ok());
-        assert!(validate_name("agent_42").is_ok());
-        assert!(validate_name("翻译助手").is_ok());
-    }
-
-    #[test]
-    fn validate_name_rejects_invalid() {
-        // 空串 / 纯空白
-        assert!(validate_name("").is_err());
-        assert!(validate_name("   ").is_err());
-        // 路径分隔符 / 路径穿越
-        assert!(validate_name("a/b").is_err());
-        assert!(validate_name("a\\b").is_err());
-        assert!(validate_name("..").is_err());
-        assert!(validate_name("a../b").is_err());
-        // Windows 非法字符
-        assert!(validate_name("a<b").is_err());
-        assert!(validate_name("a:b").is_err());
-        assert!(validate_name("a*b").is_err());
-        assert!(validate_name("a|b").is_err());
-        // Windows 保留名
-        assert!(validate_name("CON").is_err());
-        assert!(validate_name("con.txt").is_err());
-        assert!(validate_name("COM1").is_err());
-        assert!(validate_name("LPT9").is_err());
-        // 保留字 default
-        assert!(validate_name("default").is_err());
-        // 超长
-        let long = "a".repeat(256);
-        assert!(validate_name(&long).is_err());
-    }
-
-    #[test]
     fn registry_list_no_systemmd_fills_default() {
         // 空文件夹（无 system.md）→ list 返回，name=文件夹名，system_prompt=默认提示词
         let temp = std::env::temp_dir().join("fuyao_test_registry_empty_folder");
@@ -1023,22 +821,5 @@ command = "node"
         assert!(matches!(err, RegistryError::DefaultForbidden));
 
         std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn agent_file_serializes_snake_case() {
-        assert_eq!(
-            serde_json::to_string(&AgentFile::SystemMd).unwrap(),
-            "\"system_md\""
-        );
-        assert_eq!(
-            serde_json::to_string(&AgentFile::FuyaoToml).unwrap(),
-            "\"fuyao_toml\""
-        );
-        // 反序列化（PUT 请求体 file 字段）
-        let req: UpdateContentRequest =
-            serde_json::from_str(r#"{"file":"system_md","content":"x"}"#).unwrap();
-        assert_eq!(req.file, AgentFile::SystemMd);
-        assert_eq!(req.content, "x");
     }
 }

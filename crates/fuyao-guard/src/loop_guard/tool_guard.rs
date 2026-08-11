@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 
 use crate::loop_guard::detectors::{detect_tool_repetition, detect_tool_sequence_pattern};
+use crate::loop_guard::escalation;
 use crate::loop_guard::types::{LoopSeverity, ToolCallRecord};
 use fuyao_api::LoopGuardConfig;
 
@@ -77,26 +78,15 @@ impl ToolLoopGuard {
         let detected = rep_result.or(seq_result);
 
         let result = if let Some(msg) = detected {
-            let severity = self.escalate_tool();
-            let should_interrupt = severity == LoopSeverity::Interrupt;
-            // 已中断 3 次以上，升级为终止
-            let (severity, _) = if should_interrupt && interrupt_count >= 3 {
-                (LoopSeverity::Abort, true)
-            } else {
-                (severity, should_interrupt)
-            };
-
-            // Interrupt 级别使用递增后的计数（与 Python 版一致：先递增再生成警告）
-            let effective_count = if matches!(severity, LoopSeverity::Interrupt) {
-                interrupt_count + 1
-            } else {
-                interrupt_count
-            };
-
+            let base = self.escalate_tool();
+            let outcome = escalation::resolve(base, interrupt_count);
             Some(ToolDetectResult {
-                severity,
-                message: if matches!(severity, LoopSeverity::Interrupt | LoopSeverity::Abort) {
-                    self.get_interrupt_warning(effective_count)
+                severity: outcome.severity,
+                message: if escalation::should_interrupt(outcome.severity) {
+                    escalation::interrupt_warning(
+                        escalation::DetectKind::Tool,
+                        outcome.effective_count,
+                    )
                 } else {
                     msg
                 },
@@ -121,7 +111,7 @@ impl ToolLoopGuard {
         self.tool_escalation = 0;
     }
 
-    /// 工具循环升级逻辑
+    /// 工具循环升级逻辑（返回基础严重程度，Abort 升级由 escalation::resolve 统一处理）
     fn escalate_tool(&mut self) -> LoopSeverity {
         self.tool_escalation += 1;
         if self.tool_escalation >= 3 {
@@ -130,22 +120,6 @@ impl ToolLoopGuard {
             LoopSeverity::Inject
         } else {
             LoopSeverity::Warn
-        }
-    }
-
-    /// 根据中断次数生成升级警告
-    fn get_interrupt_warning(&self, interrupt_count: usize) -> String {
-        if interrupt_count >= 3 {
-            return "[循环检测] AI 在多次干预后仍持续循环执行工具，已彻底终止。请手动调整任务或重新开始。"
-                .to_string();
-        }
-
-        if interrupt_count == 1 {
-            "[循环检测] 你在重复执行相同的工具操作。请检查工具参数，尝试不同的方法完成任务。"
-                .to_string()
-        } else {
-            "[循环检测] 你已多次重复相同的工具操作。请立即停止当前工具，换用其他工具或方法。"
-                .to_string()
         }
     }
 }

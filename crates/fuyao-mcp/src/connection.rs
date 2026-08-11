@@ -198,132 +198,19 @@ impl MCPConnection {
         Ok(())
     }
 
-    /// 尝试一次性连接
+    /// 尝试一次性连接（主流程建立初始连接）
+    ///
+    /// 按协议 serve + 发现工具 + 写入 client。后台保活与重连由 `start`
+    /// 启动的 Task 负责，不再在此重复 `serve()`，避免主流程与后台 Task
+    /// 各 serve 一次、产生两个 RunningService 争抢写 self.client 的双连接竞争。
     async fn try_connect_once(&mut self) -> Result<Vec<McpToolInfo>, ConnectionError> {
-        let server_name = self.server_name.clone();
-        let config = self.config.clone();
-
-        if config.is_http() {
-            self.connect_http(&server_name, &config).await
-        } else {
-            self.connect_stdio(&server_name, &config).await
-        }
-    }
-
-    /// stdio 传输连接
-    async fn connect_stdio(
-        &mut self,
-        server_name: &str,
-        config: &MCPServerConfig,
-    ) -> Result<Vec<McpToolInfo>, ConnectionError> {
-        let command = config
-            .command
-            .as_ref()
-            .ok_or(ConnectionError::MissingCommand)?;
-
-        let mut cmd = Command::new(resolve_command(command));
-        if let Some(args) = &config.args {
-            cmd.args(args);
-        }
-
-        // 构建安全环境变量
-        let safe_env = build_safe_env(config.env.as_ref());
-        for (k, v) in &safe_env {
-            cmd.env(k, v);
-        }
-
-        let transport = TokioChildProcess::new(cmd.configure(|_| {})).map_err(|e| {
-            ConnectionError::InitialConnectFailed {
-                server: server_name.to_string(),
-                reason: e.to_string(),
-            }
-        })?;
-
-        let client =
-            ().serve(transport)
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        // 发现工具
-        let tools =
-            client
-                .list_all_tools()
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        let tool_infos = convert_tools(&tools);
-
+        let (svc, tools) = serve_transport(&self.server_name, &self.config).await?;
         // 保存 RunningService（保持连接存活）
         {
             let mut c = self.client.lock().await;
-            *c = Some(client);
+            *c = Some(svc);
         }
-
-        Ok(tool_infos)
-    }
-
-    /// HTTP 传输连接
-    async fn connect_http(
-        &mut self,
-        server_name: &str,
-        config: &MCPServerConfig,
-    ) -> Result<Vec<McpToolInfo>, ConnectionError> {
-        let url = config.url.as_ref().ok_or(ConnectionError::MissingUrl)?;
-
-        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
-            .reinit_on_expired_session(true);
-
-        // 注入自定义 headers（如 Authorization、mcp-protocol-version 等）
-        if let Some(headers) = &config.headers {
-            let mut custom_headers = HashMap::new();
-            for (name, value) in headers {
-                if let (Ok(hn), Ok(hv)) = (
-                    http::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    custom_headers.insert(hn, hv);
-                }
-            }
-            if !custom_headers.is_empty() {
-                transport_config = transport_config.custom_headers(custom_headers);
-            }
-        }
-
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
-
-        let client =
-            ().serve(transport)
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        // 发现工具
-        let tools =
-            client
-                .list_all_tools()
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        let tool_infos = convert_tools(&tools);
-
-        // 保存 RunningService（保持连接存活）
-        {
-            let mut c = self.client.lock().await;
-            *c = Some(client);
-        }
-
-        Ok(tool_infos)
+        Ok(tools)
     }
 
     /// 调用 MCP 工具
@@ -455,7 +342,10 @@ fn resolve_command(command: &str) -> String {
     command.to_string()
 }
 
-/// 运行传输层连接（长连接 Task 内部使用）
+/// 运行传输层连接（长连接 Task 内部使用的重连路径）
+///
+/// 复用 `serve_transport` 完成按协议 serve + 发现工具，写入 client 并标记已连接。
+/// 与主流程 `try_connect_once` 共用同一份传输构造逻辑，避免两处重复实现。
 async fn run_transport(
     server_name: &str,
     config: &MCPServerConfig,
@@ -463,105 +353,121 @@ async fn run_transport(
     client: &Arc<Mutex<Option<RunningService<RoleClient, ()>>>>,
     _rpc_lock: &Arc<Mutex<()>>,
 ) -> Result<Vec<McpToolInfo>, ConnectionError> {
+    let (svc, tools) = serve_transport(server_name, config).await?;
+    connected.store(true, std::sync::atomic::Ordering::Relaxed);
+    // 保存 RunningService（保持连接存活）
+    {
+        let mut c = client.lock().await;
+        *c = Some(svc);
+    }
+    Ok(tools)
+}
+
+/// 按配置协议选择传输并完成初始 serve
+///
+/// 返回 (RunningService, 发现的工具)，调用方负责保存 RunningService 与（可选）标记连接状态。
+async fn serve_transport(
+    server_name: &str,
+    config: &MCPServerConfig,
+) -> Result<(RunningService<RoleClient, ()>, Vec<McpToolInfo>), ConnectionError> {
     if config.is_http() {
-        let url = config.url.as_ref().ok_or(ConnectionError::MissingUrl)?;
-
-        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.as_str())
-            .reinit_on_expired_session(true);
-
-        if let Some(headers) = &config.headers {
-            let mut custom_headers = HashMap::new();
-            for (name, value) in headers {
-                if let (Ok(hn), Ok(hv)) = (
-                    http::HeaderName::from_bytes(name.as_bytes()),
-                    http::HeaderValue::from_str(value),
-                ) {
-                    custom_headers.insert(hn, hv);
-                }
-            }
-            if !custom_headers.is_empty() {
-                transport_config = transport_config.custom_headers(custom_headers);
-            }
-        }
-
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
-
-        let svc =
-            ().serve(transport)
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        let tools =
-            svc.list_all_tools()
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        let tool_infos = convert_tools(&tools);
-        connected.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // 保存 RunningService（保持连接存活）
-        {
-            let mut c = client.lock().await;
-            *c = Some(svc);
-        }
-
-        Ok(tool_infos)
+        serve_http(server_name, config).await
     } else {
-        let command = config
-            .command
-            .as_ref()
-            .ok_or(ConnectionError::MissingCommand)?;
+        serve_stdio(server_name, config).await
+    }
+}
 
-        let mut cmd = Command::new(resolve_command(command));
-        if let Some(args) = &config.args {
-            cmd.args(args);
+/// 构建 HTTP 传输并完成初始 serve
+///
+/// 配置 url + 自定义 headers（如 Authorization、mcp-protocol-version），
+/// 发起 serve 并列出全部工具。
+async fn serve_http(
+    server_name: &str,
+    config: &MCPServerConfig,
+) -> Result<(RunningService<RoleClient, ()>, Vec<McpToolInfo>), ConnectionError> {
+    let url = config.url.as_ref().ok_or(ConnectionError::MissingUrl)?;
+
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(url.as_str()).reinit_on_expired_session(true);
+
+    // 注入自定义 headers（如 Authorization、mcp-protocol-version 等）
+    if let Some(headers) = &config.headers {
+        let mut custom_headers = HashMap::new();
+        for (name, value) in headers {
+            if let (Ok(hn), Ok(hv)) = (
+                http::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(value),
+            ) {
+                custom_headers.insert(hn, hv);
+            }
         }
-
-        let safe_env = build_safe_env(config.env.as_ref());
-        for (k, v) in &safe_env {
-            cmd.env(k, v);
+        if !custom_headers.is_empty() {
+            transport_config = transport_config.custom_headers(custom_headers);
         }
+    }
 
-        let transport = TokioChildProcess::new(cmd.configure(|_| {})).map_err(|e| {
-            ConnectionError::InitialConnectFailed {
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let svc =
+        ().serve(transport)
+            .await
+            .map_err(|e| ConnectionError::InitialConnectFailed {
                 server: server_name.to_string(),
                 reason: e.to_string(),
-            }
+            })?;
+    let tools = svc
+        .list_all_tools()
+        .await
+        .map_err(|e| ConnectionError::InitialConnectFailed {
+            server: server_name.to_string(),
+            reason: e.to_string(),
         })?;
+    Ok((svc, convert_tools(&tools)))
+}
 
-        let svc =
-            ().serve(transport)
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
+/// 构建 stdio 传输并完成初始 serve
+///
+/// 解析命令（Windows 兼容）+ 注入安全环境变量，发起 serve 并列出全部工具。
+async fn serve_stdio(
+    server_name: &str,
+    config: &MCPServerConfig,
+) -> Result<(RunningService<RoleClient, ()>, Vec<McpToolInfo>), ConnectionError> {
+    let command = config
+        .command
+        .as_ref()
+        .ok_or(ConnectionError::MissingCommand)?;
 
-        let tools =
-            svc.list_all_tools()
-                .await
-                .map_err(|e| ConnectionError::InitialConnectFailed {
-                    server: server_name.to_string(),
-                    reason: e.to_string(),
-                })?;
-
-        let tool_infos = convert_tools(&tools);
-        connected.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // 保存 RunningService（保持连接存活）
-        {
-            let mut c = client.lock().await;
-            *c = Some(svc);
-        }
-
-        Ok(tool_infos)
+    let mut cmd = Command::new(resolve_command(command));
+    if let Some(args) = &config.args {
+        cmd.args(args);
     }
+
+    // 构建安全环境变量，防止泄露敏感信息给 MCP 子进程
+    let safe_env = build_safe_env(config.env.as_ref());
+    for (k, v) in &safe_env {
+        cmd.env(k, v);
+    }
+
+    let transport = TokioChildProcess::new(cmd.configure(|_| {})).map_err(|e| {
+        ConnectionError::InitialConnectFailed {
+            server: server_name.to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    let svc =
+        ().serve(transport)
+            .await
+            .map_err(|e| ConnectionError::InitialConnectFailed {
+                server: server_name.to_string(),
+                reason: e.to_string(),
+            })?;
+    let tools = svc
+        .list_all_tools()
+        .await
+        .map_err(|e| ConnectionError::InitialConnectFailed {
+            server: server_name.to_string(),
+            reason: e.to_string(),
+        })?;
+    Ok((svc, convert_tools(&tools)))
 }
 
 /// 从 rmcp Tool 列表转换为 McpToolInfo 列表

@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fuyao_api::{CancellationToken, ToolCallContext, ToolFn};
+use rmcp::model::CallToolResult;
 use serde_json::Value;
 
-use crate::circuit_breaker::{bump_error, check_breaker, reset_error};
+use crate::circuit_breaker::CircuitBreaker;
 use crate::connection::MCPConnection;
 use crate::security::{sanitize_error, sanitize_mcp_name_component};
 
@@ -36,11 +37,49 @@ pub fn should_register_tool(tool_name: &str, tools_filter: &HashMap<String, bool
     tools_filter.get(tool_name).copied().unwrap_or(true)
 }
 
+/// 从 CallToolResult 提取错误文本（is_error=true 时用）
+///
+/// 收集所有文本内容片段拼接为完整错误描述。
+pub(crate) fn extract_error_text(result: &CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
+        .collect::<Vec<&str>>()
+        .join("")
+}
+
+/// 从 CallToolResult 提取文本与结构化内容，组装为统一的 JSON 输出
+///
+/// 规则：有 structuredContent 时并入 result；否则仅返回 result 文本。
+/// 统一 call_tool（管理器直调）与 do_call（handler 路径）的结果形态。
+pub(crate) fn extract_call_output(result: &CallToolResult) -> String {
+    let parts: Vec<String> = result
+        .content
+        .iter()
+        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
+        .collect();
+    let text_result = parts.join("\n");
+
+    if let Some(structured) = &result.structured_content {
+        if !text_result.is_empty() {
+            serde_json::json!({"result": text_result, "structuredContent": structured})
+        } else {
+            serde_json::json!({"result": structured})
+        }
+    } else {
+        serde_json::json!({"result": text_result})
+    }
+    .to_string()
+}
+
 /// 构建带 MCPConnection 引用的工具 handler
 ///
-/// 由于 ToolFn 需要是 'static 的，通过 `Arc<Mutex<Option<MCPConnection>>>` 传递连接。
+/// 由于 ToolFn 需要是 'static 的，通过 `Arc<Mutex<Option<MCPConnection>>>` 传递连接，
+/// 熔断器状态经 `Arc<CircuitBreaker>` 共享给同一 manager 下的所有工具。
 pub fn make_tool_call_handler(
     connection: Arc<tokio::sync::Mutex<Option<MCPConnection>>>,
+    breaker: Arc<CircuitBreaker>,
     tool_name: String,
     server_name: String,
     tool_timeout: u32,
@@ -51,6 +90,7 @@ pub fn make_tool_call_handler(
             let server_name = server_name.clone();
             let timeout_secs = tool_timeout;
             let conn = connection.clone();
+            let breaker = breaker.clone();
 
             Box::pin(async move {
                 // 调用入口留痕：一被发起就记录，立即能区分「handler 没被调起」
@@ -64,7 +104,7 @@ pub fn make_tool_call_handler(
                 );
 
                 // 检查熔断器
-                if let Some(msg) = check_breaker(&server_name) {
+                if let Some(msg) = breaker.check_breaker(&server_name) {
                     tracing::warn!(
                         server = %server_name,
                         tool = %tool_name,
@@ -86,71 +126,29 @@ pub fn make_tool_call_handler(
                     Ok(Ok(result)) => {
                         if let Ok(parsed) = serde_json::from_str::<Value>(&result) {
                             if parsed.get("error").is_some() {
-                                bump_error(&server_name);
+                                breaker.bump_error(&server_name);
                             } else {
-                                reset_error(&server_name);
+                                breaker.reset_error(&server_name);
                             }
                         }
                         result
                     }
                     Ok(Err(err_msg)) => {
-                        // 检测 Auth 错误并尝试恢复
-                        if crate::recovery::is_auth_error_str(&err_msg) {
-                            tracing::warn!(
-                                server = %server_name,
-                                tool = %tool_name,
-                                kind = "auth",
-                                attempt = 1u8,
-                                recovered = false,
-                                cause = %err_msg,
-                                "MCP 调用遇到可恢复错误，触发重连"
-                            );
-                            notify_reconnect(&conn);
-                            let retry_result =
-                                wait_and_retry(&conn, &server_name, &tool_name, &args).await;
-                            if let Some(result) = retry_result {
-                                reset_error(&server_name);
-                                tracing::info!(
-                                    name = %server_name,
-                                    tool = %tool_name,
-                                    ok = !result.contains("\"error\""),
-                                    recovered = true,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
-                                    "MCP 工具调用完成"
-                                );
-                                return result;
-                            }
+                        // 检测可恢复错误（Auth/Session）并尝试重连重试
+                        if let Some(recovered) = try_recover_and_retry(
+                            &conn,
+                            &breaker,
+                            &server_name,
+                            &tool_name,
+                            &err_msg,
+                            &args,
+                            started,
+                        )
+                        .await
+                        {
+                            return recovered;
                         }
-
-                        // 检测 Session 过期并尝试恢复
-                        if crate::recovery::is_session_expired_error_str(&err_msg) {
-                            tracing::warn!(
-                                server = %server_name,
-                                tool = %tool_name,
-                                kind = "session",
-                                attempt = 1u8,
-                                recovered = false,
-                                cause = %err_msg,
-                                "MCP 调用遇到可恢复错误，触发重连"
-                            );
-                            notify_reconnect(&conn);
-                            let retry_result =
-                                wait_and_retry(&conn, &server_name, &tool_name, &args).await;
-                            if let Some(result) = retry_result {
-                                reset_error(&server_name);
-                                tracing::info!(
-                                    name = %server_name,
-                                    tool = %tool_name,
-                                    ok = !result.contains("\"error\""),
-                                    recovered = true,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
-                                    "MCP 工具调用完成"
-                                );
-                                return result;
-                            }
-                        }
-
-                        bump_error(&server_name);
+                        breaker.bump_error(&server_name);
                         serde_json::json!({
                             "error": sanitize_error(&format!("MCP 调用失败: {err_msg}"))
                         })
@@ -165,11 +163,11 @@ pub fn make_tool_call_handler(
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "MCP 工具调用超时"
                         );
-                        bump_error(&server_name);
+                        breaker.bump_error(&server_name);
                         serde_json::json!({
-                        "error": format!("MCP tool '{tool_name}' timed out after {timeout_secs}s")
-                    })
-                    .to_string()
+                            "error": format!("MCP tool '{tool_name}' timed out after {timeout_secs}s")
+                        })
+                        .to_string()
                     }
                 };
 
@@ -202,45 +200,58 @@ async fn do_call(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 处理 MCP 调用结果
+    // 处理 MCP 调用结果：is_error 时以 {"error": ...} 返回（handler 侧据此计入熔断）
     if result.is_error.unwrap_or(false) {
-        let error_text: String = result
-            .content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.as_str()))
-            .collect::<Vec<&str>>()
-            .join("");
-        return Ok(serde_json::json!({
-            "error": sanitize_error(&error_text)
-        })
-        .to_string());
+        let error_text = extract_error_text(&result);
+        return Ok(serde_json::json!({"error": sanitize_error(&error_text)}).to_string());
     }
 
-    // 提取文本内容
-    let parts: Vec<String> = result
-        .content
-        .iter()
-        .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-        .collect();
-    let text_result = parts.join("\n");
+    Ok(extract_call_output(&result))
+}
 
-    // 检查 structuredContent
-    let structured = result.structured_content.as_ref();
-
-    let output = if let Some(structured) = structured {
-        if !text_result.is_empty() {
-            serde_json::json!({
-                "result": text_result,
-                "structuredContent": structured
-            })
-        } else {
-            serde_json::json!({"result": structured})
-        }
+/// 对可恢复错误（Auth/Session）触发重连并重试，成功返回 Some(result)
+///
+/// 两条恢复路径（鉴权失败、会话过期）结构相同，仅错误分类器不同，
+/// 此处合并为一条：归类 → 留痕 → 通知重连 → 等待恢复后重试。
+async fn try_recover_and_retry(
+    conn: &Arc<tokio::sync::Mutex<Option<MCPConnection>>>,
+    breaker: &CircuitBreaker,
+    server_name: &str,
+    tool_name: &str,
+    err_msg: &str,
+    args: &Value,
+    started: std::time::Instant,
+) -> Option<String> {
+    // 归类可恢复错误：auth 或 session，其余不处理
+    let kind = if crate::recovery::is_auth_error_str(err_msg) {
+        "auth"
+    } else if crate::recovery::is_session_expired_error_str(err_msg) {
+        "session"
     } else {
-        serde_json::json!({"result": text_result})
+        return None;
     };
 
-    Ok(output.to_string())
+    tracing::warn!(
+        server = %server_name,
+        tool = %tool_name,
+        kind,
+        attempt = 1u8,
+        recovered = false,
+        cause = %err_msg,
+        "MCP 调用遇到可恢复错误，触发重连"
+    );
+    notify_reconnect(conn);
+    let retry_result = wait_and_retry(conn, server_name, tool_name, args).await?;
+    breaker.reset_error(server_name);
+    tracing::info!(
+        name = %server_name,
+        tool = %tool_name,
+        ok = !retry_result.contains("\"error\""),
+        recovered = true,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "MCP 工具调用完成"
+    );
+    Some(retry_result)
 }
 
 /// 通知连接重连

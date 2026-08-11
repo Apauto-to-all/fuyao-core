@@ -11,6 +11,7 @@
 //!   register 时注册 observe/intercept/send_input 三个钩子
 
 mod detectors;
+mod escalation;
 mod guard;
 mod text_guard;
 mod tool_guard;
