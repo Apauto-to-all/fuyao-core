@@ -30,6 +30,11 @@ use crate::history_replay;
 /// - `SessionManager` 管「会话的检索 / 浏览 / 手动编辑」（列会话 / 查历史 / 改标题）
 ///
 /// 两者共享同一份 `SessionStore`（Arc 克隆，零拷贝共享连接池）。
+///
+/// `Clone` 廉价：唯一字段是 `Arc<SessionStore>`，clone 仅增引用计数、零拷贝，
+/// 两个 clone 共享同一份存储与连接池。供消费方（如适配层在锁内 clone 出 owned
+/// 句柄以消除借用穿透 await）按需取用。
+#[derive(Clone)]
 pub struct SessionManager {
     /// 会话存储句柄（与 Engine 共享同一份，Arc 克隆）
     store: Arc<SessionStore>,
