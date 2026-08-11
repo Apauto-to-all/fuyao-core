@@ -51,22 +51,10 @@ impl Emitter {
     }
 }
 
-/// 给事件的 base.session_id 盖标签（递归处理所有带 base 的变体）
+/// 给事件的 base.session_id 盖标签
+///
+/// 复用 [`OutputEvent::base_mut`] 多态访问器：新增 `OutputEvent` 变体无需在此补 arm，
+/// 否则会被静默漏标记（违反「session id 全程标签」原则）。
 fn stamp_session_id(event: &mut OutputEvent, session_id: &str) {
-    let id = Some(session_id.to_string());
-    match event {
-        OutputEvent::Chunk(m) => m.base.session_id = id,
-        OutputEvent::User(m) => m.base.session_id = id,
-        OutputEvent::ToolCall(m) => m.base.session_id = id,
-        OutputEvent::ToolResult(m) => m.base.session_id = id,
-        OutputEvent::Assistant(m) => m.base.session_id = id,
-        OutputEvent::Interrupt(m) => m.base.session_id = id,
-        OutputEvent::Error(m) => m.base.session_id = id,
-        OutputEvent::Plugin(m) => m.base.session_id = id,
-        OutputEvent::Compression(m) => m.base.session_id = id,
-        OutputEvent::Title(m) => m.base.session_id = id,
-        OutputEvent::Retry(m) => m.base.session_id = id,
-        OutputEvent::ChildSession(m) => m.base.session_id = id,
-        OutputEvent::Rollback(m) => m.base.session_id = id,
-    }
+    event.base_mut().session_id = Some(session_id.to_string());
 }

@@ -1,16 +1,13 @@
 //! 消息处理管道（dispatch）
 //!
-//! 统一所有输出消息的处理链路：拦截 → 处理 → 发送 → 观察。
+//! 统一所有输出消息的处理链路：拦截 → 发送 → 观察。
 //! 管道在每个 session 内运行（session 层），引擎层只负责装配 hooks
 //! 并路由消息到对应 session 的管道。多 session 各自一条独立管道，互不干扰。
 //!
-//! 四段职责（串行执行）：
+//! 三段职责（串行执行）：
 //! 1. **拦截（intercept）**：插件可修改或阻断事件（`InterceptResult::Block` 短路丢弃）
-//! 2. **处理（process）**：引擎内部业务逻辑，由调用方按消息类型注入回调。
-//!    回调必须是轻量、不阻塞的动作（入队、收集批次、投递信号）；
-//!    耗时的动作（如工具执行）在管道外批量进行。
-//! 3. **发送（deliver）**：经 `Emitter::emit` 推到出口通道（全引擎唯一发送出口）
-//! 4. **观察（observe）**：插件只读副作用（持久化/日志/统计）
+//! 2. **发送（deliver）**：经 `Emitter::emit` 推到出口通道（全引擎唯一发送出口）
+//! 3. **观察（observe）**：插件只读副作用（持久化/日志/统计）
 //!
 //! 调用方式：
 //! - **进历史的消息**（User 回显后的入队、Assistant、ToolResult 等）用
@@ -18,7 +15,7 @@
 //!   单条落 DB → 发送事件 → 观察。**所有要落到 DB 的消息必经此入口**，保证
 //!   拦截→存储→消费三者一致。消息产生即落库（事件级落库），不进任何内存数组——
 //!   单个 session 内存占用恒定（不随历史增长）。
-//! - 不进历史的纯事件（Chunk/Error/Compression/Interrupt 通知等）用 [`dispatch`]，process 传 None
+//! - 不进历史的纯事件（Chunk/Error/Compression/Interrupt 通知等）用 [`dispatch`]
 //! - 工具调用需要拿拦截结果回灌时，用 [`intercept`] 单独拦截
 
 use crate::emit::Emitter;
@@ -26,15 +23,6 @@ use fuyao_api::Message;
 use fuyao_api::message::OutputEvent;
 use fuyao_hooks::{InterceptResult, SharedHooks};
 use fuyao_session::SessionStore;
-use std::future::Future;
-use std::pin::Pin;
-
-/// 处理回调类型（拦截后、发送前执行的不阻塞动作）
-///
-/// 拿到拦截后的消息（只读借用），执行轻量副作用（入队、收集批次、投递信号）。
-/// 耗时动作（工具执行）不放在这里——它们在管道外批量进行。
-pub(crate) type ProcessFn =
-    Box<dyn FnOnce(&OutputEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
 
 // ===== 管道各段：intercept / deliver =====
 
@@ -98,32 +86,19 @@ pub(crate) async fn deliver(
 
 // ===== 完整管道入口 =====
 
-/// 完整管道：拦截 → 处理 → 发送 → 观察
+/// 完整管道：拦截 → 发送 → 观察
 ///
-/// `process` 为处理回调：拦截 Pass 后、发送前执行。传 `None` 表示无处理动作（透传）。
-/// 处理回调必须是轻量、不阻塞的（入队、收集、投递）；耗时动作（工具执行）在管道外。
-///
-/// Block 时整条丢弃（不执行处理、不发送、不观察）。
+/// Block 时整条丢弃（不发送、不观察）。
 ///
 /// 注意：本函数**不 push session.messages**——只走管道。如需把拦截后的消息落到
 /// 历史（进 DB + 下轮 LLM 输入），用 [`emit_to_history`]。
-pub(crate) async fn dispatch(
-    emitter: &Emitter,
-    hooks: &SharedHooks,
-    event: OutputEvent,
-    process: Option<ProcessFn>,
-) {
+pub(crate) async fn dispatch(emitter: &Emitter, hooks: &SharedHooks, event: OutputEvent) {
     // 1. 拦截
     let Some(intercepted) = intercept(emitter, hooks, event).await else {
         return; // Block：丢弃
     };
 
-    // 2. 处理（拦截后、发送前；轻量不阻塞的动作）
-    if let Some(process_fn) = process {
-        process_fn(&intercepted).await;
-    }
-
-    // 3. 发送 + 4. 观察
+    // 2. 发送 + 3. 观察
     deliver(emitter, hooks, intercepted).await;
 }
 
@@ -223,7 +198,7 @@ mod tests {
     async fn dispatch_passes_event_through_when_no_hooks() {
         // 空 hooks、无处理：事件直通，接收端能收到
         let (emitter, hooks, mut rx) = make_emitter_hooks();
-        dispatch(&emitter, &hooks, make_assistant_event("hello"), None).await;
+        dispatch(&emitter, &hooks, make_assistant_event("hello")).await;
 
         let received = rx.recv().await.expect("应收到事件");
         match received {
@@ -284,9 +259,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_drops_event_on_block() {
-        // Block 时 dispatch 整条丢弃，不执行处理、不发送
+        // Block 时 dispatch 整条丢弃，不发送、不观察
         let (emitter, hooks, mut rx) = make_emitter_hooks();
-        let processed = std::sync::Arc::new(std::sync::Mutex::new(false));
         {
             let mut reg = hooks.lock().await;
             reg.register_output_intercept(
@@ -294,63 +268,9 @@ mod tests {
                 std::sync::Arc::new(|_| InterceptResult::Block("拦截丢弃".to_string())),
             );
         }
-        let processed_clone = processed.clone();
-        let process_fn: ProcessFn = Box::new(move |_| {
-            Box::pin(async move {
-                *processed_clone.lock().unwrap() = true;
-            })
-        });
-        dispatch(
-            &emitter,
-            &hooks,
-            make_assistant_event("dropped"),
-            Some(process_fn),
-        )
-        .await;
+        dispatch(&emitter, &hooks, make_assistant_event("dropped")).await;
 
         assert!(rx.try_recv().is_err(), "Block 后不应有事件发出");
-        assert!(!*processed.lock().unwrap(), "Block 时处理回调不应执行");
-    }
-
-    #[tokio::test]
-    async fn dispatch_runs_process_before_deliver() {
-        // process 在 deliver 之前执行：先标记 processed，再发出
-        let (emitter, hooks, mut rx) = make_emitter_hooks();
-        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
-        let order_clone = order.clone();
-        let process_fn: ProcessFn = Box::new(move |_| {
-            let order = order_clone.clone();
-            Box::pin(async move {
-                order.lock().unwrap().push("process");
-            })
-        });
-        // observe 也标记，验证 process 在 observe 前
-        {
-            let order = order.clone();
-            let mut reg = hooks.lock().await;
-            reg.register_output_observe(std::sync::Arc::new(move |_| {
-                let order = order.clone();
-                Box::pin(async move {
-                    order.lock().unwrap().push("observe");
-                })
-            }));
-        }
-
-        dispatch(
-            &emitter,
-            &hooks,
-            make_assistant_event("test"),
-            Some(process_fn),
-        )
-        .await;
-        assert!(rx.try_recv().is_ok(), "应发出事件");
-
-        let order = order.lock().unwrap();
-        assert_eq!(
-            *order,
-            vec!["process", "observe"],
-            "顺序应为 process → observe"
-        );
     }
 
     #[tokio::test]

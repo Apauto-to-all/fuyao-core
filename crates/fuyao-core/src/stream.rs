@@ -69,7 +69,7 @@ pub(crate) async fn run_stream_session(
                 // 解码成 OutputEvent 并经管道发出（拦截 → 发送 → 观察）
                 let output_events = decoder.process(event);
                 for ev in output_events {
-                    dispatch::dispatch(emitter, hooks, ev, None).await;
+                    dispatch::dispatch(emitter, hooks, ev).await;
                 }
 
                 // 同步共享状态（block scope 锁，不跨 await）

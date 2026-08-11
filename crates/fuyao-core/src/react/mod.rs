@@ -197,7 +197,6 @@ pub(crate) async fn run_session(
                                 &emitter,
                                 &hooks,
                                 OutputEvent::Plugin(msg),
-                                None,
                             )
                             .await;
                         }
@@ -486,7 +485,6 @@ async fn run_compression(
                 context_length: model.context_length,
             }),
         }),
-        None,
     )
     .await;
 
@@ -547,7 +545,6 @@ async fn run_compression(
                         reasoning,
                     }),
                 }),
-                None,
             )
             .await;
         }
@@ -659,7 +656,6 @@ async fn run_compression(
                         new_seq,
                     }),
                 }),
-                None,
             )
             .await;
         }
@@ -756,7 +752,6 @@ async fn run_rollback(ctx: &SessionCtx, target_seq: i64) {
                         recoverable: true,
                     },
                 }),
-                None,
             )
             .await;
             return;
@@ -801,7 +796,6 @@ async fn run_rollback(ctx: &SessionCtx, target_seq: i64) {
             base: EventBase::default(),
             payload,
         }),
-        None,
     )
     .await;
 }

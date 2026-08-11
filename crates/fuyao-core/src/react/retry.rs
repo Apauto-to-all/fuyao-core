@@ -179,7 +179,6 @@ async fn emit_retry_event(
                 cause: error.to_string(),
             },
         }),
-        None,
     )
     .await;
 }

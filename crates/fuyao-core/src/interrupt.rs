@@ -286,7 +286,7 @@ pub(crate) async fn emit_interrupt_event(
         base: EventBase::default(),
         payload: interrupt.clone(),
     });
-    dispatch::dispatch(emitter, hooks, event, None).await;
+    dispatch::dispatch(emitter, hooks, event).await;
 }
 
 #[cfg(test)]

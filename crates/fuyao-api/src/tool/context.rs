@@ -5,7 +5,7 @@
 
 use crate::AgentPaths;
 use crate::tool::ops::{SubagentOps, TodoStoreOps};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Weak};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -88,44 +88,6 @@ impl std::fmt::Debug for ToolCallContext {
 }
 
 impl ToolCallContext {
-    /// 从工具 args JSON 中提取上下文
-    ///
-    /// 提取 `_workspace`、`_session_id`、`_agent_id` 隐藏字段，构建 `ToolCallContext`。
-    /// 这些字段由编排层注入，不出现在工具 Schema 中。
-    pub fn from_args(args: &serde_json::Value) -> Self {
-        let session_id = args
-            .get("_session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let workspace = args
-            .get("_workspace")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-
-        let agent_paths = if workspace.is_some() || session_id.is_some() {
-            Some(AgentPaths {
-                agent_id: args
-                    .get("_agent_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
-                workspace,
-                ..Default::default()
-            })
-        } else {
-            None
-        };
-
-        Self {
-            session_id,
-            agent_paths,
-            tool_call_id: None,
-            subagent_ops: None,
-            event_forwarder: None,
-            todo_store: None,
-        }
-    }
-
     /// 获取 workspace 路径
     pub fn workspace(&self) -> Option<&Path> {
         self.agent_paths
@@ -151,37 +113,14 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_context_from_args_with_context_fields() {
-        let args = serde_json::json!({
-            "path": "src/main.rs",
-            "_session_id": "abc123",
-            "_workspace": "/tmp/project",
-            "_agent_id": "global/coder"
-        });
-        let ctx = ToolCallContext::from_args(&args);
-        assert_eq!(ctx.session_id, Some("abc123".to_string()));
-        assert!(ctx.agent_paths.is_some());
-        let ap = ctx.agent_paths.unwrap();
-        assert_eq!(ap.agent_id, Some("global/coder".to_string()));
-        assert_eq!(ap.workspace, Some(PathBuf::from("/tmp/project")));
-    }
-
-    #[test]
-    fn tool_call_context_from_args_without_context_fields() {
-        let args = serde_json::json!({
-            "path": "src/main.rs"
-        });
-        let ctx = ToolCallContext::from_args(&args);
-        assert!(ctx.session_id.is_none());
-        assert!(ctx.agent_paths.is_none());
-    }
-
-    #[test]
     fn tool_call_context_workspace_accessor() {
-        let args = serde_json::json!({
-            "_workspace": "/tmp/project"
-        });
-        let ctx = ToolCallContext::from_args(&args);
+        let ctx = ToolCallContext {
+            agent_paths: Some(AgentPaths {
+                workspace: Some("/tmp/project".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         assert_eq!(ctx.workspace(), Some(Path::new("/tmp/project")));
     }
 
@@ -193,10 +132,10 @@ mod tests {
 
     #[test]
     fn tool_call_context_task_id_from_session() {
-        let args = serde_json::json!({
-            "_session_id": "my_session"
-        });
-        let ctx = ToolCallContext::from_args(&args);
+        let ctx = ToolCallContext {
+            session_id: Some("my_session".into()),
+            ..Default::default()
+        };
         assert_eq!(ctx.task_id(), "my_session");
     }
 }

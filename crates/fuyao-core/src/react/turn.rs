@@ -293,7 +293,7 @@ pub(crate) async fn run_turn(
                         recoverable: false,
                     },
                 });
-                crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event, None).await;
+                crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event).await;
                 return TurnOutcome::Failed;
             }
         }
@@ -312,7 +312,7 @@ async fn emit_config_error(ctx: &SessionCtx, message: &str) {
             recoverable: false,
         },
     });
-    crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event, None).await;
+    crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event).await;
 }
 
 /// 处理最终回复（AI 不调用工具，一轮 ReAct 结束）
@@ -468,7 +468,6 @@ pub(super) async fn maybe_spawn_title_generation(ctx: &SessionCtx, is_child: boo
                         base: EventBase::default(),
                         payload: TitlePayload { title },
                     }),
-                    None,
                 )
                 .await;
             }

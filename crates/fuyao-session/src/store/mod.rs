@@ -99,9 +99,4 @@ impl SessionStore {
     pub fn db_path(&self) -> &PathBuf {
         &self.db_path
     }
-
-    /// 获取连接池引用（供引擎层或兄弟模块共享同一连接池）
-    pub fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
 }
