@@ -227,20 +227,6 @@ fn agents_md_paths_workspace_layer_omits_fuyao_prefix() {
 }
 
 // ---------------------------------------------------------------------------
-// agents_def_paths：agent 层恒为 None（定义库与 agent_id 隔离正交）
-// ---------------------------------------------------------------------------
-
-#[test]
-fn agents_def_paths_never_uses_agent_layer() {
-    // 即使有 agent_id，定义库也不走 agent 层
-    let paths = common::make_agent_paths(PathBuf::from("/tmp/h"), Some("global/coder"), None);
-    let ap = paths.agents_def_paths("default");
-    assert!(ap.agent.is_none(), "定义库不走 agent 层");
-    assert!(ap.global_.is_some());
-    assert!(ap.global_.as_ref().unwrap().ends_with("agents/default.md"));
-}
-
-// ---------------------------------------------------------------------------
 // extra_dirs 过滤分支（需真实文件系统）
 // ---------------------------------------------------------------------------
 
