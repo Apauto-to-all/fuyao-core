@@ -54,7 +54,7 @@ impl From<&str> for AgentMode {
 /// （`HashMap<工具名, 是否启用>`，未列出默认启用，显式 `false` 禁用）。
 /// 定义层 tools 与全局 `[tools.enabled]` 取交集——全局禁用是最高优先级硬约束，
 /// 定义层只能在全局允许的范围内收窄。默认空 = 无限制（向后兼容）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentDefinition {
     /// Agent 名称，为空时从文件名读取
     pub name: String,

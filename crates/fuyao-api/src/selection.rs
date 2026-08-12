@@ -32,7 +32,7 @@ pub enum Source {
 ///
 /// `id` 为纯文件夹名（不带 `global/` / `workspace/` 前缀），来源由 `source` 承载；
 /// 调用方按需自行拼成 `global/{id}` / `workspace/{id}` 设给 agent_id。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentIdOption {
     /// 纯文件夹名，如 "coder"
     pub id: String,
@@ -45,7 +45,7 @@ pub struct AgentIdOption {
 /// 复用 [`AgentDefinition`]（含 name / description / mode / tools / system_prompt 等），
 /// 不重复平铺其字段。`id` 为 file stem（设给 `AgentConfig.definition` 的值），
 /// 与 `definition.name`（frontmatter 显示名）职责分开。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DefinitionOption {
     /// file stem，设给 `AgentConfig.definition` 的值
     pub id: String,
@@ -60,7 +60,7 @@ pub struct DefinitionOption {
 /// `id` 为纯模型名（不带 `provider/` 前缀），供应商由 `provider` 独立承载；
 /// 调用方按需拼成 `provider/id` 设给 `ModelConfig.model_id`。
 /// 无 `source`：model 配置在 fuyao.toml 多层合并，无单一层来源。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelOption {
     /// 纯模型名，如 "deepseek-v4-flash"
     pub id: String,
@@ -89,6 +89,72 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Source::Builtin).unwrap(),
             "\"Builtin\""
+        );
+    }
+
+    /// 三个 option 类型连同内嵌领域类型（AgentDefinition / Model）整链可序列化。
+    ///
+    /// 回归守卫：后续给这些类型新增字段时，若误加不可序列化字段，本测试即编译失败，
+    /// 及早暴露问题。
+    #[test]
+    fn option_types_serialize_with_embedded_domain_types() {
+        // AgentIdOption：纯 id + source
+        let agent_id = AgentIdOption {
+            id: "coder".to_string(),
+            source: Source::Workspace,
+        };
+        let json = serde_json::to_string(&agent_id).unwrap();
+        assert!(json.contains("\"id\":\"coder\""), "id 应进 JSON：{json}");
+        assert!(
+            json.contains("\"source\":\"Workspace\""),
+            "source 应进 JSON：{json}"
+        );
+
+        // DefinitionOption：内嵌 AgentDefinition，验证整条链可序列化
+        let definition = DefinitionOption {
+            id: "coder".to_string(),
+            source: Source::Global,
+            definition: crate::AgentDefinition::new("coder", "编码 agent", "你是编码助手"),
+        };
+        let json = serde_json::to_string(&definition).unwrap();
+        assert!(json.contains("\"id\":\"coder\""), "id 应进 JSON：{json}");
+        assert!(
+            json.contains("\"source\":\"Global\""),
+            "source 应进 JSON：{json}"
+        );
+        assert!(
+            json.contains("\"name\":\"coder\""),
+            "AgentDefinition.name 应进 JSON：{json}"
+        );
+        assert!(
+            json.contains("\"system_prompt\":\"你是编码助手\""),
+            "AgentDefinition.system_prompt 应进 JSON：{json}"
+        );
+
+        // ModelOption：内嵌 Model（连带 ModelCost / ModelLimit / PriceTier），验证整条链可序列化
+        let model = ModelOption {
+            id: "deepseek-v4-flash".to_string(),
+            provider: "deepseek".to_string(),
+            model: crate::Model {
+                name: "DeepSeek V4 Flash".to_string(),
+                cost: crate::ModelCost::default(),
+                limit: crate::ModelLimit::default(),
+                reasoning_efforts: vec![],
+                modalities: crate::ModelModalities::default(),
+            },
+        };
+        let json = serde_json::to_string(&model).unwrap();
+        assert!(
+            json.contains("\"id\":\"deepseek-v4-flash\""),
+            "id 应进 JSON：{json}"
+        );
+        assert!(
+            json.contains("\"provider\":\"deepseek\""),
+            "provider 应进 JSON：{json}"
+        );
+        assert!(
+            json.contains("\"name\":\"DeepSeek V4 Flash\""),
+            "Model.name 应进 JSON：{json}"
         );
     }
 }

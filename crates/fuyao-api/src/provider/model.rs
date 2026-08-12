@@ -5,7 +5,7 @@
 /// 价格梯度区间
 ///
 /// 定义不同 token 数量区间的价格。
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PriceTier {
     /// 区间上限
     pub max_tokens: u32,
@@ -24,7 +24,7 @@ pub struct PriceTier {
 }
 
 /// 模型价格信息
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelCost {
     /// 输入 tokens 价格（价格/M）
     pub input: Option<f64>,
@@ -43,7 +43,7 @@ pub struct ModelCost {
 }
 
 /// 模型限制信息
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelLimit {
     /// 最大上下文窗口（tokens）
     pub context: u32,
@@ -116,7 +116,7 @@ pub enum ThinkingType {
 }
 
 /// 模型配置
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Model {
     /// 模型显示名称
     pub name: String,
