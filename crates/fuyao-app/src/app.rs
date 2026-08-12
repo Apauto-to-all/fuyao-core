@@ -24,9 +24,14 @@ use crate::logging::LogGuard;
 
 /// fan_out 通道容量（app 层消费缓冲）
 ///
-/// per-session 出站无界已吸收瞬时突发；fan_out 是 app 消费缓冲，实测不够再调
-/// （沿用原 Engine 全局通道容量）。
-const FAN_OUT_CAPACITY: usize = 256;
+/// 两级缓冲：per-session 出站为无界通道，吸收单 session 的瞬时突发（流式 chunk 等）；
+/// fan_out 是所有 session 共享的有界汇聚缓冲，给 [`App::recv`] 的消费方留出平滑余量。
+///
+/// 有界而非无界：消费方长期不消费时（UI 卡死等）事件不无限堆积占内存；背压只落在
+/// forwarder（阻塞 send），不回传导 session task（per-session 无界仍在接）。
+///
+/// 容量为经验默认，覆盖多 session 并发流式输出下的消费抖动；实测不够再调。
+const FAN_OUT_CAPACITY: usize = 512;
 
 /// shutdown 等 forwarder task 退出的总超时阈值
 ///

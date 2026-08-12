@@ -37,6 +37,7 @@ L0  fuyao-api（零内部依赖）
   - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）
   - **工具类型**：`ToolDefinition` / `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn` / `ToolResult` / `ToolCallContext`
   - **其他**：`AgentDefinition` / `AgentMode` / `SkillDefinition` / `SkillMeta` / `MCPServerConfig` / `ApiError` / `ConfigError`
+  - **选择支持类型**：`AgentIdOption`（`{ id, source }`）/ `DefinitionOption`（`{ id, source, definition }`）/ `ModelOption`（`{ id, provider, model }`）/ `Source`（来源层：`Workspace` / `Agent` / `Global` / `Extra` / `Builtin`）——供 fuyao-app 的 `Discovery` / `list_agent_ids` 消费；`id` 为纯身份，来源层独立承载
 
 ## fuyao-provider（L1 能力）
 
@@ -123,14 +124,16 @@ L0  fuyao-api（零内部依赖）
 
 ## fuyao-app（L4 装配）
 
-- **职责**：装配入口 + fan-in 单一出口：`start` / `init_engine` / `build_tool_registry` / `App` / `SessionManager`
+- **职责**：装配入口 + fan-in 单一出口：`start` / `init_engine` / `build_tool_registry` / `App` / `SessionManager` / `Discovery` / `list_agent_ids`
 - **内部依赖**：api, core, guard, hooks, mcp, provider, prompt, session, tools
 - **公开 API**：
-  - **`start(EngineParams)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → 创建 `SessionStore` → `Engine::new`（注入 store）→ `App::new` → `SessionManager::new`），返回 `FuyaoApp { app, sessions }`——上层同时拿到运行时入口（`app`）与查询入口（`sessions`），两者共享同一份 `Arc<SessionStore>`
-  - **`FuyaoApp`**（`start` 的聚合产物）：`app: App`（运行时交互：create/send/recv/end）+ `sessions: SessionManager`（会话检索：list/count），平级正交、互不依赖
+  - **`start(EngineParams)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → 创建 `SessionStore` → `Engine::new`（注入 store）→ `App::new` → `SessionManager::new` → `Discovery::new`），返回 `FuyaoApp { app, sessions, discovery }`——上层同时拿到运行时入口（`app`）、查询入口（`sessions`）、选择支持入口（`discovery`）；`app` 与 `sessions` 共享同一份 `Arc<SessionStore>`
+  - **`FuyaoApp`**（`start` 的聚合产物）：`app: App`（运行时交互：create/send/recv/end）+ `sessions: SessionManager`（会话检索：list/count）+ `discovery: Discovery`（选择支持：列 Agent 定义 / model），平级正交、互不依赖
   - **`App`**（运行时交互门面，持 `Engine` + fan-in 出口）：`new(engine, mcp_manager, log_guard)` / `create_session(SessionParams)` → `SessionId`（rx 由内部 forwarder 消费进 fan_out）/ `resume_session` / `fork_session` / `create_child_session(parent, source, params)` → `(SessionId, rx)`（**rx 不进 fan_out**，返调用方独占消费）/ `send` / `recv()` → `Option<OutputEvent>`（单一出口）/ `end_session` / `shutdown(self)`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop log_guard）
   - **`SessionManager`**（会话检索门面，持同一份 `Arc<SessionStore>`，与 `App` 平级正交）：`new(store)` / `list_sessions(workspace_filter, limit, offset)` → `Vec<Session>`（按 `last_active_at` 倒序，可选按 workspace 过滤）/ `session_count(workspace_filter)` → `i64` / `list_messages(session_id, before_seq: Option<i64>, limit: Option<i64>)` → `Vec<Message>`（游标分页，seq 倒序；`before_seq=None` 取最新一页，`Some(N)` 向前翻；`limit=None` 用默认 50；compaction 消息正常显示不过滤；不提供总数，下一页用返回条数 == limit 判断）
   - **`init_engine(EngineParams)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`
   - **`build_tool_registry()`**：收集内置 + MCP 工具，返回 `(ToolRegistry, Option<Arc<MCPManager>>)`
+  - **`list_agent_ids(&AgentPaths)`**：列举可选 agent_id（启动前可用，不依赖引擎）。接收应用层构造的 `AgentPaths`，按其 workspace / fuyao_home 扫描 `fuyao-agents/`，返回 `Vec<AgentIdOption>`（纯名 id + 来源层 `source`，项目层同名覆盖全局层，按 id 升序）。应用层用同一份 `AgentPaths` 先列 id、再造 `EngineParams` 启动，保证列举基准与启动基准一致
+  - **`Discovery`**（选择支持门面，`FuyaoApp.discovery` 字段，持 `start` 注入的 `AgentPaths`）：`list_definitions()` → `Vec<DefinitionOption>`（四层定义目录 + 内置，零参数）/ `list_models()` → `Vec<ModelOption>`（Provider 注册缓存，启动前为空，零参数）；路径身份启动时注入一次，两个查询共用，调用方不再传参
   - **`LogGuard`**：drop 时 flush 文件日志
   - **错误**：`InitError`（`NoProviderAvailable` / `ConfigError`）/ `SetupError`（`Init`）
