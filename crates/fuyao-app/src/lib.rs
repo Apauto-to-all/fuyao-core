@@ -6,6 +6,7 @@
 //!   [`App`] 装配（fan-in 单一出口），返回可直接使用的 [`App`]。
 //! - [`App`]：装配产物，包装 [`Engine`] + fan-in 出口（[`App::recv`]）。
 //! - [`init_engine`] + [`build_tool_registry`]：分步装配，供需要介入中间过程的场景使用。
+//! - [`list_agent_ids`]：启动前列举可选 agent_id（传入 `AgentPaths`，不依赖引擎）。
 //!
 //! 工具注入时机：新架构无事后注册的 EngineHandle，工具必须在 `Engine::new` 前收集成
 //! `ToolRegistry` 一次性注入（启动引擎时装配）。
@@ -27,7 +28,7 @@ use fuyao_mcp::MCPManager;
 use fuyao_session::SessionStore;
 
 pub use app::App;
-pub use discovery::Discovery;
+pub use discovery::{Discovery, list_agent_ids};
 pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
 pub use session_manager::SessionManager;
@@ -102,12 +103,9 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
             .map_err(|e| SetupError::Storage(e.to_string()))?,
     );
 
-    // 5. 构造选择支持门面（仅凭路径，不依赖引擎）
-    //    必须在 Engine::new 消费 params 前取出 agent_paths 的路径基准，避免移动冲突。
-    let discovery = Discovery::new(
-        params.agent_paths.fuyao_home.clone(),
-        params.agent_paths.workspace.clone(),
-    );
+    // 5. 构造选择支持门面（持有启动时的完整路径身份，含 agent_id）
+    //    在 Engine::new 消费 params 前 clone 出 agent_paths，供 Discovery 零参数查询复用。
+    let discovery = Discovery::new(params.agent_paths.clone());
 
     // 6. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
