@@ -1,33 +1,17 @@
-//! Agent 注册表（读 + 写）
+//! Agent 注册表（agent_id 列举器）
 //!
-//! 扫描 fuyao-agents/ 目录（全局层 + 项目层），解析 system.md + fuyao.toml，
-//! 提供 Agent 的列举、查询、创建与文件编辑能力。
-//!
-//! 模块布局：
-//! - [`types`]：对外数据类型与错误（wire 形态）
-//! - [`naming`]：名称的文件系统安全校验
-//! - 本文件：AgentRegistry 主体（扫描 / 读取 / CRUD）+ 配置解析辅助
+//! 纯文件夹扫描：扫描全局层与项目层的 `fuyao-agents/` 目录，按文件夹存在性列举
+//! 所有 agent_id。不读取任何内容文件，不注入合成 default。
+//! 列举元素 [`AgentIdOption`] / [`Source`] 定义于 fuyao-api 的 `selection` 模块。
 
-mod naming;
-pub(crate) mod types;
-
-pub use types::{
-    AgentContent, AgentFile, AgentInfo, AgentSource, PagedAgents, RegistryError,
-    UpdateContentRequest,
-};
-
-use crate::default::DEFAULT_FUYAO_AGENT;
-use crate::loader::load_agent_definition;
-use fuyao_api::get_workspace_agents_dir;
+use fuyao_api::{AgentIdOption, Source, get_workspace_agents_dir};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use naming::validate_name;
-
 /// Agent 注册表
 ///
-/// 扫描全局层和项目层的 fuyao-agents/ 目录，合并同名 Agent（项目层优先）。
-/// 同时承担创建 Agent 目录与编辑其文件的写操作（default Agent 受保护，禁止写）。
+/// 扫描全局层和项目层的 `fuyao-agents/` 目录，合并同名 Agent（项目层优先），
+/// 列举所有可用的 agent_id。仅做文件夹存在性扫描，不读内容文件、不做 CRUD。
 pub struct AgentRegistry {
     /// 工作目录（用于扫描项目层 Agent）
     workspace: Option<PathBuf>,
@@ -39,7 +23,7 @@ impl AgentRegistry {
     /// 创建 AgentRegistry
     ///
     /// `workspace` 为 None 时只扫描全局层。
-    /// `fuyao_home` 为全局基准路径，扫描 `{fuyao_home}/fuyao-agents/` 和加载默认 Agent。
+    /// `fuyao_home` 为全局基准路径，扫描 `{fuyao_home}/fuyao-agents/`。
     pub fn new(workspace: Option<PathBuf>, fuyao_home: PathBuf) -> Self {
         Self {
             workspace,
@@ -47,385 +31,61 @@ impl AgentRegistry {
         }
     }
 
-    /// 列举 Agent（全局 + 项目合并 + 默认 Agent），支持分页、来源过滤与关键字搜索
+    /// 列举所有 agent_id（扫描 `fuyao-agents/` 文件夹）
     ///
-    /// - `page`：页码，从 1 开始（< 1 视为 1）
-    /// - `size`：每页大小（< 1 视为 1）
-    /// - `scope`：来源过滤，`Some("global")` 仅全局层、`Some("workspace")` 仅项目层、`None` 全部
-    /// - `q`：关键字过滤，匹配文件夹名（去前缀）子串，大小写不敏感
-    ///
-    /// 默认 Agent（id = `default`）仅在 `scope = None`（全部）且 `q` 未命中过滤时出现。
-    pub fn list(
-        &self,
-        page: usize,
-        size: usize,
-        scope: Option<&str>,
-        q: Option<&str>,
-    ) -> PagedAgents {
-        // key = 文件夹名（去前缀），用于项目层覆盖同名全局
-        let mut results: HashMap<String, AgentInfo> = HashMap::new();
+    /// 扫描全局层 `{fuyao_home}/fuyao-agents/` 和项目层 `{ws}/.fuyao/fuyao-agents/`，
+    /// 项目层同名覆盖全局层。仅按文件夹存在性列举，不读任何内容文件。
+    /// [`AgentIdOption::id`] 为纯文件夹名（不带 `global/` / `workspace/` 前缀），
+    /// 来源由 `source` 字段承载；调用方按需自行拼成带前缀的 agent_id。
+    /// 不注入合成 default（default 是定义名不是 agent_id；agent_id=None 表示无隔离）。
+    /// 结果按 id 升序排序。
+    pub fn list_all_ids(&self) -> Vec<AgentIdOption> {
+        // key = 文件夹名（纯名），用于项目层覆盖同名全局
+        let mut by_name: HashMap<String, AgentIdOption> = HashMap::new();
 
         // 全局层
-        self.scan_dir(
+        scan_layer(
             &self.fuyao_home.join("fuyao-agents"),
-            AgentSource::Global,
-            &mut results,
+            Source::Global,
+            &mut by_name,
         );
 
         // 项目层（覆盖同名全局）
         if let Some(ref ws) = self.workspace {
-            self.scan_dir(
+            scan_layer(
                 &get_workspace_agents_dir(ws),
-                AgentSource::Workspace,
-                &mut results,
+                Source::Workspace,
+                &mut by_name,
             );
         }
 
-        // 默认 Agent（来自 ~/.fuyao/，仅在无 scope 过滤时纳入）
-        if scope.is_none()
-            && let Some(default_agent) = self.load_default_agent()
-        {
-            results.insert("default".to_string(), default_agent);
-        }
-
-        // 关键字小写化（q 仅匹配文件夹名，大小写不敏感）
-        let q_lower = q.map(|s| s.to_lowercase());
-
-        // 来源过滤（按 id 前缀）+ 关键字过滤（匹配文件夹名子串）
-        let mut filtered: Vec<AgentInfo> = results
-            .into_values()
-            .filter(|agent| match scope {
-                Some("global") => agent.id.starts_with("global/"),
-                Some("workspace") => agent.id.starts_with("workspace/"),
-                _ => true,
-            })
-            .filter(|agent| match &q_lower {
-                Some(query) => folder_name_of(&agent.id).to_lowercase().contains(query),
-                None => true,
-            })
-            .collect();
-
-        filtered.sort_by(|a, b| a.id.cmp(&b.id));
-
-        // 分页
-        let total = filtered.len();
-        let page = page.max(1);
-        let size = size.max(1);
-        let start = (page - 1) * size;
-        let items = if start >= total {
-            Vec::new()
-        } else {
-            let end = (start + size).min(total);
-            filtered.drain(start..end).collect()
-        };
-
-        PagedAgents {
-            items,
-            total,
-            page,
-            size,
-        }
-    }
-
-    /// 查询单个 Agent 完整信息
-    ///
-    /// 解析 id 前缀定位目录：
-    /// - `global/{名}` → 全局层
-    /// - `workspace/{名}` → 项目层
-    /// - `default` → 默认 Agent（~/.fuyao/）
-    ///
-    /// Agent 不存在返回 None。
-    pub fn get(&self, id: &str) -> Option<AgentInfo> {
-        // 默认 Agent
-        if id == "default" {
-            return self.load_default_agent();
-        }
-
-        // 解析前缀
-        let (source, name) = if let Some(name) = id.strip_prefix("global/") {
-            (AgentSource::Global, name)
-        } else if let Some(name) = id.strip_prefix("workspace/") {
-            (AgentSource::Workspace, name)
-        } else {
-            return None;
-        };
-
-        // 定位目录
-        let dir = match source {
-            AgentSource::Global => self.fuyao_home.join("fuyao-agents").join(name),
-            AgentSource::Workspace => {
-                let ws = self.workspace.as_ref()?;
-                get_workspace_agents_dir(ws).join(name)
-            }
-        };
-
-        if !dir.exists() {
-            return None;
-        }
-
-        self.read_info(id, &dir, source)
-    }
-
-    /// 扫描单个目录，将发现的 Agent 加入 results
-    ///
-    /// key 为文件夹名（不含来源前缀），用于项目层覆盖同名全局；
-    /// Agent 的 id 字段带来源前缀（`global/` 或 `workspace/`）。
-    fn scan_dir(&self, dir: &Path, source: AgentSource, results: &mut HashMap<String, AgentInfo>) {
-        let entries = match std::fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return, // 目录不存在 → 跳过
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            let folder = entry.file_name().to_string_lossy().to_string();
-            let id = match source {
-                AgentSource::Global => format!("global/{folder}"),
-                AgentSource::Workspace => format!("workspace/{folder}"),
-            };
-
-            // 读取完整信息（无 system.md 或解析失败 → 跳过）
-            if let Some(info) = self.read_info(&id, &path, source) {
-                results.insert(folder, info);
-            }
-        }
-    }
-
-    /// 从 Agent 目录读取完整信息
-    ///
-    /// 文件夹存在即是一个 Agent：
-    /// - 有 system.md（可读）→ 解析 frontmatter(name/description) + body(system_prompt)
-    /// - 无 system.md 或读取失败 → name=文件夹名、description=空、system_prompt=全局默认提示词
-    ///
-    /// 这样空文件夹创建后立即可见、可编辑。
-    fn read_info(&self, id: &str, dir: &Path, source: AgentSource) -> Option<AgentInfo> {
-        // 文件夹名（无 system.md 时作为 name）
-        let folder_name = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-
-        // 解析 system.md（缺失或读取失败 → 用全局默认提示词填充）
-        let (name, description, system_prompt, mode) =
-            match load_agent_definition(&dir.join("system.md")) {
-                Some(def) => (def.name, def.description, def.system_prompt, def.mode),
-                None => (
-                    folder_name,
-                    String::new(),
-                    DEFAULT_FUYAO_AGENT.system_prompt.clone(),
-                    DEFAULT_FUYAO_AGENT.mode,
-                ),
-            };
-
-        // 解析 fuyao.toml（可选）
-        let (model, tools, mcp_servers) = parse_fuyao_toml(&dir.join("fuyao.toml"));
-
-        // 扫描 profiles/ 子目录
-        let profiles = scan_profiles(&dir.join("profiles"));
-
-        Some(AgentInfo {
-            id: id.to_string(),
-            name,
-            description,
-            mode,
-            source,
-            system_prompt,
-            model,
-            tools,
-            mcp_servers,
-            profiles,
-        })
-    }
-
-    /// 创建 Agent（空文件夹）
-    ///
-    /// 不生成 system.md / fuyao.toml，编辑时按需创建。
-    /// 同名文件夹已存在 → `AlreadyExists`。
-    pub fn create(&self, source: AgentSource, name: &str) -> Result<(), RegistryError> {
-        validate_name(name)?;
-        let dir = self.agent_dir(source, name)?;
-        if dir.exists() {
-            return Err(RegistryError::AlreadyExists(name.to_string()));
-        }
-        std::fs::create_dir_all(&dir)?;
-        Ok(())
-    }
-
-    /// 读取 Agent 文件内容（system.md + fuyao.toml 文本）
-    ///
-    /// 文件不存在返回空串（前端显示空白可编辑）。
-    pub fn read_content(
-        &self,
-        source: AgentSource,
-        name: &str,
-    ) -> Result<AgentContent, RegistryError> {
-        self.reject_default(source, name)?;
-        validate_name(name)?;
-        let dir = self.agent_dir(source, name)?;
-        if !dir.exists() {
-            return Err(RegistryError::NotFound(name.to_string()));
-        }
-        Ok(AgentContent {
-            system_md: read_file_or_empty(&dir.join("system.md")),
-            fuyao_toml: read_file_or_empty(&dir.join("fuyao.toml")),
-        })
-    }
-
-    /// 写入 Agent 文件内容（单文件覆盖）
-    ///
-    /// 后端零验证——原样覆盖写入，文件不存在则创建。
-    pub fn write_content(
-        &self,
-        source: AgentSource,
-        name: &str,
-        file: AgentFile,
-        content: &str,
-    ) -> Result<(), RegistryError> {
-        self.reject_default(source, name)?;
-        validate_name(name)?;
-        let dir = self.agent_dir(source, name)?;
-        if !dir.exists() {
-            return Err(RegistryError::NotFound(name.to_string()));
-        }
-        std::fs::write(dir.join(file.file_name()), content)?;
-        Ok(())
-    }
-
-    /// 解析 `{source}/{name}` → 物理路径（CRUD 专用，直接映射，不自动 resolve）
-    fn agent_dir(&self, source: AgentSource, name: &str) -> Result<PathBuf, RegistryError> {
-        let base = match source {
-            AgentSource::Global => self.fuyao_home.join("fuyao-agents"),
-            AgentSource::Workspace => {
-                let ws = self
-                    .workspace
-                    .as_ref()
-                    .ok_or(RegistryError::WorkspaceMissing)?;
-                get_workspace_agents_dir(ws)
-            }
-        };
-        Ok(base.join(name))
-    }
-
-    /// 拒绝 default（编辑/删除保护：对应 ~/.fuyao/ 而非 fuyao-agents/ 子目录）
-    fn reject_default(&self, source: AgentSource, name: &str) -> Result<(), RegistryError> {
-        if source == AgentSource::Global && name == "default" {
-            return Err(RegistryError::DefaultForbidden);
-        }
-        Ok(())
-    }
-
-    /// 加载默认 Agent（来自 `{fuyao_home}/agents/default.md`）
-    ///
-    /// - 定义文件：`{fuyao_home}/agents/default.md` 存在则解析，否则用硬编码 `DEFAULT_FUYAO_AGENT`
-    /// - fuyao.toml：`{fuyao_home}/fuyao.toml` 存在则解析 model/tools/mcp_servers
-    fn load_default_agent(&self) -> Option<AgentInfo> {
-        // 解析定义文件（缺失则用硬编码默认 Agent）
-        let (name, description, system_prompt, mode) =
-            match load_agent_definition(&self.fuyao_home.join("agents").join("default.md")) {
-                Some(def) => (def.name, def.description, def.system_prompt, def.mode),
-                None => (
-                    DEFAULT_FUYAO_AGENT.name.clone(),
-                    DEFAULT_FUYAO_AGENT.description.clone(),
-                    DEFAULT_FUYAO_AGENT.system_prompt.clone(),
-                    DEFAULT_FUYAO_AGENT.mode,
-                ),
-            };
-
-        // 解析 fuyao.toml（可选）
-        let (model, tools, mcp_servers) = parse_fuyao_toml(&self.fuyao_home.join("fuyao.toml"));
-
-        Some(AgentInfo {
-            id: "default".to_string(),
-            name,
-            description,
-            mode,
-            source: AgentSource::Global,
-            system_prompt,
-            model,
-            tools,
-            mcp_servers,
-            profiles: Vec::new(),
-        })
+        let mut ids: Vec<AgentIdOption> = by_name.into_values().collect();
+        ids.sort_by(|a, b| a.id.cmp(&b.id));
+        ids
     }
 }
 
-/// 解析 fuyao.toml 提取 model / tools / mcp_servers
+/// 扫描单个目录，将发现的子文件夹作为 agent_id 加入 `by_name`
 ///
-/// 轻量解析，不依赖 fuyao-config 全套。
-fn parse_fuyao_toml(path: &Path) -> (Option<String>, Vec<String>, Vec<String>) {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return (None, Vec::new(), Vec::new()); // 文件不存在 → 空配置
-    };
-
-    let Ok(table) = toml::from_str::<toml::Table>(&content) else {
-        return (None, Vec::new(), Vec::new()); // 解析失败 → 空配置
-    };
-
-    // model：[models.default] 的 model 字段（默认模型）
-    let model = table
-        .get("models")
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get("default"))
-        .and_then(|v| v.as_table())
-        .and_then(|t| t.get("model"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    // tools：[tools] 表的 key 列表
-    let tools: Vec<String> = table
-        .get("tools")
-        .and_then(|v| v.as_table())
-        .map(|t| t.keys().cloned().collect())
-        .unwrap_or_default();
-
-    // mcp_servers：[mcp_servers] 表的 key 列表
-    let mcp_servers: Vec<String> = table
-        .get("mcp_servers")
-        .and_then(|v| v.as_table())
-        .map(|t| t.keys().cloned().collect())
-        .unwrap_or_default();
-
-    (model, tools, mcp_servers)
-}
-
-/// 扫描 profiles/ 目录，返回 .md 文件名列表（无后缀）
-fn scan_profiles(dir: &Path) -> Vec<String> {
+/// key 为文件夹名（纯名），用于项目层覆盖同名全局；
+/// [`AgentIdOption::id`] 为纯文件夹名，`source` 标记来源层。
+/// 仅按 `is_dir()` 判定，目录不存在或读取失败 → 静默跳过。
+fn scan_layer(dir: &Path, source: Source, by_name: &mut HashMap<String, AgentIdOption>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new(); // 目录不存在 → 空列表
+        return; // 目录不存在 → 跳过
     };
 
-    let mut profiles = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file()
-            && path.extension().is_some_and(|ext| ext == "md")
-            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-        {
-            profiles.push(stem.to_string());
+        if !path.is_dir() {
+            continue;
         }
+
+        let Some(name) = entry.file_name().to_str().map(|s| s.to_string()) else {
+            continue;
+        };
+        by_name.insert(name.clone(), AgentIdOption { id: name, source });
     }
-
-    profiles.sort();
-    profiles
-}
-
-/// 从 id 提取文件夹名（去 global/ 或 workspace/ 前缀，default 保持原样）
-///
-/// 用于 `q` 关键字匹配（只比对文件夹名，不比对前缀）。
-fn folder_name_of(id: &str) -> &str {
-    id.strip_prefix("global/")
-        .or_else(|| id.strip_prefix("workspace/"))
-        .unwrap_or(id)
-}
-
-/// 读取文件内容，不存在或读取失败返回空串
-fn read_file_or_empty(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -433,392 +93,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_list_empty_no_panic() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_empty");
+    fn list_all_ids_empty_no_panic() {
+        // 无 fuyao-agents/ 目录时不 panic，返回空
+        let temp = std::env::temp_dir().join("fuyao_test_registry_ids_empty");
+        std::fs::remove_dir_all(&temp).ok();
         std::fs::create_dir_all(&temp).unwrap();
+
         let registry = AgentRegistry::new(None, temp.clone());
-        // list 接受分页参数，空目录不 panic
-        let paged = registry.list(1, 10, None, None);
-        assert_eq!(paged.page, 1);
-        assert_eq!(paged.size, 10);
+        assert!(registry.list_all_ids().is_empty(), "空目录应返回空列表");
+
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn registry_get_returns_none_for_no_prefix() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_no_prefix");
-        std::fs::create_dir_all(&temp).unwrap();
+    fn list_all_ids_global_layer_pure_name() {
+        // 全局层文件夹 → id 为纯名（无前缀），source = Global；普通文件被忽略
+        let temp = std::env::temp_dir().join("fuyao_test_registry_ids_global");
+        std::fs::remove_dir_all(&temp).ok();
+        std::fs::create_dir_all(temp.join("fuyao-agents").join("coder")).unwrap();
+        std::fs::create_dir_all(temp.join("fuyao-agents").join("reviewer")).unwrap();
+        // 普通文件不应被当作 agent_id
+        std::fs::write(temp.join("fuyao-agents").join("not-a-dir.txt"), "x").unwrap();
+
         let registry = AgentRegistry::new(None, temp.clone());
-        assert!(registry.get("noprefix").is_none());
-        std::fs::remove_dir_all(&temp).ok();
-    }
+        let ids = registry.list_all_ids();
 
-    #[test]
-    fn registry_get_returns_none_for_nonexistent() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_nonexistent");
-        std::fs::create_dir_all(&temp).unwrap();
-        let registry = AgentRegistry::new(None, temp.clone());
-        assert!(registry.get("global/nonexistent_xyz").is_none());
-        assert!(registry.get("workspace/nonexistent_xyz").is_none());
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn parse_fuyao_toml_nonexistent() {
-        let (model, tools, mcp) = parse_fuyao_toml(Path::new("/nonexistent/fuyao.toml"));
-        assert!(model.is_none());
-        assert!(tools.is_empty());
-        assert!(mcp.is_empty());
-    }
-
-    #[test]
-    fn parse_fuyao_toml_valid() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_toml");
-        std::fs::create_dir_all(&temp).unwrap();
-        let toml_path = temp.join("fuyao.toml");
-        std::fs::write(
-            &toml_path,
-            r#"[models.default]
-model = "deepseek/deepseek-v4-flash"
-
-[tools]
-read = true
-write = true
-bash = false
-
-[mcp_servers.filesystem]
-command = "node"
-"#,
-        )
-        .unwrap();
-
-        let (model, tools, mcp) = parse_fuyao_toml(&toml_path);
-        assert_eq!(model.as_deref(), Some("deepseek/deepseek-v4-flash"));
-        assert!(tools.contains(&"read".to_string()));
-        assert!(tools.contains(&"write".to_string()));
-        assert!(tools.contains(&"bash".to_string()));
-        assert_eq!(tools.len(), 3);
-        assert_eq!(mcp, vec!["filesystem"]);
+        assert_eq!(ids.len(), 2, "仅 2 个文件夹应被列举");
+        let coder = ids.iter().find(|a| a.id == "coder").expect("应找到 coder");
+        assert_eq!(coder.source, Source::Global);
+        // 按纯名排序：coder 在 reviewer 前
+        assert_eq!(ids[0].id, "coder");
+        assert_eq!(ids[1].id, "reviewer");
+        // 普通文件不在结果中
+        assert!(!ids.iter().any(|a| a.id == "not-a-dir"));
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn scan_profiles_nonexistent_dir() {
-        let profiles = scan_profiles(Path::new("/nonexistent/profiles"));
-        assert!(profiles.is_empty());
-    }
-
-    #[test]
-    fn scan_profiles_finds_md_files() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_profiles");
-        std::fs::create_dir_all(&temp).unwrap();
-        std::fs::write(temp.join("python.md"), "# Python").unwrap();
-        std::fs::write(temp.join("rust.md"), "# Rust").unwrap();
-        std::fs::write(temp.join("readme.txt"), "not a profile").unwrap();
-
-        let profiles = scan_profiles(&temp);
-        assert_eq!(profiles.len(), 2);
-        assert!(profiles.contains(&"python".to_string()));
-        assert!(profiles.contains(&"rust".to_string()));
-
+    fn list_all_ids_workspace_overrides_global() {
+        // 项目层同名文件夹覆盖全局层 → 只剩该名，source = Workspace
+        let temp = std::env::temp_dir().join("fuyao_test_registry_ids_override");
         std::fs::remove_dir_all(&temp).ok();
-    }
+        std::fs::create_dir_all(temp.join("fuyao-agents").join("coder")).unwrap();
 
-    #[test]
-    fn registry_list_prefix_default_paging() {
-        // 创建临时全局 Agent 目录结构
-        let temp = std::env::temp_dir().join("fuyao_test_registry_prefix");
-        let global_agents = temp.join("fuyao-agents").join("coder");
-        std::fs::create_dir_all(&global_agents).unwrap();
-        std::fs::write(
-            global_agents.join("system.md"),
-            "---\nname: 开发\ndescription: 代码开发\n---\n你是开发工程师",
-        )
-        .unwrap();
-        std::fs::write(
-            global_agents.join("fuyao.toml"),
-            "[models.default]\nmodel = \"deepseek/deepseek-v4-flash\"\n",
-        )
-        .unwrap();
-
-        // profiles
-        let profiles_dir = global_agents.join("profiles");
-        std::fs::create_dir_all(&profiles_dir).unwrap();
-        std::fs::write(profiles_dir.join("python.md"), "# Python guide").unwrap();
-
-        // 全局 fuyao.toml（默认 Agent 的 model 来源）
-        std::fs::write(
-            temp.join("fuyao.toml"),
-            "[models.default]\nmodel = \"aliyun/qwen3.6-plus\"\n",
-        )
-        .unwrap();
-
-        // 注入 fuyao_home 指向临时目录
-        let registry = AgentRegistry::new(None, temp.clone());
-
-        // 全部（含默认 Agent）：coder 带前缀，且包含 default
-        let all = registry.list(1, 10, None, None);
-        assert!(all.items.iter().any(|a| a.id == "global/coder"));
-        assert!(all.items.iter().any(|a| a.id == "default"));
-        assert_eq!(all.total, 2);
-
-        // coder 字段完整
-        let coder = all
-            .items
-            .iter()
-            .find(|a| a.id == "global/coder")
-            .expect("应找到 global/coder");
-        assert_eq!(coder.name, "开发");
-        assert_eq!(coder.description, "代码开发");
-        assert_eq!(coder.source, AgentSource::Global);
-        assert_eq!(coder.model.as_deref(), Some("deepseek/deepseek-v4-flash"));
-        assert_eq!(coder.profiles, vec!["python"]);
-        assert!(coder.system_prompt.contains("开发工程师"));
-
-        // 默认 Agent 的 model 来自全局 fuyao.toml
-        let default = all
-            .items
-            .iter()
-            .find(|a| a.id == "default")
-            .expect("应找到 default");
-        assert_eq!(default.model.as_deref(), Some("aliyun/qwen3.6-plus"));
-
-        // scope 过滤：仅全局 → 不含 default
-        let global_only = registry.list(1, 10, Some("global"), None);
-        assert!(
-            global_only
-                .items
-                .iter()
-                .all(|a| a.id.starts_with("global/"))
-        );
-        assert!(!global_only.items.iter().any(|a| a.id == "default"));
-
-        // 分页：size=1 → 第一页 1 个，总数 2
-        let page1 = registry.list(1, 1, None, None);
-        assert_eq!(page1.items.len(), 1);
-        assert_eq!(page1.total, 2);
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn registry_list_project_overrides_global() {
-        // 项目层同名 Agent 覆盖全局层（id 前缀变 workspace/）
-        let temp = std::env::temp_dir().join("fuyao_test_registry_override");
-        let global_agents = temp.join("fuyao-agents").join("coder");
-        std::fs::create_dir_all(&global_agents).unwrap();
-        std::fs::write(
-            global_agents.join("system.md"),
-            "---\nname: 全局开发\ndescription: 全局\n---\n全局",
-        )
-        .unwrap();
-
-        // 项目层同名 coder
         let ws = temp.join("myproject");
-        let project_agents = ws.join(".fuyao").join("fuyao-agents").join("coder");
-        std::fs::create_dir_all(&project_agents).unwrap();
-        std::fs::write(
-            project_agents.join("system.md"),
-            "---\nname: 项目开发\ndescription: 项目\n---\n项目",
-        )
-        .unwrap();
+        std::fs::create_dir_all(ws.join(".fuyao").join("fuyao-agents").join("coder")).unwrap();
 
-        // 注入 fuyao_home 指向临时目录
         let registry = AgentRegistry::new(Some(ws), temp.clone());
-        let all = registry.list(1, 10, None, None);
+        let ids = registry.list_all_ids();
 
-        // coder 被项目层覆盖 → id 为 workspace/coder，name 为项目开发
-        let coder = all
-            .items
-            .iter()
-            .find(|a| a.id == "workspace/coder")
-            .expect("项目层应覆盖为 workspace/coder");
-        assert_eq!(coder.name, "项目开发");
-        assert_eq!(coder.source, AgentSource::Workspace);
-        // 不应同时存在 global/coder
-        assert!(!all.items.iter().any(|a| a.id == "global/coder"));
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn folder_name_of_strips_prefix() {
-        assert_eq!(folder_name_of("global/coder"), "coder");
-        assert_eq!(folder_name_of("workspace/translator"), "translator");
-        assert_eq!(folder_name_of("default"), "default");
-    }
-
-    #[test]
-    fn registry_list_no_systemmd_fills_default() {
-        // 空文件夹（无 system.md）→ list 返回，name=文件夹名，system_prompt=默认提示词
-        let temp = std::env::temp_dir().join("fuyao_test_registry_empty_folder");
-        let empty_agent = temp.join("fuyao-agents").join("blank");
-        std::fs::create_dir_all(&empty_agent).unwrap();
-
-        // 注入 fuyao_home 指向临时目录
-        let registry = AgentRegistry::new(None, temp.clone());
-        let all = registry.list(1, 10, None, None);
-
-        let blank = all
-            .items
-            .iter()
-            .find(|a| a.id == "global/blank")
-            .expect("空文件夹应作为 Agent 出现");
-        assert_eq!(blank.name, "blank");
-        assert!(blank.description.is_empty());
-        assert!(!blank.system_prompt.is_empty());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn registry_list_q_filter_matches_folder_name() {
-        // q 仅匹配文件夹名（去前缀），大小写不敏感
-        let temp = std::env::temp_dir().join("fuyao_test_registry_q");
-        let agents = temp.join("fuyao-agents");
-        std::fs::create_dir_all(agents.join("coder")).unwrap();
-        std::fs::write(
-            agents.join("coder").join("system.md"),
-            "---\nname: c\n---\nx",
-        )
-        .unwrap();
-        std::fs::create_dir_all(agents.join("translator")).unwrap();
-        std::fs::write(
-            agents.join("translator").join("system.md"),
-            "---\nname: t\n---\nx",
-        )
-        .unwrap();
-
-        // 注入 fuyao_home 指向临时目录
-        let registry = AgentRegistry::new(None, temp.clone());
-
-        // q="cod" → 仅 coder
-        let filtered = registry.list(1, 10, None, Some("cod"));
-        let ids: Vec<_> = filtered.items.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["global/coder"]);
-
-        // q="TRAN" → 匹配 translator（大小写不敏感）
-        let filtered = registry.list(1, 10, None, Some("TRAN"));
-        let ids: Vec<_> = filtered.items.iter().map(|a| a.id.as_str()).collect();
-        assert_eq!(ids, vec!["global/translator"]);
-
-        // q 不命中任何文件夹名 → 空（含 default 也被过滤）
-        let filtered = registry.list(1, 10, None, Some("zzz"));
-        assert!(filtered.items.is_empty());
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn registry_crud_create_and_conflict() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_crud_create");
-        // 清理上次失败运行可能残留的目录
-        std::fs::remove_dir_all(&temp).ok();
-        std::fs::create_dir_all(temp.join("fuyao-agents")).unwrap();
-
-        // 注入 fuyao_home 指向临时目录
-        let registry = AgentRegistry::new(None, temp.clone());
-
-        // 创建空文件夹
-        registry
-            .create(AgentSource::Global, "newagent")
-            .expect("创建应成功");
-        assert!(temp.join("fuyao-agents").join("newagent").is_dir());
-
-        // 同名 → AlreadyExists
-        let err = registry
-            .create(AgentSource::Global, "newagent")
-            .unwrap_err();
-        assert!(matches!(err, RegistryError::AlreadyExists(_)));
-
-        // 非法名 → InvalidName
-        let err = registry.create(AgentSource::Global, "a/b").unwrap_err();
-        assert!(matches!(err, RegistryError::InvalidName(_)));
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn registry_crud_read_content() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_crud_read");
-        let agent_dir = temp.join("fuyao-agents").join("reader");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("system.md"), "---\nname: r\n---\nbody").unwrap();
-
-        // 注入 fuyao_home 指向临时目录
-        let registry = AgentRegistry::new(None, temp.clone());
-
-        // 读取：system.md 有内容，fuyao.toml 不存在 → 空串
-        let content = registry
-            .read_content(AgentSource::Global, "reader")
-            .unwrap();
-        assert_eq!(content.system_md, "---\nname: r\n---\nbody");
-        assert!(content.fuyao_toml.is_empty());
-
-        // 不存在 → NotFound
-        let err = registry
-            .read_content(AgentSource::Global, "nope")
-            .unwrap_err();
-        assert!(matches!(err, RegistryError::NotFound(_)));
-
-        // default → DefaultForbidden
-        let err = registry
-            .read_content(AgentSource::Global, "default")
-            .unwrap_err();
-        assert!(matches!(err, RegistryError::DefaultForbidden));
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn registry_crud_write_content() {
-        let temp = std::env::temp_dir().join("fuyao_test_registry_crud_write");
-        let agent_dir = temp.join("fuyao-agents").join("writer");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-
-        // 注入 fuyao_home 指向临时目录
-        let registry = AgentRegistry::new(None, temp.clone());
-
-        // 写入 system.md（文件不存在则创建）
-        registry
-            .write_content(
-                AgentSource::Global,
-                "writer",
-                AgentFile::SystemMd,
-                "---\nname: w\n---\nwritten",
-            )
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(agent_dir.join("system.md")).unwrap(),
-            "---\nname: w\n---\nwritten"
-        );
-
-        // 写入 fuyao.toml
-        registry
-            .write_content(
-                AgentSource::Global,
-                "writer",
-                AgentFile::FuyaoToml,
-                "[models.default]\nmodel = \"deepseek/deepseek-v4-flash\"\n",
-            )
-            .unwrap();
-        assert!(agent_dir.join("fuyao.toml").exists());
-
-        // 覆盖写入
-        registry
-            .write_content(AgentSource::Global, "writer", AgentFile::SystemMd, "覆盖")
-            .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(agent_dir.join("system.md")).unwrap(),
-            "覆盖"
-        );
-
-        // default → DefaultForbidden
-        let err = registry
-            .write_content(AgentSource::Global, "default", AgentFile::SystemMd, "x")
-            .unwrap_err();
-        assert!(matches!(err, RegistryError::DefaultForbidden));
+        assert_eq!(ids.len(), 1, "同名应被项目层覆盖去重");
+        assert_eq!(ids[0].id, "coder");
+        assert_eq!(ids[0].source, Source::Workspace);
 
         std::fs::remove_dir_all(&temp).ok();
     }

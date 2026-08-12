@@ -6,6 +6,7 @@
 //! - `config`: 全局配置类型与共享句柄（单一真相源）
 //! - `message`: 消息类型（输入/输出）
 //! - `paths`: 路径系统（三层目录架构）
+//! - `selection`: 选择支持的公共类型（列举 agent_id / 定义 / model 的可选项）
 //! - `provider`: 模型和供应商配置
 //! - `tool`: 工具定义和执行
 
@@ -20,6 +21,7 @@ mod paths;
 mod prompt_types;
 mod provider;
 mod queue_snapshot;
+mod selection;
 mod session_types;
 mod skill_types;
 mod tool;
@@ -51,6 +53,7 @@ pub use provider::{
     Provider, ProviderOptions, ThinkingType,
 };
 pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
+pub use selection::{AgentIdOption, DefinitionOption, ModelOption, Source};
 pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{

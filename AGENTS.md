@@ -71,16 +71,17 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 ### 注意事项
 
-项目中存在两个「Agent」相关概念，**完全正交，不可混为一谈**：
+项目中存在两个「Agent」相关概念，**分属不同维度、不可混为一谈**：
 
 | 概念 | 本质 | 存储位置 | 决定什么 |
 | ------ | ------ | --------- | --------- |
 | **agent_id** | 独立 Agent 实体（数据隔离单元） | `fuyao-agents/{id}/`（一个目录） | 数据在哪：sessions.db、Provider 配置、缓存 |
-| **Agent 定义** | 定义提示词（一项能力/人格） | `agents/{name}.md`（一个文件） | 内容是什么：系统提示词、人格、行为指令 |
+| **Agent 定义** | 定义提示词（一项能力/人格） | 四层 `agents/{name}.md`（见下） | 内容是什么：系统提示词、人格、行为指令 |
 
 - **agent_id** 是路径参数：`global/{名}` / `workspace/{名}` / `{名}`（自动解析：工作目录优先，回退全局层）
-- **Agent 定义** 由 `AgentConfig.definition` 选择，None 时加载 `agents/default.md`
-- **正交组合**：agent_id 为 `coder` 的独立 Agent，可以使用 `reviewer` 定义——数据隔离照常，人格内容来自 reviewer.md
+- **Agent 定义** 由 `AgentConfig.definition` 选择（None 时取 `"default"`），按四层优先级解析同名 `.md`：workspace > agent > global > extra，外加内置 `default`/`explore`/`executor` 兜底
+- **agent 层**：提供 agent_id 时，`{agent_root}/agents/{name}.md` 作为定义来源之一——独立 Agent 可携带私有定义（含私有 `default`），覆盖同名共享定义
+- **任意组合**：任何 agent_id 仍可经 `AgentConfig.definition` 选择任何具名定义（如 agent_id=`coder` 用 `reviewer`）；agent 层只是额外来源，不限制组合自由
 
 ## 开发规范
 

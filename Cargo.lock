@@ -1008,6 +1008,7 @@ dependencies = [
  "fuyao-guard",
  "fuyao-hooks",
  "fuyao-mcp",
+ "fuyao-prompt",
  "fuyao-provider",
  "fuyao-session",
  "fuyao-tools",

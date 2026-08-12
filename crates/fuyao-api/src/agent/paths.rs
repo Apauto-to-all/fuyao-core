@@ -136,15 +136,16 @@ impl AgentPaths {
 
     /// Agent 定义文件分层路径（`agents/{name}.md`）
     ///
-    /// 集中定义库，按 name 匹配单个定义文件。三层优先级（不含 agent 层）：
+    /// 集中定义库，按 name 匹配单个定义文件。四层优先级：
     /// - workspace: `{workspace}/.fuyao/agents/{name}.md`
+    /// - agent: `{agent_root}/agents/{name}.md`（仅当提供 agent_id）
     /// - global: `~/.fuyao/agents/{name}.md`
     /// - extra: `{插件根}/agents/{name}.md`（仅保留存在的文件）
     ///
-    /// 不用 agent 层：agent_root 是独立 Agent 的数据隔离目录（sessions/config/provider），
-    /// 定义库与 agent_id 隔离体系正交，不应塞进每个独立 Agent 的数据目录。
+    /// agent 层让每个独立 Agent 可携带私有定义（覆盖同名全局/工作区定义）；
+    /// 未提供 agent_id 时该层为 None，行为退化为三层。
     ///
-    /// 调用方用 `first_exists()` 取首个命中。本期 name 固定为 `"default"`。
+    /// 调用方用 `first_exists()` 取首个命中。
     pub fn agents_def_paths(&self, name: &str) -> LayeredPaths {
         let file_name = format!("{name}.md");
 
@@ -158,7 +159,9 @@ impl AgentPaths {
 
         LayeredPaths {
             global_: Some(self.fuyao_home.join("agents").join(&file_name)),
-            agent: None,
+            agent: self
+                .agent_root()
+                .map(|root| root.join("agents").join(&file_name)),
             workspace: self
                 .workspace
                 .as_ref()
@@ -169,19 +172,21 @@ impl AgentPaths {
 
     /// Agent 定义目录分层路径（`agents/`）
     ///
-    /// 列举所有存放 Agent 定义的 `agents/` 目录（三层，不含 agent 层），
-    /// 供调用方扫描目录下全部 `*.md`（如构建子代理索引）。各目录内的文件
+    /// 列举所有存放 Agent 定义的 `agents/` 目录（四层），
+    /// 供调用方扫描目录下全部 `*.md`（如构建定义索引）。各目录内的文件
     /// 按 file stem 作为定义 name。
     ///
     /// - workspace: `{workspace}/.fuyao/agents/`
+    /// - agent: `{agent_root}/agents/`（仅当提供 agent_id）
     /// - global: `~/.fuyao/agents/`
     /// - extra: `{插件根}/agents/`（仅保留存在的目录）
     ///
+    /// 未提供 agent_id 时 agent 层为 None，退化为三层。
     /// 调用方用 `merge_exists()` 取所有存在的目录。
     pub fn agents_def_dirs(&self) -> LayeredPaths {
         LayeredPaths {
             global_: Some(self.fuyao_home.join("agents")),
-            agent: None,
+            agent: self.agent_root().map(|root| root.join("agents")),
             workspace: self
                 .workspace
                 .as_ref()
@@ -243,8 +248,8 @@ impl AgentPaths {
     ///
     /// workspace 层固定经 [`get_workspace_root`]（`.fuyao/` 根）。不走此规则的方法
     ///（如 [`Self::agents_md_paths`] 把 AGENTS.md 放在 workspace 根、
-    /// [`Self::sessions_db_paths`] 条件性 global、[`Self::agents_def_paths`] 不用
-    /// agent 层）保持各自 bespoke 实现——它们的差异是真实的，不该被强行统一。
+    /// [`Self::sessions_db_paths`] 条件性 global、[`Self::agents_def_paths`] 按
+    /// 文件粒度过滤 extra）保持各自 bespoke 实现——它们的差异是真实的，不该被强行统一。
     fn layered(&self, sub: &str) -> LayeredPaths {
         LayeredPaths {
             global_: Some(self.fuyao_home.join(sub)),
@@ -411,20 +416,61 @@ mod tests {
                 .unwrap()
                 .ends_with(".fuyao/agents/default.md")
         );
-        // agent 层不用
+        // 无 agent_id，agent 层为 None
         assert!(ap.agent.is_none());
     }
 
     #[test]
-    fn agents_def_paths_no_agent_layer_regardless_of_agent_id() {
-        // 即使有 agent_id，agents 定义也不走 agent 层（与 agent_id 隔离体系正交）
+    fn agents_def_paths_uses_agent_layer_when_agent_id_set() {
+        // 提供 agent_id 时，agents 定义走 agent 层（携带私有定义）
         let paths = AgentPaths {
             agent_id: Some("global/coder".to_string()),
             ..Default::default()
         };
         let ap = paths.agents_def_paths("default");
+        // agent 层命中：{agent_root}/agents/default.md
+        assert!(ap.agent.is_some());
+        assert!(ap.agent.as_ref().unwrap().ends_with("agents/default.md"));
+        assert!(ap.global_.is_some());
+    }
+
+    #[test]
+    fn agents_def_paths_no_agent_layer_without_agent_id() {
+        // 未提供 agent_id 时，agent 层为 None（退化为三层）
+        let paths = AgentPaths {
+            agent_id: None,
+            ..Default::default()
+        };
+        let ap = paths.agents_def_paths("default");
         assert!(ap.agent.is_none());
         assert!(ap.global_.is_some());
+    }
+
+    #[test]
+    fn agents_def_dirs_uses_agent_layer_when_agent_id_set() {
+        // 提供 agent_id 时，agents 定义目录走 agent 层（四层齐全）
+        let paths = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            workspace: Some(PathBuf::from("/tmp/project")),
+            ..Default::default()
+        };
+        let ad = paths.agents_def_dirs();
+        assert!(ad.global_.is_some());
+        assert!(ad.agent.is_some());
+        assert!(ad.workspace.is_some());
+        assert!(ad.agent.as_ref().unwrap().ends_with("agents"));
+    }
+
+    #[test]
+    fn agents_def_dirs_no_agent_layer_without_agent_id() {
+        // 未提供 agent_id 时，agent 层为 None（退化为三层）
+        let paths = AgentPaths {
+            agent_id: None,
+            ..Default::default()
+        };
+        let ad = paths.agents_def_dirs();
+        assert!(ad.agent.is_none());
+        assert!(ad.global_.is_some());
     }
 
     #[test]

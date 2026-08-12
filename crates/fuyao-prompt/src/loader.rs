@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn load_agent_definition_not_found() {
-        let result = load_agent_definition(Path::new("nonexistent/path/system.md"));
+        let result = load_agent_definition(Path::new("nonexistent/path/missing.md"));
         assert!(result.is_none());
     }
 

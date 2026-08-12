@@ -45,22 +45,6 @@ pub fn write_default_agent(home: &std::path::Path, md: &str) {
     write_agent_def(home, "default", md);
 }
 
-/// 在 fuyao_home/fuyao-agents/{name}/ 下创建 system.md（注册表扫描用）
-pub fn write_registry_agent(fuyao_home: &std::path::Path, name: &str, system_md: &str) -> PathBuf {
-    let agent_dir = fuyao_home.join("fuyao-agents").join(name);
-    std::fs::create_dir_all(&agent_dir).expect("创建 fuyao-agents 子目录失败");
-    std::fs::write(agent_dir.join("system.md"), system_md).expect("写入 system.md 失败");
-    agent_dir
-}
-
-/// 在工作目录的 .fuyao/fuyao-agents/{name}/ 下创建 system.md（项目层）
-pub fn write_workspace_agent(workspace: &std::path::Path, name: &str, system_md: &str) -> PathBuf {
-    let agent_dir = workspace.join(".fuyao").join("fuyao-agents").join(name);
-    std::fs::create_dir_all(&agent_dir).expect("创建项目层 fuyao-agents 子目录失败");
-    std::fs::write(agent_dir.join("system.md"), system_md).expect("写入 system.md 失败");
-    agent_dir
-}
-
 /// 在 base 目录下创建 instructions/{file} 补充指令文件
 pub fn write_instruction(base: &std::path::Path, file: &str, content: &str) {
     let instr_dir = base.join("instructions");

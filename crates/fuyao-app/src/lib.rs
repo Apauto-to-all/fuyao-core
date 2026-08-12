@@ -11,6 +11,7 @@
 //! `ToolRegistry` 一次性注入（启动引擎时装配）。
 
 mod app;
+mod discovery;
 mod history_replay;
 mod init;
 mod logging;
@@ -26,9 +27,12 @@ use fuyao_mcp::MCPManager;
 use fuyao_session::SessionStore;
 
 pub use app::App;
+pub use discovery::Discovery;
 pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
 pub use session_manager::SessionManager;
+// 透出 fuyao-api 的列举选项类型，让二次开发只依赖 fuyao-app 即可消费 Discovery 结果
+pub use fuyao_api::{AgentIdOption, DefinitionOption, ModelOption, Source};
 
 /// 装配错误
 #[derive(Debug, thiserror::Error)]
@@ -42,19 +46,22 @@ pub enum SetupError {
     Storage(String),
 }
 
-/// 装配产物：运行时交互入口 + 会话管理入口
+/// 装配产物：运行时交互入口 + 会话管理入口 + 选择支持入口
 ///
-/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到两个正交门面：
+/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到三个正交门面：
 /// - [`app`](self::FuyaoApp::app)：运行时交互（create / send / recv / 对话生命周期）
 /// - [`sessions`](self::FuyaoApp::sessions)：会话管理查询（列会话 / 查历史）
+/// - [`discovery`](self::FuyaoApp::discovery)：选择支持（列 agent_id / Agent 定义 / model）
 ///
-/// 两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
-/// 各持一份 `Arc` 克隆，零拷贝共享连接池）。
+/// 前两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
+/// 各持一份 `Arc` 克隆，零拷贝共享连接池）；[`discovery`] 仅凭路径构造，不依赖引擎。
 pub struct FuyaoApp {
     /// 运行时交互门面（对话的进行）
     pub app: App,
     /// 会话管理门面（会话的检索与浏览）
     pub sessions: SessionManager,
+    /// 选择支持门面（列举 agent_id / Agent 定义 / model）
+    pub discovery: Discovery,
 }
 
 /// 一键启动：init_engine → build_tool_registry → 创建 store → Engine::new → 装配
@@ -95,16 +102,24 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
             .map_err(|e| SetupError::Storage(e.to_string()))?,
     );
 
-    // 5. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
+    // 5. 构造选择支持门面（仅凭路径，不依赖引擎）
+    //    必须在 Engine::new 消费 params 前取出 agent_paths 的路径基准，避免移动冲突。
+    let discovery = Discovery::new(
+        params.agent_paths.fuyao_home.clone(),
+        params.agent_paths.workspace.clone(),
+    );
+
+    // 6. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
     let engine = Engine::new(params, provider, tools, plugin_host, store.clone()).await;
 
     tracing::info!("引擎启动完成");
 
-    // 6. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）
+    // 7. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）+ 选择支持门面
     Ok(FuyaoApp {
         app: App::new(engine, mcp_manager, log_guard),
         sessions: SessionManager::new(store),
+        discovery,
     })
 }
 

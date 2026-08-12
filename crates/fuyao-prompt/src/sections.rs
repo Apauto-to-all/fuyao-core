@@ -18,10 +18,10 @@ use crate::loader::{
     load_agent_definition, load_agent_definition_from_agent_paths, load_builtin_definition,
 };
 use chrono::Local;
-use fuyao_api::{AgentConfig, AgentDefinition, AgentPaths};
+use fuyao_api::{AgentConfig, AgentDefinition, AgentPaths, DefinitionOption, Source};
 use fuyao_skills::find_all_skills;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 解析当前 session 使用的完整 Agent 定义
 ///
@@ -248,35 +248,38 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
     lines.join("\n")
 }
 
-/// 收集可用子代理定义（name + description）
+/// 收集所有 Agent 定义（四层 .md + 内置），按优先级去重
 ///
-/// 实时查询（每次调用现查，无缓存），供两个消费方共享：
-/// - [`build_subagent_index_section`]：格式化为系统提示词的「子代理」索引层
-/// - 子代理工具 handler：校验 `subagent_type` 是否合法，不合法时返可用列表
+/// 共享扫描器，供 [`list_definitions`]（全模式）与 [`list_subagent_definitions`]（过滤
+/// 子代理模式）复用。返回 [`DefinitionOption`] 列表：`id` = file stem（去重键与对外名），
+/// `definition` = 解析得到的完整定义，`source` = 来源层。
 ///
-/// 来源合并（低 → 高优先级，后者覆盖前者）：
-/// 1. 内置默认子代理（explore / executor）—— 编译期嵌入，永远存在
-/// 2. 用户 `agents/*.md`（三层目录扫描，file stem 作为 name）—— mode 须 `is_usable_as_subagent`
-///
-/// 用户同名文件覆盖内置：与 [`load_agent_definition_from_agent_paths`] 的加载链一致。
-/// 内置主 Agent（default）mode = All 也算可用子代理，列入清单（LLM 可显式选它当子代理）。
-/// 返回结果按 name 升序排序，输出稳定可读。
-pub fn list_subagent_definitions(agent_paths: &AgentPaths) -> Vec<(String, String)> {
-    // name → description，用户层覆盖内置层
-    let mut by_name: HashMap<String, String> = HashMap::new();
+/// 遍历顺序遵循 [`AgentPaths::agents_def_dirs`] 的优先级（workspace > agent > global > extra），
+/// 同名定义首现胜（高优先级层覆盖低优先级层）；内置定义（default / explore / executor）
+/// 作为最低优先级注入，与用户文件同名时用户文件胜。最后按 id 升序排序。
+fn collect_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
+    // id(stem) → (定义, 来源)，首现胜（按优先级顺序插入，已存在则跳过）
+    let mut by_id: HashMap<String, (AgentDefinition, Source)> = HashMap::new();
 
-    // 内置默认子代理（最低优先）
-    for builtin_name in ["explore", "executor"] {
-        if let Some(def) = load_builtin_definition(builtin_name)
-            && def.mode.is_usable_as_subagent()
-        {
-            by_name.insert(builtin_name.to_string(), def.description);
-        }
+    let dirs = agent_paths.agents_def_dirs();
+
+    // 按优先级构造 (目录, 来源) 列表（read_dir 自身处理目录不存在）
+    let mut layered: Vec<(&Path, Source)> = Vec::new();
+    if let Some(d) = dirs.workspace.as_deref() {
+        layered.push((d, Source::Workspace));
+    }
+    if let Some(d) = dirs.agent.as_deref() {
+        layered.push((d, Source::Agent));
+    }
+    if let Some(d) = dirs.global_.as_deref() {
+        layered.push((d, Source::Global));
+    }
+    for d in &dirs.extra {
+        layered.push((d.as_path(), Source::Extra));
     }
 
-    // 用户文件（覆盖内置）
-    for dir in agent_paths.agents_def_dirs().merge_exists() {
-        let md_files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
+    for (dir, source) in layered {
+        let mut md_files: Vec<PathBuf> = match std::fs::read_dir(dir) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok())
                 .map(|e| e.path())
@@ -284,21 +287,71 @@ pub fn list_subagent_definitions(agent_paths: &AgentPaths) -> Vec<(String, Strin
                 .collect(),
             Err(_) => continue,
         };
+        // 目录内按文件名排序，保证同层同优先级下输出稳定
+        md_files.sort();
+
         for file_path in md_files {
             let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if let Some(def) = load_agent_definition(&file_path)
-                && def.mode.is_usable_as_subagent()
-            {
-                by_name.insert(stem.to_string(), def.description);
+            // 首现胜：高优先级层已记录同名则跳过
+            if by_id.contains_key(stem) {
+                continue;
+            }
+            if let Some(def) = load_agent_definition(&file_path) {
+                by_id.insert(stem.to_string(), (def, source));
             }
         }
     }
 
-    let mut entries: Vec<(String, String)> = by_name.into_iter().collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    // 内置定义（最低优先级）：与用户文件同名时用户文件胜
+    for builtin_name in ["default", "explore", "executor"] {
+        if by_id.contains_key(builtin_name) {
+            continue;
+        }
+        if let Some(def) = load_builtin_definition(builtin_name) {
+            by_id.insert(builtin_name.to_string(), (def, Source::Builtin));
+        }
+    }
+
+    let mut entries: Vec<DefinitionOption> = by_id
+        .into_iter()
+        .map(|(id, (definition, source))| DefinitionOption {
+            id,
+            source,
+            definition,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
     entries
+}
+
+/// 列举所有可用 Agent 定义（四层 .md + 内置），全模式（Primary + Subagent）
+///
+/// 遍历 `agent_paths.agents_def_dirs()` 各层（优先级 workspace > agent > global > extra），
+/// 解析每个 `*.md`，按 file stem 作 name，同名按优先级去重（首现胜）。
+/// 再注入内置定义（default = Primary、explore / executor = Subagent）为最低优先级，
+/// 与用户文件同名时用户文件胜。按 name 排序返回。
+pub fn list_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
+    collect_definitions(agent_paths)
+}
+
+/// 收集可用子代理定义（name + description）
+///
+/// 实时查询（每次调用现查，无缓存），供两个消费方共享：
+/// - [`build_subagent_index_section`]：格式化为系统提示词的「子代理」索引层
+/// - 子代理工具 handler：校验 `subagent_type` 是否合法，不合法时返可用列表
+///
+/// 基于 [`collect_definitions`] 全量扫描后过滤 `is_usable_as_subagent()`：内置主 Agent
+///（default = Primary）被过滤掉，explore / executor（Subagent）保留。
+/// name 取 file stem（与 [`load_agent_definition_from_agent_paths`] 的 `agents/{name}.md`
+/// 查找链一致），用户同名文件覆盖内置。返回结果按 name 升序排序，输出稳定可读。
+pub fn list_subagent_definitions(agent_paths: &AgentPaths) -> Vec<(String, String)> {
+    collect_definitions(agent_paths)
+        .into_iter()
+        .filter(|opt| opt.definition.mode.is_usable_as_subagent())
+        .map(|opt| (opt.id, opt.definition.description))
+        .collect()
 }
 
 /// 构建子代理索引 section（Layer 5.5）
@@ -344,6 +397,7 @@ pub fn build_environment_section() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuyao_api::AgentMode;
 
     #[test]
     fn build_tool_guidance_section_works() {
@@ -545,6 +599,134 @@ mod tests {
         let section = build_subagent_index_section(&ctx);
         assert!(!section.contains("boss"));
         assert!(!section.contains("专属主代理"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn list_definitions_lists_all_modes() {
+        // 全模式列举：Primary 与 Subagent 定义都出现
+        let temp = std::env::temp_dir().join("fuyao_test_list_defs_all_modes");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        // 一个 primary、一个 subagent
+        std::fs::write(
+            plugin.join("agents").join("boss.md"),
+            "---\nname: boss\ndescription: 专属主代理\nmode: primary\n---\n仅主代理",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("agents").join("helper.md"),
+            "---\nname: helper\ndescription: 助手\nmode: subagent\n---\n子代理",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let defs = list_definitions(&ctx);
+
+        let boss = defs.iter().find(|d| d.id == "boss").expect("应含 boss");
+        assert_eq!(boss.definition.mode, AgentMode::Primary);
+        assert_eq!(boss.definition.description, "专属主代理");
+        let helper = defs.iter().find(|d| d.id == "helper").expect("应含 helper");
+        assert_eq!(helper.definition.mode, AgentMode::Subagent);
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn list_definitions_includes_builtins_when_no_user_files() {
+        // 无用户文件时注入内置 default(Primary) / explore / executor(Subagent)
+        let ctx = AgentPaths::default();
+        let defs = list_definitions(&ctx);
+
+        let default = defs
+            .iter()
+            .find(|d| d.id == "default")
+            .expect("应注入内置 default");
+        assert_eq!(default.definition.mode, AgentMode::Primary);
+        assert_eq!(default.source, Source::Builtin);
+
+        let explore = defs
+            .iter()
+            .find(|d| d.id == "explore")
+            .expect("应注入内置 explore");
+        assert_eq!(explore.definition.mode, AgentMode::Subagent);
+        assert_eq!(explore.source, Source::Builtin);
+
+        let executor = defs
+            .iter()
+            .find(|d| d.id == "executor")
+            .expect("应注入内置 executor");
+        assert_eq!(executor.definition.mode, AgentMode::Subagent);
+        assert_eq!(executor.source, Source::Builtin);
+    }
+
+    #[test]
+    fn list_definitions_user_file_overrides_builtin() {
+        // 用户 agents/explore.md 覆盖内置 explore（同名首现胜，source 跟随用户层）
+        let temp = std::env::temp_dir().join("fuyao_test_list_defs_override");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("explore.md"),
+            "---\nname: explore\ndescription: 我的自定义探索\nmode: subagent\n---\n自定义",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let defs = list_definitions(&ctx);
+
+        let explore = defs
+            .iter()
+            .find(|d| d.id == "explore")
+            .expect("应含 explore");
+        assert_eq!(explore.definition.description, "我的自定义探索");
+        assert_eq!(explore.source, Source::Extra);
+        // 内置 explore 描述被覆盖，不再出现
+        assert!(
+            !defs
+                .iter()
+                .any(|d| d.definition.description.contains("只读探索")
+                    && d.source == Source::Builtin)
+        );
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn list_definitions_sorted_by_name() {
+        // 输出按 name 升序排序
+        let temp = std::env::temp_dir().join("fuyao_test_list_defs_sorted");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("zebra.md"),
+            "---\nname: zebra\nmode: primary\n---\nz",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("agents").join("alpha.md"),
+            "---\nname: alpha\nmode: primary\n---\na",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let defs = list_definitions(&ctx);
+        let names: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
+        // 升序：alpha 在 zebra 前
+        assert!(names.windows(2).all(|w| w[0] <= w[1]));
+        assert!(
+            names.iter().position(|n| *n == "alpha") < names.iter().position(|n| *n == "zebra")
+        );
 
         std::fs::remove_dir_all(&temp).ok();
     }
