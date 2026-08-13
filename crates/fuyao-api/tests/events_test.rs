@@ -392,19 +392,19 @@ fn assistant_payload_accepts_zero_tokens() {
 }
 
 // ---------------------------------------------------------------------------
-// ThinkingType：序列化为 snake_case 字符串
+// ThinkingType：序列化为 PascalCase 变体名
 // ---------------------------------------------------------------------------
 
 #[rstest]
-fn thinking_type_serializes_to_snake_case(
+fn thinking_type_serializes_to_pascal_case(
     #[values(ThinkingType::Enabled, ThinkingType::Disabled)] variant: ThinkingType,
 ) {
     let json = serde_json::to_string(&variant).expect("序列化失败");
     let restored: ThinkingType = serde_json::from_str(&json).expect("反序列化失败");
-    // 往返一致 + 序列化结果应为带引号的 snake_case 字符串
+    // 往返一致 + 序列化结果应为带引号的 PascalCase 变体名
     assert_eq!(format!("{:?}", restored), format!("{:?}", variant));
     assert!(
-        json == r#""enabled""# || json == r#""disabled""#,
-        "ThinkingType 应序列化为 snake_case 字符串，实际：{json}"
+        json == r#""Enabled""# || json == r#""Disabled""#,
+        "ThinkingType 应序列化为 PascalCase 变体名，实际：{json}"
     );
 }

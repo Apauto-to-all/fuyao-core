@@ -162,6 +162,22 @@ impl App {
             .await
     }
 
+    /// 更新对话级参数（运行时配置热切，直接代理 [`Engine::update_session_params`]）
+    ///
+    /// 与 [`App::resume_session`](Self::resume_session) 职责正交：resume 负责会话装配加载
+    ///（从 DB 读、重建队列/通道），本方法负责运行中会话的配置热切——覆盖 session 的
+    /// `SessionParams` 共享句柄，消费点（跑 turn、压缩）下次现读即用新值。
+    ///
+    /// 全量覆盖语义：无论传入什么 `SessionParams`，整份直接替代当前值——agent_config /
+    /// model_config 一视同仁。session 不在调度表返 [`EngineError::SessionNotFound`]。
+    pub async fn update_session_params(
+        &self,
+        id: &SessionId,
+        params: SessionParams,
+    ) -> Result<(), EngineError> {
+        self.engine.update_session_params(id, params).await
+    }
+
     /// 入事件（单一入口，直接代理 [`Engine::send`]）
     pub async fn send(&self, id: &SessionId, event: InputEvent) -> Result<(), EngineError> {
         self.engine.send(id, event).await

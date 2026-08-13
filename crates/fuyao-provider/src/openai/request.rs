@@ -4,7 +4,7 @@
 //! 与传输层解耦：输入是领域消息结构，输出是 `serde_json::Value`，可独立单测。
 
 use crate::provider::{ChatRequest, StreamOptions};
-use fuyao_api::{ImageContent, MessageRole};
+use fuyao_api::{ImageContent, MessageRole, ThinkingType};
 
 /// OpenAI 协议支持的图片 MIME 白名单（仅图像：PNG / JPEG / WEBP / 非动画 GIF）
 const SUPPORTED_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
@@ -170,9 +170,13 @@ pub(crate) fn build_request_body(
     // 各自为 Some 时各自发送，互不压制。配置了就必须发——禁止因 thinking_type=Disabled
     // 而压掉 reasoning_effort，两者由服务器各自解释，fuyao 不替服务器做语义裁剪。
     if let Some(t) = &options.thinking_type {
-        body["thinking"] = serde_json::json!({
-            "type": serde_json::to_value(t).expect("ThinkingType 序列化不会失败")
-        });
+        // thinking.type 是 OpenAI 协议约定的小写字面量，在请求构造层固化，
+        // 与 ThinkingType 枚举的序列化形态解耦——枚举形态只服务 IPC
+        let thinking_type_str = match t {
+            ThinkingType::Enabled => "enabled",
+            ThinkingType::Disabled => "disabled",
+        };
+        body["thinking"] = serde_json::json!({ "type": thinking_type_str });
     }
     if let Some(e) = &options.reasoning_effort {
         body["reasoning_effort"] = serde_json::Value::String(e.clone());

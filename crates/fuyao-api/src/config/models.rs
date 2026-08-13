@@ -14,7 +14,7 @@
 //! ```toml
 //! [models.default]
 //! model = "deepseek/deepseek-v4-flash"
-//! thinking_type = "enabled"
+//! thinking_type = "Enabled"
 //! reasoning_effort = "high"
 //!
 //! [models.fast]
@@ -105,7 +105,7 @@ model = "deepseek/deepseek-v4-flash"
         let toml_str = r#"
 [models.default]
 model = "deepseek/deepseek-v4-flash"
-thinking_type = "enabled"
+thinking_type = "Enabled"
 reasoning_effort = "high"
 "#;
         #[derive(Deserialize)]

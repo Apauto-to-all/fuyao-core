@@ -105,9 +105,9 @@ impl Default for ModelModalities {
 
 /// 思考模式开关（对应 OpenAI 兼容协议的 thinking.type 字段）
 ///
-/// 序列化为 snake_case 字符串："enabled" / "disabled"
+/// 序列化为 PascalCase 变体名（Enabled / Disabled），与项目其他枚举一致；
+/// OpenAI 协议 thinking.type 的小写字面量在 provider 请求构造层固化，不靠此 serde 形态
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum ThinkingType {
     /// 开启思考
     Enabled,
@@ -212,10 +212,10 @@ mod tests {
     }
 
     #[test]
-    fn thinking_type_serializes_snake_case() {
+    fn thinking_type_serializes_pascal_case() {
         let json = serde_json::to_string(&ThinkingType::Enabled).unwrap();
-        assert_eq!(json, "\"enabled\"");
+        assert_eq!(json, "\"Enabled\"");
         let json = serde_json::to_string(&ThinkingType::Disabled).unwrap();
-        assert_eq!(json, "\"disabled\"");
+        assert_eq!(json, "\"Disabled\"");
     }
 }
