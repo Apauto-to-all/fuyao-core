@@ -13,7 +13,7 @@ use std::pin::Pin;
 
 use tokio::sync::mpsc;
 
-use crate::{InputEvent, OutputEvent, SessionParams, TodoItem};
+use crate::{AgentConfig, InputEvent, OutputEvent, TodoItem};
 
 /// 子任务 session 的上下文来源
 ///
@@ -43,7 +43,7 @@ pub trait SubagentOps: Send + Sync {
         &'a self,
         parent_session_id: &'a str,
         source: ChildSessionSource,
-        params: SessionParams,
+        child_agent_config: AgentConfig,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<(String, mpsc::UnboundedReceiver<OutputEvent>), String>>

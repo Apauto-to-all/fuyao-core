@@ -115,8 +115,6 @@ fn three_layer_precedence_workspace_overrides_global() {
     common::write_config_file(
         &global_dir,
         r#"
-[models.default]
-model = "global/model"
 [llm]
 request_timeout_secs = 100
 "#,
@@ -146,11 +144,7 @@ request_timeout_secs = 300
 
     // workspace 层最高优先级覆盖
     assert_eq!(config.llm.request_timeout_secs, 300);
-    // global 层的 models.default 被保留（其他层未覆盖）
-    assert_eq!(
-        config.models.default.as_ref().unwrap().model,
-        "global/model"
-    );
+    // global 层的 llm.request_timeout_secs 被保留（其他层未覆盖）
 }
 
 #[test]
@@ -447,13 +441,11 @@ fn load_config_returns_none_when_no_config_anywhere() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn model_selection_accepts_default_and_fast_tags() {
+fn model_selection_accepts_fast_tag() {
     let temp = tempfile::tempdir().expect("创建临时目录失败");
     common::write_config_file(
         temp.path(),
         r#"
-[models.default]
-model = "deepseek/deepseek-v4-flash"
 [models.fast]
 model = "deepseek/deepseek-v4-flash"
 "#,
@@ -463,10 +455,6 @@ model = "deepseek/deepseek-v4-flash"
     let config = load_merged_config(Some(&path), None, None)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        config.models.default.as_ref().unwrap().model,
-        "deepseek/deepseek-v4-flash"
-    );
     assert_eq!(
         config.models.fast.as_ref().unwrap().model,
         "deepseek/deepseek-v4-flash"

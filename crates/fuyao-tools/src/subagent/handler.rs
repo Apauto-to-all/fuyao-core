@@ -24,9 +24,7 @@ use fuyao_api::message::output::{
     ChildSessionMessage, ChildSessionOrigin, ChildSessionPayload, ChildSessionState,
 };
 use fuyao_api::message::{EventBase, InputEvent};
-use fuyao_api::{
-    AgentConfig, CancellationToken, ChildSessionSource, SessionParams, ToolCallContext,
-};
+use fuyao_api::{AgentConfig, CancellationToken, ChildSessionSource, ToolCallContext};
 
 /// 子代理执行超时兜底
 ///
@@ -81,14 +79,12 @@ pub async fn subagent_handler(
     // 4. 派生子 session（Fresh 模式：空上下文，子代理不继承父会话历史）
     //    subagent_type → definition，引擎按名加载 agents/{type}.md（含 mode 校验）
     let parent_id = ctx.session_id.as_deref().unwrap_or("");
-    let params = SessionParams {
-        agent_config: AgentConfig {
-            definition: Some(subagent_type.clone()),
-        },
-        ..Default::default()
+    // 子代理人格配置（definition）；model_config 由引擎从父 session 继承，此处不传
+    let child_agent_config = AgentConfig {
+        definition: Some(subagent_type.clone()),
     };
     let (child_id, mut child_rx) = match ops
-        .create_child_session(parent_id, ChildSessionSource::Fresh, params)
+        .create_child_session(parent_id, ChildSessionSource::Fresh, child_agent_config)
         .await
     {
         Ok(x) => x,

@@ -73,8 +73,14 @@ let app = fuyao_app::start(EngineParams { agent_paths }).await?;
 // MCPManager 由 App 内部持有；此处用 App::recv 验证工具可调
 // （若需直接查 server 状态，自行调 init_engine + build_tool_registry 拿 MCPManager）
 
-// 让 LLM 调用 MCP 工具
-let session_id = app.create_session(SessionParams::default()).await?;
+// 让 LLM 调用 MCP 工具（创建会话时显式提供 model_id，String 必填）
+let session_id = app.create_session(SessionParams {
+    model_config: ModelConfig {
+        model_id: "deepseek/deepseek-v4-flash".to_string(),
+        ..Default::default()
+    },
+    ..Default::default()
+}).await?;
 app.send(&session_id, InputEvent::User(msg)).await?;
 // 观察事件流：ToolCall(tool_name="mcp_filesystem_read_file") → ToolResult → ...
 ```

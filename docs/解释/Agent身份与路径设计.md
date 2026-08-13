@@ -27,8 +27,8 @@ SessionParams {                  // 对话级，创建对话时提供（agent_co
         definition: Option<String>  // 用哪个定义（加载 agents/{definition}.md，None 时用 default）
     }
     model_config: ModelConfig {
-        model_id: Option<String>        // 用哪个模型（provider_id/model_id，None 时用 [models.default]）
-        thinking_type: Option<...>      // 思考开关
+        model_id: String                  // 用哪个模型（provider_id/model_id，必填非空，未指定则拒绝对话）
+        thinking_type: Option<...>        // 思考开关
         reasoning_effort: Option<String>  // 思考强度档位
     }
 }

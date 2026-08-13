@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{AgentPaths, EngineParams, ImageContent, ModelConfig, SessionParams};
+use fuyao_api::{AgentConfig, AgentPaths, EngineParams, ImageContent, ModelConfig, SessionParams};
 use fuyao_app::App;
 use fuyao_app::{InitResult, init_engine};
 use fuyao_core::{Engine, PluginHost, ToolRegistry};
@@ -87,11 +87,12 @@ async fn image_input_described_by_real_llm() {
     // 3. 创建 session，绑定目标模型
     let session_id = app
         .create_session(SessionParams {
+            agent_config: AgentConfig::default(),
             model_config: ModelConfig {
-                model_id: Some(MODEL_ID.to_string()),
-                ..Default::default()
+                model_id: MODEL_ID.to_string(),
+                thinking_type: None,
+                reasoning_effort: None,
             },
-            ..Default::default()
         })
         .await
         .expect("创建 session 失败");

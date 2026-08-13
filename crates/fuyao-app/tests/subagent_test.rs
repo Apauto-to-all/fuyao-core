@@ -13,8 +13,8 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,7 +23,7 @@ use futures_util::stream;
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::output::{ChildSessionOrigin, ChildSessionState};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{EngineParams, FuyaoConfig, ModelConfig, ModelRef, SessionParams, set_config};
+use fuyao_api::{AgentConfig, EngineParams, ModelConfig, SessionParams};
 use fuyao_app::{App, LogGuard, build_tool_registry};
 use fuyao_core::{Engine, PluginHost};
 use fuyao_provider::{
@@ -31,25 +31,6 @@ use fuyao_provider::{
     StreamOptions, StreamUsage,
 };
 use tokio::time::timeout;
-
-/// 全局配置注入守护：本测试二进制内只 set_config 一次
-///
-/// 子代理 handler 用 `SessionParams::default()` 派生子 session，依赖全局 `[models.default]`
-/// 兜底模型路由。set_config 基于 OnceLock，进程内只能成功一次——用 `Once` 保证多测试并行时
-/// 仅一个线程进入 set_config，其余直接放行（get_config 读已设值）。
-static CONFIG_GUARD: Once = Once::new();
-
-fn ensure_test_config() {
-    CONFIG_GUARD.call_once(|| {
-        let mut cfg = FuyaoConfig::default();
-        // 与 session_params() 的 model_id 同源：test/model → provider_id="test" / model="model"
-        cfg.models.default = Some(ModelRef {
-            model: "test/model".to_string(),
-            ..Default::default()
-        });
-        set_config(Arc::new(cfg));
-    });
-}
 
 /// 按调用次数依次返回脚本中的事件序列
 ///
@@ -135,11 +116,12 @@ fn guide_msg(content: &str) -> InputEvent {
 /// 测试用 SessionParams：`test/model` 与 MockProvider 注册表匹配
 fn session_params() -> SessionParams {
     SessionParams {
+        agent_config: AgentConfig::default(),
         model_config: ModelConfig {
-            model_id: Some("test/model".to_string()),
-            ..Default::default()
+            model_id: "test/model".to_string(),
+            thinking_type: None,
+            reasoning_effort: None,
         },
-        ..Default::default()
     }
 }
 
@@ -159,8 +141,6 @@ fn as_providers<P: Provider + 'static>(p: P) -> fuyao_provider::ProviderRegistry
 /// 6. 父继续下一 turn 产出 finish_reason=stop 的最终 Assistant
 #[tokio::test]
 async fn parent_react_invokes_subagent_and_receives_tool_result() {
-    ensure_test_config();
-
     let (agent_paths, _home) = temp_agent_paths();
     let (registry, _mcp_manager) = build_tool_registry().await;
     let store = make_store(&agent_paths).await;

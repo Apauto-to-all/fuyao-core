@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fuyao_api::message::OutputEvent;
-use fuyao_api::{InputEvent, SessionParams};
+use fuyao_api::{AgentConfig, InputEvent, SessionParams};
 use fuyao_core::{ChildSessionSource, Engine, EngineError, SessionId};
 use fuyao_mcp::MCPManager;
 use tokio::sync::{Mutex, mpsc};
@@ -154,11 +154,11 @@ impl App {
         &self,
         parent_session_id: &SessionId,
         source: ChildSessionSource,
-        params: SessionParams,
+        child_agent_config: AgentConfig,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
         // 不 spawn forwarder，rx 直接返调用方独占消费
         self.engine
-            .create_child_session(parent_session_id, source, params)
+            .create_child_session(parent_session_id, source, child_agent_config)
             .await
     }
 

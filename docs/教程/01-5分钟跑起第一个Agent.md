@@ -12,9 +12,6 @@
 在项目根创建 `fuyao.toml`：
 
 ```toml
-[models.default]
-model = "deepseek/deepseek-v4-flash"
-
 [providers.deepseek]
 name = "DeepSeek"
 api_key_env_vars = ["DEEPSEEK_API_KEY"]
@@ -26,7 +23,7 @@ base_url = "https://api.deepseek.com/v1"
 name = "deepseek-v4-flash"
 ```
 
-**预期结果**：配置文件创建成功，指定了默认模型和供应商。
+**预期结果**：配置文件创建成功，指定了供应商和模型（主对话模型在创建会话时显式提供，不在 fuyao.toml 配置）。
 
 ## 第 2 步：配置 .env
 
@@ -43,7 +40,7 @@ DEEPSEEK_API_KEY=sk-你的密钥
 在你的项目中添加依赖并启动。引擎支持**多 session 并发**——必须先创建对话拿编号，再发消息：
 
 ```rust
-use fuyao_api::{AgentPaths, EngineParams, InputEvent, OutputEvent, SessionParams};
+use fuyao_api::{AgentPaths, EngineParams, InputEvent, ModelConfig, OutputEvent, SessionParams};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,7 +54,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Agent 启动成功！");
 
     // 3. 创建对话拿编号（每个对话有独立 session_id）
-    let session_id = app.create_session(SessionParams::default()).await?;
+    //    主对话模型在此时显式提供（ModelConfig.model_id，String 必填），引擎不提供隐式兜底
+    let session_id = app.create_session(SessionParams {
+        model_config: ModelConfig {
+            model_id: "deepseek/deepseek-v4-flash".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }).await?;
 
     // 4. 发送一条用户消息（模型由 session 的 SessionParams.model_config 决定）
     use fuyao_api::message::input::{UserMessage, UserPayload};

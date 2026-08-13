@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// model_config 整 session 共享一份，可经 `Engine::update_session_params` 随时切。
 ///
 /// 与旧"引擎持单个 `Arc<dyn Provider>`"模型的差异：
-/// - 旧：启动时按 default model_id 选一个 Provider 实例，所有调用都打到这里
+/// - 旧：启动时按给定的 model_id 选一个 Provider 实例，所有调用都打到这里
 /// - 新：启动时把所有已注册 Provider 都建实例；每次调用按 session 的 provider_id 路由
 ///
 /// 失败容错：单个 Provider 实例构造失败（如 API Key 缺失）不影响其他——

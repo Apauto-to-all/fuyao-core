@@ -59,7 +59,7 @@ async fn resolve_compression_model(
         tracing::warn!(
             session_id = ctx.emitter.session_id(),
             cause = %msg,
-            "压缩跳过：模型解析失败（model_id 无效或未配置 [models.default]）"
+            "压缩跳过：模型解析失败（model_id 无效或为空）"
         );
         msg
     })

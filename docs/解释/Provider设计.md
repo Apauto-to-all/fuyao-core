@@ -107,9 +107,9 @@ impl ProviderRegistry {
 
 ### 路由机制
 
-session 的 `SessionParams.model_config.model_id` 形如 `"provider_id/model_id"`——session task 在执行该轮 LLM 调用前：
+session 的 `SessionParams.model_config.model_id`（`String` 必填非空）形如 `"provider_id/model_id"`——session task 在执行该轮 LLM 调用前：
 
-1. `resolve_model(params)` 拆 model_id（provider_id 小写、model 原样）；None 读 `[models.default]`，没配 fail-loud
+1. `resolve_model(params)` 拆 model_id（provider_id 小写、model 原样）；空值 fail-loud 发 Error（引擎不提供隐式兜底，直接拒绝对话）
 2. `ctx.providers.get(&resolved.provider_id)` 取 Provider 实例
 3. 取不到 → fail-loud 发 `OutputEvent::Error`（错误信息精准："provider_id 'xxx' 未注册，可用: [...]"）
 4. 把 Provider 实例传给 `run_stream_with_retry`

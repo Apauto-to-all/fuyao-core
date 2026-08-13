@@ -20,10 +20,9 @@ name = "deepseek-v4-flash"
 [providers.deepseek.models."deepseek-v4-flash".limit]
 context = 128000
 output = 8192
-
-[models.default]
-model = "deepseek/deepseek-v4-flash"
 ```
+
+> 主对话模型不在 fuyao.toml 配置——创建会话时在 `ModelConfig.model_id` 显式提供（如 `"deepseek/deepseek-v4-flash"`），`String` 必填非空，空值引擎拒绝对话。
 
 在 .env 中设 API Key：
 
@@ -51,23 +50,25 @@ base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 [providers.aliyun.models."qwen3.6-plus"]
 name = "qwen3.6-plus"
 
-# 默认模型（model_config.model_id = None 时用）
-[models.default]
-model = "deepseek/deepseek-v4-flash"
-
 # 轻量任务模型（标题生成、压缩摘要等用）
 [models.fast]
 model = "aliyun/qwen3.6-plus"
 ```
 
 ```rust
-// 用默认模型（model_config.model_id = None 时走 [models.default]）
-let id = app.create_session(SessionParams::default()).await?;
+// 创建会话时必须显式提供 model_id（String 必填），引擎不提供隐式兜底，空值拒绝对话
+let id = app.create_session(SessionParams {
+    model_config: ModelConfig {
+        model_id: "deepseek/deepseek-v4-flash".to_string(),
+        ..Default::default()
+    },
+    ..Default::default()
+}).await?;
 
 // 显式指定 aliyun 的模型（创建时在 model_config 定）
 let id = app.create_session(SessionParams {
     model_config: ModelConfig {
-        model_id: Some("aliyun/qwen3.6-plus".to_string()),
+        model_id: "aliyun/qwen3.6-plus".to_string(),
         ..Default::default()
     },
     ..Default::default()
@@ -125,7 +126,14 @@ let engine = Engine::new(
 ```rust
 let app = fuyao_app::start(EngineParams { agent_paths }).await?;
 
-let session_id = app.create_session(SessionParams::default()).await?;
+// 创建会话时显式提供 model_id（String 必填），引擎不提供隐式兜底
+let session_id = app.create_session(SessionParams {
+    model_config: ModelConfig {
+        model_id: "deepseek/deepseek-v4-flash".to_string(),
+        ..Default::default()
+    },
+    ..Default::default()
+}).await?;
 app.send(&session_id, InputEvent::User(msg)).await?;
 
 // 观察 OutputEvent::Chunk 流式输出

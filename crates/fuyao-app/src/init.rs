@@ -112,7 +112,7 @@ pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError>
     }
 
     tracing::info!(
-        default_model = ?config.as_ref().and_then(|c| c.models.default.as_ref().map(|r| &r.model)),
+        fast_model = ?config.as_ref().and_then(|c| c.models.fast.as_ref().map(|r| &r.model)),
         provider_count = provider.provider_ids().len(),
         providers = ?provider.provider_ids(),
         console = logging_config.console,

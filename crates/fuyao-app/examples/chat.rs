@@ -2,8 +2,8 @@
 //!
 //! 通过 `fuyao_app::start` 一键装配启动引擎，验证项目完整可用。
 //! 启动时选择 session 数量：
-//! - 单对话：使用默认模型（见 `DEFAULT_MODEL`），事件以 JSON 原样打印（无颜色）
-//! - 双对话：同一条消息同时发给两个 session，A/B 各用不同模型（见 `DEFAULT_MODEL` / `MODEL_B`），
+//! - 单对话：单 session 用模型 A（见 `MODEL_A`），事件以 JSON 原样打印（无颜色）
+//! - 双对话：同一条消息同时发给两个 session，A/B 各用不同模型（见 `MODEL_A` / `MODEL_B`），
 //!   流式输出交错到达，用颜色区分来源（A 青色 / B 黄色），体现多 session 并发不阻塞
 //! - 子代理派生期间，子 session 事件用紫色与父 lane 区分，仍归父 lane 渲染
 //!
@@ -21,12 +21,12 @@ use std::io::Write;
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
 use fuyao_api::message::output::ChildSessionState;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{AgentPaths, EngineParams, ModelConfig, SessionParams};
+use fuyao_api::{AgentConfig, AgentPaths, EngineParams, ModelConfig, SessionParams};
 use fuyao_app::App;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// 模型 1（默认，provider/model 形式，按项目约定）：单对话与双对话的 session A 使用此模型
-const DEFAULT_MODEL: &str = "sensenova/deepseek-v4-flash";
+/// 模型 A（provider/model 形式，按项目约定）：单对话与双对话的 session A 使用此模型
+const MODEL_A: &str = "sensenova/deepseek-v4-flash";
 
 /// 模型 2：双对话的 session B 使用此模型，与 A 并行对比两路回答
 const MODEL_B: &str = "sensenova/sensenova-6.7-flash-lite";
@@ -73,11 +73,12 @@ async fn main() {
 
     let session_a = app
         .create_session(SessionParams {
+            agent_config: AgentConfig::default(),
             model_config: ModelConfig {
-                model_id: Some(DEFAULT_MODEL.to_string()),
-                ..Default::default()
+                model_id: MODEL_A.to_string(),
+                thinking_type: None,
+                reasoning_effort: None,
             },
-            ..Default::default()
         })
         .await
         .expect("创建 session A 失败");
@@ -91,11 +92,12 @@ async fn main() {
     if two {
         let session_b = app
             .create_session(SessionParams {
+                agent_config: AgentConfig::default(),
                 model_config: ModelConfig {
-                    model_id: Some(MODEL_B.to_string()),
-                    ..Default::default()
+                    model_id: MODEL_B.to_string(),
+                    thinking_type: None,
+                    reasoning_effort: None,
                 },
-                ..Default::default()
             })
             .await
             .expect("创建 session B 失败");
@@ -106,13 +108,13 @@ async fn main() {
             finished: false,
         });
         println!(
-            "\n已创建两个并发对话（颜色区分，A 用 {DEFAULT_MODEL} / B 用 {MODEL_B}）：\n  {ca}[A]{r}  {cb}[B]{r}\n",
+            "\n已创建两个并发对话（颜色区分，A 用 {MODEL_A} / B 用 {MODEL_B}）：\n  {ca}[A]{r}  {cb}[B]{r}\n",
             ca = COLOR_A,
             cb = COLOR_B,
             r = COLOR_RESET
         );
     } else {
-        println!("\n已创建单个对话（模型 {DEFAULT_MODEL}）\n");
+        println!("\n已创建单个对话（模型 {MODEL_A}）\n");
     }
 
     // 3. 交互循环：读取输入 → 发给所有 session → 消费本轮事件

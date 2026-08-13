@@ -19,14 +19,16 @@ use crate::provider::ThinkingType;
 /// 模型运行配置（session 级共享一份）
 ///
 /// 聚合「用哪个模型」+「怎么思考」三个运行时模型参数。
-/// 三字段默认 `None`，请求体不发对应字段，走模型自身默认行为。
+/// model_id 必填（构造时必须显式提供非空值，空值引擎拒绝对话），故本结构不实现
+/// `Default`——杜绝 `ModelConfig::default()` 产生空 model_id 的漏洞，强制所有构造点显式提供；
+/// thinking 两字段 `None` 时请求体不发对应字段，走模型自身默认行为。
 ///
 /// 归属：装入 [`SessionParams`]，整 session 共享一份——消费点（跑 turn、压缩）
 /// 每次现读 `SessionParams` 取值，更新即通过引擎接口写回去，不存在"生效时机"问题。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ModelConfig {
-    /// 模型 ID，如 aliyun/qwen3.6-plus。None 时自动使用默认模型
-    pub model_id: Option<String>,
+    /// 模型 ID（格式：provider_id/model_id），必填：空串时引擎拒绝对话
+    pub model_id: String,
 
     /// 思考开关（对应 thinking.type 字段）。None 时不发，走模型默认
     pub thinking_type: Option<ThinkingType>,
@@ -73,7 +75,10 @@ pub struct EngineParams {
 /// 边界（前缀缓存红线）：
 /// - `agent_config`：创建时定死不应改——改了要重建 system_prompt，冲掉前缀缓存。
 /// - `model_config`：可随时更新（切模型不破坏前缀缓存语义，下一轮自然用新模型）。
-#[derive(Debug, Clone, Default)]
+///
+/// 不实现 `Default`：`ModelConfig` 已不实现 `Default`（model_id 必填），
+/// 故本结构连带不实现 `Default`，强制构造点显式提供 model_config。
+#[derive(Debug, Clone)]
 pub struct SessionParams {
     /// Agent 运行配置（definition 选择 + 未来扩展，创建时定死不应改）
     pub agent_config: AgentConfig,
@@ -84,14 +89,6 @@ pub struct SessionParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn model_config_default_all_none() {
-        let config = ModelConfig::default();
-        assert!(config.model_id.is_none());
-        assert!(config.thinking_type.is_none());
-        assert!(config.reasoning_effort.is_none());
-    }
 
     #[test]
     fn agent_config_default_definition_is_none() {
@@ -108,27 +105,16 @@ mod tests {
     }
 
     #[test]
-    fn session_params_default_all_none() {
-        let params = SessionParams::default();
-        assert!(params.agent_config.definition.is_none());
-        assert!(params.model_config.model_id.is_none());
-        assert!(params.model_config.thinking_type.is_none());
-        assert!(params.model_config.reasoning_effort.is_none());
-    }
-
-    #[test]
     fn session_params_model_id_set() {
         let params = SessionParams {
             agent_config: AgentConfig::default(),
             model_config: ModelConfig {
-                model_id: Some("deepseek/deepseek-v4-flash".to_string()),
-                ..Default::default()
+                model_id: "deepseek/deepseek-v4-flash".to_string(),
+                thinking_type: None,
+                reasoning_effort: None,
             },
         };
-        assert_eq!(
-            params.model_config.model_id.as_deref(),
-            Some("deepseek/deepseek-v4-flash")
-        );
+        assert_eq!(params.model_config.model_id, "deepseek/deepseek-v4-flash");
     }
 
     #[test]
@@ -137,7 +123,11 @@ mod tests {
             agent_config: AgentConfig {
                 definition: Some("coder".to_string()),
             },
-            model_config: ModelConfig::default(),
+            model_config: ModelConfig {
+                model_id: "test/model".to_string(),
+                thinking_type: None,
+                reasoning_effort: None,
+            },
         };
         assert_eq!(params.agent_config.definition.as_deref(), Some("coder"));
     }

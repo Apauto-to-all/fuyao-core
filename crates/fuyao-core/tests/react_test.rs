@@ -15,7 +15,7 @@ use std::time::Duration;
 use common::{FlakyThenSuccessProvider, MockProvider, make_store, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{EngineParams, ModelConfig, SessionParams};
+use fuyao_api::{AgentConfig, EngineParams, ModelConfig, SessionParams};
 use fuyao_core::{Engine, EngineError, PluginHost};
 use fuyao_provider::{
     BoxStream, ChatRequest, ChatResponse, Provider, StreamError, StreamEvent, StreamOptions,
@@ -37,11 +37,12 @@ fn guide_user_message(content: &str) -> InputEvent {
 /// 测试用 SessionParams：携带 `test/model` 形式的 model_id（与各测试的 ProviderRegistry 匹配）
 fn test_session_params() -> SessionParams {
     SessionParams {
+        agent_config: AgentConfig::default(),
         model_config: ModelConfig {
-            model_id: Some("test/model".to_string()),
-            ..Default::default()
+            model_id: "test/model".to_string(),
+            thinking_type: None,
+            reasoning_effort: None,
         },
-        ..Default::default()
     }
 }
 

@@ -17,7 +17,7 @@ use std::time::Duration;
 use common::{MockProvider, make_store, temp_agent_paths, text_events};
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{ChildSessionSource, EngineParams, ModelConfig, SessionParams};
+use fuyao_api::{AgentConfig, ChildSessionSource, EngineParams, ModelConfig, SessionParams};
 use fuyao_core::{Engine, EngineError, PluginHost};
 use tokio::time::timeout;
 
@@ -37,11 +37,12 @@ fn guide_user_message(content: &str) -> InputEvent {
 /// 测试用 SessionParams：携带 `test/model` 形式的 model_id（与各测试的 ProviderRegistry 匹配）
 fn test_session_params() -> SessionParams {
     SessionParams {
+        agent_config: AgentConfig::default(),
         model_config: ModelConfig {
-            model_id: Some("test/model".to_string()),
-            ..Default::default()
+            model_id: "test/model".to_string(),
+            thinking_type: None,
+            reasoning_effort: None,
         },
-        ..Default::default()
     }
 }
 
@@ -276,7 +277,11 @@ async fn child_session_has_independent_channel_from_parent() {
 
     // 子 session：持独立 rx_child
     let (child_id, mut rx_child) = engine
-        .create_child_session(&parent_id, ChildSessionSource::Fresh, test_session_params())
+        .create_child_session(
+            &parent_id,
+            ChildSessionSource::Fresh,
+            fuyao_api::AgentConfig::default(),
+        )
         .await
         .expect("创建 child session 失败");
 
@@ -360,7 +365,11 @@ async fn child_session_rx_returns_none_after_session_exits() {
         .expect("创建父 session 失败");
 
     let (child_id, mut rx_child) = engine
-        .create_child_session(&parent_id, ChildSessionSource::Fresh, test_session_params())
+        .create_child_session(
+            &parent_id,
+            ChildSessionSource::Fresh,
+            fuyao_api::AgentConfig::default(),
+        )
         .await
         .expect("创建 child session 失败");
 

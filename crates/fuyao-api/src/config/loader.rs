@@ -243,8 +243,6 @@ mod tests {
         let global = temp_config_path(
             "global",
             r#"
-[models.default]
-model = "global/model"
 [llm]
 request_timeout_secs = 100
 [tools.limits]
@@ -261,8 +259,6 @@ connect_timeout_secs = 20
         let workspace = temp_config_path(
             "workspace",
             r#"
-[models.default]
-model = "workspace/model"
 [tools.limits]
 terminal_default_timeout_secs = 240
 "#,
@@ -272,11 +268,6 @@ terminal_default_timeout_secs = 240
             .unwrap()
             .unwrap();
 
-        // models.default：workspace 覆盖 global
-        assert_eq!(
-            cfg.models.default.as_ref().map(|m| m.model.as_str()),
-            Some("workspace/model")
-        );
         // llm.request_timeout_secs 来自 global（无更高优先级覆盖）
         assert_eq!(cfg.llm.request_timeout_secs, 100);
         // llm.connect_timeout_secs 来自 agent（agent 覆盖 default）

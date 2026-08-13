@@ -1,24 +1,22 @@
 //! 多模型选择配置（按用途标签区分）
 //!
-//! 对应 `fuyao.toml` 中 `[models.{tag}]` 子段。不同用途的场景按标签选取模型，
-//! 实现主对话用强模型、轻量任务用便宜模型的区分。
+//! 对应 `fuyao.toml` 中 `[models.{tag}]` 子段。轻量任务场景按标签选取专用模型，
+//! 与主对话模型区分（主对话用强模型，标题 / 压缩等用便宜快速模型）。
 //!
 //! # 内置标签
-//! - `default`：默认模型（主对话）。未显式指定 model_id 时使用。
-//! - `fast`：轻量任务模型（标题生成、压缩总结等）。便宜快速，不可用时回退 `default`。
+//! - `fast`：轻量任务模型（标题生成、压缩总结等）。可选配置，未配置时轻量任务
+//!   回退到当前会话模型。
 //!
-//! 标签固定为 `default` / `fast`，配置未知标签会加载报错（`deny_unknown_fields`），
-//! 避免死配置。加新标签时在 [`ModelSelection`] 加 `Option<ModelRef>` 字段，TOML 格式不变。
+//! 主对话模型**不在此配置**——由调用方创建会话时在 `ModelConfig.model_id` 显式提供，
+//! 未提供则引擎拒绝对话（fail-loud，见 `resolve_model`）。标签固定为 `fast`，
+//! 配置未知标签会加载报错（`deny_unknown_fields`），避免死配置。
 //!
 //! # 配置示例
 //! ```toml
-//! [models.default]
+//! [models.fast]
 //! model = "deepseek/deepseek-v4-flash"
 //! thinking_type = "Enabled"
 //! reasoning_effort = "high"
-//!
-//! [models.fast]
-//! model = "deepseek/deepseek-v4-flash"
 //! ```
 
 use crate::provider::ThinkingType;
@@ -29,8 +27,8 @@ use serde::Deserialize;
 /// 对应 `fuyao.toml` 中 `[models.{tag}]` 子段，按用途标签配置一个模型引用。
 /// 承载模型 ID + 思考运行参数（思考开关 / 思考强度档位）。
 ///
-/// default 与 fast 同结构——任何标签都支持全部字段，新增标签无需适配。
-/// 三字段均可选：缺省即 None，请求体不发对应字段，走模型自身默认行为。
+/// 标签无关——任何 `[models.{tag}]` 子段都用此结构，三字段均可选：
+/// 缺省即 None，请求体不发对应字段，走模型自身默认行为。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ModelRef {
@@ -46,17 +44,15 @@ pub struct ModelRef {
 
 /// 多模型选择（固定标签）
 ///
-/// 对应 `fuyao.toml` 中 `[models]` 段。标签固定为 `default` / `fast`，
-/// 配置未知标签会加载报错（`deny_unknown_fields`），避免配了不生效的死配置。
+/// 对应 `fuyao.toml` 中 `[models]` 段。标签固定为 `fast`，配置未知标签会加载报错
+/// （`deny_unknown_fields`），避免配了不生效的死配置。
 ///
-/// 加新标签时在此结构体加 `Option<ModelRef>` 字段，TOML 格式不变。
+/// 主对话模型不在配置内——创建会话时由 `ModelConfig.model_id` 显式指定，
+/// 引擎不提供任何隐式兜底。加新标签时在此结构体加 `Option<ModelRef>` 字段，TOML 格式不变。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelSelection {
-    /// 默认模型（主对话）。未显式指定 model_id 时使用
-    pub default: Option<ModelRef>,
-
-    /// 轻量任务模型（标题生成、压缩总结等）。不可用时回退 `default`
+    /// 轻量任务模型（标题生成、压缩总结等）。可选，未配置时轻量任务回退到当前会话模型
     pub fast: Option<ModelRef>,
 }
 
@@ -71,19 +67,15 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_default_is_all_none() {
+    fn model_selection_default_is_fast_none() {
         let s = ModelSelection::default();
-        assert!(s.default.is_none());
         assert!(s.fast.is_none());
     }
 
-    /// [models.default] / [models.fast] 反序列化
+    /// [models.fast] 反序列化
     #[test]
     fn model_selection_deserialize() {
         let toml_str = r#"
-[models.default]
-model = "deepseek/deepseek-v4-flash"
-
 [models.fast]
 model = "deepseek/deepseek-v4-flash"
 "#;
@@ -92,10 +84,6 @@ model = "deepseek/deepseek-v4-flash"
             models: ModelSelection,
         }
         let w: Wrapper = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            w.models.default.unwrap().model,
-            "deepseek/deepseek-v4-flash"
-        );
         assert_eq!(w.models.fast.unwrap().model, "deepseek/deepseek-v4-flash");
     }
 
@@ -103,7 +91,7 @@ model = "deepseek/deepseek-v4-flash"
     #[test]
     fn model_ref_deserialize_thinking_fields() {
         let toml_str = r#"
-[models.default]
+[models.fast]
 model = "deepseek/deepseek-v4-flash"
 thinking_type = "Enabled"
 reasoning_effort = "high"
@@ -113,10 +101,10 @@ reasoning_effort = "high"
             models: ModelSelection,
         }
         let w: Wrapper = toml::from_str(toml_str).unwrap();
-        let default = w.models.default.unwrap();
-        assert_eq!(default.model, "deepseek/deepseek-v4-flash");
-        assert_eq!(default.thinking_type, Some(ThinkingType::Enabled));
-        assert_eq!(default.reasoning_effort.as_deref(), Some("high"));
+        let fast = w.models.fast.unwrap();
+        assert_eq!(fast.model, "deepseek/deepseek-v4-flash");
+        assert_eq!(fast.thinking_type, Some(ThinkingType::Enabled));
+        assert_eq!(fast.reasoning_effort.as_deref(), Some("high"));
     }
 
     /// thinking 字段缺省 → None（不强制配置）
@@ -125,22 +113,6 @@ reasoning_effort = "high"
         let r = ModelRef::default();
         assert!(r.thinking_type.is_none());
         assert!(r.reasoning_effort.is_none());
-    }
-
-    /// 只配 default，fast 缺失 → fast 为 None
-    #[test]
-    fn model_selection_deserialize_partial() {
-        let toml_str = r#"
-[models.default]
-model = "deepseek/deepseek-v4-flash"
-"#;
-        #[derive(Deserialize)]
-        struct Wrapper {
-            models: ModelSelection,
-        }
-        let w: Wrapper = toml::from_str(toml_str).unwrap();
-        assert!(w.models.default.is_some());
-        assert!(w.models.fast.is_none());
     }
 
     /// 未知标签报错（deny_unknown_fields）
@@ -158,5 +130,27 @@ model = "deepseek/deepseek-v4-flash"
         }
         let result: Result<Wrapper, _> = toml::from_str(toml_str);
         assert!(result.is_err());
+    }
+
+    /// `[models.default]` 被拒绝——主对话模型不在配置内，由 ModelConfig.model_id 显式指定
+    ///
+    /// 该标签曾用于配置全局兜底模型，现已移除；保留此断言作为回归保护，
+    /// 防止旧配置文件带 `[models.default]` 段时被静默吞掉（应加载失败让用户感知）。
+    #[test]
+    fn model_selection_rejects_default_tag() {
+        let toml_str = r#"
+[models.default]
+model = "deepseek/deepseek-v4-flash"
+"#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[expect(dead_code)]
+            models: ModelSelection,
+        }
+        let result: Result<Wrapper, _> = toml::from_str(toml_str);
+        assert!(
+            result.is_err(),
+            "[models.default] 应被 deny_unknown_fields 拒绝"
+        );
     }
 }

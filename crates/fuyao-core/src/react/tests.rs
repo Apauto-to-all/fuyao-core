@@ -249,13 +249,13 @@ fn echo_registry() -> Arc<ToolRegistry> {
 
 /// 测试用 ModelConfig：携带 `test/...` 形式的 model_id
 ///
-/// 必须带 model_id——否则 turn.rs::resolve_model 在 None + 无 [models.default] 时
-/// 返回 Err，走配置错误分支结束 turn，测试 ReAct 行为就跑不起来。所有测试的
+/// 必须带 model_id——model_id 为空时 turn.rs::resolve_model 返回 Err，
+/// 走配置错误分支结束 turn，测试 ReAct 行为就跑不起来。所有测试的
 /// ProviderRegistry 都用 `with_instance("test", ...)` 构造，model_id 拆出的
 /// provider_id = "test" 能匹配到。
 fn test_params() -> fuyao_api::ModelConfig {
     fuyao_api::ModelConfig {
-        model_id: Some("test/test-model".to_string()),
+        model_id: "test/test-model".to_string(),
         thinking_type: None,
         reasoning_effort: None,
     }
@@ -1626,7 +1626,7 @@ async fn cost_accumulated_per_assistant_message() {
 
     // 用带 model_id 的 model_config，让累积逻辑能查到价格表
     let mut params = test_params();
-    params.model_id = Some("test/cost-model".to_string());
+    params.model_id = "test/cost-model".to_string();
 
     turn::run_turn(&h.ctx, &mut h.rx_interrupt, &mut h.rx_control, params).await;
 

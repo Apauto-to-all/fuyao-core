@@ -156,7 +156,6 @@ mod tests {
     #[test]
     fn fuyao_config_default_subsections_match_their_defaults() {
         let c = FuyaoConfig::default();
-        assert!(c.models.default.is_none());
         assert!(c.models.fast.is_none());
         assert!(c.providers.is_empty());
         assert!(c.mcp_servers.is_empty());

@@ -9,7 +9,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use fuyao_api::{ChildSessionSource, InputEvent, OutputEvent, SessionParams, SubagentOps};
+use fuyao_api::{AgentConfig, ChildSessionSource, InputEvent, OutputEvent, SubagentOps};
 use tokio::sync::mpsc;
 
 use super::Engine;
@@ -19,7 +19,7 @@ impl SubagentOps for Engine {
         &'a self,
         parent_session_id: &'a str,
         source: ChildSessionSource,
-        params: SessionParams,
+        child_agent_config: AgentConfig,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<(String, mpsc::UnboundedReceiver<OutputEvent>), String>>
@@ -31,7 +31,7 @@ impl SubagentOps for Engine {
         // Engine::create_child_session 收 &SessionId；两层接口对齐时改其中之一可省此分配）
         let parent_id = parent_session_id.to_string();
         Box::pin(async move {
-            Engine::create_child_session(self, &parent_id, source, params)
+            Engine::create_child_session(self, &parent_id, source, child_agent_config)
                 .await
                 .map_err(|e| e.to_string())
         })

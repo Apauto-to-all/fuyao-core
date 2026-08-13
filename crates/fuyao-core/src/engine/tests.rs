@@ -10,7 +10,9 @@
 //! （会 spawn 一个 idle session task，测试末尾用 end_session 收尾拆除）。
 
 use super::*;
-use fuyao_api::{AgentPaths, EngineParams, Message, Session, SessionParams};
+use fuyao_api::{
+    AgentConfig, AgentPaths, EngineParams, Message, ModelConfig, Session, SessionParams,
+};
 use fuyao_hooks::PluginHost;
 use fuyao_provider::ProviderRegistry;
 
@@ -138,13 +140,25 @@ async fn build_forked_session_missing_source_returns_not_found() {
 async fn create_child_session_fresh_sets_parent() {
     // create_child_session 的 Fresh 模式：空上下文，parent 标记为父 id
     let (engine, _dir) = make_engine().await;
-    let parent_id = "parent-main".to_string();
+    // 先建父 session：create_child_session 从父继承 model_config，父必须在调度表
+    let parent_id = engine
+        .create_session(SessionParams {
+            agent_config: AgentConfig::default(),
+            model_config: ModelConfig {
+                model_id: "test/model".to_string(),
+                thinking_type: None,
+                reasoning_effort: None,
+            },
+        })
+        .await
+        .unwrap()
+        .0;
 
     let (child_id, _rx) = engine
         .create_child_session(
             &parent_id,
             ChildSessionSource::Fresh,
-            SessionParams::default(),
+            AgentConfig::default(),
         )
         .await
         .unwrap();

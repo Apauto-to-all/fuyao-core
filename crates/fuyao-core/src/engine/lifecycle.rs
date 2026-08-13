@@ -15,6 +15,7 @@
 
 use super::*;
 use crate::emit::Emitter;
+use fuyao_api::AgentConfig;
 
 impl Engine {
     /// 创建对话（动作二）
@@ -198,8 +199,9 @@ impl Engine {
     /// - [`Fork`](ChildSessionSource::Fork)：复制某源 session 的可见消息 + `system_prompt`
     ///   （复用 [`fork_session`](Self::fork_session) 的拷贝逻辑）
     ///
-    /// # SessionParams 处理
-    /// 由调用方提供 `SessionParams`（`agent_config` + `model_config`），整体贯穿到 `SessionCtx`。
+    /// # 参数处理
+    /// 调用方只提供子代理的 `agent_config`（definition）；`model_config` 由引擎从父 session
+    /// 继承——子代理复用父模型，无需调用方重复指定。整体贯穿到 `SessionCtx`。
     /// Fresh 模式用 `agent_config` 构建初始 `system_prompt`；Fork 模式不重建（直接复制源的），
     /// `agent_config` 仅在子任务 session 后续压缩时参与重建。
     ///
@@ -210,14 +212,31 @@ impl Engine {
     /// - fire-and-forget 后台任务：spawn 独立 task 消费 rx（写日志 / 丢弃均可——事件已落库）
     ///
     /// # 错误
-    /// - [`EngineError::SessionNotFound`]：`Fork` 模式的源 session id 在数据库中不存在
+    /// - [`EngineError::SessionNotFound`]：父 session 不在调度表（未创建 / 已结束），或 `Fork` 模式的源 session id 在数据库中不存在
     /// - [`EngineError::Storage`]：落库失败
     pub async fn create_child_session(
         &self,
         parent_session_id: &SessionId,
         source: ChildSessionSource,
-        params: SessionParams,
+        child_agent_config: AgentConfig,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
+        // 子会话复用父会话的 model_config（子代理用父模型）；agent_config 用子代理自己的 definition。
+        // 从父 session 调度表读 model_config——父派生子代理时一定活跃（正跑 turn）。
+        // sessions 锁在 block 内先 drop，再 await session_params 锁，避免持锁跨 await（铁律）。
+        let model_config = {
+            let parent_params = {
+                let sessions = self.sessions.lock().await;
+                sessions
+                    .get(parent_session_id)
+                    .map(|h| Arc::clone(&h.session_params))
+                    .ok_or_else(|| EngineError::SessionNotFound(parent_session_id.clone()))?
+            };
+            parent_params.lock().await.model_config.clone()
+        };
+        let params = SessionParams {
+            agent_config: child_agent_config,
+            model_config,
+        };
         // 子任务 session 固定 Subagent 用途（parent_session_id = Some），definition 加载一次
         // 供 Fresh 模式构建系统提示词 + assemble per-session 工具过滤复用
         let usage = fuyao_prompt::PromptUsage::Subagent;
