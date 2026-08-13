@@ -316,7 +316,7 @@ async fn handle_final_reply(ctx: &SessionCtx, result: &StreamResult, model_confi
                 msg.model_id = Some(model_id.to_string());
                 msg.finish_reason = Some("stop".to_string());
                 // 填 token + cost（拦截不改 usage）——统一调 session 模块
-                fuyao_session::fill_message_cost(&mut msg, &usage, Some(model_id), &agent_paths);
+                fuyao_session::fill_message_cost(&mut msg, &usage, model_id, &agent_paths);
                 Some(msg)
             }
             _ => None,
@@ -523,7 +523,7 @@ async fn handle_tool_calls(
                 msg.model_id = Some(model_id.to_string());
                 msg.finish_reason = Some("tool_calls".to_string());
                 // 填 token + cost（拦截不改 usage）——统一调 session 模块
-                fuyao_session::fill_message_cost(&mut msg, &usage, Some(model_id), &agent_paths);
+                fuyao_session::fill_message_cost(&mut msg, &usage, model_id, &agent_paths);
                 Some(msg)
             }
             _ => None,

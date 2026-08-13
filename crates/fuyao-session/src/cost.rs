@@ -152,7 +152,8 @@ pub fn calculate_cost(
 /// 由 emit_to_history 闭包调用——闭包构造 Message 时一步完成"填 token + 算 cost"。
 /// 拦截不改 usage（token 是模型给的客观值），计费用原始 result.usage。
 ///
-/// model_id 缺失（理论不应发生）时跳过 cost 计算只填 token——不会污染 session 总计。
+/// model_id 必填（会话级 ModelConfig.model_id 已是 String，跑 turn 时经 resolve_model
+/// 校验非空），故本函数收到的 model_id 恒非空——不再有「缺失跳过」的分支。
 ///
 /// 注：`msg.cost` 字段是 f64（DB schema 决定），Decimal → f64 转换在这一步发生。
 /// session 总计的累积由 `insert_message` 事务内 SQL 原子自增完成（DB 唯一数据源）；
@@ -160,7 +161,7 @@ pub fn calculate_cost(
 pub fn fill_message_cost(
     msg: &mut Message,
     usage: &StreamUsage,
-    model_id: Option<&str>,
+    model_id: &str,
     agent_paths: &AgentPaths,
 ) {
     // 1. 填 token 字段（整数，无精度问题）
@@ -170,17 +171,15 @@ pub fn fill_message_cost(
     msg.cached_tokens = usage.prompt_cached_tokens.unwrap_or(0) as i64;
 
     // 2. 算 cost 并填进 msg.cost（Decimal 精确算，落 f64 时损失在所难免——DB schema 决定）
-    if let Some(mid) = model_id {
-        let cost = calculate_cost(
-            mid,
-            msg.prompt_tokens,
-            msg.completion_tokens,
-            msg.reasoning_tokens,
-            msg.cached_tokens,
-            agent_paths,
-        );
-        msg.cost = cost.to_f64().unwrap_or(0.0);
-    }
+    let cost = calculate_cost(
+        model_id,
+        msg.prompt_tokens,
+        msg.completion_tokens,
+        msg.reasoning_tokens,
+        msg.cached_tokens,
+        agent_paths,
+    );
+    msg.cost = cost.to_f64().unwrap_or(0.0);
 }
 
 #[cfg(test)]

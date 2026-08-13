@@ -153,7 +153,7 @@ fn fill_message_cost_sets_tokens_and_cost() {
         completion_reasoning_tokens: Some(0),
         prompt_cached_tokens: Some(0),
     };
-    fill_message_cost(&mut msg, &usage, Some(&reg.full_id), &reg.paths);
+    fill_message_cost(&mut msg, &usage, &reg.full_id, &reg.paths);
 
     // token 字段已填
     assert_eq!(msg.prompt_tokens, 1000);
@@ -164,26 +164,4 @@ fn fill_message_cost_sets_tokens_and_cost() {
     assert!(msg.cost > 0.0, "cost 应非零");
     assert!((msg.cost - 0.008).abs() < 0.0001);
     cleanup(&reg.paths);
-}
-
-#[test]
-fn fill_message_cost_skips_when_model_id_missing() {
-    // model_id 为 None 时跳过 cost 计算（只填 token，不污染 cost）
-    let paths = unique_paths("fill_none");
-    let mut msg = Message::assistant(Some("resp".to_string()));
-
-    let usage = StreamUsage {
-        prompt_tokens: 1000,
-        completion_tokens: 500,
-        total_tokens: 1500,
-        completion_reasoning_tokens: None,
-        prompt_cached_tokens: None,
-    };
-    fill_message_cost(&mut msg, &usage, None, &paths);
-
-    // token 已填，cost 保持默认 0
-    assert_eq!(msg.prompt_tokens, 1000);
-    assert_eq!(msg.completion_tokens, 500);
-    assert_eq!(msg.cost, 0.0, "model_id 缺失时不应计算 cost");
-    cleanup(&paths);
 }
