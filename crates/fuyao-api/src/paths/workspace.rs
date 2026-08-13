@@ -30,12 +30,15 @@ pub fn get_workspace_agents_dir(workspace: &Path) -> PathBuf {
 /// - `"agent-id"` → 默认行为：
 ///     1. 优先使用已存在的 Agent 目录（工作目录 > 全局）
 ///     2. 都不存在时，返回全局层（Agent 是全局概念）
+///
+/// 前缀比较大小写不敏感——`"Global/..."`、`"GLOBAL/..."` 与 `"global/..."` 等价，
+/// 使上游直接用来源枚举的序列化值（PascalCase）作前缀时无需额外大小写转换。
 pub fn get_agent_root(agent_id: &str, workspace: Option<&Path>) -> PathBuf {
     if let Some((prefix, name)) = agent_id.split_once('/') {
-        if prefix == "global" {
+        if prefix.eq_ignore_ascii_case("global") {
             return get_fuyao_agents_dir().join(name);
         }
-        if prefix == "workspace"
+        if prefix.eq_ignore_ascii_case("workspace")
             && let Some(ws) = workspace
         {
             return get_workspace_agents_dir(ws).join(name);
@@ -77,6 +80,21 @@ mod tests {
         assert!(root.to_string_lossy().contains(".fuyao"));
         assert!(root.to_string_lossy().contains("fuyao-agents"));
         assert!(root.to_string_lossy().ends_with("coder"));
+    }
+
+    #[test]
+    fn get_agent_root_前缀大小写不敏感() {
+        // PascalCase 前缀（与 Source 枚举序列化值同形）应与小写前缀等价命中层定位，
+        // 上游无需为大小写做额外转换
+        let root_global = get_agent_root("Global/coder", None);
+        assert!(root_global.to_string_lossy().contains("fuyao-agents"));
+        assert!(root_global.to_string_lossy().ends_with("coder"));
+
+        let ws = PathBuf::from("/tmp/project");
+        let root_ws = get_agent_root("Workspace/coder", Some(&ws));
+        assert!(root_ws.to_string_lossy().contains(".fuyao"));
+        assert!(root_ws.to_string_lossy().contains("fuyao-agents"));
+        assert!(root_ws.to_string_lossy().ends_with("coder"));
     }
 
     #[test]
