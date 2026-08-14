@@ -24,4 +24,9 @@ pub enum ConfigError {
     /// `name` 非字符串；模型条目缺 `limit.context` 或值非法）
     #[error("模型配置无效: {0}")]
     InvalidModel(String),
+
+    /// `providers` 段结构错误（顶层键存在但值不是 table，
+    /// 如误写 `providers = "deepseek"`、`providers = 123`、`providers = ["a"]`）
+    #[error("供应商配置段无效: {0}")]
+    InvalidProvidersSection(String),
 }

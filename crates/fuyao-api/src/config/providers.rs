@@ -11,6 +11,9 @@
 //!   `name` 非字符串）同样直接判为配置错误（fail-loud），错误信息带
 //!   `provider_id/model_id` 定位——残缺条目静默消失会让写坏的配置无声丢失，
 //!   与必填校验在同一处解析，语义保持一致：一律在加载期拦下。
+//! - 段级结构校验：顶层 `providers` 段本身必须是 table——键存在但写成标量 /
+//!   数组（如 `providers = "deepseek"`）直接判为配置错误（fail-loud），错误信息
+//!   指明实际值的类型；顶层完全没有 `providers` 键是合法状态（未配置任何供应商）。
 //!
 //! 配置文件结构示例：
 //! ```toml
@@ -315,16 +318,41 @@ fn parse_provider(provider_id: &str, provider_data: &toml::Value) -> Result<Prov
     })
 }
 
+/// 给出 TOML 值的中文类型描述，供结构错误信息指明实际写出的类型
+///
+/// 穷举全部变体：TOML 值类型集合变化时此处强制同步补齐中文名。
+fn toml_type_desc(value: &toml::Value) -> &'static str {
+    match value {
+        toml::Value::String(_) => "字符串",
+        toml::Value::Integer(_) => "整数",
+        toml::Value::Float(_) => "浮点数",
+        toml::Value::Boolean(_) => "布尔值",
+        toml::Value::Datetime(_) => "日期时间",
+        toml::Value::Array(_) => "数组",
+        toml::Value::Table(_) => "table",
+    }
+}
+
 /// 加载 Provider 配置
 ///
-/// 必填校验语义见模块注释：Provider / Model 条目残缺（非 table、缺 `name`、
-/// `name` 非字符串）或模型 `limit.context` 缺失 / 非正整数均返回
-/// [`ConfigError::InvalidModel`]（带 `provider_id/model_id` 定位），整个加载失败。
+/// 校验语义见模块注释：`providers` 段非 table 返回
+/// [`ConfigError::InvalidProvidersSection`]（指明实际类型）；Provider / Model
+/// 条目残缺（非 table、缺 `name`、`name` 非字符串）或模型 `limit.context`
+/// 缺失 / 非正整数返回 [`ConfigError::InvalidModel`]（带 `provider_id/model_id`
+/// 定位）——均使整个加载失败。
 pub fn load_providers(
     providers_data: &toml::Value,
 ) -> Result<HashMap<String, Provider>, ConfigError> {
-    let empty_table = toml::Table::new();
-    let table = providers_data.as_table().unwrap_or(&empty_table);
+    // providers 段必须是 table：键存在但写成标量 / 数组属于结构写错，判为配置
+    // 错误（fail-loud）——按空表放行会让结构错误伪装成「未配置任何供应商」，
+    // 把排查方向带偏到 API Key 上
+    let table = providers_data.as_table().ok_or_else(|| {
+        ConfigError::InvalidProvidersSection(format!(
+            "providers 段不是 table（实际为{}）：\
+             必须以 [providers.<id>] 表形式声明供应商",
+            toml_type_desc(providers_data)
+        ))
+    })?;
 
     let mut valid_providers = HashMap::new();
     for (provider_id, provider_data) in table {
@@ -835,5 +863,31 @@ mod tests {
             msg.contains("不是 table"),
             "错误信息应指出条目非 table：{msg}"
         );
+    }
+
+    // ===== providers 段级结构校验 =====
+
+    #[test]
+    fn non_table_providers_section_fails_with_actual_type() {
+        // 顶层 providers 键存在但值不是 table（字符串 / 整数 / 数组）：判为配置
+        // 错误，错误信息指明实际类型与 table 要求
+        for (toml_snippet, type_desc) in [
+            (r#"providers = "deepseek""#, "字符串"),
+            ("providers = 123", "整数"),
+            (r#"providers = ["a"]"#, "数组"),
+        ] {
+            let value: toml::Value = toml::from_str(toml_snippet).unwrap();
+            let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::InvalidProvidersSection(_)),
+                "应为段级结构错误变体：{err}"
+            );
+            let msg = err.to_string();
+            assert!(msg.contains("table"), "错误信息应指向 table：{msg}");
+            assert!(
+                msg.contains(type_desc),
+                "错误信息应含实际类型（{type_desc}）：{msg}"
+            );
+        }
     }
 }

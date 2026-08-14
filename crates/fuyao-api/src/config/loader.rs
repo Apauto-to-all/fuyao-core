@@ -90,7 +90,8 @@ pub fn load_merged_config(
     }
 
     // providers 单独走解析（serde 不支持 TOML 整数→f64 价格转换）；
-    // 模型 limit.context 缺失 / 非正整数在此判为配置错误，整体加载失败（fail-loud）
+    // providers 段非 table、模型 limit.context 缺失 / 非正整数在此判为配置错误，
+    // 整体加载失败（fail-loud）；顶层没有 providers 键是合法状态，得到空表
     let providers = merged_table
         .remove("providers")
         .map(|v| load_providers(&v))
@@ -336,6 +337,25 @@ name = "qwen3.6-plus"
             msg.contains("limit.context"),
             "错误信息应指向 limit.context：{msg}"
         );
+
+        let _ = std::fs::remove_file(&workspace);
+    }
+
+    /// 顶层没有 providers 键：合法状态（未配置任何供应商），加载成功且为空表
+    #[test]
+    fn absent_providers_key_loads_empty_providers() {
+        let workspace = temp_config_path(
+            "no_providers",
+            r#"
+[llm]
+request_timeout_secs = 100
+"#,
+        );
+
+        let cfg = load_merged_config(None, None, Some(&workspace))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.providers.is_empty());
 
         let _ = std::fs::remove_file(&workspace);
     }
