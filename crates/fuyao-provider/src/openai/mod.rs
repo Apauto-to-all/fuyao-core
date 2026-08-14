@@ -34,13 +34,28 @@ use std::time::Duration;
 pub struct OpenAIProvider {
     /// HTTP 客户端（复用连接池）
     client: Client,
-    /// API 密钥
-    api_key: String,
-    /// API 基础 URL（如 <https://api.openai.com/v1>）
-    base_url: String,
+    /// chat completions 完整请求 URL（构造时定形，Provider 生命周期内不变）
+    chat_url: String,
+    /// 预拼装的 Bearer 鉴权头值（构造时定形，避免每请求重复分配）
+    auth_header: String,
 }
 
 impl OpenAIProvider {
+    /// 构造不变的请求要素：完整 URL 与鉴权头值
+    ///
+    /// 两者只依赖 api_key / base_url，在 Provider 生命周期内不变，
+    /// 构造时一次算好，每次请求直接复用。
+    fn build_request_parts(api_key: &str, base_url: &str) -> (String, String) {
+        let base = base_url.trim_end_matches('/');
+        // 如果 base_url 已包含 /chat/completions 则直接使用
+        let chat_url = if base.ends_with("/chat/completions") {
+            base.to_string()
+        } else {
+            format!("{base}/chat/completions")
+        };
+        (chat_url, format!("Bearer {api_key}"))
+    }
+
     /// 从 provider_id 和 agent_paths 创建
     ///
     /// 从注册表解析 api_key 和 base_url，构建 reqwest Client。
@@ -69,29 +84,22 @@ impl OpenAIProvider {
             }
         };
 
+        let (chat_url, auth_header) = Self::build_request_parts(&api_key, &base_url);
         Some(Self {
             client,
-            api_key,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            chat_url,
+            auth_header,
         })
     }
 
     /// 从已有配置创建（用于测试）
     pub fn from_parts(api_key: String, base_url: String, client: Client) -> Self {
+        let (chat_url, auth_header) = Self::build_request_parts(&api_key, &base_url);
         Self {
             client,
-            api_key,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            chat_url,
+            auth_header,
         }
-    }
-
-    /// 构建 chat completions 请求 URL
-    fn chat_url(&self) -> String {
-        // 如果 base_url 已包含 /chat/completions 则直接使用
-        if self.base_url.ends_with("/chat/completions") {
-            return self.base_url.clone();
-        }
-        format!("{}/chat/completions", self.base_url)
     }
 
     /// 构造已带 url + auth + content-type 的 POST 请求构建器（未发送）
@@ -102,8 +110,8 @@ impl OpenAIProvider {
     /// yield 持有 `&self`（这正是 stream_chat 不能直接调 `&self` 异步方法的原因）。
     fn post_builder(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
         self.client
-            .post(self.chat_url())
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .post(&self.chat_url)
+            .header("Authorization", self.auth_header.as_str())
             .header("Content-Type", "application/json")
             .json(body)
     }
@@ -278,7 +286,7 @@ impl Provider for OpenAIProvider {
     }
 }
 
-// chat_url 等保留在 adapter 上的纯字符串操作；其余职责的测试见各子模块
+// URL / 鉴权头预计算等保留在 adapter 上的纯字符串操作；其余职责的测试见各子模块
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +295,7 @@ mod tests {
     fn chat_url_appends_path() {
         let provider = test_provider_with_base("https://api.test.com/v1");
         assert_eq!(
-            provider.chat_url(),
+            provider.chat_url,
             "https://api.test.com/v1/chat/completions"
         );
     }
@@ -296,7 +304,7 @@ mod tests {
     fn chat_url_preserves_full_path() {
         let provider = test_provider_with_base("https://api.test.com/v1/chat/completions");
         assert_eq!(
-            provider.chat_url(),
+            provider.chat_url,
             "https://api.test.com/v1/chat/completions"
         );
     }
@@ -305,9 +313,15 @@ mod tests {
     fn chat_url_strips_trailing_slash() {
         let provider = test_provider_with_base("https://api.test.com/v1/");
         assert_eq!(
-            provider.chat_url(),
+            provider.chat_url,
             "https://api.test.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn auth_header_prebuilt() {
+        let provider = test_provider_with_base("https://api.test.com/v1");
+        assert_eq!(provider.auth_header, "Bearer test-key");
     }
 
     fn test_provider_with_base(base_url: &str) -> OpenAIProvider {

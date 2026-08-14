@@ -130,7 +130,7 @@ impl StreamAggregator {
                 })
             })
             .collect();
-        calls.sort_by_key(|c| c.id.clone());
+        calls.sort_by(|a, b| a.id.cmp(&b.id));
         calls
     }
 
@@ -150,7 +150,7 @@ impl StreamAggregator {
                 })
             })
             .collect();
-        calls.sort_by_key(|c| c.id.clone());
+        calls.sort_by(|a, b| a.id.cmp(&b.id));
         calls
     }
 
