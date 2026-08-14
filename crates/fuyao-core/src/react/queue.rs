@@ -47,19 +47,13 @@ pub(crate) fn drain_pending_to_guide(guide: &SharedQueue, pending: &SharedQueue)
 ///
 /// Block 时：该消息不落库、不发（插件的责任，与 assistant Block 语义一致）。
 ///
-/// **图片降级决策在落库入口**：消费时按 session 模型能力判断一次——
-/// 模型不支持图像输入则图不落库、content 附加占位文本。此后所有读库路径
-/// （主对话请求 / 上下文压缩 / 标题生成）看到的都是降级后的形态，全链路一致。
+/// **图片忠实落库**：带图消息不做任何模型能力判断——图片经入站节流（超限压缩、
+/// 失败省略）后随消息原样落库、原样发送。不支持图片输入的模型由 provider 返回
+/// 4xx 显式报错（fail-loud），引擎不擅自降级。
 pub(crate) async fn inject_messages(ctx: &SessionCtx, msgs: Vec<OutputUserMessage>) {
-    // 会话模型配置（现读快照）+ 图片能力判定
-    let supports_images = {
-        let params = ctx.session_params.lock().await;
-        super::builders::model_supports_images(&params.model_config, &ctx.agent_paths)
-    };
-
     for m in msgs {
         // 入站节流（CPU 密集：base64 解码 + 图像编解码）放阻塞线程池，避免占用 async worker
-        let (kept, failed) = if m.payload.images.is_empty() || !supports_images {
+        let (kept, failed) = if m.payload.images.is_empty() {
             (Vec::new(), 0usize)
         } else {
             let imgs = m.payload.images.clone();
@@ -86,14 +80,11 @@ pub(crate) async fn inject_messages(ctx: &SessionCtx, msgs: Vec<OutputUserMessag
             &ctx.hooks,
             ctx.store.as_ref(),
             event,
-            move |ev| user_msg_from_event(ev, supports_images, kept, failed),
+            move |ev| user_msg_from_event(ev, kept, failed),
         )
         .await;
     }
 }
-
-/// 模型不支持图像输入时的占位文本（可见于对话，告知用户图片未发送的原因）
-const IMAGE_OMITTED_PLACEHOLDER: &str = "[图片已省略：当前模型不支持图像输入]";
 
 /// 图片入站节流失败时的占位文本（解码失败 / 压缩后仍超限）
 const IMAGE_PROCESS_FAILED_PLACEHOLDER: &str = "[图片已省略：图片处理失败]";
@@ -101,13 +92,10 @@ const IMAGE_PROCESS_FAILED_PLACEHOLDER: &str = "[图片已省略：图片处理�
 /// 从 User 输出事件构造 Message（emit_to_history 闭包）
 ///
 /// 拦截后的 content 用于构造 Message——保证「拦截 → 存储 → 发送」三者一致。
-/// 带图消息按模型能力分流：
-/// - 不支持 → 图丢弃、content 附加占位文本并告警（对话连续性优先，整体不失败）
-/// - 支持 → 图已在 [`inject_messages`] 经阻塞池节流得到 `kept`（达标图）与 `failed`
-///   （失败计数），失败图替换为占位文本，不拖累其余图
+/// 带图消息：图已在 [`inject_messages`] 经阻塞池节流得到 `kept`（达标图）与 `failed`
+/// （失败计数），失败图替换为占位文本，不拖累其余图；达标图随消息原样落库。
 fn user_msg_from_event(
     ev: &OutputEvent,
-    supports_images: bool,
     kept: Vec<ImageContent>,
     failed: usize,
 ) -> Option<Message> {
@@ -117,19 +105,7 @@ fn user_msg_from_event(
             if m.payload.images.is_empty() {
                 return Some(Message::user(m.payload.content.clone()));
             }
-            // 模型不支持图像输入：图不落库，content 附加占位文本
-            if !supports_images {
-                tracing::warn!(
-                    session_id = %m.base.session_id.as_deref().unwrap_or(""),
-                    image_count = m.payload.images.len(),
-                    "图片已省略：当前模型不支持图像输入"
-                );
-                return Some(Message::user(append_placeholder(
-                    &m.payload.content,
-                    IMAGE_OMITTED_PLACEHOLDER,
-                )));
-            }
-            // 模型支持：用阻塞池节流结果（kept 达标图 + failed 失败计数）
+            // 有图消息：节流失败计数 > 0 时附加占位文本（处理失败容错，非能力判断）
             if failed > 0 {
                 tracing::warn!(
                     session_id = %m.base.session_id.as_deref().unwrap_or(""),

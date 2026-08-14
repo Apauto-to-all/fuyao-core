@@ -134,7 +134,6 @@ pub(crate) async fn run_turn(
         ctx.is_child,
         &ctx.definition.tools,
         &ctx.agent_paths,
-        ctx.compression_config.fallback_context,
     ) {
         Ok(r) => r,
         Err(msg) => {
@@ -168,10 +167,12 @@ pub(crate) async fn run_turn(
     let options = resolved.options.clone();
 
     // 可见窗口的 keep_recent token 预算：按当前模型上下文比例算（与压缩侧同口径）
-    // context_length 已由 resolve_model 一并解析（resolved.context_length），无需散算
+    // context_length 已由 resolve_model 一并解析（resolved.context_length）；模型未注册
+    // 时为 None——保留预算按 0（仅影响已压缩会话的近期消息附带量），该模型的 LLM
+    // 调用自会在 provider 处失败，无需此处兜底
     let keep_tokens = ctx
         .compression_config
-        .effective_keep_tokens(resolved.context_length);
+        .effective_keep_tokens(resolved.context_length.unwrap_or(0));
 
     loop {
         // === 控制通道间隙检查点 ===
@@ -683,17 +684,16 @@ async fn emit_interrupt_and_complete_tool_results(
     // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
     // keep_tokens 与主对话同口径（effective_keep_tokens 按 context_length 算）。
     // 本路径在 run_turn 之外、无 resolved 在手：复用 resolve_context_length 纯函数，
-    // 传入 session 的 model_id（创建会话时已给定的非空值）。
+    // 传入 session 的 model_id（创建会话时已给定的非空值）；模型未注册时为 None，
+    // 保留预算按 0（与主对话同语义）。
     let context_length = {
         let p = ctx.session_params.lock().await;
         let model_id = p.model_config.model_id.as_str();
-        resolve_context_length(
-            model_id,
-            &ctx.agent_paths,
-            ctx.compression_config.fallback_context,
-        )
+        resolve_context_length(model_id, &ctx.agent_paths)
     };
-    let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
+    let keep_tokens = ctx
+        .compression_config
+        .effective_keep_tokens(context_length.unwrap_or(0));
     let answered: std::collections::HashSet<String> = match ctx
         .store
         .load_visible_messages(ctx.emitter.session_id(), keep_tokens)

@@ -19,4 +19,8 @@ pub enum ConfigError {
     /// 配置文件不存在
     #[error("配置文件不存在: {0}")]
     FileNotFound(String),
+
+    /// 配置内容校验失败（如模型条目缺 `limit.context`）
+    #[error("模型配置无效: {0}")]
+    InvalidModel(String),
 }

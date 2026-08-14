@@ -53,7 +53,6 @@ async fn resolve_compression_model(
         ctx.is_child,
         &ctx.definition.tools,
         &ctx.agent_paths,
-        ctx.compression_config.fallback_context,
     )
     .map_err(|msg| {
         tracing::warn!(
@@ -97,10 +96,21 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
         None => return,
     };
 
+    // 模型未注册 → 注册表查不到 limit.context，无从判定阈值——不编造数字，
+    // 跳过本次压缩判定（该模型的 turn 调用自会在 provider 处失败，不在压缩侧兜底）
+    let Some(context_length) = model.context_length else {
+        tracing::debug!(
+            session_id = ctx.emitter.session_id(),
+            model_id = %model.model_id,
+            "模型未注册，上下文长度未知，跳过压缩判定"
+        );
+        return;
+    };
+
     // 阈值检测：prompt_tokens >= threshold × (context_length - summary_max_tokens)
     let trigger = fuyao_session::should_compress(
         usage.prompt_tokens,
-        model.context_length,
+        context_length,
         &ctx.compression_config,
     );
     if !trigger {
@@ -169,11 +179,15 @@ async fn run_compression(
     model: &builders::ResolvedModel,
     provider: &std::sync::Arc<dyn fuyao_provider::Provider>,
 ) {
+    // 上下文长度未知（模型未注册）时按 0：仅影响 Started 事件展示值与 keep 预算，
+    // 摘要 LLM 调用会因模型不存在在 provider 处失败，不在压缩侧兜底
+    let context_length = model.context_length.unwrap_or(0);
+
     tracing::info!(
         session_id = ctx.emitter.session_id(),
         reason = ?reason,
         prompt_tokens = prompt_tokens,
-        context_length = model.context_length,
+        context_length = context_length,
         model_id = %model.model_id,
         "触发上下文压缩"
     );
@@ -187,7 +201,7 @@ async fn run_compression(
             payload: CompressionPayload::Started(CompressionStartedPayload {
                 reason,
                 prompt_tokens,
-                context_length: model.context_length,
+                context_length,
             }),
         }),
     )
@@ -195,9 +209,7 @@ async fn run_compression(
 
     // 从 DB 加载可见窗口：与主对话同口径（effective_keep_tokens 按 context_length 算），
     // 前缀缓存可复用。generate_summary 内部不切窗，把传入 messages 全量发给 LLM
-    let keep_tokens = ctx
-        .compression_config
-        .effective_keep_tokens(model.context_length);
+    let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
     let visible_messages = match ctx
         .store
         .load_visible_messages(ctx.emitter.session_id(), keep_tokens)

@@ -349,8 +349,8 @@ async fn make_harness_with_hooks(
 
 /// 同 make_harness_with_hooks，但可指定 agent_paths
 ///
-/// 全局模型缓存按 agent_paths 隔离——需要注册独立模型配置（如图片能力）的测试
-/// 用独立的 agent_id 键，避免污染/被污染其他并行测试的缓存。
+/// 全局模型缓存按 agent_paths 隔离——需要注册独立模型配置（如费用测试的
+/// 价格表）的测试用独立的 agent_id 键，避免污染/被污染其他并行测试的缓存。
 async fn make_harness_full(
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
@@ -1987,14 +1987,21 @@ async fn inject_messages_preserves_plugin_source_in_event() {
 }
 
 /// 构造带图输出用户消息
+///
+/// `data` 传裸 base64（小图，字节达标，节流原样保留）
 fn make_inbound_with_images(content: &str) -> OutputUserMessage {
+    make_inbound_with_image_data(content, "aGVsbG8=".to_string())
+}
+
+/// 构造带任意图数据的输出用户消息（超标 / 非法数据用，验证节流失败分支）
+fn make_inbound_with_image_data(content: &str, data: String) -> OutputUserMessage {
     OutputUserMessage {
         base: EventBase::default(),
         payload: OutputUserPayload {
             content: content.to_string(),
             images: vec![fuyao_api::ImageContent {
                 mime_type: "image/png".into(),
-                data: "aGVsbG8=".into(),
+                data,
             }],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
@@ -2003,89 +2010,58 @@ fn make_inbound_with_images(content: &str) -> OutputUserMessage {
 }
 
 #[tokio::test]
-async fn inject_images_omitted_when_model_unsupported() {
-    // 模型未声明图片能力（默认安全）：图不落库，content 附加占位文本告警
+async fn inject_images_persisted_faithfully() {
+    // 图片忠实落库：不做任何模型能力判断，图随消息完整落库、content 原样。
+    // harness 不注册任何模型（注册表为空）——落库路径不查模型注册表
     let provider = Arc::new(MockProvider::new(vec![]));
     let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     queue::inject_messages(&h.ctx, vec![make_inbound_with_images("看图")]).await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(visible.len(), 1);
-    assert!(visible[0].images.is_empty(), "不支持图时图片不应落库");
+    assert_eq!(visible[0].images.len(), 1, "图片应完整落库");
+    assert_eq!(visible[0].images[0].mime_type, "image/png");
+    assert_eq!(visible[0].images[0].data, "aGVsbG8=");
+    assert_eq!(visible[0].content.as_deref(), Some("看图"), "content 原样");
+}
+
+#[tokio::test]
+async fn inject_images_failed_processing_appends_placeholder() {
+    // 图片处理失败（超限且非法 base64，解码必败）：失败图省略，content 附加占位文本
+    // ——处理失败容错分支，与模型能力无关
+    let bad_image = "!!!not-base64!!!".repeat(1_000_000); // 约 16MB，远超 5MB 上限
+    let provider = Arc::new(MockProvider::new(vec![]));
+    let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    queue::inject_messages(
+        &h.ctx,
+        vec![make_inbound_with_image_data("看图", bad_image)],
+    )
+    .await;
+
+    let visible = visible_messages(&h).await;
+    assert_eq!(visible.len(), 1);
+    assert!(visible[0].images.is_empty(), "处理失败的图不应落库");
     let content = visible[0].content.as_deref().unwrap();
     assert!(content.starts_with("看图"), "文本应原样保留");
     assert!(
-        content.contains("[图片已省略"),
-        "content 应含图片省略占位文本，实际：{content}"
+        content.contains("[图片已省略：图片处理失败]"),
+        "content 应含处理失败占位文本，实际：{content}"
     );
 }
 
 #[tokio::test]
-async fn inject_images_empty_text_uses_placeholder_only() {
-    // 消息无文本只有图 + 模型不支持：content 就是占位文本本身
+async fn inject_images_failed_processing_empty_text_placeholder_only() {
+    // 无文本 + 处理失败：占位文本即全文
+    let bad_image = "!!!not-base64!!!".repeat(1_000_000);
     let provider = Arc::new(MockProvider::new(vec![]));
     let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    queue::inject_messages(&h.ctx, vec![make_inbound_with_images("")]).await;
+    queue::inject_messages(&h.ctx, vec![make_inbound_with_image_data("", bad_image)]).await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(
         visible[0].content.as_deref(),
-        Some("[图片已省略：当前模型不支持图像输入]")
+        Some("[图片已省略：图片处理失败]")
     );
-}
-
-#[tokio::test]
-async fn inject_images_persisted_when_model_supports() {
-    // 模型声明输入模态含 image：图随消息完整落库，content 原样
-    // 用独立 agent_id 的缓存键注册模型，避免污染默认键上其他并行测试
-    let paths = fuyao_api::AgentPaths {
-        agent_id: Some("test/images-support".into()),
-        workspace: None,
-        extra_dirs: vec![],
-        fuyao_home: std::env::temp_dir().join("fuyao_core_test_home"),
-    };
-    let model = fuyao_api::Model {
-        name: "test-model".into(),
-        cost: Default::default(),
-        limit: Default::default(),
-        reasoning_efforts: vec![],
-        modalities: fuyao_api::ModelModalities {
-            input: vec![
-                fuyao_api::InputModality::Text,
-                fuyao_api::InputModality::Image,
-            ],
-            output: vec![fuyao_api::OutputModality::Text],
-        },
-    };
-    let key = fuyao_provider::agent_paths_cache_key(&paths);
-    fuyao_provider::register_model("test/test-model", model, &key);
-
-    let provider = Arc::new(MockProvider::new(vec![]));
-    let h = make_harness_full(
-        provider,
-        Arc::new(ToolRegistry::builder().build()),
-        empty_hooks(),
-        paths.clone(),
-    )
-    .await;
-    queue::inject_messages(&h.ctx, vec![make_inbound_with_images("看图")]).await;
-
-    let visible = visible_messages(&h).await;
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].images.len(), 1, "支持图时图片应完整落库");
-    assert_eq!(visible[0].images[0].mime_type, "image/png");
-    assert_eq!(visible[0].images[0].data, "aGVsbG8=");
-    assert_eq!(visible[0].content.as_deref(), Some("看图"), "content 原样");
-    assert!(
-        !visible[0]
-            .content
-            .as_deref()
-            .unwrap()
-            .contains("[图片已省略")
-    );
-
-    // 清理独立缓存键（只影响本测试）
-    fuyao_provider::clear_cache(&paths);
 }
 
 /// 手动压缩：直接调 run_manual_compression，验证跳过阈值 + reason=manual + 复用执行流程
@@ -2100,8 +2076,9 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
         "压缩摘要",
     )]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门，fallback_context 仅影响
-    // CompressionStarted 事件里的 context_length 展示值，不影响压缩能否执行。
+    // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门——harness 未注册模型，
+    // context_length 解析为 None 仅影响 CompressionStarted 事件里的展示值与
+    // keep 预算，不影响压缩能否执行。
     preload_user(&h, "第一段对话内容").await;
     preload_user(&h, "第二段对话内容").await;
     preload_user(&h, "第三段对话内容").await;

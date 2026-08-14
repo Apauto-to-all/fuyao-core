@@ -16,7 +16,7 @@ use fuyao_api::message::output::{
     AssistantPayload, ToolCallMessage, ToolCallPayload, extract_id_name_pairs,
 };
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{AgentPaths, InputModality, MessageRole, ModelConfig};
+use fuyao_api::{AgentPaths, MessageRole, ModelConfig};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
 use fuyao_session::SessionStore;
 use std::collections::HashMap;
@@ -29,8 +29,8 @@ use std::collections::HashMap;
 /// 三者从 `ModelConfig.model_id` 拆分而来（model_id 必须非空，空值在 resolve_model 即报错）。
 ///
 /// `context_length` 一并解析进来——主对话 keep_tokens 预算、压缩阈值门、中断补发
-/// 三处消费点原本各自内联 `get_model(id).map(context).unwrap_or(fallback)` 片段，
-/// 收进本字段后调用方直接读 `resolved.context_length`，口径天然一致。
+/// 三处消费点共用一份解析（`None` 表示模型未注册、上下文长度未知），
+/// 调用方直接读 `resolved.context_length`，口径天然一致。
 #[derive(Debug)]
 pub(crate) struct ResolvedModel {
     /// 完整模型 ID（`"provider_id/model_id"` 形，写回 session / 落库 / 计费用）
@@ -41,10 +41,13 @@ pub(crate) struct ResolvedModel {
     pub model: String,
     /// 流式选项（思考参数取自 session 的 ModelConfig）
     pub options: StreamOptions,
-    /// 模型上下文长度（查 `model.limit.context`，查不到取 `fallback_context`）
+    /// 模型上下文长度（查注册表 `model.limit.context`，查不到为 `None`）
     ///
+    /// `None` 表示模型未注册（注册表无此条目）——不编造任何数字，由各消费点
+    /// 自行决定降级语义：keep_tokens 预算按 0、压缩判定直接跳过；
+    /// 该模型的 turn 调用自会在 provider 调用处失败，无需此处兜底。
     /// keep_tokens 预算、压缩阈值门等各消费点共用一份，避免散算漂移。
-    pub context_length: u32,
+    pub context_length: Option<u32>,
 }
 
 /// 从 DB 加载可见消息凑 ChatRequest
@@ -146,38 +149,18 @@ pub(crate) async fn build_chat_request(
     }
 }
 
-/// 查询模型是否支持图片输入（`modalities.input` 含 [`InputModality::Image`]）
+/// 解析模型上下文长度：查注册表 `model.limit.context`
 ///
-/// model_id 取自 `ModelConfig.model_id`（必填非空）。空 / 格式非法 / 配置缺失
-/// （模型未声明 modalities）一律按不支持处理（安全默认）。
-///
-/// 消费点：user 消息落库时做图片降级决策——模型不支持则图不落库、
-/// 以占位文本代替，后续所有读库路径（主对话 / 压缩 / 标题）自然一致。
-pub(crate) fn model_supports_images(model_config: &ModelConfig, agent_paths: &AgentPaths) -> bool {
-    let model_id = model_config.model_id.as_str();
-    fuyao_provider::get_model(model_id, agent_paths)
-        .map(|m| {
-            m.modalities
-                .input
-                .iter()
-                .any(|x| matches!(x, InputModality::Image))
-        })
-        .unwrap_or(false)
-}
-
-/// 解析模型上下文长度：查 `model.limit.context`，查不到取 `fallback`
-///
-/// 集中此片段，供 [`resolve_model`]（首轮解析）与压缩侧 / 中断补发侧等独立调用点共用，
-/// 避免 `get_model(id).map(context).unwrap_or(fallback)` 散在多处各自漂移。
+/// 集中此片段，供 [`resolve_model`]（首轮解析）与压缩侧 / 中断补发侧等独立调用点共用。
+/// 返回 `None` 表示模型未注册（注册表查不到该条目）——不编造任何数字，由调用方
+/// 决定降级语义（压缩判定跳过 / keep_tokens 预算按 0）。`context` 为 0 的条目
+/// 视同未声明（配置加载层已保证 toml 声明的 context 必为正整数，0 只可能来自
+/// 程序化注册的残缺条目），同样返回 `None`。
 /// `get_model` 查全局静态缓存（非 IO），本函数保持纯计算。
-pub(crate) fn resolve_context_length(
-    model_id: &str,
-    agent_paths: &AgentPaths,
-    fallback: u32,
-) -> u32 {
+pub(crate) fn resolve_context_length(model_id: &str, agent_paths: &AgentPaths) -> Option<u32> {
     fuyao_provider::get_model(model_id, agent_paths)
         .map(|m| m.limit.context)
-        .unwrap_or(fallback)
+        .filter(|context| *context > 0)
 }
 
 /// 从 ModelConfig 解析本轮模型信息
@@ -192,8 +175,8 @@ pub(crate) fn resolve_context_length(
 /// 结果进 `options`，调用方（turn.rs）据此写回 session 物化（见写回逻辑），保证
 /// DB 消息 / 费用 / 标题三处消费点都能读到实际生效值。
 ///
-/// `context_length` 一并由 [`resolve_context_length`] 算出填进返回值——调用方不再
-/// 各自内联该片段。传入 `fallback_context`（压缩配置里的 `fallback_context`）作兜底。
+/// `context_length` 一并由 [`resolve_context_length`] 算出填进返回值——模型未注册
+/// 时为 `None`（不编造数字，各消费点从返回值取同一份口径，无需自行解析）。
 ///
 /// 工具定义按 `is_child`（递归防护）+ `definition_tools`（定义层收窄）双重过滤后序列化，
 /// 两者取交集。
@@ -206,7 +189,6 @@ pub(crate) fn resolve_model(
     is_child: bool,
     definition_tools: &HashMap<String, bool>,
     agent_paths: &AgentPaths,
-    fallback_context: u32,
 ) -> Result<ResolvedModel, String> {
     // model_id 必须非空——空串视为未指定（引擎不提供隐式兜底模型，调用方必须显式给出）
     let model_id: &str = &model_config.model_id;
@@ -241,7 +223,7 @@ pub(crate) fn resolve_model(
     };
 
     // context_length 与主对话 keep_tokens 预算、压缩阈值门共用一份（集中此处解析）
-    let context_length = resolve_context_length(model_id, agent_paths, fallback_context);
+    let context_length = resolve_context_length(model_id, agent_paths);
 
     Ok(ResolvedModel {
         model_id: model_id.to_string(),
@@ -490,7 +472,6 @@ mod tests {
             false,
             &HashMap::new(),
             &AgentPaths::default(),
-            64000,
         )
         .expect("显式 model_id 应解析成功");
         // provider_id 小写化
@@ -516,7 +497,6 @@ mod tests {
             false,
             &HashMap::new(),
             &AgentPaths::default(),
-            64000,
         )
         .expect("解析应成功");
         assert_eq!(
@@ -537,7 +517,6 @@ mod tests {
             false,
             &HashMap::new(),
             &AgentPaths::default(),
-            64000,
         )
         .expect_err("空 model_id 应返回 Err");
         assert!(err.contains("未指定模型"), "错误信息应明确：{err}");
@@ -553,7 +532,6 @@ mod tests {
             false,
             &HashMap::new(),
             &AgentPaths::default(),
-            64000,
         )
         .expect_err("格式错误应返回 Err");
         assert!(err.contains("格式错误"), "错误信息应明确：{err}");
@@ -570,7 +548,6 @@ mod tests {
             false,
             &HashMap::new(),
             &AgentPaths::default(),
-            64000,
         )
         .expect_err("provider 空应报错");
         // "provider/" — model 空
@@ -581,7 +558,6 @@ mod tests {
             false,
             &HashMap::new(),
             &AgentPaths::default(),
-            64000,
         )
         .expect_err("model 空应报错");
     }

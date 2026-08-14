@@ -1,11 +1,14 @@
-//! Provider 配置容错解析
+//! Provider 配置解析（数值容错 + 必填校验）
 //!
-//! 容错加载：跳过无效的 Provider/Model，加载有效的部分。
-//!
-//! 为何不走 serde 默认 Deserialize：TOML 区分整数 (`2`) 与浮点数 (`2.0`)，
-//! serde 的 `f64` 只接受浮点字面量，用户写 `input = 2` 时价格会被静默丢弃。
-//! `toml_number_as_f64` 同时处理两种类型，避免此问题。因此 Provider 段单独走
-//! 本模块的容错解析，`FuyaoConfig` 的 `providers` 字段以 `#[serde(skip)]` 跳过 serde。
+//! - 数值容错：TOML 区分整数 (`2`) 与浮点数 (`2.0`)，serde 的 `f64` 只接受浮点字面量，
+//!   用户写 `input = 2` 时价格会被静默丢弃。`toml_number_as_f64` 同时处理两种类型，
+//!   避免此问题。因此 Provider 段单独走本模块解析，`FuyaoConfig` 的 `providers`
+//!   字段以 `#[serde(skip)]` 跳过 serde。
+//! - 必填校验：每个模型条目必须声明 `limit.context` 且为正整数——缺失 / 为 0 /
+//!   类型不符直接判为配置错误（fail-loud），错误信息带 `provider_id/model_id` 定位，
+//!   整个配置加载失败，由引擎启动时暴露给用户。
+//! - 条目容错（跳过不致命缺陷）：Provider 缺 `name`、Model 缺 `name` 属条目级缺陷，
+//!   跳过该条目继续加载其余部分。
 //!
 //! 配置文件结构示例：
 //! ```toml
@@ -20,6 +23,7 @@
 
 use std::collections::HashMap;
 
+use crate::config::error::ConfigError;
 use crate::provider::{
     InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
     Provider, ProviderOptions,
@@ -114,41 +118,68 @@ fn parse_output_modality(s: &str) -> Option<OutputModality> {
 
 /// 解析单个 Model 配置
 ///
-/// - name：必须字段，缺失则返回 None
+/// - name：必须字段，缺失则返回 `Ok(None)`（条目级缺陷，跳过该模型）
 /// - cost：可选，缺失使用默认值
-/// - limit：可选，缺失使用默认值
+/// - limit.context：**必须**为正整数——缺失 / 为 0 / 类型不符返回 `Err`（配置错误，
+///   fail-loud，整个加载失败），错误信息带 `{provider_id}/{model_id}` 定位
+/// - limit.input / limit.output：可选，缺省不设限
 /// - modalities：可选，缺失使用 ["text"]
-fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
-    let table = model_data.as_table()?;
+///
+/// 返回值三态：`Ok(Some)` 解析成功；`Ok(None)` 条目级缺陷跳过；`Err` 配置错误。
+fn parse_model(
+    provider_id: &str,
+    model_id: &str,
+    model_data: &toml::Value,
+) -> Result<Option<Model>, String> {
+    let Some(table) = model_data.as_table() else {
+        return Ok(None);
+    };
 
     // name 是必须字段
-    let name = table.get("name").and_then(|v| v.as_str())?;
+    let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
     let name = name.to_string();
 
     // cost 可选
     let cost = table.get("cost").map(parse_cost).unwrap_or_default();
 
-    // limit 可选
-    let limit = table
-        .get("limit")
-        .and_then(|v| {
-            let limit_table = v.as_table()?;
-            Some(ModelLimit {
-                context: limit_table
-                    .get("context")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(0) as u32,
-                input: limit_table
-                    .get("input")
-                    .and_then(|v| v.as_integer())
-                    .map(|v| v as u32),
-                output: limit_table
-                    .get("output")
-                    .and_then(|v| v.as_integer())
-                    .unwrap_or(0) as u32,
-            })
-        })
-        .unwrap_or_default();
+    // limit.context 必填且为正整数：压缩触发公式直接消费该值，缺声明会导致
+    // usable=0、阈值恒真、每轮必压缩，因此在加载期拦下而非运行期兜底
+    let limit_table = table.get("limit").and_then(|v| v.as_table());
+    let context = match limit_table.and_then(|lt| lt.get("context")) {
+        // 缺 limit 段或缺 context 键同报缺失
+        None => {
+            return Err(format!(
+                "{provider_id}/{model_id} 的 limit.context 缺失：必须声明为正整数\
+                 （上下文窗口 tokens，如 limit = {{ context = 128000 }}）"
+            ));
+        }
+        Some(v) => match v.as_integer() {
+            None => {
+                return Err(format!(
+                    "{provider_id}/{model_id} 的 limit.context 类型错误：必须为正整数"
+                ));
+            }
+            Some(n) if n > 0 && n <= u32::MAX as i64 => n as u32,
+            Some(n) => {
+                return Err(format!(
+                    "{provider_id}/{model_id} 的 limit.context 非法（{n}）：必须为正整数"
+                ));
+            }
+        },
+    };
+    let limit = ModelLimit {
+        context,
+        input: limit_table
+            .and_then(|lt| lt.get("input"))
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32),
+        output: limit_table
+            .and_then(|lt| lt.get("output"))
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0) as u32,
+    };
 
     // modalities 可选，默认 ["text"]；非法模态值静默跳过
     let input = table
@@ -183,13 +214,13 @@ fn parse_model(_model_id: &str, model_data: &toml::Value) -> Option<Model> {
         })
         .unwrap_or_default();
 
-    Some(Model {
+    Ok(Some(Model {
         name,
         cost,
         limit,
         reasoning_efforts,
         modalities: ModelModalities { input, output },
-    })
+    }))
 }
 
 /// 解析 ProviderOptions
@@ -213,13 +244,21 @@ fn parse_provider_options(table: &toml::Table) -> ProviderOptions {
 
 /// 解析单个 Provider 配置
 ///
-/// - name：必须字段，缺失则返回 None
-/// - models：可选，遍历并解析每个 Model
-fn parse_provider(_provider_id: &str, provider_data: &toml::Value) -> Option<Provider> {
-    let table = provider_data.as_table()?;
+/// - name：必须字段，缺失则返回 `Ok(None)`（条目级缺陷，跳过该 Provider）
+/// - models：可选，遍历并解析每个 Model；模型 `limit.context` 非法时返回 `Err`
+///   （配置错误，整个加载失败）
+fn parse_provider(
+    provider_id: &str,
+    provider_data: &toml::Value,
+) -> Result<Option<Provider>, String> {
+    let Some(table) = provider_data.as_table() else {
+        return Ok(None);
+    };
 
     // name 是必须字段
-    let name = table.get("name").and_then(|v| v.as_str())?;
+    let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
     let name = name.to_string();
 
     // 解析 api_key_env_vars（可选）
@@ -236,40 +275,46 @@ fn parse_provider(_provider_id: &str, provider_data: &toml::Value) -> Option<Pro
     // 解析 options（可选）
     let options = parse_provider_options(table);
 
-    // 解析 models（可选）
+    // 解析 models（可选）；limit.context 非法直接冒泡（fail-loud）
     let mut models = HashMap::new();
     if let Some(models_table) = table.get("models").and_then(|v| v.as_table()) {
         for (model_id, model_data) in models_table {
-            // 容错：跳过无效 Model
-            if let Some(model) = parse_model(model_id, model_data) {
+            // 条目容错：缺 name 的 Model 跳过；limit.context 非法则整体失败
+            if let Some(model) = parse_model(provider_id, model_id, model_data)? {
                 models.insert(model_id.clone(), model);
             }
         }
     }
 
-    Some(Provider {
+    Ok(Some(Provider {
         name,
         models,
         options,
         api_key_env_vars,
-    })
+    }))
 }
 
 /// 加载 Provider 配置
 ///
-/// 容错加载：跳过无效的 Provider/Model，加载有效的部分。
-pub fn load_providers(providers_data: &toml::Value) -> HashMap<String, Provider> {
+/// 条目容错（跳过）与必填校验（失败）的边界见模块注释：
+/// 缺 `name` 的条目跳过；模型 `limit.context` 缺失 / 非正整数返回
+/// [`ConfigError::InvalidModel`]（带 `provider_id/model_id` 定位），整个加载失败。
+pub fn load_providers(
+    providers_data: &toml::Value,
+) -> Result<HashMap<String, Provider>, ConfigError> {
     let empty_table = toml::Table::new();
     let table = providers_data.as_table().unwrap_or(&empty_table);
 
     let mut valid_providers = HashMap::new();
     for (provider_id, provider_data) in table {
-        if let Some(provider) = parse_provider(provider_id, provider_data) {
+        if let Some(provider) =
+            parse_provider(provider_id, provider_data).map_err(ConfigError::InvalidModel)?
+        {
             valid_providers.insert(provider_id.clone(), provider);
         }
     }
 
-    valid_providers
+    Ok(valid_providers)
 }
 
 #[cfg(test)]
@@ -279,7 +324,7 @@ mod tests {
     #[test]
     fn parse_empty_providers() {
         let value = toml::Value::Table(toml::Table::new());
-        let providers = load_providers(&value);
+        let providers = load_providers(&value).unwrap();
         assert!(providers.is_empty());
     }
 
@@ -290,10 +335,11 @@ mod tests {
             name = "阿里云百炼"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         assert_eq!(providers.len(), 1);
         assert!(providers.contains_key("aliyun"));
@@ -308,6 +354,7 @@ mod tests {
             name = "DeepSeek"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
+            limit = { context = 128000 }
             [providers.deepseek.models.deepseek-v4-flash.cost]
             input = 1.0
             output = 2.0
@@ -315,7 +362,7 @@ mod tests {
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["deepseek"].models["deepseek-v4-flash"];
         assert_eq!(model.cost.input, Some(1.0));
@@ -330,6 +377,7 @@ mod tests {
             name = "阿里云百炼"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
             [[providers.aliyun.models."qwen3.6-plus".cost.tiers]]
             max_tokens = 256000
             input = 2.0
@@ -338,7 +386,7 @@ mod tests {
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.tiers.len(), 1);
@@ -356,7 +404,7 @@ mod tests {
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         assert!(!providers.contains_key("bad"));
     }
@@ -369,10 +417,11 @@ mod tests {
             api_key_env_vars = ["DASHSCOPE_API_KEY"]
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         assert_eq!(
             providers["aliyun"].api_key_env_vars,
@@ -389,10 +438,11 @@ mod tests {
             base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         assert_eq!(
             providers["aliyun"].options.base_url.as_deref(),
@@ -407,6 +457,7 @@ mod tests {
             name = "阿里云百炼"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
             [providers.aliyun.models."qwen3.6-plus".cost]
             input = 2
             output = 12
@@ -415,7 +466,7 @@ mod tests {
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.input, Some(2.0));
@@ -431,6 +482,7 @@ mod tests {
             name = "阿里云百炼"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
             [[providers.aliyun.models."qwen3.6-plus".cost.tiers]]
             max_tokens = 256000
             input = 2
@@ -439,7 +491,7 @@ mod tests {
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.tiers.len(), 1);
@@ -466,10 +518,11 @@ mod tests {
             name = "阿里云百炼"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
+            limit = { context = 131072 }
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
         assert!(model.reasoning_efforts.is_empty());
@@ -482,11 +535,12 @@ mod tests {
             name = "DeepSeek"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
+            limit = { context = 128000 }
             reasoning_efforts = ["low", "medium", "high", "max"]
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["deepseek"].models["deepseek-v4-flash"];
         assert_eq!(
@@ -508,11 +562,12 @@ mod tests {
             name = "SomeVendor"
             [providers.somevendor.models.weird-model]
             name = "weird-model"
+            limit = { context = 64000 }
             reasoning_efforts = ["big", "max", "turbo"]
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["somevendor"].models["weird-model"];
         assert_eq!(
@@ -529,16 +584,166 @@ mod tests {
             name = "DeepSeek"
             [providers.deepseek.models.test-model]
             name = "test-model"
+            limit = { context = 64000 }
             reasoning_efforts = ["high", 123, "max"]
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
         let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table);
+        let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["deepseek"].models["test-model"];
         assert_eq!(
             model.reasoning_efforts,
             vec!["high".to_string(), "max".to_string()]
+        );
+    }
+
+    // ===== limit.context 必填校验 =====
+
+    #[test]
+    fn missing_limit_context_fails_with_model_name() {
+        // 完全没写 limit 段：配置加载失败，错误信息带 provider_id/model_id 定位
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deepseek/deepseek-v4-flash"),
+            "错误信息应含模型名：{msg}"
+        );
+        assert!(
+            msg.contains("limit.context"),
+            "错误信息应指向 limit.context：{msg}"
+        );
+        assert!(msg.contains("缺失"), "错误信息应说明缺失：{msg}");
+    }
+
+    #[test]
+    fn limit_section_without_context_key_fails() {
+        // 写了 [limit] 段但缺 context 键：同样判缺失失败
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { output = 8192 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deepseek/deepseek-v4-flash"),
+            "错误信息应含模型名：{msg}"
+        );
+        assert!(msg.contains("缺失"), "错误信息应说明缺失：{msg}");
+    }
+
+    #[test]
+    fn zero_limit_context_fails() {
+        // context = 0 会使压缩触发公式 usable=0、阈值恒真，加载期必须拦下
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { context = 0 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deepseek/deepseek-v4-flash"),
+            "错误信息应含模型名：{msg}"
+        );
+        assert!(msg.contains("正整数"), "错误信息应指出必须为正整数：{msg}");
+    }
+
+    #[test]
+    fn negative_limit_context_fails() {
+        // 负数同属非法值
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { context = -1 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        assert!(err.to_string().contains("正整数"));
+    }
+
+    #[test]
+    fn non_integer_limit_context_fails() {
+        // 类型不符（字符串 / 浮点）失败；浮点虽是 TOML 数值，但 context 必须是整数
+        for bad in [r#"context = "128000""#, "context = 128000.5"] {
+            let toml_str = format!(
+                r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = {{ {bad} }}
+        "#
+            );
+            let value: toml::Value = toml::from_str(&toml_str).unwrap();
+            let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("deepseek/deepseek-v4-flash"),
+                "错误信息应含模型名：{msg}"
+            );
+            assert!(
+                msg.contains("类型错误") || msg.contains("正整数"),
+                "错误信息应指出类型/取值问题：{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_limit_context_parses_with_optional_fields() {
+        // 合法声明通过：context 进 ModelLimit；input / output 可选
+        let toml_str = r#"
+            [providers.aliyun]
+            name = "阿里云百炼"
+            [providers.aliyun.models."qwen3.6-plus"]
+            name = "qwen3.6-plus"
+            limit = { context = 1000000, input = 900000, output = 65536 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers = load_providers(value.get("providers").unwrap()).unwrap();
+
+        let model = &providers["aliyun"].models["qwen3.6-plus"];
+        assert_eq!(model.limit.context, 1_000_000);
+        assert_eq!(model.limit.input, Some(900_000));
+        assert_eq!(model.limit.output, 65536);
+    }
+
+    #[test]
+    fn missing_name_still_skips_model_without_error() {
+        // 条目级缺陷（缺 name）仍是跳过语义：不影响其余模型，也不报错
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.no-name-model]
+            limit = { context = 64000 }
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { context = 128000 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers = load_providers(value.get("providers").unwrap()).unwrap();
+
+        assert!(!providers["deepseek"].models.contains_key("no-name-model"));
+        assert!(
+            providers["deepseek"]
+                .models
+                .contains_key("deepseek-v4-flash")
         );
     }
 }

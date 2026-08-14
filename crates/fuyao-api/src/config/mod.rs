@@ -66,8 +66,9 @@ pub use loader::{load_config, load_merged_config};
 /// 对应 `fuyao.toml` 顶层结构。所有子段 `#[serde(default)]`，缺失时走各自 `Default`，
 /// 与原硬编码值一致。
 ///
-/// `providers` 字段 `#[serde(skip)]`：容错解析由 `providers::load_providers` 完成
-/// （serde 不支持 TOML 整数→f64 价格自动转换），由加载流程单独回填。
+/// `providers` 字段 `#[serde(skip)]`：由 `providers::load_providers` 单独解析
+/// （serde 不支持 TOML 整数→f64 价格自动转换；模型 `limit.context` 必填校验也在该层），
+/// 由加载流程回填。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct FuyaoConfig {

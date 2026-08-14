@@ -10,9 +10,11 @@
 //!
 //! ## providers 特殊处理
 //!
-//! Provider 段走 `providers::load_providers` 容错解析（serde 不支持 TOML 整数→f64 价格
+//! Provider 段走 `providers::load_providers` 解析（serde 不支持 TOML 整数→f64 价格
 //! 自动转换），因此从合并表中 `remove` 出来单独解析，其余字段整体反序列化为 `FuyaoConfig`
 //! （`providers` 字段以 `#[serde(skip)]` 跳过 serde），最后回填 providers。
+//! 解析失败（如模型缺 `limit.context`）产生 `ConfigError` 向上层传播——引擎启动时
+//! fail-loud。
 
 use std::path::Path;
 
@@ -87,10 +89,12 @@ pub fn load_merged_config(
         interpolate_env_vars_table(mcp_table);
     }
 
-    // providers 单独走容错解析（serde 不支持 TOML 整数→f64 价格转换）
+    // providers 单独走解析（serde 不支持 TOML 整数→f64 价格转换）；
+    // 模型 limit.context 缺失 / 非正整数在此判为配置错误，整体加载失败（fail-loud）
     let providers = merged_table
         .remove("providers")
         .map(|v| load_providers(&v))
+        .transpose()?
         .unwrap_or_default();
 
     // 其余字段整体反序列化（providers 字段 #[serde(skip)]，不参与 serde）
@@ -283,9 +287,9 @@ terminal_default_timeout_secs = 240
         let _ = std::fs::remove_file(&workspace);
     }
 
-    /// providers 走容错解析（整数价格不被丢弃）
+    /// providers 数值容错解析（整数价格不被丢弃），limit.context 必填校验
     #[test]
-    fn providers_tolerant_parsing_via_loader() {
+    fn providers_parsing_via_loader_enforces_limit_context() {
         let workspace = temp_config_path(
             "providers",
             r#"
@@ -293,6 +297,7 @@ terminal_default_timeout_secs = 240
 name = "阿里云百炼"
 [providers.aliyun.models."qwen3.6-plus"]
 name = "qwen3.6-plus"
+limit = { context = 131072 }
 [providers.aliyun.models."qwen3.6-plus".cost]
 input = 2
 "#,
@@ -303,6 +308,34 @@ input = 2
             .unwrap();
         let model = &cfg.providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.input, Some(2.0));
+        assert_eq!(model.limit.context, 131_072);
+
+        let _ = std::fs::remove_file(&workspace);
+    }
+
+    /// 模型缺 limit.context：load_merged_config 整体失败，错误信息含模型名
+    #[test]
+    fn providers_missing_limit_context_fails_whole_load() {
+        let workspace = temp_config_path(
+            "providers_no_limit",
+            r#"
+[providers.aliyun]
+name = "阿里云百炼"
+[providers.aliyun.models."qwen3.6-plus"]
+name = "qwen3.6-plus"
+"#,
+        );
+
+        let err = load_merged_config(None, None, Some(&workspace)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("aliyun/qwen3.6-plus"),
+            "错误信息应含模型名：{msg}"
+        );
+        assert!(
+            msg.contains("limit.context"),
+            "错误信息应指向 limit.context：{msg}"
+        );
 
         let _ = std::fs::remove_file(&workspace);
     }

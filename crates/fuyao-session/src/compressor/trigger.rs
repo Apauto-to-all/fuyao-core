@@ -5,7 +5,8 @@
 //! prompt_tokens >= threshold × (context_length - summary_max_tokens)
 //! ```
 //! - `prompt_tokens` 来自上一轮 LLM 返回的真实 usage
-//! - `context_length` 由调用方从 ModelConfig 解析后传入；解析不到用 cfg.fallback_context
+//! - `context_length` 由调用方从模型注册表（`model.limit.context`）解析后传入；
+//!   模型未注册时调用方无从取值，直接跳过压缩判定（本函数不接收任何回退值）
 //! - `summary_max_tokens` 作为输出预留扣除（防止压缩后又因输出超限触发）
 
 use fuyao_api::CompressionConfig;
@@ -38,7 +39,6 @@ mod tests {
             keep_ratio: 0.05,
             keep_tokens_max: 8000,
             summary_max_tokens: 4096,
-            fallback_context: 128_000,
             tokens_per_image: 1000,
             skip_child: true,
         }

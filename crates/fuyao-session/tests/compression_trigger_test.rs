@@ -42,7 +42,7 @@ fn default_config_is_enabled_with_reasonable_threshold() {
 fn default_config_does_not_trigger_on_small_context() {
     // 默认 config + 小上下文 + 少量 token → 不应触发压缩
     let cfg = default_cfg();
-    // default fallback_context = 128000，usable ≈ 123904，trigger_line ≈ 0.85 × 123904 ≈ 105318
+    // context=128000，usable ≈ 123904，trigger_line ≈ 0.85 × 123904 ≈ 105318
     assert!(
         !should_compress(1_000, 128_000, &cfg),
         "1k token 远低于阈值，不应触发"

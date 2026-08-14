@@ -12,7 +12,8 @@ use serde::Deserialize;
 /// prompt_tokens >= threshold × (context_length - summary_max_tokens)
 /// ```
 /// - `prompt_tokens` 来自上一轮 LLM 返回的真实 usage（pre-turn 触发时只能用上一轮值）
-/// - `context_length` 从 ModelConfig 解析；解析不到时回退 `fallback_context`
+/// - `context_length` 从模型注册表（`model.limit.context`，加载期已校验必为正整数）
+///   解析；模型未注册时调用方无从判定阈值，跳过压缩判定
 /// - `summary_max_tokens` 作为输出预留扣除
 ///
 /// 保留窗口按模型上下文比例动态计算（替代固定 `keep_tokens`）：
@@ -34,8 +35,6 @@ pub struct CompressionConfig {
     pub keep_tokens_max: usize,
     /// 摘要 LLM 输出上限（token）
     pub summary_max_tokens: usize,
-    /// 无法解析模型上下文长度时的回退值
-    pub fallback_context: u32,
     /// 压缩 token 估算：每张图固定占用 token（不按 base64 字符数，避免撑爆触发误压缩），原 `compressor/window.rs TOKENS_PER_IMAGE = 1000`
     pub tokens_per_image: usize,
     /// 是否跳过子 session（有 parent_session_id）的上下文压缩
@@ -55,7 +54,6 @@ impl Default for CompressionConfig {
             keep_ratio: 0.05,
             keep_tokens_max: 8000,
             summary_max_tokens: 4096,
-            fallback_context: 128_000,
             tokens_per_image: 1000,
             skip_child: true,
         }
@@ -149,7 +147,7 @@ mod tests {
         assert!((c.keep_ratio - 0.05).abs() < f64::EPSILON);
         assert_eq!(c.keep_tokens_max, 8000);
         assert_eq!(c.summary_max_tokens, 4096);
-        assert_eq!(c.fallback_context, 128_000);
+        assert_eq!(c.tokens_per_image, 1000);
         assert!(c.skip_child);
     }
 
@@ -235,5 +233,24 @@ tokens_per_image = 2000
         assert!((w.session.compression.keep_ratio - 0.05).abs() < f64::EPSILON);
         assert_eq!(w.session.compression.keep_tokens_max, 8000);
         assert_eq!(w.session.compression.tokens_per_image, 2000);
+    }
+
+    /// compression 配置不包含任何上下文长度回退项：模型上下文长度只来自模型清单的
+    /// `limit.context`（加载期必填校验）。toml 里的残留未知键按 serde 现状
+    /// （未知字段忽略）静默丢弃，无兼容读取。
+    #[test]
+    fn deserialize_compression_ignores_unknown_leftover_keys() {
+        let toml_str = r#"
+[session.compression]
+threshold = 0.7
+fallback_context = 96000
+"#;
+        #[derive(Deserialize)]
+        struct Wrap {
+            session: SessionConfig,
+        }
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert!((w.session.compression.threshold - 0.7).abs() < f64::EPSILON);
+        assert_eq!(w.session.compression.summary_max_tokens, 4096);
     }
 }

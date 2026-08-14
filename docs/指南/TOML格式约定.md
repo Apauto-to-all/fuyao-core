@@ -42,7 +42,7 @@ options = { base_url = "https://api.deepseek.com" }
 
 ### 模型属性 cost / limit / modalities
 
-模型的 `cost`、`limit`、`modalities` 都是叶子表，内联：
+模型的 `cost`、`limit`、`modalities` 都是叶子表，内联。其中 `limit.context` **必填且为正整数**（缺失 / 为 0 / 类型不符会导致整个配置加载失败，引擎启动时报错并带 `provider_id/model_id` 定位），因此 `limit` 内联时至少写 `context`：
 
 ```toml
 # 避免
