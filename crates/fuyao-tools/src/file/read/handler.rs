@@ -27,6 +27,7 @@ use crate::file::safety::{has_binary_extension, is_blocked_device, is_internal_p
 use crate::file::tracker::{check_dedup, record_read};
 use crate::redact::redact_sensitive_text;
 use serde_json::Value;
+use std::io::BufRead;
 use std::path::Path;
 
 const DEFAULT_LIMIT: i64 = 500;
@@ -216,36 +217,50 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
         Err(_) => 0,
     };
 
-    let content = match std::fs::read_to_string(&resolved_path_obj) {
-        Ok(c) => c,
+    // 流式逐行读取：只为请求窗口内的行解码分配，窗口外的行仅计数（total_lines 需要
+    // 全量行数）。旧实现整文件 read_to_string + 全行收集后再切片，读大日志文件的
+    // 几百行也会把整个文件搬进内存
+    let file = match std::fs::File::open(&resolved_path_obj) {
+        Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             return common::tool_error(&format!("无权限读取文件: {path}"));
-        }
-        // 区分 UTF-8 编码错误（InvalidData）和其他 IO 错误：编码错误给用户明确的修复提示
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            return common::tool_error(&format!(
-                "文件编码无法解析: {path}。文件可能包含非 UTF-8 字节，请用二进制编辑器查看。"
-            ));
         }
         Err(e) => {
             return common::tool_error(&format!("读取文件失败: {e}"));
         }
     };
+    let mut reader = std::io::BufReader::new(file);
 
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len();
+    let mut raw_line: Vec<u8> = Vec::new();
+    let mut line_no: usize = 0;
+    let mut content_lines: Vec<String> = Vec::with_capacity(limit);
+    loop {
+        raw_line.clear();
+        match reader.read_until(b'\n', &mut raw_line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                return common::tool_error(&format!("读取文件失败: {e}"));
+            }
+        }
+        line_no += 1;
+        // 只解码并格式化窗口内的行；窗口外仅推进行号
+        if line_no >= offset && content_lines.len() < limit {
+            let line = match std::str::from_utf8(&raw_line) {
+                Ok(s) => s.trim_end_matches(['\n', '\r']),
+                // 区分 UTF-8 编码错误（InvalidData）和其他 IO 错误：编码错误给用户明确的修复提示
+                Err(_) => {
+                    return common::tool_error(&format!(
+                        "文件编码无法解析: {path}。文件可能包含非 UTF-8 字节，请用二进制编辑器查看。"
+                    ));
+                }
+            };
+            content_lines.push(format!("{:>6}\t{line}", line_no));
+        }
+    }
+    let total_lines = line_no;
     let start_idx = offset - 1;
     let end_idx = std::cmp::min(start_idx + limit, total_lines);
-
-    let mut content_lines = Vec::with_capacity(end_idx - start_idx);
-    for (idx, line) in lines
-        .iter()
-        .enumerate()
-        .skip(start_idx)
-        .take(end_idx - start_idx)
-    {
-        content_lines.push(format!("{:>6}\t{line}", idx + 1));
-    }
 
     let output = content_lines.join("\n");
 
@@ -330,6 +345,131 @@ mod tests {
         assert!(result.contains("line3"));
         assert!(!result.contains("line1"));
         assert!(!result.contains("line4"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 末行无换行符：仍是完整一行，计入 total_lines
+    #[test]
+    fn read_file_without_trailing_newline() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_no_trailing_nl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        std::fs::write(&file_path, "line1\nline2").unwrap();
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string()
+        });
+        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        assert!(result.contains("line1"));
+        assert!(result.contains("line2"));
+        assert!(result.contains("\"total_lines\":2"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CRLF 行尾：\r\n 不带入行内容
+    #[test]
+    fn read_file_crlf_lines() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_crlf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        std::fs::write(&file_path, "line1\r\nline2\r\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "limit": 1
+        });
+        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        assert!(result.contains("line1"));
+        assert!(!result.contains("line2"));
+        assert!(result.contains("\"total_lines\":2"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// offset 超出文件末尾：空结果、无截断提示
+    #[test]
+    fn read_offset_beyond_eof() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_offset_eof");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        std::fs::write(&file_path, "line1\nline2\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "offset": 10,
+            "limit": 5
+        });
+        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        assert!(result.contains("\"total_lines\":2"));
+        assert!(!result.contains("truncated"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 大文件小窗口：行号正确，窗口外不进入结果
+    #[test]
+    fn read_large_file_small_window() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_large_window");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("big.txt");
+        let content: String = (1..=10000).map(|i| format!("row-{i}\n")).collect();
+        std::fs::write(&file_path, content).unwrap();
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "offset": 9990,
+            "limit": 3
+        });
+        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        assert!(result.contains("row-9990"));
+        assert!(result.contains("row-9992"));
+        assert!(!result.contains("row-9989"));
+        assert!(!result.contains("row-9993"));
+        assert!(result.contains("\"total_lines\":10000"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 非 UTF-8 字节位于窗口外的行：只读取窗口时不受影响（流式只解码窗口内行）
+    #[test]
+    fn read_tolerates_bad_utf8_outside_window() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_bad_utf8_outside");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        let mut content = Vec::new();
+        content.extend_from_slice(b"good line\n");
+        content.extend_from_slice(&[0xff, 0xfe, b'\n']); // 窗口外的坏字节行
+        std::fs::write(&file_path, content).unwrap();
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "offset": 1,
+            "limit": 1
+        });
+        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        assert!(result.contains("good line"));
+        assert!(!result.contains("编码无法解析"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 非 UTF-8 字节位于窗口内的行：明确报编码错误
+    #[test]
+    fn read_rejects_bad_utf8_inside_window() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_bad_utf8_inside");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("test.txt");
+        std::fs::write(&file_path, b"\xff\xfe\ngood\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "offset": 1,
+            "limit": 1
+        });
+        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        assert!(result.contains("编码无法解析"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
