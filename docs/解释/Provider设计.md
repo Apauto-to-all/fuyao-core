@@ -170,11 +170,11 @@ registry.rs:
 
 **按 agent 路径缓存**：不同 agent_id 有不同的 provider/model 配置，缓存以 agent_paths 为 key 隔离。
 
-### 容错解析（load_providers）
+### 手动解析（load_providers）
 
-`[providers.*]` 段不走 serde 默认反序列化，而是手动容错解析：
+`[providers.*]` 段不走 serde 默认反序列化，而是单独手动解析：
 
-- 缺 `name` 的 Provider / Model 静默跳过（不报错）
+- 条目必填报错：Provider / Model 条目不是 table、缺 `name`、`name` 非字符串，或模型缺 `limit.context` / 值非法，均判为配置错误（fail-loud），整个配置加载失败，错误信息带 `provider_id/model_id` 定位
 - 价格字段（`cost.input` 等）兼容整数和浮点（`input = 2` 和 `input = 2.0` 等价）
 - 解析成功后回填到 `FuyaoConfig.providers`（该字段 `#[serde(skip)]` 不参与 serde）
 

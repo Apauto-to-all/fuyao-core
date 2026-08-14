@@ -7,8 +7,10 @@
 //! - 必填校验：每个模型条目必须声明 `limit.context` 且为正整数——缺失 / 为 0 /
 //!   类型不符直接判为配置错误（fail-loud），错误信息带 `provider_id/model_id` 定位，
 //!   整个配置加载失败，由引擎启动时暴露给用户。
-//! - 条目容错（跳过不致命缺陷）：Provider 缺 `name`、Model 缺 `name` 属条目级缺陷，
-//!   跳过该条目继续加载其余部分。
+//! - 条目残缺报错：Provider / Model 条目存在但残缺（条目不是 table、缺 `name`、
+//!   `name` 非字符串）同样直接判为配置错误（fail-loud），错误信息带
+//!   `provider_id/model_id` 定位——残缺条目静默消失会让写坏的配置无声丢失，
+//!   与必填校验在同一处解析，语义保持一致：一律在加载期拦下。
 //!
 //! 配置文件结构示例：
 //! ```toml
@@ -118,26 +120,38 @@ fn parse_output_modality(s: &str) -> Option<OutputModality> {
 
 /// 解析单个 Model 配置
 ///
-/// - name：必须字段，缺失则返回 `Ok(None)`（条目级缺陷，跳过该模型）
+/// - 条目必须是 table：写成标量 / 数组等非 table 形态返回 `Err`（配置错误，
+///   fail-loud），错误信息带 `{provider_id}/{model_id}` 定位
+/// - name：必须字段且必须为字符串——缺失 / 类型不符返回 `Err`（配置错误，
+///   fail-loud），错误信息带 `{provider_id}/{model_id}` 定位
 /// - cost：可选，缺失使用默认值
 /// - limit.context：**必须**为正整数——缺失 / 为 0 / 类型不符返回 `Err`（配置错误，
 ///   fail-loud，整个加载失败），错误信息带 `{provider_id}/{model_id}` 定位
 /// - limit.input / limit.output：可选，缺省不设限
 /// - modalities：可选，缺失使用 ["text"]
-///
-/// 返回值三态：`Ok(Some)` 解析成功；`Ok(None)` 条目级缺陷跳过；`Err` 配置错误。
 fn parse_model(
     provider_id: &str,
     model_id: &str,
     model_data: &toml::Value,
-) -> Result<Option<Model>, String> {
+) -> Result<Model, String> {
     let Some(table) = model_data.as_table() else {
-        return Ok(None);
+        return Err(format!(
+            "{provider_id}/{model_id} 的条目不是 table：模型必须以\
+             [providers.{provider_id}.models.\"{model_id}\"] 表形式声明"
+        ));
     };
 
     // name 是必须字段
-    let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
-        return Ok(None);
+    let Some(name_value) = table.get("name") else {
+        return Err(format!(
+            "{provider_id}/{model_id} 的 name 缺失：必须声明为字符串\
+             （模型显示名，如 name = \"{model_id}\"）"
+        ));
+    };
+    let Some(name) = name_value.as_str() else {
+        return Err(format!(
+            "{provider_id}/{model_id} 的 name 类型错误：必须为字符串"
+        ));
     };
     let name = name.to_string();
 
@@ -214,13 +228,13 @@ fn parse_model(
         })
         .unwrap_or_default();
 
-    Ok(Some(Model {
+    Ok(Model {
         name,
         cost,
         limit,
         reasoning_efforts,
         modalities: ModelModalities { input, output },
-    }))
+    })
 }
 
 /// 解析 ProviderOptions
@@ -244,20 +258,29 @@ fn parse_provider_options(table: &toml::Table) -> ProviderOptions {
 
 /// 解析单个 Provider 配置
 ///
-/// - name：必须字段，缺失则返回 `Ok(None)`（条目级缺陷，跳过该 Provider）
-/// - models：可选，遍历并解析每个 Model；模型 `limit.context` 非法时返回 `Err`
-///   （配置错误，整个加载失败）
-fn parse_provider(
-    provider_id: &str,
-    provider_data: &toml::Value,
-) -> Result<Option<Provider>, String> {
+/// - 条目必须是 table：写成标量 / 数组等非 table 形态返回 `Err`（配置错误，
+///   fail-loud），错误信息带 `{provider_id}` 定位
+/// - name：必须字段且必须为字符串——缺失 / 类型不符返回 `Err`（配置错误，
+///   fail-loud），错误信息带 `{provider_id}` 定位
+/// - models：可选，遍历并解析每个 Model；模型条目残缺或 `limit.context` 非法时
+///   返回 `Err`（配置错误，整个加载失败）
+fn parse_provider(provider_id: &str, provider_data: &toml::Value) -> Result<Provider, String> {
     let Some(table) = provider_data.as_table() else {
-        return Ok(None);
+        return Err(format!(
+            "{provider_id} 的条目不是 table：Provider 必须以\
+             [providers.{provider_id}] 表形式声明"
+        ));
     };
 
     // name 是必须字段
-    let Some(name) = table.get("name").and_then(|v| v.as_str()) else {
-        return Ok(None);
+    let Some(name_value) = table.get("name") else {
+        return Err(format!(
+            "{provider_id} 的 name 缺失：必须声明为字符串\
+             （Provider 显示名，如 name = \"{provider_id}\"）"
+        ));
+    };
+    let Some(name) = name_value.as_str() else {
+        return Err(format!("{provider_id} 的 name 类型错误：必须为字符串"));
     };
     let name = name.to_string();
 
@@ -275,29 +298,27 @@ fn parse_provider(
     // 解析 options（可选）
     let options = parse_provider_options(table);
 
-    // 解析 models（可选）；limit.context 非法直接冒泡（fail-loud）
+    // 解析 models（可选）；条目残缺或 limit.context 非法直接冒泡（fail-loud）
     let mut models = HashMap::new();
     if let Some(models_table) = table.get("models").and_then(|v| v.as_table()) {
         for (model_id, model_data) in models_table {
-            // 条目容错：缺 name 的 Model 跳过；limit.context 非法则整体失败
-            if let Some(model) = parse_model(provider_id, model_id, model_data)? {
-                models.insert(model_id.clone(), model);
-            }
+            let model = parse_model(provider_id, model_id, model_data)?;
+            models.insert(model_id.clone(), model);
         }
     }
 
-    Ok(Some(Provider {
+    Ok(Provider {
         name,
         models,
         options,
         api_key_env_vars,
-    }))
+    })
 }
 
 /// 加载 Provider 配置
 ///
-/// 条目容错（跳过）与必填校验（失败）的边界见模块注释：
-/// 缺 `name` 的条目跳过；模型 `limit.context` 缺失 / 非正整数返回
+/// 必填校验语义见模块注释：Provider / Model 条目残缺（非 table、缺 `name`、
+/// `name` 非字符串）或模型 `limit.context` 缺失 / 非正整数均返回
 /// [`ConfigError::InvalidModel`]（带 `provider_id/model_id` 定位），整个加载失败。
 pub fn load_providers(
     providers_data: &toml::Value,
@@ -307,11 +328,9 @@ pub fn load_providers(
 
     let mut valid_providers = HashMap::new();
     for (provider_id, provider_data) in table {
-        if let Some(provider) =
-            parse_provider(provider_id, provider_data).map_err(ConfigError::InvalidModel)?
-        {
-            valid_providers.insert(provider_id.clone(), provider);
-        }
+        let provider =
+            parse_provider(provider_id, provider_data).map_err(ConfigError::InvalidModel)?;
+        valid_providers.insert(provider_id.clone(), provider);
     }
 
     Ok(valid_providers)
@@ -394,19 +413,6 @@ mod tests {
         assert_eq!(model.cost.tiers[0].input, Some(2.0));
         assert_eq!(model.cost.tiers[0].output, Some(12.0));
         assert_eq!(model.cost.tiers[0].cache, Some(0.4));
-    }
-
-    #[test]
-    fn skip_invalid_provider_missing_name() {
-        let toml_str = r#"
-            [providers.bad]
-            # no name field
-        "#;
-        let value: toml::Value = toml::from_str(toml_str).unwrap();
-        let providers_table = value.get("providers").unwrap();
-        let providers = load_providers(providers_table).unwrap();
-
-        assert!(!providers.contains_key("bad"));
     }
 
     #[test]
@@ -724,26 +730,110 @@ mod tests {
         assert_eq!(model.limit.output, 65536);
     }
 
+    // ===== 条目残缺必填报错（非 table / name） =====
+
     #[test]
-    fn missing_name_still_skips_model_without_error() {
-        // 条目级缺陷（缺 name）仍是跳过语义：不影响其余模型，也不报错
+    fn missing_provider_name_fails_with_provider_id() {
+        // Provider 条目存在但缺 name：配置加载失败，错误信息带 provider_id 定位
+        let toml_str = r#"
+            [providers.bad]
+            # no name field
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad"), "错误信息应含 provider_id：{msg}");
+        assert!(msg.contains("name"), "错误信息应指向 name 字段：{msg}");
+        assert!(msg.contains("缺失"), "错误信息应说明缺失：{msg}");
+    }
+
+    #[test]
+    fn non_string_provider_name_fails() {
+        // name 写成非字符串（如数字）：判为配置错误而非静默跳过
+        let toml_str = r#"
+            [providers.bad]
+            name = 123
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad"), "错误信息应含 provider_id：{msg}");
+        assert!(msg.contains("类型错误"), "错误信息应指出类型问题：{msg}");
+    }
+
+    #[test]
+    fn non_table_provider_entry_fails() {
+        // Provider 条目写成标量值（非 table）：判为配置错误而非静默消失
+        let toml_str = r#"
+            [providers]
+            broken = "oops"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("broken"), "错误信息应含 provider_id：{msg}");
+        assert!(
+            msg.contains("不是 table"),
+            "错误信息应指出条目非 table：{msg}"
+        );
+    }
+
+    #[test]
+    fn missing_name_fails_with_model_name() {
+        // 模型条目存在但缺 name：配置加载失败，错误信息带 provider_id/model_id 定位
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
             [providers.deepseek.models.no-name-model]
             limit = { context = 64000 }
-            [providers.deepseek.models.deepseek-v4-flash]
-            name = "deepseek-v4-flash"
-            limit = { context = 128000 }
         "#;
         let value: toml::Value = toml::from_str(toml_str).unwrap();
-        let providers = load_providers(value.get("providers").unwrap()).unwrap();
-
-        assert!(!providers["deepseek"].models.contains_key("no-name-model"));
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            providers["deepseek"]
-                .models
-                .contains_key("deepseek-v4-flash")
+            msg.contains("deepseek/no-name-model"),
+            "错误信息应含模型名：{msg}"
+        );
+        assert!(msg.contains("name"), "错误信息应指向 name 字段：{msg}");
+        assert!(msg.contains("缺失"), "错误信息应说明缺失：{msg}");
+    }
+
+    #[test]
+    fn non_string_model_name_fails() {
+        // 模型 name 写成非字符串（如数字）：判为配置错误而非静默跳过
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.bad-model]
+            name = 123
+            limit = { context = 64000 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("deepseek/bad-model"),
+            "错误信息应含模型名：{msg}"
+        );
+        assert!(msg.contains("类型错误"), "错误信息应指出类型问题：{msg}");
+    }
+
+    #[test]
+    fn non_table_model_entry_fails() {
+        // 模型条目写成标量值（非 table）：判为配置错误而非静默消失
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models]
+            broken = "oops"
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("deepseek/broken"), "错误信息应含模型名：{msg}");
+        assert!(
+            msg.contains("不是 table"),
+            "错误信息应指出条目非 table：{msg}"
         );
     }
 }
