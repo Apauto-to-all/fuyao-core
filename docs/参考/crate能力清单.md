@@ -134,6 +134,6 @@ L0  fuyao-api（零内部依赖）
   - **`init_engine(EngineParams)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`
   - **`build_tool_registry()`**：收集内置 + MCP 工具，返回 `(ToolRegistry, Option<Arc<MCPManager>>)`
   - **`list_agent_ids(&AgentPaths)`**：列举可选 agent_id（启动前可用，不依赖引擎）。接收应用层构造的 `AgentPaths`，按其 workspace / fuyao_home 扫描 `fuyao-agents/`，返回 `Vec<AgentIdOption>`（纯名 id + 来源层 `source`，项目层同名覆盖全局层，按 id 升序）。应用层用同一份 `AgentPaths` 先列 id、再造 `EngineParams` 启动，保证列举基准与启动基准一致
-  - **`Discovery`**（选择支持门面，`FuyaoApp.discovery` 字段，持 `start` 注入的 `AgentPaths`）：`list_definitions()` → `Vec<DefinitionOption>`（四层定义目录 + 内置，零参数）/ `list_models()` → `Vec<ModelOption>`（Provider 注册缓存，启动前为空，零参数）；路径身份启动时注入一次，两个查询共用，调用方不再传参
+  - **`Discovery`**（选择支持门面，`FuyaoApp.discovery` 字段，持 `start` 注入的 `AgentPaths`）：`list_primary_definitions()` → `Vec<DefinitionOption>`（会话人格专用，仅 Primary 模式，四层定义目录 + 内置，零参数）/ `list_subagent_definitions()` → `Vec<DefinitionOption>`（子代理工具候选全集，仅 Subagent 模式，与主代理列举按 mode 互斥）/ `list_models()` → `Vec<ModelOption>`（Provider 注册缓存，启动前为空，零参数）；路径身份启动时注入一次，所有查询共用，调用方不再传参
   - **`LogGuard`**：drop 时 flush 文件日志
   - **错误**：`InitError`（`NoProviderAvailable` / `ConfigError`）/ `SetupError`（`Init`）

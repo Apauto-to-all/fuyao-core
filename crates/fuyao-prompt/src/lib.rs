@@ -18,4 +18,4 @@ pub use loader::{
     load_agent_definition, load_agent_definition_from_agent_paths, load_builtin_definition,
 };
 pub use registry::AgentRegistry;
-pub use sections::{list_definitions, list_subagent_definitions, resolve_definition};
+pub use sections::{list_primary_definitions, list_subagent_definitions, resolve_definition};

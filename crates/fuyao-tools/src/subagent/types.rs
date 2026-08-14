@@ -19,12 +19,16 @@ pub struct SubagentMetaItem {
 /// 列出可用子代理定义
 ///
 /// 实时查询 `fuyao_prompt::list_subagent_definitions`：扫 `agents/` 目录 + 内置默认，
-/// 过滤 `is_usable_as_subagent`。与系统提示词「子代理」索引层同源，每次调用现查
-/// （无缓存，反映最新状态——用户会话中途新增 `agents/*.md` 也能立即查到）。
+/// 过滤 `is_usable_as_subagent`，取回完整定义后降为校验/展示所需的最小元数据。
+/// 与系统提示词「子代理」索引层同源，每次调用现查（无缓存，反映最新状态——
+/// 用户会话中途新增 `agents/*.md` 也能立即查到）。
 pub fn list_available_subagents(agent_paths: &AgentPaths) -> Vec<SubagentMetaItem> {
     fuyao_prompt::list_subagent_definitions(agent_paths)
         .into_iter()
-        .map(|(name, description)| SubagentMetaItem { name, description })
+        .map(|opt| SubagentMetaItem {
+            name: opt.id,
+            description: opt.definition.description,
+        })
         .collect()
 }
 
