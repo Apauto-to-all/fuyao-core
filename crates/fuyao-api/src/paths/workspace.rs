@@ -3,9 +3,8 @@
 //! 工作目录层架构：
 //! - .fuyao 根目录: `{workspace}/.fuyao/`
 //! - Agents 目录: `{workspace}/.fuyao/fuyao-agents/`
-//! - Workflow 配置: `{workspace}/.fuyao/workflow.toml`
 
-use super::global::get_fuyao_agents_dir;
+use crate::selection::AgentIdSource;
 use std::path::{Path, PathBuf};
 
 /// 返回工作目录的 .fuyao 根目录路径
@@ -22,86 +21,154 @@ pub fn get_workspace_agents_dir(workspace: &Path) -> PathBuf {
     get_workspace_root(workspace).join("fuyao-agents")
 }
 
-/// 返回 Agent 目录路径
+/// 解析 agent_id 字符串为（来源层, 目录名）
 ///
-/// `agent_id` 格式：
-/// - `"global/agent-id"` → 强制全局层，忽略 workspace 参数
-/// - `"workspace/agent-id"` → 强制工作目录层（需要 workspace 参数）
-/// - `"agent-id"` → 默认行为：
-///     1. 优先使用已存在的 Agent 目录（工作目录 > 全局）
-///     2. 都不存在时，返回全局层（Agent 是全局概念）
+/// 格式规则：`split_once('/')`，首段为来源，次段为目录名。
+/// - 必须带 `/` 且两段均非空（裸名 / 空段即格式错误）
+/// - 来源仅认 global / workspace（大小写不敏感——前端可直接用列举侧
+///   [`AgentIdSource`](crate::AgentIdSource) 的 PascalCase 序列化值作前缀）
+/// - 目录名须为单段名称（不含额外斜杠）
 ///
-/// 前缀比较大小写不敏感——`"Global/..."`、`"GLOBAL/..."` 与 `"global/..."` 等价，
-/// 使上游直接用来源枚举的序列化值（PascalCase）作前缀时无需额外大小写转换。
-pub fn get_agent_root(agent_id: &str, workspace: Option<&Path>) -> PathBuf {
-    if let Some((prefix, name)) = agent_id.split_once('/') {
-        if prefix.eq_ignore_ascii_case("global") {
-            return get_fuyao_agents_dir().join(name);
+/// 数据去向必须显式声明：裸名与未知来源一律报错，禁止隐式选址。
+fn parse_agent_id(agent_id: &str) -> Result<(AgentIdSource, &str), String> {
+    let (source, name) = match agent_id.split_once('/') {
+        Some((s, n)) if !s.is_empty() && !n.is_empty() => (s, n),
+        _ => {
+            return Err(format!(
+                "agent_id 格式错误（应为 global/{{名}} 或 workspace/{{名}}）: {agent_id}"
+            ));
         }
-        if prefix.eq_ignore_ascii_case("workspace")
-            && let Some(ws) = workspace
-        {
-            return get_workspace_agents_dir(ws).join(name);
-        }
-        return resolve_agent_root(agent_id, workspace);
+    };
+
+    let source = if source.eq_ignore_ascii_case("global") {
+        AgentIdSource::Global
+    } else if source.eq_ignore_ascii_case("workspace") {
+        AgentIdSource::Workspace
+    } else {
+        return Err(format!(
+            "agent_id 来源未知（应为 global 或 workspace，大小写不敏感）: {agent_id}"
+        ));
+    };
+
+    if name.contains('/') {
+        return Err(format!(
+            "agent_id 目录名非法（须为单段名称，不含斜杠）: {agent_id}"
+        ));
     }
 
-    resolve_agent_root(agent_id, workspace)
+    Ok((source, name))
 }
 
-/// 解析 agent_id 的实际路径（无前缀或未知前缀）
+/// 返回 Agent 目录路径
 ///
-/// 优先使用已存在的目录（工作目录优先级更高），否则返回全局层。
-fn resolve_agent_root(agent_id: &str, workspace: Option<&Path>) -> PathBuf {
-    if let Some(ws) = workspace {
-        let local = get_workspace_agents_dir(ws).join(agent_id);
-        if local.exists() {
-            return local;
+/// agent_id 的数据去向由来源前缀唯一决定，无隐式选址：
+/// - `global/{名}` → `{fuyao_home}/fuyao-agents/{名}`（忽略 workspace 参数）
+/// - `workspace/{名}` → `{workspace}/.fuyao/fuyao-agents/{名}`（必须配 workspace 参数）
+///
+/// `fuyao_home` 由调用方注入（读 [`AgentPaths`](crate::AgentPaths) 的 `fuyao_home`
+/// 字段），路径解析为纯函数、零全局状态。
+///
+/// # 错误
+///
+/// 格式非法（裸名 / 未知来源 / 目录名含斜杠）或 workspace 来源缺 workspace 参数时
+/// 返回 Err，错误信息面向最终用户，含格式与修正建议。
+pub fn get_agent_root(
+    agent_id: &str,
+    fuyao_home: &Path,
+    workspace: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let (source, name) = parse_agent_id(agent_id)?;
+
+    match source {
+        AgentIdSource::Global => Ok(fuyao_home.join("fuyao-agents").join(name)),
+        AgentIdSource::Workspace => {
+            let ws = workspace.ok_or_else(|| {
+                format!(
+                    "agent_id \"{agent_id}\" 为 workspace 来源但未提供 workspace 参数，\
+                     项目层数据目录无法定位；请提供工作目录或改用 global 来源"
+                )
+            })?;
+            Ok(get_workspace_agents_dir(ws).join(name))
         }
     }
-    get_fuyao_agents_dir().join(agent_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// `global/{名}`：全局层，用注入的 fuyao_home，忽略 workspace 参数
     #[test]
-    fn get_agent_root_global_prefix() {
-        let root = get_agent_root("global/coder", None);
-        assert!(root.to_string_lossy().contains("fuyao-agents"));
-        assert!(root.to_string_lossy().ends_with("coder"));
-    }
+    fn get_agent_root_global_prefix_uses_injected_home() {
+        let home = PathBuf::from("/tmp/home");
+        let root = get_agent_root("global/coder", &home, None).unwrap();
+        assert_eq!(root, home.join("fuyao-agents").join("coder"));
 
-    #[test]
-    fn get_agent_root_workspace_prefix() {
+        // 提供 workspace 也不影响：global 前缀强制全局层
         let ws = PathBuf::from("/tmp/project");
-        let root = get_agent_root("workspace/coder", Some(&ws));
-        assert!(root.to_string_lossy().contains(".fuyao"));
-        assert!(root.to_string_lossy().contains("fuyao-agents"));
-        assert!(root.to_string_lossy().ends_with("coder"));
+        let root_with_ws = get_agent_root("global/coder", &home, Some(&ws)).unwrap();
+        assert_eq!(root_with_ws, home.join("fuyao-agents").join("coder"));
     }
 
+    /// `workspace/{名}` + workspace=Some：强制工作目录层 `{ws}/.fuyao/fuyao-agents/{名}`
     #[test]
-    fn get_agent_root_前缀大小写不敏感() {
-        // PascalCase 前缀（与 AgentIdSource 枚举序列化值同形）应与小写前缀等价命中层定位，
-        // 上游无需为大小写做额外转换
-        let root_global = get_agent_root("Global/coder", None);
-        assert!(root_global.to_string_lossy().contains("fuyao-agents"));
-        assert!(root_global.to_string_lossy().ends_with("coder"));
-
+    fn get_agent_root_workspace_prefix_uses_workspace_layer() {
+        let home = PathBuf::from("/tmp/home");
         let ws = PathBuf::from("/tmp/project");
-        let root_ws = get_agent_root("Workspace/coder", Some(&ws));
-        assert!(root_ws.to_string_lossy().contains(".fuyao"));
-        assert!(root_ws.to_string_lossy().contains("fuyao-agents"));
-        assert!(root_ws.to_string_lossy().ends_with("coder"));
+        let root = get_agent_root("workspace/coder", &home, Some(&ws)).unwrap();
+        assert_eq!(root, ws.join(".fuyao").join("fuyao-agents").join("coder"));
     }
 
+    /// `workspace/{名}` + workspace=None：报错，信息含修正建议（不再隐式回退）
     #[test]
-    fn get_agent_root_bare_id_defaults_to_global() {
-        let root = get_agent_root("nonexistent_agent_12345", None);
-        assert!(root.to_string_lossy().contains("fuyao-agents"));
-        assert!(root.to_string_lossy().ends_with("nonexistent_agent_12345"));
+    fn get_agent_root_workspace_prefix_without_workspace_errors() {
+        let err = get_agent_root("workspace/coder", Path::new("/tmp/home"), None).unwrap_err();
+        assert!(err.contains("workspace/coder"), "{err}");
+        assert!(err.contains("global"), "应建议改用 global 来源：{err}");
+    }
+
+    /// 前缀大小写不敏感（Global/ / WORKSPACE/ 等价命中对应层），路径结果一致
+    #[test]
+    fn get_agent_root_prefix_case_insensitive() {
+        let home = PathBuf::from("/tmp/home");
+        let ws = PathBuf::from("/tmp/project");
+
+        let pascal_global = get_agent_root("Global/coder", &home, Some(&ws)).unwrap();
+        assert_eq!(
+            pascal_global,
+            home.join("fuyao-agents").join("coder"),
+            "Global/ 前缀应命中全局层"
+        );
+
+        let upper_ws = get_agent_root("WORKSPACE/coder", &home, Some(&ws)).unwrap();
+        assert_eq!(
+            upper_ws,
+            ws.join(".fuyao").join("fuyao-agents").join("coder"),
+            "WORKSPACE/ 前缀应命中工作目录层"
+        );
+    }
+
+    /// 裸名（无斜杠）报错，信息含正确格式
+    #[test]
+    fn get_agent_root_bare_name_errors() {
+        let err = get_agent_root("coder", Path::new("/tmp/home"), None).unwrap_err();
+        assert!(err.contains("global/{名}"), "{err}");
+        assert!(err.contains("workspace/{名}"), "{err}");
+    }
+
+    /// 未知来源 / 空目录名 / 多段目录名均报错
+    #[test]
+    fn get_agent_root_illegal_forms_error() {
+        let home = Path::new("/tmp/home");
+
+        let unknown = get_agent_root("test/coder", home, None).unwrap_err();
+        assert!(unknown.contains("来源未知"), "{unknown}");
+
+        let empty_name = get_agent_root("global/", home, None).unwrap_err();
+        assert!(empty_name.contains("格式错误"), "{empty_name}");
+
+        let nested = get_agent_root("global/a/b", home, None).unwrap_err();
+        assert!(nested.contains("目录名非法"), "{nested}");
     }
 
     #[test]

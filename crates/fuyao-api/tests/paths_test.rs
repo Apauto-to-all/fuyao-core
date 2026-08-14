@@ -1,7 +1,8 @@
 //! 路径系统集成测试
 //!
 //! 钉死 `AgentPaths` 与路径解析函数的公共 API 契约：
-//! - agent_id 三形式（global/{名} / workspace/{名} / 裸名）× workspace 有无 的解析组合
+//! - agent_id 两形式（global/{名} / workspace/{名}，前缀大小写不敏感）× workspace 有无
+//!   的解析组合，及非法格式（裸名 / 未知来源 / 嵌套斜杠）的报错
 //! - 各纯函数路径方法（config_paths / env_paths / sessions_db_path / logs_dir / cache_key 等）
 //! - extra_dirs 过滤分支（skills_paths / instructions_paths / agents_def_paths）
 //!
@@ -10,93 +11,113 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fuyao_api::AgentPaths;
 use rstest::rstest;
 
 // ---------------------------------------------------------------------------
-// get_agent_root：agent_id 三形式 × workspace 有无（核心解析规则）
+// get_agent_root：agent_id 两形式 × workspace 有无 + 非法格式报错（核心解析规则）
 // ---------------------------------------------------------------------------
 
-/// `global/{名}`：强制全局层，忽略 workspace 参数，结果落在 fuyao-agents 下
+/// `global/{名}`：强制全局层，用注入的 fuyao_home，忽略 workspace 参数
 #[test]
 fn get_agent_root_global_prefix_ignores_workspace() {
-    let root = fuyao_api::get_agent_root("global/coder", None);
-    assert!(
-        root.to_string_lossy().contains("fuyao-agents"),
-        "应在 fuyao-agents 下"
-    );
-    assert!(root.to_string_lossy().ends_with("coder"), "应以 name 结尾");
+    let home = PathBuf::from("/tmp/home");
+    let root = fuyao_api::get_agent_root("global/coder", &home, None).unwrap();
+    assert_eq!(root, home.join("fuyao-agents").join("coder"));
+
+    // 提供 workspace 也不影响：global 前缀强制全局层
+    let ws = PathBuf::from("/tmp/project");
+    let root_with_ws = fuyao_api::get_agent_root("global/coder", &home, Some(&ws)).unwrap();
+    assert_eq!(root_with_ws, home.join("fuyao-agents").join("coder"));
 }
 
 /// `workspace/{名}` + workspace=Some：强制工作目录层 `{ws}/.fuyao/fuyao-agents/{名}`
 #[test]
 fn get_agent_root_workspace_prefix_with_workspace() {
+    let home = PathBuf::from("/tmp/home");
     let ws = PathBuf::from("/tmp/project");
-    let root = fuyao_api::get_agent_root("workspace/coder", Some(&ws));
-    // 平台无关断言：按路径组件逐段检查（Windows 用 \，Unix 用 /）
-    let expected = get_fuyao_workspace_agents_dir(&ws).join("coder");
-    assert_eq!(root, expected);
+    let root = fuyao_api::get_agent_root("workspace/coder", &home, Some(&ws)).unwrap();
+    assert_eq!(root, ws.join(".fuyao").join("fuyao-agents").join("coder"));
 }
 
-/// 构造工作目录 agents 目录路径（与源码 get_workspace_agents_dir 一致的拼接逻辑）
-fn get_fuyao_workspace_agents_dir(ws: &std::path::Path) -> PathBuf {
-    ws.join(".fuyao").join("fuyao-agents")
-}
-
-/// `workspace/{名}` + workspace=None：走 resolve 回退，整串当名字落全局层（微妙契约）
+/// `workspace/{名}` + workspace=None：报错（不再隐式回退），信息含修正建议
 #[test]
-fn get_agent_root_workspace_prefix_without_workspace_falls_back() {
-    // workspace 前缀但无 workspace 参数 → 进入 resolve_agent_root("workspace/coder", None)
-    // → 无 workspace 可检查 → 整串 "workspace/coder" 作为 agent_id 落全局层
-    let root = fuyao_api::get_agent_root("workspace/coder", None);
-    assert!(
-        root.to_string_lossy().contains("fuyao-agents"),
-        "应回退到全局层"
-    );
-    assert!(
-        root.to_string_lossy().ends_with("workspace/coder"),
-        "整串（含斜杠）应作为名字"
+fn get_agent_root_workspace_prefix_without_workspace_errors() {
+    let err =
+        fuyao_api::get_agent_root("workspace/coder", Path::new("/tmp/home"), None).unwrap_err();
+    assert!(err.contains("workspace/coder"), "{err}");
+    assert!(err.contains("global"), "应建议改用 global 来源：{err}");
+}
+
+/// 前缀大小写不敏感：PascalCase / 全大写等价命中对应层（列举侧序列化值可直接用）
+#[test]
+fn get_agent_root_prefix_case_insensitive() {
+    let home = PathBuf::from("/tmp/home");
+    let ws = PathBuf::from("/tmp/project");
+
+    let pascal = fuyao_api::get_agent_root("Global/coder", &home, Some(&ws)).unwrap();
+    assert_eq!(pascal, home.join("fuyao-agents").join("coder"));
+
+    let upper = fuyao_api::get_agent_root("WORKSPACE/coder", &home, Some(&ws)).unwrap();
+    assert_eq!(upper, ws.join(".fuyao").join("fuyao-agents").join("coder"));
+}
+
+/// 裸名（无斜杠）：格式错误，信息含正确格式建议
+#[test]
+fn get_agent_root_bare_name_errors() {
+    let err = fuyao_api::get_agent_root("coder", Path::new("/tmp/home"), None).unwrap_err();
+    assert!(err.contains("格式错误"), "{err}");
+    assert!(err.contains("global/{名}"), "{err}");
+}
+
+/// 未知来源 / 空目录名 / 嵌套斜杠：报错，不隐式落全局层
+#[test]
+fn get_agent_root_illegal_forms_error() {
+    let home = Path::new("/tmp/home");
+
+    let unknown = fuyao_api::get_agent_root("test/coder", home, None).unwrap_err();
+    assert!(unknown.contains("来源未知"), "{unknown}");
+
+    let empty = fuyao_api::get_agent_root("global/", home, None).unwrap_err();
+    assert!(empty.contains("格式错误"), "{empty}");
+
+    let nested = fuyao_api::get_agent_root("global/a/b", home, None).unwrap_err();
+    assert!(nested.contains("目录名非法"), "{nested}");
+}
+
+/// agent_root 读注入的 fuyao_home（纯函数），不落进程全局 home
+#[test]
+fn agent_root_uses_injected_fuyao_home() {
+    let paths = common::make_agent_paths(PathBuf::from("/tmp/home"), Some("global/coder"), None);
+    assert_eq!(
+        paths.agent_root(),
+        Some(PathBuf::from("/tmp/home/fuyao-agents/coder"))
     );
 }
 
-/// 裸名 + 无 workspace：落全局层
+/// validate：workspace 来源缺 workspace 参数 / 裸名 → Err；合法组合 → Ok
 #[test]
-fn get_agent_root_bare_id_without_workspace_falls_to_global() {
-    let root = fuyao_api::get_agent_root("nonexistent_xyz", None);
-    assert!(
-        root.to_string_lossy().contains("fuyao-agents"),
-        "裸名应落全局层"
+fn validate_rejects_illegal_and_accepts_legal_agent_id() {
+    let ws_missing =
+        common::make_agent_paths(PathBuf::from("/tmp/home"), Some("workspace/coder"), None);
+    let err = ws_missing.validate().unwrap_err();
+    assert!(err.contains("workspace/coder"), "{err}");
+    assert!(err.contains("global"), "{err}");
+
+    let bare = common::make_agent_paths(PathBuf::from("/tmp/home"), Some("coder"), None);
+    assert!(bare.validate().unwrap_err().contains("格式错误"));
+
+    let ws_ok = common::make_agent_paths(
+        PathBuf::from("/tmp/home"),
+        Some("workspace/coder"),
+        Some(PathBuf::from("/tmp/project")),
     );
-    assert!(root.to_string_lossy().ends_with("nonexistent_xyz"));
-}
+    assert!(ws_ok.validate().is_ok());
 
-/// 裸名 + workspace 存在目录：优先 workspace-local（需真实文件系统）
-#[test]
-fn get_agent_root_bare_id_prefers_existing_workspace_local() {
-    let temp = tempfile::tempdir().expect("创建临时目录失败");
-    let ws = temp.path();
-    // 预创建 workspace-local 的 agent 目录
-    let local = ws.join(".fuyao").join("fuyao-agents").join("coder");
-    std::fs::create_dir_all(&local).unwrap();
-
-    let root = fuyao_api::get_agent_root("coder", Some(ws));
-    assert_eq!(root, local, "存在的 workspace-local 目录应优先");
-}
-
-/// 裸名 + workspace 但目录不存在：回退全局层
-#[test]
-fn get_agent_root_bare_id_falls_back_when_workspace_local_missing() {
-    let temp = tempfile::tempdir().expect("创建临时目录失败");
-    let ws = temp.path();
-    // 不创建 workspace-local 目录
-    let root = fuyao_api::get_agent_root("coder", Some(ws));
-    assert!(
-        root.to_string_lossy().contains("fuyao-agents"),
-        "workspace-local 不存在时回退全局层"
-    );
-    assert!(root.to_string_lossy().ends_with("coder"));
+    let none = common::make_agent_paths(PathBuf::from("/tmp/home"), None, None);
+    assert!(none.validate().is_ok());
 }
 
 // ---------------------------------------------------------------------------
@@ -125,9 +146,11 @@ fn config_paths_three_layers_with_agent_id_and_workspace() {
     let cp = paths.config_paths();
     assert_eq!(cp.global_, Some(home.join("fuyao.toml")));
     assert_eq!(cp.workspace, Some(ws.join(".fuyao").join("fuyao.toml")));
-    // agent 层 = agent_root/fuyao.toml（global/coder 的 agent_root 落全局 agents 目录）
-    let agent = cp.agent.expect("有 agent_id 时 agent 层应为 Some");
-    assert!(agent.ends_with("fuyao.toml"));
+    // agent 层 = agent_root/fuyao.toml（global/coder 的 agent_root 落注入 home 的 agents 目录）
+    assert_eq!(
+        cp.agent,
+        Some(home.join("fuyao-agents").join("coder").join("fuyao.toml"))
+    );
 }
 
 #[test]

@@ -43,17 +43,22 @@ UI 层只需在对应动作时提供对应 Params：
 
 ## agent_id 解析
 
-三种格式（入口：`get_agent_root(agent_id, workspace)`）：
+两种格式（入口：`get_agent_root(agent_id, fuyao_home, workspace)`）：
 
 | 格式 | 语义 | agent_root |
 |------|------|-----------|
-| `global/{名}` | 强制全局层 | `~/.fuyao/fuyao-agents/{名}` |
+| `global/{名}` | 强制全局层 | `{fuyao_home}/fuyao-agents/{名}` |
 | `workspace/{名}` | 强制工作区层 | `{workspace}/.fuyao/fuyao-agents/{名}` |
-| `{名}` | 自动选址 | 工作区已存在 → 用它；否则 → 全局层 |
 
-裸 ID（无前缀）的自动选址：优先复用已存在的目录（工作区 > 全局），都未创建时新建到全局层。
+数据去向必须显式声明，禁止隐式选址：
 
-> 全局层基准：`~/.fuyao/`，可用 `FUYAO_HOME` 环境变量覆盖。
+- **来源前缀必填**：裸名、未知来源、目录名含斜杠或为空，一律视为格式错误（与 model_id 的 `provider/model` 拆分同构：`/` 前是来源、`/` 后是目录）
+- **前缀大小写不敏感**：`Global/coder`、`WORKSPACE/coder` 与小写形式等价命中对应层——列举侧 `AgentIdSource` 的 PascalCase 序列化值可直接作前缀，前端无需大小写转换
+- **配对约束**：`workspace/{名}` 必须提供 workspace 参数，否则报错（不再整串隐式落全局层）
+- **启动即校验**：引擎装配（`init_engine`）启动时校验，非法输入 fail-fast 报错（`InitError::InvalidAgentId`），错误信息含正确格式与修正建议
+
+> 全局层基准：`~/.fuyao/`，可用 `FUYAO_HOME` 环境变量覆盖。agent_root 路径解析读
+> `AgentPaths` 注入的 `fuyao_home` 字段（纯函数、零全局状态）。
 
 ## 三层路径系统
 
@@ -115,6 +120,11 @@ agent_root（如 `~/.fuyao/fuyao-agents/coder/`）是数据隔离目录（sessio
 
 `fuyao_home` 字段在构造时注入，所有路径方法读此字段而非调 `get_fuyao_home()`。这让路径解析成为纯函数——零全局状态，测试可 per-instance 隔离（不同测试用不同 fuyao_home，互不干扰）。
 
-### 为什么裸 ID 自动选址而非报错？
+### 为什么强制来源前缀而非自动选址？
 
-降低使用门槛。用户不指定前缀时，系统自动选最合理的位置（工作区已有则复用，否则全局层新建）。带前缀则是"强制选址"——用户明确知道数据该在哪。
+agent_id 决定数据（sessions.db、日志、配置）的物理位置，必须无歧义。自动选址让
+数据去向取决于磁盘状态（工作区已有目录则复用，否则落全局）——同一个裸名在
+不同机器、不同时刻可能指向不同目录，会话历史悄悄分叉且无法追溯。强制前缀把
+「数据在哪」变成调用方显式声明的契约：同名文件夹可在全局层与项目层并存且都是
+合法目标，前缀是唯一消歧手段；格式错误在引擎启动时即报错，而不是隐式选一个
+位置继续跑。

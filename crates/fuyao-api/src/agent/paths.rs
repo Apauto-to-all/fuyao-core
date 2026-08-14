@@ -10,7 +10,12 @@ use std::path::PathBuf;
 /// 不可变模型，切换 workspace 时创建新实例。
 #[derive(Debug, Clone)]
 pub struct AgentPaths {
-    /// Agent 标识符，如 "global/coder"、"workspace/coder"
+    /// Agent 标识符（带来源前缀的字符串，如 "global/coder"、"workspace/coder"）
+    ///
+    /// 格式：`{来源}/{目录名}`，来源仅认 global / workspace（大小写不敏感），
+    /// 目录名为单段非空名称。数据去向必须显式声明——裸名与未知来源在引擎启动
+    /// 校验（[`AgentPaths::validate`]）时即报错，禁止隐式选址。
+    /// `None` 表示无数据隔离（sessions / 日志等落全局层默认位置）。
     pub agent_id: Option<String>,
 
     /// 工作目录路径
@@ -221,10 +226,30 @@ impl AgentPaths {
     }
 
     /// Agent 根目录路径
+    ///
+    /// 按 agent_id 的来源前缀显式定位（global → 注入的 fuyao_home、workspace →
+    /// workspace 参数），无隐式选址。非法格式在此为设计异常：启动入口经
+    /// [`Self::validate`] 校验拒绝后本分支不可达，panic 是兜底防线。
     pub fn agent_root(&self) -> Option<PathBuf> {
-        self.agent_id
-            .as_deref()
-            .map(|id| get_agent_root(id, self.workspace.as_deref()))
+        self.agent_id.as_deref().map(|id| {
+            get_agent_root(id, &self.fuyao_home, self.workspace.as_deref())
+                .unwrap_or_else(|e| panic!("{e}"))
+        })
+    }
+
+    /// 校验 agent_id 的合法性（启动入口调用，fail-fast）
+    ///
+    /// 规则与 [`get_agent_root`](crate::get_agent_root) 完全一致（同一函数实现）：
+    /// - 格式：`global/{名}` / `workspace/{名}`，前缀大小写不敏感，名为单段非空
+    /// - 配对：workspace 来源必须提供 workspace 参数
+    ///
+    /// 引擎装配（init_engine）启动时调用，非法输入直接报错；错误信息面向最终
+    /// 用户，含格式与修正建议。
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(id) = &self.agent_id {
+            get_agent_root(id, &self.fuyao_home, self.workspace.as_deref()).map(|_| ())?;
+        }
+        Ok(())
     }
 
     /// 生成缓存 key（用于 Provider/Model 注册表）
@@ -370,6 +395,76 @@ mod tests {
     fn agent_paths_cache_key_default() {
         let paths = AgentPaths::default();
         assert_eq!(paths.cache_key(), "|");
+    }
+
+    /// agent_root 读注入的 fuyao_home（纯函数），不落进程全局 home
+    #[test]
+    fn agent_root_uses_injected_fuyao_home() {
+        let paths = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            fuyao_home: PathBuf::from("/tmp/home"),
+            ..AgentPaths::default()
+        };
+        assert_eq!(
+            paths.agent_root(),
+            Some(PathBuf::from("/tmp/home/fuyao-agents/coder"))
+        );
+    }
+
+    /// agent_root 遇非法 agent_id（裸名）panic——启动校验后的兜底防线
+    #[test]
+    #[should_panic(expected = "agent_id 格式错误")]
+    fn agent_root_panics_on_bare_name() {
+        let paths = AgentPaths {
+            agent_id: Some("coder".to_string()),
+            ..AgentPaths::default()
+        };
+        paths.agent_root();
+    }
+
+    /// validate：workspace 来源 + 无 workspace 参数 → 报错且信息含修正建议
+    #[test]
+    fn validate_rejects_workspace_id_without_workspace() {
+        let paths = AgentPaths {
+            agent_id: Some("workspace/coder".to_string()),
+            workspace: None,
+            ..AgentPaths::default()
+        };
+        let err = paths.validate().unwrap_err();
+        assert!(err.contains("workspace/coder"), "{err}");
+        assert!(err.contains("global"), "应建议改用 global 来源：{err}");
+    }
+
+    /// validate：裸名 agent_id → 格式错误
+    #[test]
+    fn validate_rejects_bare_name() {
+        let paths = AgentPaths {
+            agent_id: Some("coder".to_string()),
+            ..AgentPaths::default()
+        };
+        let err = paths.validate().unwrap_err();
+        assert!(err.contains("格式错误"), "{err}");
+    }
+
+    /// validate：workspace 来源 + 有 workspace 参数 / global 来源 / 无 agent_id 均合法
+    #[test]
+    fn validate_accepts_legal_combinations() {
+        let ws_ok = AgentPaths {
+            agent_id: Some("workspace/coder".to_string()),
+            workspace: Some(PathBuf::from("/tmp/project")),
+            ..AgentPaths::default()
+        };
+        assert!(ws_ok.validate().is_ok());
+
+        let global_ok = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            workspace: None,
+            ..AgentPaths::default()
+        };
+        assert!(global_ok.validate().is_ok());
+
+        let none_ok = AgentPaths::default();
+        assert!(none_ok.validate().is_ok());
     }
 
     #[test]

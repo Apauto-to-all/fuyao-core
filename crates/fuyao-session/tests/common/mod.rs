@@ -54,7 +54,7 @@ pub fn unique_paths(tag: &str) -> AgentPaths {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     AgentPaths {
-        agent_id: Some(format!("integration_test/{tag}/{n}")),
+        agent_id: Some(format!("global/{tag}-{n}")),
         workspace: None,
         extra_dirs: vec![],
         fuyao_home: dirs_or_default(),

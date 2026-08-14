@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn load_env_nonexistent_paths_no_panic() {
         let paths = AgentPaths {
-            agent_id: Some("nonexistent_test".to_string()),
+            agent_id: Some("global/nonexistent_test".to_string()),
             workspace: None,
             ..Default::default()
         };

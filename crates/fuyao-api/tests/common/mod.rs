@@ -9,8 +9,8 @@ use fuyao_api::AgentPaths;
 
 /// 构造可注入 `fuyao_home` 的 `AgentPaths`，绕开环境变量，实现 per-test 隔离。
 ///
-/// `agent_id` 与 `workspace` 均可选，覆盖典型组合（裸名 / global/{名} / workspace/{名}）。
-/// `extra_dirs` 留空，需要时由调用方在返回值上追加。
+/// `agent_id` 与 `workspace` 均可选，覆盖典型组合（global/{名} / workspace/{名}，
+/// 来源前缀必须显式）。`extra_dirs` 留空，需要时由调用方在返回值上追加。
 #[allow(dead_code)]
 pub fn make_agent_paths(
     fuyao_home: PathBuf,

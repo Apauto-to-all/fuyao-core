@@ -40,6 +40,10 @@ pub enum InitError {
     /// 配置加载失败（TOML 解析错误、IO 错误等）
     #[error("配置加载失败: {0}")]
     ConfigError(String),
+
+    /// agent_id 非法（格式错误 / workspace 来源缺 workspace 参数）
+    #[error("agent_id 非法: {0}")]
+    InvalidAgentId(String),
 }
 
 /// 引擎装配准备产物
@@ -70,11 +74,18 @@ pub struct InitResult {
 /// - `params`：引擎启动参数，内含 Agent 三层目录身份证明，决定配置与数据路径。
 ///
 /// # 错误
+/// - [`InitError::InvalidAgentId`]：agent_id 格式非法（裸名 / 未知来源）或
+///   workspace 来源缺 workspace 参数
 /// - [`InitError::NoProviderAvailable`]：所有 Provider 实例创建失败
 /// - [`InitError::ConfigError`]：配置文件加载失败
 pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError> {
     // 内部工具函数只需要路径身份证明，直接取裸 &AgentPaths 复用
     let agent_paths = &params.agent_paths;
+
+    // 0. agent_id 前置校验：来源前缀必须显式（global/{名} / workspace/{名}，
+    //    大小写不敏感），workspace 来源必须配 workspace 参数。启动即报错
+    //    （fail-fast），路径方法中的 panic 是校验后的不可达兜底。
+    agent_paths.validate().map_err(InitError::InvalidAgentId)?;
 
     // 1. 加载 .env 环境变量
     load_env(agent_paths);
@@ -180,5 +191,15 @@ mod tests {
     fn init_error_config_error_passes_message() {
         let err = InitError::ConfigError("io 错误".to_string());
         assert!(err.to_string().contains("io 错误"));
+    }
+
+    /// InitError::InvalidAgentId 透传校验错误信息（含格式建议）
+    #[test]
+    fn init_error_invalid_agent_id_passes_message() {
+        let err =
+            InitError::InvalidAgentId("agent_id 格式错误（应为 global/{名}）: coder".to_string());
+        let msg = err.to_string();
+        assert!(msg.contains("agent_id 非法"), "{msg}");
+        assert!(msg.contains("global/{名}"), "{msg}");
     }
 }

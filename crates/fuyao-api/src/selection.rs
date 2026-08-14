@@ -28,7 +28,8 @@ pub enum AgentIdSource {
 /// 可选 agent_id（数据隔离身份）
 ///
 /// `id` 为纯文件夹名（不带 `global/` / `workspace/` 前缀），来源由 `source` 承载；
-/// 调用方按需自行拼成 `global/{id}` / `workspace/{id}` 设给 agent_id。
+/// 调用方按需自行拼成 `global/{id}` / `workspace/{id}` 设给 agent_id
+/// （来源前缀大小写不敏感，`AgentIdSource` 的序列化值可直接作前缀）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AgentIdOption {
     /// 纯文件夹名，如 "coder"

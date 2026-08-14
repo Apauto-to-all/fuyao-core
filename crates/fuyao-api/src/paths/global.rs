@@ -22,13 +22,6 @@ pub fn get_fuyao_home() -> PathBuf {
         .join(".fuyao")
 }
 
-/// 返回 fuyao-agents 目录路径
-///
-/// 路径: `~/.fuyao/fuyao-agents/`
-pub fn get_fuyao_agents_dir() -> PathBuf {
-    get_fuyao_home().join("fuyao-agents")
-}
-
 /// 返回用户 home 目录
 fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME")

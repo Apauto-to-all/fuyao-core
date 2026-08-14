@@ -78,7 +78,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | **agent_id** | 独立 Agent 实体（数据隔离单元） | `fuyao-agents/{id}/`（一个目录） | 数据在哪：sessions.db、Provider 配置、缓存 |
 | **Agent 定义** | 定义提示词（一项能力）；终端用户称「智能体」 | 四层 `agents/{name}.md`（见下） | 内容是什么：系统提示词、行为指令 |
 
-- **agent_id** 是路径参数：`global/{名}` / `workspace/{名}` / `{名}`（自动解析：工作目录优先，回退全局层）
+- **agent_id** 是路径参数：`global/{名}` / `workspace/{名}`（来源前缀必须显式，大小写不敏感；裸名 / 未知来源在引擎启动校验时报错，禁止隐式选址）
 - **Agent 定义** 由 `AgentConfig.definition` 选择（None 时取 `"default"`），按四层优先级解析同名 `.md`：workspace > agent > global > extra，外加内置 `default`/`explore`/`executor` 兜底
 - **agent 层**：提供 agent_id 时，`{agent_root}/agents/{name}.md` 作为定义来源之一——独立 Agent 可携带私有定义（含私有 `default`），覆盖同名共享定义
 - **任意组合**：任何 agent_id 仍可经 `AgentConfig.definition` 选择任何具名定义（如 agent_id=`coder` 用 `reviewer`）；agent 层只是额外来源，不限制组合自由

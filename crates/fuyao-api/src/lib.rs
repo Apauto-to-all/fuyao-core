@@ -46,8 +46,8 @@ pub use message::{
 };
 pub use pagination::{EventPage, MessagePage, SessionPage};
 pub use paths::{
-    LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
-    get_workspace_root, normalize_workspace, normalize_workspace_str,
+    LayeredPaths, get_agent_root, get_fuyao_home, get_workspace_agents_dir, get_workspace_root,
+    normalize_workspace, normalize_workspace_str,
 };
 pub use prompt_types::{AgentDefinition, AgentMode};
 pub use provider::{

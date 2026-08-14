@@ -106,7 +106,7 @@ mod tests {
 
     fn unique_paths(test_name: &str) -> AgentPaths {
         AgentPaths {
-            agent_id: Some(format!("test/{test_name}")),
+            agent_id: Some(format!("global/{test_name}")),
             workspace: None,
             ..Default::default()
         }
