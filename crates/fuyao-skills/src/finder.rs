@@ -139,18 +139,19 @@ fn walk_skill_mds(base: &Path) -> Vec<PathBuf> {
         .git_global(false)
         .git_exclude(false)
         .ignore(false)
+        // 目录入栈时剪枝：排除目录整棵子树不再进入。只过滤结果会白遍历整棵
+        // 子树（node_modules / dist 可达数万条目），且只比对直接父目录名时
+        // 深层条目（如 node_modules/pkg/SKILL.md）会漏排除
+        .filter_entry(|e| {
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_dir {
+                return true;
+            }
+            let name = e.file_name().to_string_lossy();
+            !EXCLUDED_DIRS.contains(&name.as_ref())
+        })
         .build()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            // 排除 EXCLUDED_DIRS 中的目录
-            if let Some(parent) = e.path().parent() {
-                let dir_name = parent.file_name().unwrap_or_default().to_string_lossy();
-                if EXCLUDED_DIRS.contains(&dir_name.as_ref()) {
-                    return false;
-                }
-            }
-            true
-        })
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
         .filter(|e| e.file_name() == "SKILL.md")
         .map(|e| e.path().to_path_buf())
@@ -218,6 +219,30 @@ mod tests {
         std::fs::write(pycache.join("SKILL.md"), "test").unwrap();
 
         // 创建正常目录中的 SKILL.md
+        let normal_dir = dir.join("normal");
+        std::fs::create_dir_all(&normal_dir).unwrap();
+        std::fs::write(normal_dir.join("SKILL.md"), "test").unwrap();
+
+        let result = walk_skill_mds(&dir);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].to_string_lossy().contains("normal"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回归测试：排除目录的深层子树同样排除（node_modules/pkg/SKILL.md）。
+    /// 旧的直接父目录名比对会漏排除深层条目。
+    #[test]
+    fn walk_skill_mds_excludes_deep_entries_in_excluded_dirs() {
+        let dir = std::env::temp_dir().join("fuyao_test_walk_excluded_deep");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 排除目录下嵌套两层的 SKILL.md
+        let nested = dir.join("node_modules").join("some-pkg").join("skills");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), "test").unwrap();
+
+        // 正常目录中的 SKILL.md
         let normal_dir = dir.join("normal");
         std::fs::create_dir_all(&normal_dir).unwrap();
         std::fs::write(normal_dir.join("SKILL.md"), "test").unwrap();
