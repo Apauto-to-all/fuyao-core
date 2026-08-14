@@ -116,6 +116,29 @@ pub async fn execute_command(
         }
     };
 
+    // 先取走 stdout 并启动并发读取：若等 wait() 完成后才读，子进程输出超过
+    // OS 管道缓冲（约 64KB）时会阻塞在 write 上永不退出，命令只能等超时被杀、输出全丢。
+    // 读任务与 wait 并行，wait 返回后经 oneshot 取回完整输出。
+    let stdout_rx = match child.stdout.take() {
+        Some(mut s) => {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // stderr 已通过 2>&1 合并到 stdout，读这一路即全部输出。
+            // 进程被杀后管道写端关闭，read_to_end 随之结束，任务自然退出。
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
+                let _ = tx.send(buf);
+            });
+            rx
+        }
+        None => {
+            // 无管道输出：预置一个已关闭的接收端，正常路径取到空输出
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            drop(tx);
+            rx
+        }
+    };
+
     // 三态等待：cancel 优先（biased），命中后杀进程组 + forget 回收
     tokio::select! {
         biased;
@@ -143,15 +166,10 @@ pub async fn execute_command(
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let exit_code = status.code().unwrap_or(-1);
 
-                // 读取 stdout（stderr 已通过 2>&1 合并到 stdout）
-                let stdout_bytes = match child.stdout.take() {
-                    Some(mut s) => {
-                        let mut buf = Vec::new();
-                        let _ = tokio::io::AsyncReadExt::read_to_end(&mut s, &mut buf).await;
-                        buf
-                    }
-                    None => Vec::new(),
-                };
+                // 读取并发任务收齐的 stdout（stderr 已通过 2>&1 合并到 stdout）。
+                // wait 返回时进程已退出、写端已关闭，读任务即将/已经送达，
+                // 此处 await 只是等最后一个 chunk 收尾，不会长期阻塞。
+                let stdout_bytes = stdout_rx.await.unwrap_or_default();
 
                 // 解码输出
                 let mut combined = decode_output(&stdout_bytes);
@@ -330,6 +348,40 @@ mod tests {
         let json = format_result(result);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["output"], "");
+    }
+
+    #[tokio::test]
+    async fn execute_command_large_output_no_deadlock() {
+        // 回归测试：输出量超过 OS 管道缓冲（约 64KB）的命令必须正常完成。
+        // 旧行为是先 wait() 等退出、后读 stdout，子进程写满管道后阻塞在 write 上
+        // 永不退出，只能等超时被杀且输出全丢；修复后并发读取，进程正常退出且输出送达。
+        let shell_info = super::super::shell::find_shell();
+        // 各 shell 生成 200KB 级输出且自身立即结束（避免逐行 fork 拖慢测试）
+        let command = match shell_info.shell_type {
+            // PowerShell 字符串乘法：单表达式输出约 200KB
+            "powershell" => "\"0123456789abcdef\" * 12800",
+            // cmd 内建 for + echo：5000 行 × 81 字节，无进程创建
+            "cmd" => {
+                "for /L %i in (1,1,5000) do @echo 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+            // bash / git_bash：yes 连续输出，head 截到 200KB 字节
+            _ => "yes 0123456789abcdef | head -c 200000",
+        };
+        let result = execute_command(
+            command,
+            None,
+            Duration::from_secs(30),
+            shell_info,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!result.timed_out, "大输出命令不应超时: {:?}", result.error);
+        assert!(
+            result.success,
+            "命令应正常退出: exit_code={}",
+            result.exit_code
+        );
+        assert!(result.output.contains("0123456789abcdef"));
     }
 
     #[tokio::test]
