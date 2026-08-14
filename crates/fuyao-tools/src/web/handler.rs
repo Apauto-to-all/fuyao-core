@@ -18,7 +18,20 @@ use super::types::{WebFetchRedirect, WebFetchResult};
 use crate::common;
 use crate::config::WEBFETCH_USER_AGENT;
 use serde_json::Value;
+use std::sync::LazyLock;
 use std::time::Instant;
+
+/// 进程级共享 HTTP 客户端
+///
+/// 连接池与 TLS 会话跨调用复用，避免每次抓取重建客户端；禁用自动重定向
+/// （重定向由本工具显式处理，跨域重定向要回报用户而非跟随），超时按请求
+/// 粒度设置（RequestBuilder::timeout）。
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("webfetch 共享 HTTP 客户端构建失败")
+});
 
 /// 验证并规范化超时时间（默认/上限从全局配置 get_config().tools.limits 读取）
 fn validate_timeout(timeout: Option<u64>) -> u64 {
@@ -98,22 +111,14 @@ pub async fn webfetch_handler(args: Value) -> String {
         return common::tool_result(serde_json::to_value(result).unwrap_or_default());
     }
 
-    // 4. HTTP 抓取（缓存未命中）
+    // 4. HTTP 抓取（缓存未命中），共享客户端 + 请求粒度超时
     let start = Instant::now();
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return common::tool_error(&format!("创建 HTTP 客户端失败: {e}")),
-    };
-
     let headers = build_request_headers();
     let mut current_url = url.clone();
-    let mut response = match client
+    let mut response = match HTTP_CLIENT
         .get(&current_url)
         .headers(headers.clone())
+        .timeout(std::time::Duration::from_secs(timeout))
         .send()
         .await
     {
@@ -163,7 +168,13 @@ pub async fn webfetch_handler(args: Value) -> String {
         }
 
         // 同域名重定向：继续抓取
-        response = match client.get(&redirect_url).headers(headers).send().await {
+        response = match HTTP_CLIENT
+            .get(&redirect_url)
+            .headers(headers)
+            .timeout(std::time::Duration::from_secs(timeout))
+            .send()
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 if e.is_timeout() {
@@ -175,18 +186,7 @@ pub async fn webfetch_handler(args: Value) -> String {
         current_url = redirect_url;
     }
 
-    // 6. 检查响应大小
-    if let Some(content_length) = response.headers().get("content-length")
-        && let Ok(len_str) = content_length.to_str()
-        && let Ok(len) = len_str.parse::<usize>()
-        && len > max_download_bytes
-    {
-        return common::tool_error(&format!(
-            "响应过大（超过 {}MB 限制）",
-            max_download_bytes / 1024 / 1024
-        ));
-    }
-
+    // 6. 检查响应大小（content-length 头；无头或不可解析按 0 放行，正文长度兜底）
     let body_bytes = response.content_length().unwrap_or(0) as usize;
     if body_bytes > max_download_bytes {
         return common::tool_error(&format!(
@@ -219,17 +219,17 @@ pub async fn webfetch_handler(args: Value) -> String {
     // 8. 内容转换
     let content = convert_content(&raw_content, &content_type, &output_format);
 
-    // 9. 缓存转换后的内容
+    // 9. 应用分页（先于缓存：分页只读全文，缓存随后接管所有权）
+    let pagination = apply_pagination(&content, offset, limit);
+
+    // 10. 缓存转换后的内容（所有权移交缓存，省一次全文 clone）
     cache::set_cached_content(
         &current_url,
         &output_format,
-        content.clone(),
+        content,
         content_type.clone(),
         final_status,
     );
-
-    // 10. 应用分页
-    let pagination = apply_pagination(&content, offset, limit);
 
     // 11. 构建结果
     let duration_ms = start.elapsed().as_millis() as u64;
