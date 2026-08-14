@@ -32,8 +32,9 @@ use std::path::PathBuf;
 ///
 /// 查找链与 [`load_agent_definition_from_agent_paths`] 一致：
 /// 用户 `agents/{name}.md` → 内置默认表。定义名由调用方显式提供（`AgentConfig.definition`
-/// 必填），链上未命中即 [`PromptError::DefinitionNotFound`]（附按用途过滤的可用列表），
-/// 绝不静默替换人格。
+/// 必填），链上未命中即 [`PromptError::DefinitionNotFound`]（附按用途过滤的可用列表）；
+/// 某层文件存在但损坏即 [`PromptError::DefinitionCorrupted`]（附文件路径与原因）——
+/// 不静默跳层或落内置表，绝不静默替换人格。
 ///
 /// mode 校验按 `usage` 方向（主 Agent 校验 `is_usable_as_primary`、子代理校验
 /// `is_usable_as_subagent`）；不符返回 [`PromptError::ModeMismatch`]。
@@ -43,8 +44,12 @@ pub fn resolve_definition(
     usage: crate::PromptUsage,
 ) -> Result<AgentDefinition, PromptError> {
     let def_name = agent_config.definition.as_str();
-    let agent_def =
-        load_agent_definition_from_agent_paths(agent_paths, def_name).ok_or_else(|| {
+    let agent_def = load_agent_definition_from_agent_paths(agent_paths, def_name)
+        .map_err(|cause| PromptError::DefinitionCorrupted {
+            name: def_name.to_string(),
+            cause,
+        })?
+        .ok_or_else(|| {
             // 未知名报错并附按用途过滤的可用列表，供调用方（或依据错误自纠的 LLM）直接修正
             let usable_as = |def: &AgentDefinition| match usage {
                 crate::PromptUsage::Primary => def.mode.is_usable_as_primary(),
@@ -264,13 +269,19 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
 
 /// 收集所有 Agent 定义（四层 .md + 内置，全模式），按优先级去重
 ///
-/// 共享扫描器，供 [`list_primary_definitions`]（过滤主代理模式）与
-/// [`list_subagent_definitions`]（过滤子代理模式）复用。返回 [`DefinitionOption`]
-/// 列表：`id` = file stem（去重键与对外名），`definition` = 解析得到的完整定义。
+/// 共享扫描器，供 [`list_primary_definitions`]（过滤主代理模式）、
+/// [`list_subagent_definitions`]（过滤子代理模式）与 [`resolve_definition`]
+/// 的可用列表生成复用。返回 [`DefinitionOption`] 列表：`id` = file stem
+/// （去重键与对外名），`definition` = 解析得到的完整定义。
 ///
 /// 遍历顺序遵循 [`AgentPaths::agents_def_dirs`] 的优先级（workspace > agent > global > extra），
 /// 同名定义首现胜（高优先级层覆盖低优先级层）；内置定义（[`crate::default::builtin_definition_names`]）
 /// 作为最低优先级注入，与用户文件同名时用户文件胜。最后按 id 升序排序。
+///
+/// 单个定义文件损坏（存在但解析失败）记 WARN 后跳过，不拖垮整个列举——
+/// 列举是辅助视图（列表 / 索引 / 报错文案），目标定义的加载路径已由
+/// [`resolve_definition`] 独立 fail-loud；此处若因旁支文件损坏而整体失败，
+/// 会让「未知名报错」退化为「另一个文件的解析错误」，干扰定位。
 fn collect_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
     // id(stem) → 定义，首现胜（按优先级顺序插入，已存在则跳过）
     let mut by_id: HashMap<String, AgentDefinition> = HashMap::new();
@@ -298,8 +309,19 @@ fn collect_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
             if by_id.contains_key(stem) {
                 continue;
             }
-            if let Some(def) = load_agent_definition(&file_path) {
-                by_id.insert(stem.to_string(), def);
+            match load_agent_definition(&file_path) {
+                // 扫描与读取之间文件被删（竞态）→ 视同未命中
+                Ok(None) => {}
+                Ok(Some(def)) => {
+                    by_id.insert(stem.to_string(), def);
+                }
+                Err(cause) => {
+                    tracing::warn!(
+                        definition_id = %stem,
+                        cause = %cause,
+                        "Agent 定义文件损坏，已从列举中跳过"
+                    );
+                }
             }
         }
     }
@@ -564,6 +586,81 @@ mod tests {
         let err = resolve_definition(&ctx, &config, crate::PromptUsage::Subagent).unwrap_err();
         assert!(matches!(err, PromptError::ModeMismatch { .. }));
         assert!(err.to_string().contains("boss"));
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn resolve_definition_corrupted_file_reports_error_not_fallback() {
+        // 定义文件存在但损坏 → DefinitionCorrupted（含文件路径），
+        // 不静默落内置表、不伪装成「未找到」
+        let temp = std::env::temp_dir().join("fuyao_test_sections_def_corrupted");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("default.md"),
+            "---\nname: [unclosed\nmode: primary\n---\n坏文件",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let config = AgentConfig {
+            definition: "default".to_string(),
+        };
+        let err = resolve_definition(&ctx, &config, crate::PromptUsage::Primary).unwrap_err();
+        match &err {
+            PromptError::DefinitionCorrupted { name, cause } => {
+                assert_eq!(name, "default");
+                assert!(
+                    cause.contains(
+                        plugin
+                            .join("agents")
+                            .join("default.md")
+                            .to_string_lossy()
+                            .as_ref()
+                    ),
+                    "错误应含损坏文件路径：{cause}"
+                );
+            }
+            other => panic!("应为 DefinitionCorrupted，实际：{other:?}"),
+        }
+        // 错误文案透传路径与原因，上层可直接展示
+        let msg = err.to_string();
+        assert!(msg.contains("文件损坏"), "错误信息应说明损坏：{msg}");
+
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    #[test]
+    fn collect_definitions_skips_corrupted_files_and_keeps_rest() {
+        // 目录里混有损坏文件时列举不整体失败：坏文件跳过（WARN），好文件保留
+        let temp = std::env::temp_dir().join("fuyao_test_sections_collect_corrupted");
+        let plugin = temp.join("plugin");
+        std::fs::create_dir_all(plugin.join("agents")).unwrap();
+        std::fs::write(
+            plugin.join("agents").join("good.md"),
+            "---\nname: good\nmode: primary\n---\n好定义",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("agents").join("bad.md"),
+            "---\nname: [unclosed\n---\n坏定义",
+        )
+        .unwrap();
+
+        let ctx = AgentPaths {
+            extra_dirs: vec![plugin.clone()],
+            ..Default::default()
+        };
+        let defs = list_primary_definitions(&ctx);
+        assert!(defs.iter().any(|d| d.id == "good"), "好定义应保留");
+        assert!(
+            !defs.iter().any(|d| d.id == "bad"),
+            "坏定义应被跳过而非进入列表"
+        );
 
         std::fs::remove_dir_all(&temp).ok();
     }

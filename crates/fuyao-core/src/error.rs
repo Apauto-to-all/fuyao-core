@@ -25,10 +25,10 @@ pub enum EngineError {
     #[error("提供者错误: {0}")]
     Provider(String),
 
-    /// Agent 定义解析错误（定义名不存在，或 mode 与用途不符）
+    /// Agent 定义解析错误（定义名不存在、mode 与用途不符，或定义文件损坏）
     ///
     /// 创建 / 恢复 / 派生会话时由 `resolve_definition` 产生，错误信息自带
-    /// 修正所需上下文（未知名附可用列表）。
+    /// 修正所需上下文（未知名附可用列表、损坏附文件路径与原因）。
     #[error("{0}")]
     Prompt(#[from] fuyao_prompt::PromptError),
 

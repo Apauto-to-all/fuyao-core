@@ -185,8 +185,9 @@ fn load_definition_hits_builtin_default_when_no_file() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def =
-        load_agent_definition_from_agent_paths(&paths, "default").expect("内置 default 应可加载");
+    let def = load_agent_definition_from_agent_paths(&paths, "default")
+        .expect("查找不应报错")
+        .expect("内置 default 应可加载");
 
     assert_eq!(def.name, "fuyao", "无文件时命中内置默认");
     assert_eq!(def.mode, AgentMode::Primary);
@@ -202,7 +203,9 @@ fn load_definition_global_default_md_overrides_builtin() {
     );
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default").unwrap();
+    let def = load_agent_definition_from_agent_paths(&paths, "default")
+        .unwrap()
+        .expect("用户 default.md 应可加载");
 
     assert_eq!(def.name, "my-agent");
     assert!(def.system_prompt.contains("测试 Agent"));
@@ -232,7 +235,9 @@ fn load_definition_workspace_overrides_global() {
         Vec::new(),
     );
 
-    let def = load_agent_definition_from_agent_paths(&paths, "reviewer").unwrap();
+    let def = load_agent_definition_from_agent_paths(&paths, "reviewer")
+        .unwrap()
+        .expect("reviewer 应可加载");
 
     assert_eq!(def.name, "ws-reviewer", "workspace 层应优先于 global");
     assert!(def.system_prompt.contains("项目层定义"));
@@ -256,21 +261,43 @@ fn load_definition_extra_layer_used_when_no_global_or_workspace() {
         vec![plugin.path().to_path_buf()],
     );
 
-    let def = load_agent_definition_from_agent_paths(&paths, "helper").unwrap();
+    let def = load_agent_definition_from_agent_paths(&paths, "helper")
+        .unwrap()
+        .expect("helper 应可加载");
 
     assert_eq!(def.name, "plugin-helper");
     assert!(def.system_prompt.contains("插件提供的助手"));
 }
 
 #[test]
-fn load_definition_unknown_name_returns_none() {
-    // name 对应文件不存在于任何层 → None（错误语义由 resolve_definition 收口）
+fn load_definition_unknown_name_returns_ok_none() {
+    // name 对应文件不存在于任何层 → Ok(None)（错误语义由 resolve_definition 收口）
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
     let result = load_agent_definition_from_agent_paths(&paths, "nonexistent");
 
-    assert!(result.is_none(), "未知名不应静默替换为默认人格");
+    assert!(
+        matches!(result, Ok(None)),
+        "未知名应返回 Ok(None)，不静默替换为默认人格"
+    );
+}
+
+#[test]
+fn load_definition_corrupted_file_reports_error_not_builtin_fallback() {
+    // 定义文件存在但损坏 → 立即 Err（含损坏文件路径），不静默落内置表
+    let home = temp_home();
+    write_default_agent(home.path(), "---\nname: [unclosed\n---\n坏文件");
+    let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
+
+    let err = load_agent_definition_from_agent_paths(&paths, "default").unwrap_err();
+    let file = home.path().join("agents").join("default.md");
+    assert!(
+        err.contains(file.to_string_lossy().as_ref()),
+        "错误信息应含损坏文件路径：{err}"
+    );
+    // 未落内置表：错误是损坏而非「命中 fuyao」
+    assert!(!err.contains("fuyao"), "不应落内置 default：{err}");
 }
 
 #[test]
@@ -284,9 +311,26 @@ fn load_definition_parses_mode_field() {
     );
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "sub").unwrap();
+    let def = load_agent_definition_from_agent_paths(&paths, "sub")
+        .unwrap()
+        .expect("sub 应可加载");
 
     assert_eq!(def.mode, AgentMode::Subagent);
+}
+
+#[test]
+fn load_definition_unknown_mode_value_reports_error() {
+    // mode 写了但值未知 → 报错（fail-loud），不静默当 Primary
+    let home = temp_home();
+    write_agent_def(
+        home.path(),
+        "bad",
+        "---\nname: bad\nmode: both\n---\n未知模式",
+    );
+    let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
+
+    let err = load_agent_definition_from_agent_paths(&paths, "bad").unwrap_err();
+    assert!(err.contains("mode 值未知"), "错误信息应说明原因：{err}");
 }
 
 #[test]
@@ -300,7 +344,9 @@ fn load_definition_ignores_agent_id() {
         fuyao_home: home.path().to_path_buf(),
     };
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default").unwrap();
+    let def = load_agent_definition_from_agent_paths(&paths, "default")
+        .unwrap()
+        .expect("内置 default 应可加载");
 
     // 无 default.md → 命中内置，与 agent_id 无关
     assert_eq!(def.name, "fuyao");
@@ -313,11 +359,29 @@ fn load_definition_empty_frontmatter_still_loads_body() {
     write_default_agent(home.path(), "---\n---\n仅有正文无元数据");
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default").unwrap();
+    let def = load_agent_definition_from_agent_paths(&paths, "default")
+        .unwrap()
+        .expect("空 frontmatter 定义应可加载");
 
     assert!(
         def.system_prompt.contains("仅有正文"),
         "空 frontmatter 下正文应保留"
     );
     assert!(def.name.is_empty(), "空 frontmatter 下 name 为空串");
+}
+
+#[test]
+fn load_definition_default_fields_are_blank_not_fabricated() {
+    // 缺省字段不编造值：name/description/version/author 为空串，mode 为 Primary
+    let home = temp_home();
+    write_agent_def(home.path(), "minimal", "---\n---\n仅正文");
+    let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
+
+    let def = load_agent_definition_from_agent_paths(&paths, "minimal")
+        .unwrap()
+        .expect("最小定义应可加载");
+
+    assert_eq!(def.version, "", "version 缺省为空串，不编造版本号");
+    assert_eq!(def.author, "");
+    assert_eq!(def.mode, AgentMode::Primary);
 }

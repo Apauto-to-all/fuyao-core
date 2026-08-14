@@ -32,15 +32,19 @@ impl AgentMode {
     pub fn is_usable_as_subagent(&self) -> bool {
         matches!(self, AgentMode::Subagent)
     }
-}
 
-/// 从 frontmatter 字符串解析模式（未知值回退 Primary）
-impl From<&str> for AgentMode {
-    fn from(s: &str) -> Self {
+    /// 从 frontmatter 字符串解析模式
+    ///
+    /// 大小写不敏感、允许首尾空白。仅接受 `primary` / `subagent` 两个合法值，
+    /// 其他值返回 `Err`（fail-loud：写了但值未知由调用方显式报错，不做静默回退）。
+    /// 字段缺省（frontmatter 没写 mode）的 Primary 默认由调用方处理，不在本函数范畴。
+    pub fn parse(s: &str) -> Result<AgentMode, String> {
         match s.trim().to_lowercase().as_str() {
-            "primary" => AgentMode::Primary,
-            "subagent" => AgentMode::Subagent,
-            _ => AgentMode::Primary,
+            "primary" => Ok(AgentMode::Primary),
+            "subagent" => Ok(AgentMode::Subagent),
+            other => Err(format!(
+                "mode 值未知：`{other}`（合法值：primary / subagent）"
+            )),
         }
     }
 }
@@ -60,7 +64,7 @@ pub struct AgentDefinition {
     pub name: String,
     /// Agent 描述
     pub description: String,
-    /// 版本号
+    /// 版本号（未提供时为空串，不编造默认值）
     pub version: String,
     /// 作者
     pub author: String,
@@ -85,7 +89,7 @@ impl AgentDefinition {
         Self {
             name: name.into(),
             description: description.into(),
-            version: "1.0.0".to_string(),
+            version: String::new(),
             author: String::new(),
             mode: AgentMode::Primary,
             tools: HashMap::new(),
@@ -100,7 +104,7 @@ impl Default for AgentDefinition {
         Self {
             name: String::new(),
             description: String::new(),
-            version: "1.0.0".to_string(),
+            version: String::new(),
             author: String::new(),
             mode: AgentMode::Primary,
             tools: HashMap::new(),
@@ -120,7 +124,9 @@ mod tests {
         assert_eq!(def.name, "test");
         assert_eq!(def.description, "desc");
         assert_eq!(def.system_prompt, "system prompt");
-        assert_eq!(def.version, "1.0.0");
+        // version 不编造默认值，未显式提供即为空串
+        assert_eq!(def.version, "");
+        assert_eq!(def.author, "");
         assert_eq!(def.mode, AgentMode::Primary);
         // 新建定义 tools 默认空（无限制）
         assert!(def.tools.is_empty());
@@ -130,7 +136,7 @@ mod tests {
     fn agent_definition_default() {
         let def = AgentDefinition::default();
         assert_eq!(def.name, "");
-        assert_eq!(def.version, "1.0.0");
+        assert_eq!(def.version, "");
         assert!(def.source_path.is_none());
         assert_eq!(def.mode, AgentMode::Primary);
         // 默认 tools 空（无限制，向后兼容）
@@ -152,14 +158,25 @@ mod tests {
     }
 
     #[test]
-    fn agent_mode_from_str() {
-        assert_eq!(AgentMode::from("primary"), AgentMode::Primary);
-        assert_eq!(AgentMode::from("subagent"), AgentMode::Subagent);
-        // 未知值/空值默认 Primary
-        assert_eq!(AgentMode::from("unknown"), AgentMode::Primary);
-        assert_eq!(AgentMode::from(""), AgentMode::Primary);
-        // 大小写不敏感
-        assert_eq!(AgentMode::from("Primary"), AgentMode::Primary);
-        assert_eq!(AgentMode::from(" SUBAGENT "), AgentMode::Subagent);
+    fn agent_mode_parse_valid_values() {
+        assert_eq!(AgentMode::parse("primary"), Ok(AgentMode::Primary));
+        assert_eq!(AgentMode::parse("subagent"), Ok(AgentMode::Subagent));
+        // 大小写不敏感 + 允许首尾空白
+        assert_eq!(AgentMode::parse("Primary"), Ok(AgentMode::Primary));
+        assert_eq!(AgentMode::parse(" SUBAGENT "), Ok(AgentMode::Subagent));
+    }
+
+    #[test]
+    fn agent_mode_parse_unknown_value_reports_error() {
+        // 未知值报错而非静默回退（fail-loud）
+        assert!(AgentMode::parse("unknown").is_err());
+        assert!(AgentMode::parse("").is_err());
+        let err = AgentMode::parse("both").unwrap_err();
+        assert!(err.contains("mode 值未知"), "错误信息应说明原因：{err}");
+        assert!(err.contains("both"), "错误信息应含未知值本身：{err}");
+        assert!(
+            err.contains("primary") && err.contains("subagent"),
+            "错误信息应附合法值提示：{err}"
+        );
     }
 }

@@ -231,13 +231,11 @@ pub(crate) fn resolve_model(
     // 构造 StreamOptions（工具定义按 is_child + definition_tools 过滤——递归防护 + 定义层收窄）
     let tool_defs = tools.definitions_json_for(is_child, definition_tools);
     let options = StreamOptions {
-        temperature: None,
         tools: if tool_defs.is_empty() {
             None
         } else {
             Some(tool_defs)
         },
-        tool_choice: None,
         thinking_type,
         reasoning_effort,
     };

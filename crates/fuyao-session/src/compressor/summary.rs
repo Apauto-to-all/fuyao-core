@@ -111,7 +111,7 @@ fn to_chat_message(m: &Message) -> ChatMessage {
 /// **压缩铁律**：压缩 = 复用 session 当前模型配置（model + thinking_type + reasoning_effort
 /// 原样），仅禁用工具，流式调一次。与主对话唯一的差别是 tools 为空——独立摘要流，不进
 /// ReAct。system / messages 原样不动（前缀缓存生命线）。options 由调用方从 session 物化值
-/// 构造，本函数在执行边界强制 tools=None / tool_choice=None，确保「禁用工具」不变量不被绕过。
+/// 构造，本函数在执行边界强制 tools=None，确保「禁用工具」不变量不被绕过。
 ///
 /// # 参数
 /// - `system_prompt`：session 原本的 system_prompt（保持不变，前缀缓存命中）
@@ -153,7 +153,6 @@ pub async fn generate_summary(
 
     // 调 provider（流式 stream_chat）。压缩铁律：强制禁用工具（独立摘要流，不进 ReAct）
     options.tools = None;
-    options.tool_choice = None;
     let mut stream: BoxStream<Result<StreamEvent, StreamError>> =
         provider.stream_chat(request, model_id, options);
 

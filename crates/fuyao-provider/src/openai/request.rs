@@ -146,24 +146,11 @@ pub(crate) fn build_request_body(
         });
     }
 
-    // 温度
-    if let Some(temp) = options.temperature {
-        body["temperature"] = serde_json::Number::from_f64(temp)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null);
-    }
-
-    // 工具
+    // 工具（tool_choice 不发送，走服务器默认的 auto 语义）
     if let Some(tools) = &options.tools
         && !tools.is_empty()
     {
         body["tools"] = serde_json::Value::Array(tools.clone());
-        body["tool_choice"] = serde_json::Value::String("auto".to_string());
-    }
-
-    // 工具选择
-    if let Some(tool_choice) = &options.tool_choice {
-        body["tool_choice"] = tool_choice.clone();
     }
 
     // 思考字段独立注入：thinking_type 与 reasoning_effort 是两个正交字段，
@@ -412,7 +399,10 @@ mod tests {
         let body = build_request_body(request, "qwen3.6-plus", &options, false);
 
         assert!(body["tools"].is_array());
-        assert_eq!(body["tool_choice"], "auto");
+        // tool_choice 不发送（走服务器默认的 auto 语义）
+        assert!(body.get("tool_choice").is_none());
+        // temperature 不在请求参数内（走服务器默认）
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]

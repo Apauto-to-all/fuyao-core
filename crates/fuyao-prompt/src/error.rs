@@ -2,7 +2,8 @@
 //!
 //! 承载 Agent 定义解析（加载 + mode 校验）的失败语义。定义名是调用方显式
 //! 提供的（`AgentConfig.definition` 必填），解析失败属于调用方输入错误，
-//! 报错带足修正信息（未知名附可用列表），不做任何静默人格替换。
+//! 报错带足修正信息（未知名附可用列表、损坏附文件路径与原因），
+//! 不做任何静默人格替换。
 
 use fuyao_api::AgentMode;
 use thiserror::Error;
@@ -31,5 +32,18 @@ pub enum PromptError {
         mode: AgentMode,
         /// 请求的用途方向
         usage: crate::PromptUsage,
+    },
+
+    /// 定义文件存在但损坏（读取或 frontmatter 解析失败）
+    ///
+    /// `cause` 为解析层的中文错误信息，含来源文件路径与具体原因。
+    /// 与 [`PromptError::DefinitionNotFound`]（链上无此文件）是两种独立语义，
+    /// 调用方可分别处理。
+    #[error("Agent 定义 `{name}` 文件损坏：{cause}")]
+    DefinitionCorrupted {
+        /// 请求的定义名
+        name: String,
+        /// 解析失败的中文原因（含来源文件路径）
+        cause: String,
     },
 }
