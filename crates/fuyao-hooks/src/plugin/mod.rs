@@ -1,16 +1,16 @@
 //! 插件抽象
 //!
-//! 两层模型：[`Plugin`]（引擎级工厂模板）+ [`PluginInstance`]（session 级实例）。
+//! 两层模型：[`Plugin`]（引擎级工厂模板）+ [`PluginInstance`](PluginInstance)（session 级实例）。
 //!
 //! - 引擎启动时装配 `Arc<PluginHost>`（持所有 [`Plugin`]）
-//! - 每个 session 装配时调用 [`PluginHost::create_instances`] 生成实例 Vec
-//! - 调用方（引擎）逐个 `instance.register(&mut hooks)` 注册到该 session 的 registry
-//! - 通过 send_input hook 把 [`SessionSender`] 传给插件（统一原则：发消息能力走 hook）
+//! - 每个 session 装配时调用 [`PluginHost::create_instances`] 生成 `(插件名, 实例)` 配对 Vec
+//! - 调用方（引擎）逐个 `instance.register(&mut hooks, &sender)` 注册到该 session 的
+//!   registry，sender 绑定该插件名（注入消息 source 可追溯）
 //!
 //! 文件夹模块拆分（避免单文件过大，按职责命名）：
 //! - [`factory`](crate::plugin::factory): Plugin trait（引擎级工厂模板）
 //! - [`instance`](crate::plugin::instance): PluginInstance trait（session 级实例）
-//! - [`sender`](crate::plugin::sender): SessionSender（封装三通道分流）
+//! - [`sender`](crate::plugin::sender): SessionSender（封装两通道分流）
 //! - [`host`](crate::plugin::host): PluginHost + PluginInstallError + panic 辅助
 
 mod factory;
@@ -21,6 +21,6 @@ mod sender;
 mod tests;
 
 pub use factory::Plugin;
-pub use host::{PluginHost, PluginInstallError, panic_payload_to_string};
+pub use host::{NamedPluginInstance, PluginHost, PluginInstallError, panic_payload_to_string};
 pub use instance::PluginInstance;
 pub use sender::SessionSender;

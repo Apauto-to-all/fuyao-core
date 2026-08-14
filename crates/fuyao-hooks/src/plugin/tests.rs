@@ -2,9 +2,8 @@
 //!
 //! 覆盖：
 //! - PluginHost（create_instances / dispose_all / validate_unique_names / list / panic 防护）
-//! - Plugin trait 默认 identity 实现
-//! - PluginInstance trait register 行为
-//! - SessionSender 三通道分流 + 身份绑定
+//! - PluginInstance trait register 行为（含 sender 接收）
+//! - SessionSender 两通道分流 + 身份绑定
 
 use super::factory::Plugin;
 use super::host::{PluginHost, PluginInstallError};
@@ -12,10 +11,8 @@ use super::instance::PluginInstance;
 use super::sender::SessionSender;
 use crate::HooksRegistry;
 use fuyao_api::InterruptSource;
-use fuyao_api::PluginEventSource;
 use fuyao_api::UserMessageMode;
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
-use fuyao_api::message::output::PluginMessage as OutputPluginMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -31,7 +28,7 @@ struct CountingInstance {
 }
 
 impl PluginInstance for CountingInstance {
-    fn register(&self, _hooks: &mut HooksRegistry) {
+    fn register(&self, _hooks: &mut HooksRegistry, _sender: &SessionSender) {
         self.register_count.fetch_add(1, Ordering::SeqCst);
     }
     fn dispose(&self) {
@@ -64,7 +61,7 @@ impl Plugin for CountingPlugin {
 // PluginHost：create_instances
 // ---------------------------------------------------------------------------
 
-/// create_instances 为每个插件生成一个实例
+/// create_instances 为每个插件生成一个 (名, 实例) 配对
 #[test]
 fn create_instances_returns_one_instance_per_plugin() {
     let reg = Arc::new(AtomicUsize::new(0));
@@ -87,6 +84,8 @@ fn create_instances_returns_one_instance_per_plugin() {
 
     let instances = host.create_instances().unwrap();
     assert_eq!(instances.len(), 2, "应为 2 个插件各生成 1 个实例");
+    let names: Vec<&str> = instances.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["a", "b"], "配对的插件名应与注册顺序一致");
     assert_eq!(
         inst.load(Ordering::SeqCst),
         2,
@@ -114,8 +113,11 @@ fn instance_register_called_when_invoked() {
 
     let instances = host.create_instances().unwrap();
     let mut hooks = HooksRegistry::new();
-    for instance in &instances {
-        instance.register(&mut hooks);
+    let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
+    let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
+    let sender = SessionSender::new("only", tx_user, tx_interrupt);
+    for (_, instance) in &instances {
+        instance.register(&mut hooks, &sender);
     }
     assert_eq!(reg.load(Ordering::SeqCst), 1, "register 应被调用 1 次");
 }
@@ -337,22 +339,6 @@ fn validate_unique_names_ok_when_unique() {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin trait：identity 默认实现
-// ---------------------------------------------------------------------------
-
-/// Plugin::identity() 默认从 name() 桥接
-#[test]
-fn plugin_identity_defaults_from_name() {
-    let plugin = CountingPlugin {
-        name: "my_plugin",
-        register_count: Arc::new(AtomicUsize::new(0)),
-        dispose_count: Arc::new(AtomicUsize::new(0)),
-        instance_count: Arc::new(AtomicUsize::new(0)),
-    };
-    assert_eq!(plugin.identity().name, "my_plugin");
-}
-
-// ---------------------------------------------------------------------------
 // PluginInstance trait：默认 dispose 不 panic
 // ---------------------------------------------------------------------------
 
@@ -361,41 +347,32 @@ fn plugin_identity_defaults_from_name() {
 fn plugin_instance_default_dispose_noop() {
     struct NoopInstance;
     impl PluginInstance for NoopInstance {
-        fn register(&self, _hooks: &mut HooksRegistry) {}
+        fn register(&self, _hooks: &mut HooksRegistry, _sender: &SessionSender) {}
     }
     let instance = NoopInstance;
     instance.dispose(); // 默认实现，不应 panic
 }
 
 // ---------------------------------------------------------------------------
-// SessionSender：三通道分流 + 身份绑定
+// SessionSender：两通道分流 + 身份绑定
 // ---------------------------------------------------------------------------
 
-/// 构造测试用 SessionSender + 三条接收端
+/// 构造测试用 SessionSender + 两条接收端
 fn make_sender() -> (
     SessionSender,
     tokio::sync::mpsc::Receiver<OutputUserMessage>,
     tokio::sync::mpsc::Receiver<OutputInterruptMessage>,
-    tokio::sync::mpsc::Receiver<OutputPluginMessage>,
 ) {
     let (tx_user, rx_user) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let (tx_plugin, rx_plugin) = tokio::sync::mpsc::channel(16);
-    let sender = SessionSender::new(
-        PluginEventSource {
-            name: "test_plugin".into(),
-        },
-        tx_user,
-        tx_interrupt,
-        tx_plugin,
-    );
-    (sender, rx_user, rx_interrupt, rx_plugin)
+    let sender = SessionSender::new("test_plugin", tx_user, tx_interrupt);
+    (sender, rx_user, rx_interrupt)
 }
 
 /// send_user 默认 Guide 模式
 #[tokio::test]
 async fn sender_send_user_uses_guide_mode_by_default() {
-    let (sender, mut rx_user, _rx_int, _rx_plug) = make_sender();
+    let (sender, mut rx_user, _rx_int) = make_sender();
     sender.send_user("hello");
     let received = rx_user.recv().await.expect("应收到 User 消息");
     assert_eq!(received.payload.content, "hello");
@@ -405,89 +382,58 @@ async fn sender_send_user_uses_guide_mode_by_default() {
 /// send_user_with_mode 指定 Pending 模式
 #[tokio::test]
 async fn sender_send_user_with_mode_pending() {
-    let (sender, mut rx_user, _rx_int, _rx_plug) = make_sender();
+    let (sender, mut rx_user, _rx_int) = make_sender();
     sender.send_user_with_mode("排队", UserMessageMode::Pending);
     let received = rx_user.recv().await.expect("应收到 User 消息");
     assert_eq!(received.payload.content, "排队");
     assert_eq!(received.payload.mode, UserMessageMode::Pending);
 }
 
+/// send_user 自动填 source = Plugin（绑插件名）
+#[tokio::test]
+async fn sender_send_user_fills_plugin_source() {
+    let (sender, mut rx_user, _rx_int) = make_sender();
+    sender.send_user("来源校验");
+    let received = rx_user.recv().await.expect("应收到 User 消息");
+    match received.payload.source {
+        fuyao_api::UserMessageSource::Plugin(src) => assert_eq!(src.name, "test_plugin"),
+        other => panic!("source 应为 Plugin，实际 {other:?}"),
+    }
+}
+
 /// send_interrupt 投递到 Interrupt 通道，source = Hook
 #[tokio::test]
 async fn sender_send_interrupt_routes_to_interrupt_channel() {
-    let (sender, _rx_user, mut rx_int, _rx_plug) = make_sender();
+    let (sender, _rx_user, mut rx_int) = make_sender();
     sender.send_interrupt("循环检测");
     let received = rx_int.recv().await.expect("应收到 Interrupt 消息");
     assert_eq!(received.payload.reason, "循环检测");
     assert_eq!(received.payload.source, InterruptSource::Hook);
 }
 
-/// send_plugin 自动填 source = identity
+/// 两通道完全隔离：发 User 不影响 Interrupt 通道
 #[tokio::test]
-async fn sender_send_plugin_fills_source_from_identity() {
-    let (sender, _rx_user, _rx_int, mut rx_plug) = make_sender();
-    sender.send_plugin("warn", "检测到异常");
-    let received = rx_plug.recv().await.expect("应收到 Plugin 消息");
-    assert_eq!(received.payload.source.name, "test_plugin");
-    assert_eq!(received.payload.event_type, "warn");
-    assert_eq!(received.payload.message.as_deref(), Some("检测到异常"));
-    assert!(received.payload.data.is_none());
-    assert!(received.payload.error.is_none());
-}
-
-/// send_plugin_data 带 data 字段
-#[tokio::test]
-async fn sender_send_plugin_data_carries_payload() {
-    let (sender, _rx_user, _rx_int, mut rx_plug) = make_sender();
-    sender.send_plugin_data("cumulative", serde_json::json!({"count": 42}));
-    let received = rx_plug.recv().await.expect("应收到 Plugin 消息");
-    assert_eq!(received.payload.source.name, "test_plugin");
-    assert_eq!(received.payload.event_type, "cumulative");
-    assert_eq!(received.payload.data.unwrap()["count"], 42);
-    assert!(received.payload.message.is_none());
-}
-
-/// send_plugin_full 同时带 data + message
-#[tokio::test]
-async fn sender_send_plugin_full_with_all_fields() {
-    let (sender, _rx_user, _rx_int, mut rx_plug) = make_sender();
-    sender.send_plugin_full(
-        "report",
-        Some(serde_json::json!({"key": "value"})),
-        Some("err".to_string()),
-        Some("msg".to_string()),
-    );
-    let received = rx_plug.recv().await.expect("应收到 Plugin 消息");
-    assert_eq!(received.payload.event_type, "report");
-    assert_eq!(received.payload.data.unwrap()["key"], "value");
-    assert_eq!(received.payload.error.as_deref(), Some("err"));
-    assert_eq!(received.payload.message.as_deref(), Some("msg"));
-}
-
-/// 三通道完全隔离：发 User 不影响 Interrupt/Plugin 通道
-#[tokio::test]
-async fn sender_three_channels_are_independent() {
-    let (sender, mut rx_user, mut rx_int, mut rx_plug) = make_sender();
+async fn sender_two_channels_are_independent() {
+    let (sender, mut rx_user, mut rx_int) = make_sender();
     sender.send_user("只发 User");
-    // 其他两个通道应无消息
+    // Interrupt 通道应无消息
     assert!(rx_int.try_recv().is_err(), "Interrupt 通道不应有消息");
-    assert!(rx_plug.try_recv().is_err(), "Plugin 通道不应有消息");
     // User 通道有消息
     let received = rx_user.recv().await.expect("User 通道应有消息");
     assert_eq!(received.payload.content, "只发 User");
 }
 
-/// identity() 只读访问
+/// name() 只读访问
 #[test]
-fn sender_identity_is_readable() {
-    let (sender, _rx_user, _rx_int, _rx_plug) = make_sender();
-    assert_eq!(sender.identity().name, "test_plugin");
+fn sender_name_is_readable() {
+    let (sender, _rx_user, _rx_int) = make_sender();
+    assert_eq!(sender.name(), "test_plugin");
 }
 
 /// SessionSender 是 Clone（每插件实例持有自己的克隆）
 #[test]
 fn sender_is_cloneable() {
-    let (sender, _rx_user, _rx_int, _rx_plug) = make_sender();
+    let (sender, _rx_user, _rx_int) = make_sender();
     let cloned = sender.clone();
-    assert_eq!(cloned.identity().name, "test_plugin");
+    assert_eq!(cloned.name(), "test_plugin");
 }

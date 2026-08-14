@@ -9,10 +9,11 @@ use futures_util::stream;
 use fuyao_api::MessageRole;
 use fuyao_api::Session;
 use fuyao_api::message::EventBase;
+use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::{
-    InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
-    UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
+    InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
+    UserPayload as OutputUserPayload,
 };
 
 /// 测试固定使用的 session_id（落库后内核不再常驻内存 Session，只认 DB + id）
@@ -307,9 +308,7 @@ fn empty_queue() -> SharedQueue {
 
 /// 构造空 SharedHooks（无拦截/观察钩子，管道纯透传）
 fn empty_hooks() -> fuyao_hooks::SharedHooks {
-    Arc::new(tokio::sync::Mutex::new(
-        fuyao_hooks::HooksRegistry::default(),
-    ))
+    Arc::new(fuyao_hooks::HooksRegistry::default())
 }
 
 /// 构造测试用 SessionCtx + session + rx_interrupt + 收事件的 rx
@@ -457,7 +456,6 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Assistant(m) => m.base.session_id.as_deref(),
         OutputEvent::Interrupt(m) => m.base.session_id.as_deref(),
         OutputEvent::Error(m) => m.base.session_id.as_deref(),
-        OutputEvent::Plugin(m) => m.base.session_id.as_deref(),
         OutputEvent::Compression(m) => m.base.session_id.as_deref(),
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),
@@ -739,8 +737,6 @@ async fn pending_consumed_when_task_idle() {
     let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
-    // Plugin 通道（保持打开，避免 rx_plugin.recv() 提前返回 None）
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
     // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
     let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
@@ -763,7 +759,6 @@ async fn pending_consumed_when_task_idle() {
         SessionRx {
             inbound: rx_inbound,
             interrupt: rx_interrupt,
-            plugin: rx_plugin,
             control: rx_control,
         },
     ));
@@ -829,7 +824,6 @@ async fn turn_restart_on_new_inbound_after_drained() {
     let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
     let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     std::mem::forget(rx_interrupt_tx);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
     let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
@@ -850,7 +844,6 @@ async fn turn_restart_on_new_inbound_after_drained() {
         SessionRx {
             inbound: rx_inbound,
             interrupt: rx_interrupt,
-            plugin: rx_plugin,
             control: rx_control,
         },
     ));
@@ -890,225 +883,6 @@ async fn turn_restart_on_new_inbound_after_drained() {
     assert!(
         got_second.unwrap_or(false),
         "停止后发新消息应重新启动 turn 并收到「回复2」"
-    );
-}
-
-/// Plugin 消息路由：经 tx_plugin 通道发 output 侧 PluginMessage（Engine::send
-/// 已在入口转化） → 从 rx_event 流出 OutputEvent::Plugin（session_id 标签正确）。
-///
-/// 验证链路：
-/// - tx_plugin 通道承载 output 侧 PluginMessage（入口转化后内核只认 output 侧）
-/// - session task 过 dispatch 管道，经 Emitter 自动盖 session_id 标签
-#[tokio::test]
-async fn plugin_message_routes_through_dispatch() {
-    use fuyao_api::PluginEventSource;
-    use fuyao_api::message::output::{PluginMessage, PluginPayload};
-
-    // 不会被调用（Plugin 消息不触发 ReAct），随便给个空响应占位
-    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
-
-    let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "plugin_session".to_string();
-    store.create(&session).await.unwrap();
-
-    let guide = empty_queue();
-    let pending = empty_queue();
-    let (_tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
-    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
-    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    std::mem::forget(rx_interrupt_tx);
-    // tx_plugin 需要保留以发送消息
-    let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
-    // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
-    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
-    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
-
-    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
-        "test", provider,
-    ));
-    let ctx = make_run_session_ctx(
-        Arc::clone(&store),
-        providers,
-        "plugin_session",
-        tx_event,
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        tokio_util::sync::CancellationToken::new(),
-    );
-    let task = tokio::spawn(run_session(
-        ctx,
-        SessionRx {
-            inbound: rx_inbound,
-            interrupt: rx_interrupt,
-            plugin: rx_plugin,
-            control: rx_control,
-        },
-    ));
-
-    // 模拟 Engine::send 入口转化后送入 tx_plugin 通道的 output 侧 PluginMessage
-    tx_plugin
-        .send(PluginMessage {
-            base: fuyao_api::message::EventBase::default(),
-            payload: PluginPayload {
-                source: PluginEventSource {
-                    name: "loop_guard".into(),
-                },
-                event_type: "loop_warn".into(),
-                data: None,
-                error: None,
-                message: Some("检测到循环".into()),
-            },
-        })
-        .await
-        .unwrap();
-
-    // 期待从 rx_event 收到 OutputEvent::Plugin（带 session_id 标签）
-    let mut got_plugin = false;
-    let timed_out = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while let Some(ev) = rx_event.recv().await {
-            if let OutputEvent::Plugin(m) = ev {
-                assert_eq!(m.payload.source.name, "loop_guard");
-                assert_eq!(m.payload.event_type, "loop_warn");
-                assert_eq!(m.payload.message.as_deref(), Some("检测到循环"));
-                // 经 Emitter 自动盖 session_id 标签
-                assert_eq!(
-                    m.base.session_id.as_deref(),
-                    Some("plugin_session"),
-                    "Plugin 事件应盖 session_id 标签"
-                );
-                got_plugin = true;
-                break;
-            }
-        }
-    })
-    .await
-    .is_err();
-
-    task.abort();
-
-    assert!(
-        !timed_out,
-        "2 秒内未收到 Plugin 事件，tx_plugin → dispatch 管道路由未通"
-    );
-    assert!(got_plugin, "应收到 OutputEvent::Plugin");
-}
-
-/// Plugin 通知在**活跃 turn 期间**也能立即转发（不到等回 idle）。
-///
-/// 这是本次修复的核心回归保护：修复前 rx_plugin 仅在主循环 idle select! 消费，
-/// turn 运行（LLM 流式 + 工具执行）期间通知堆在通道里，延迟整轮。
-/// 修复后由独立 forwarder task 并发消费，turn 挂起在流上时通知仍即时透传。
-///
-/// 时序：ControllableProvider 吐一个 TextDelta 后流挂起（turn 仍活跃）→
-/// 发 Plugin 消息 → 断言 500ms 内收到 OutputEvent::Plugin。
-/// 修复前此断言会超时（流不结束 = 主循环不回 idle = 永不消费 plugin）。
-#[tokio::test]
-async fn plugin_forwards_during_active_turn() {
-    use fuyao_api::PluginEventSource;
-    use fuyao_api::message::output::{PluginMessage, PluginPayload};
-
-    // 1 轮事件流：吐一个 TextDelta 后挂起（第二个事件不发 → turn 停在流式 select!）
-    let (provider, txs) = ControllableProvider::with_batches(1);
-    let provider: Arc<dyn Provider> = Arc::new(provider);
-
-    let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "plugin_active".to_string();
-    store.create(&session).await.unwrap();
-
-    let guide = empty_queue();
-    let pending = empty_queue();
-    // 预置一条 user 进 guide，让主循环进 turn（不需经 inbound 通道）
-    guide.lock().unwrap().push_back(make_inbound("问题"));
-    let (_tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
-    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
-    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    std::mem::forget(rx_interrupt_tx);
-    let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
-    // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
-    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
-    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
-
-    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
-        "test", provider,
-    ));
-    let shutdown_token = tokio_util::sync::CancellationToken::new();
-    let ctx = make_run_session_ctx(
-        Arc::clone(&store),
-        providers,
-        "plugin_active",
-        tx_event,
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        // 传 clone：ctx.shutdown_token 与下方 cancel 用的 shutdown_token 联动，
-        // cancel 才能真正抵达 session 让挂起的 turn 经 shutdown 分支退出。
-        shutdown_token.clone(),
-    );
-    let task = tokio::spawn(run_session(
-        ctx,
-        SessionRx {
-            inbound: rx_inbound,
-            interrupt: rx_interrupt,
-            plugin: rx_plugin,
-            control: rx_control,
-        },
-    ));
-
-    // 喂一个 TextDelta：run_session 进 turn，流式消费后挂起在第二个事件上（turn 活跃）
-    txs[0]
-        .send(Ok(StreamEvent::TextDelta {
-            content: "部分".to_string(),
-        }))
-        .unwrap();
-    // 等 turn 跑过 inject + build_chat_request(DB 查询) + 进入流式挂起
-    for _ in 0..8 {
-        tokio::task::yield_now().await;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-    // 活跃 turn 期间发 Plugin 消息
-    tx_plugin
-        .send(PluginMessage {
-            base: EventBase::default(),
-            payload: PluginPayload {
-                source: PluginEventSource {
-                    name: "test_plugin".into(),
-                },
-                event_type: "notify".into(),
-                data: None,
-                error: None,
-                message: Some("turn 中转发".into()),
-            },
-        })
-        .await
-        .unwrap();
-
-    // 断言：500ms 内收到 Plugin 事件（修复前会延迟整轮，流挂起=主循环永不回 idle=超时）
-    let got = tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        loop {
-            if let Some(ev) = rx_event.recv().await
-                && let OutputEvent::Plugin(m) = ev
-            {
-                assert_eq!(m.payload.source.name, "test_plugin");
-                assert_eq!(
-                    m.base.session_id.as_deref(),
-                    Some("plugin_active"),
-                    "Plugin 事件应盖 session_id 标签"
-                );
-                return;
-            }
-        }
-    })
-    .await;
-
-    // 收尾：cancel shutdown 让挂起的 turn 经 shutdown 分支退出，再等 task 结束
-    shutdown_token.cancel();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-
-    assert!(
-        got.is_ok(),
-        "活跃 turn 期间 Plugin 事件应在 500ms 内转发；修复前会延迟整轮"
     );
 }
 
@@ -1738,25 +1512,23 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     let tools = Arc::new(ToolRegistry::builder().build());
 
     // 注册拦截器：给 Assistant content 加前缀 "[脱敏]"
-    let hooks: fuyao_hooks::SharedHooks =
-        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
-    {
-        let mut reg = hooks.lock().await;
-        reg.register_output_intercept(
-            0,
-            Arc::new(|ev| {
-                if let OutputEvent::Assistant(m) = ev {
-                    let mut modified = m.clone();
-                    if let Some(c) = &mut modified.payload.content {
-                        *c = format!("[脱敏]{c}");
-                    }
-                    InterceptResult::Pass(OutputEvent::Assistant(modified))
-                } else {
-                    InterceptResult::Pass(ev.clone())
+    let mut reg = HooksRegistry::default();
+    reg.register_output_intercept(
+        0,
+        Arc::new(|ev: &OutputEvent| {
+            if let OutputEvent::Assistant(m) = ev {
+                let mut modified = m.clone();
+                if let Some(c) = &mut modified.payload.content {
+                    *c = format!("[脱敏]{c}");
                 }
-            }),
-        );
-    }
+                InterceptResult::Pass(OutputEvent::Assistant(modified))
+            } else {
+                InterceptResult::Pass(ev.clone())
+            }
+        }),
+    );
+    reg.finalize();
+    let hooks: fuyao_hooks::SharedHooks = Arc::new(reg);
 
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
     preload_user(&h, "用户问题").await;
@@ -1802,21 +1574,19 @@ async fn intercept_block_skips_final_assistant_in_history() {
     )]));
     let tools = Arc::new(ToolRegistry::builder().build());
 
-    let hooks: fuyao_hooks::SharedHooks =
-        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
-    {
-        let mut reg = hooks.lock().await;
-        reg.register_output_intercept(
-            0,
-            Arc::new(|ev| {
-                if matches!(ev, OutputEvent::Assistant(_)) {
-                    InterceptResult::Block("拦截 assistant".to_string())
-                } else {
-                    InterceptResult::Pass(ev.clone())
-                }
-            }),
-        );
-    }
+    let mut reg = HooksRegistry::default();
+    reg.register_output_intercept(
+        0,
+        Arc::new(|ev: &OutputEvent| {
+            if matches!(ev, OutputEvent::Assistant(_)) {
+                InterceptResult::Block("拦截 assistant".to_string())
+            } else {
+                InterceptResult::Pass(ev.clone())
+            }
+        }),
+    );
+    reg.finalize();
+    let hooks: fuyao_hooks::SharedHooks = Arc::new(reg);
 
     let mut h = make_harness_with_hooks(provider, tools, hooks).await;
     preload_user(&h, "用户问题").await;
@@ -1854,23 +1624,21 @@ async fn intercept_block_skips_final_assistant_in_history() {
 async fn inject_messages_intercepts_user_at_consume_time() {
     let (tx_event, _rx_event) = mpsc::unbounded_channel::<OutputEvent>();
     let emitter = Emitter::new(tx_event, "test_session".to_string());
-    let hooks: fuyao_hooks::SharedHooks =
-        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
-    {
-        let mut reg = hooks.lock().await;
-        reg.register_output_intercept(
-            0,
-            Arc::new(|ev| {
-                if let OutputEvent::User(m) = ev {
-                    let mut modified = m.clone();
-                    modified.payload.content = format!("[脱敏]{}", modified.payload.content);
-                    InterceptResult::Pass(OutputEvent::User(modified))
-                } else {
-                    InterceptResult::Pass(ev.clone())
-                }
-            }),
-        );
-    }
+    let mut reg = HooksRegistry::default();
+    reg.register_output_intercept(
+        0,
+        Arc::new(|ev: &OutputEvent| {
+            if let OutputEvent::User(m) = ev {
+                let mut modified = m.clone();
+                modified.payload.content = format!("[脱敏]{}", modified.payload.content);
+                InterceptResult::Pass(OutputEvent::User(modified))
+            } else {
+                InterceptResult::Pass(ev.clone())
+            }
+        }),
+    );
+    reg.finalize();
+    let hooks: fuyao_hooks::SharedHooks = Arc::new(reg);
     let store = temp_store().await;
     let ctx = SessionCtx {
         is_child: false,
@@ -1931,8 +1699,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
 async fn inject_messages_preserves_plugin_source_in_event() {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<OutputEvent>();
     let emitter = Emitter::new(tx_event, "test_session".to_string());
-    let hooks: fuyao_hooks::SharedHooks =
-        Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
+    let hooks: fuyao_hooks::SharedHooks = Arc::new(HooksRegistry::default());
     let store = temp_store().await;
     let ctx = SessionCtx {
         is_child: false,

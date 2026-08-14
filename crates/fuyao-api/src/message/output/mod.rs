@@ -10,7 +10,6 @@
 //! - `assistant`: 助手消息
 //! - `interrupt`: 中断（引擎中断轮次后发出）
 //! - `error`: 错误
-//! - `plugin`: 插件事件
 //! - `compression`: 上下文压缩事件（Started/Delta/Ended 三阶段）
 //! - `title`: 会话标题更新（首轮对话后异步生成）
 //! - `retry`: LLM 重试事件（重试前发，前端据此渲染「N 秒后重试」提示）
@@ -23,7 +22,6 @@ mod chunk;
 mod compression;
 mod error;
 mod interrupt;
-mod plugin;
 mod retry;
 mod rollback;
 mod title;
@@ -43,7 +41,6 @@ pub use compression::{
 };
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
-pub use plugin::{PluginMessage, PluginPayload};
 pub use retry::{RetryMessage, RetryPayload};
 pub use rollback::{RollbackMessage, RollbackPayload};
 pub use title::{TitleMessage, TitlePayload};
@@ -74,8 +71,6 @@ pub enum OutputEvent {
     Interrupt(InterruptMessage),
     /// 错误
     Error(ErrorMessage),
-    /// 插件事件
-    Plugin(PluginMessage),
     /// 上下文压缩事件（含 Started/Delta/Ended 三阶段，前端据此追踪压缩生命周期）
     Compression(CompressionMessage),
     /// 会话标题更新（首轮对话后异步生成，前端据此更新会话列表标题）
@@ -103,7 +98,6 @@ impl OutputEvent {
             OutputEvent::Assistant(m) => &mut m.base,
             OutputEvent::Interrupt(m) => &mut m.base,
             OutputEvent::Error(m) => &mut m.base,
-            OutputEvent::Plugin(m) => &mut m.base,
             OutputEvent::Compression(m) => &mut m.base,
             OutputEvent::Title(m) => &mut m.base,
             OutputEvent::Retry(m) => &mut m.base,
@@ -117,7 +111,7 @@ impl OutputEvent {
 mod tests {
     use super::*;
     use crate::message::EventBase;
-    use crate::message::input::{InterruptSource, PluginEventSource};
+    use crate::message::input::InterruptSource;
 
     #[test]
     fn chunk_variant() {
@@ -199,23 +193,6 @@ mod tests {
             },
         });
         assert!(matches!(event, OutputEvent::Interrupt(_)));
-    }
-
-    #[test]
-    fn plugin_variant() {
-        let event = OutputEvent::Plugin(PluginMessage {
-            base: EventBase::default(),
-            payload: PluginPayload {
-                source: PluginEventSource {
-                    name: "test".into(),
-                },
-                event_type: "custom".into(),
-                data: None,
-                error: None,
-                message: None,
-            },
-        });
-        assert!(matches!(event, OutputEvent::Plugin(_)));
     }
 
     #[test]

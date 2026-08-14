@@ -2,51 +2,40 @@
 //!
 //! 单元测试已覆盖 LoopGuardState 内部状态机的纯逻辑。本集成测试聚焦跨模块的
 //! 端到端装配链路——这是单元测试的空白带：
-//! `LoopGuardPlugin::create_instance()` → `instance.register(&mut hooks)` 装三个钩子进 HooksRegistry
-//! → `init_send_inputs(sender)` 注入 SessionSender → `hook_output_observe/intercept` 喂真实 OutputEvent
-//! → 验证检测链路生效。
+//! `LoopGuardPlugin::create_instance()` → `instance.register(&mut hooks, &sender)` 装钩子进 HooksRegistry
+//! → `hook_output_observe/intercept` 喂真实 OutputEvent → 验证检测链路生效。
 //!
 //! 全部使用默认配置（不调 set_config），走 get_config 未 set 返回 default 的兜底。
 
 mod common;
 
-use std::sync::Arc;
-
 use common::{make_chunk, make_tool_call, make_tool_result};
-use fuyao_api::message::input::{PluginEventSource, UserMessageSource};
+use fuyao_api::message::input::UserMessageSource;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_guard::LoopGuardPlugin;
-use fuyao_hooks::{HooksRegistry, InterceptResult, Plugin, SessionSender};
+use fuyao_hooks::{HooksRegistry, InterceptResult, Plugin, SessionSender, SharedHooks};
 
 use fuyao_api::message::UserMessageMode;
 use fuyao_api::message::output::UserPayload as OutputUserPayload;
 
 /// 构造已注册 loop_guard 插件的 hooks
 ///
-/// 装配链路：create_instance → register 三钩子 → init_send_inputs 注入 SessionSender。
-/// SessionSender 持有 dummy 通道（测试不验证消息投递，只验证 observe/intercept 链路）。
-async fn assembled_guard() -> Arc<tokio::sync::Mutex<HooksRegistry>> {
+/// 装配链路：create_instance → register（sender 持 dummy 通道，测试不验证消息投递，
+/// 只验证 observe/intercept 链路）→ finalize 冻结 → 包 Arc 只读共享。
+fn assembled_guard() -> SharedHooks {
     let plugin = LoopGuardPlugin::new();
     let mut registry = HooksRegistry::new();
     let instance = plugin.create_instance();
-    instance.register(&mut registry);
 
     // 构造 SessionSender（dummy 通道，测试不验证投递侧）
-    let (tx_plugin, _rx_plugin) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
     let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
-    let sender = SessionSender::new(
-        PluginEventSource {
-            name: "loop_guard".into(),
-        },
-        tx_user,
-        tx_interrupt,
-        tx_plugin,
-    );
-    registry.init_send_inputs(sender).await;
+    let sender = SessionSender::new("loop_guard", tx_user, tx_interrupt);
+    instance.register(&mut registry, &sender);
 
-    Arc::new(tokio::sync::Mutex::new(registry))
+    registry.finalize();
+    std::sync::Arc::new(registry)
 }
 
 /// 构造用户主动消息事件（source=User，触发完全重置）
@@ -66,23 +55,25 @@ fn make_user_event_from_user() -> OutputEvent {
 // 插件装配与钩子注册
 // ============================================================================
 
-#[tokio::test]
-async fn plugin_registers_three_hooks() {
-    // register 后 hooks 应含 output_observe + output_intercept + send_input 三类钩子
+#[test]
+fn plugin_registers_hooks() {
+    // register 后 hooks 应含 output_observe + output_intercept 两类钩子
     let plugin = LoopGuardPlugin::new();
     assert_eq!(plugin.name(), "loop_guard");
-    assert_eq!(plugin.identity().name, "loop_guard");
 
     let mut registry = HooksRegistry::new();
     let instance = plugin.create_instance();
-    instance.register(&mut registry);
-    // register 完成（不 panic）即说明三钩子注册成功
+    let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
+    let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
+    let sender = SessionSender::new("loop_guard", tx_user, tx_interrupt);
+    instance.register(&mut registry, &sender);
+    // register 完成（不 panic）即说明钩子注册 + sender 保存成功
 }
 
-#[tokio::test]
-async fn init_send_inputs_does_not_panic_without_consumer() {
-    // 即使无人消费 rx，init_send_inputs 也能正常完成（sender 注入不阻塞）
-    let hooks = assembled_guard().await;
+#[test]
+fn register_with_sender_does_not_panic_without_consumer() {
+    // 即使无人消费 rx，register 注入 sender 也能正常完成（try_send 非阻塞）
+    let hooks = assembled_guard();
     let _ = hooks;
 }
 
@@ -94,21 +85,18 @@ async fn init_send_inputs_does_not_panic_without_consumer() {
 async fn tool_repeat_triggers_warn_then_inject_via_intercept() {
     // 重复同一工具调用（达到默认 threshold=4），observe 触发 Warn →
     // 紧接着 intercept 修改 ToolResult 内容注入警告
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     // 默认 tool_repeat_threshold=4，连续 4 次相同调用后第 5 次触发检测
     for _ in 0..5 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.lock().await.hook_output_observe(event).await;
+        hooks.hook_output_observe(event).await;
     }
 
     // observe 应已产生 pending（Warn 或更高级别，取决于升级链）
     // 验证 intercept 将检测信息注入 ToolResult（Warn 追加前缀保留原文，Inject 替换内容）
     let tr = make_tool_result("read", "原始文件内容");
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::ToolResult(tr));
+    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
     match result {
         InterceptResult::Pass(modified) => match modified {
             OutputEvent::ToolResult(tr) => {
@@ -127,21 +115,18 @@ async fn tool_repeat_triggers_warn_then_inject_via_intercept() {
 #[tokio::test]
 async fn tool_sequence_pattern_triggers_escalation() {
     // A→B→A→B 序列模式（默认 tool_alternate_threshold=6）触发检测
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     // 交替调用两个工具 7 次（超过 threshold=6）
     for i in 0..7 {
         let tool = if i % 2 == 0 { "read" } else { "grep" };
         let event = OutputEvent::ToolCall(make_tool_call(tool, r#"{"pattern":"x"}"#));
-        hooks.lock().await.hook_output_observe(event).await;
+        hooks.hook_output_observe(event).await;
     }
 
     // 检测触发后，intercept 应修改 ToolResult（pending 非空）
     let tr = make_tool_result("read", "结果");
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::ToolResult(tr));
+    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
     if let InterceptResult::Pass(OutputEvent::ToolResult(tr)) = result {
         assert!(
             tr.payload.content.contains("循环检测"),
@@ -160,13 +145,13 @@ async fn tool_sequence_pattern_triggers_escalation() {
 #[tokio::test]
 async fn text_repetition_triggers_detection() {
     // 默认 streaming_check_interval=100，需要累积足够字符；用长重复文本触发
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     // 反复喂入相同的长文本块，累积到 interval 触发检测
     let long_text = "重复内容重复内容重复内容".repeat(20);
     for _ in 0..15 {
         let event = OutputEvent::Chunk(make_chunk(Some(&long_text), None));
-        hooks.lock().await.hook_output_observe(event).await;
+        hooks.hook_output_observe(event).await;
     }
     // 文本检测触发后 pending_severity 被设置；intercept 处理 Chunk 时清理 pending
     // 这里不硬断言具体级别（受 Jaccard 阈值影响），只验证链路不 panic
@@ -175,9 +160,9 @@ async fn text_repetition_triggers_detection() {
 #[tokio::test]
 async fn chunk_with_reasoning_accumulates() {
     // reasoning 内容也应被累积（不影响 content 检测）
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
     let event = OutputEvent::Chunk(make_chunk(Some("正文"), Some("思考过程")));
-    hooks.lock().await.hook_output_observe(event).await;
+    hooks.hook_output_observe(event).await;
     // 不 panic 即通过
 }
 
@@ -188,27 +173,20 @@ async fn chunk_with_reasoning_accumulates() {
 #[tokio::test]
 async fn user_message_fully_resets_state() {
     // 用户主动消息（source=User）触发完全重置：先制造 pending，再发用户消息，pending 应清空
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     // 制造 pending（重复工具调用）
     for _ in 0..5 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.lock().await.hook_output_observe(event).await;
+        hooks.hook_output_observe(event).await;
     }
 
     // 用户主动消息 → 完全重置
-    hooks
-        .lock()
-        .await
-        .hook_output_observe(make_user_event_from_user())
-        .await;
+    hooks.hook_output_observe(make_user_event_from_user()).await;
 
     // 重置后 intercept 不再注入（pending 已清空）
     let tr = make_tool_result("read", "结果");
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::ToolResult(tr));
+    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
     if let InterceptResult::Pass(OutputEvent::ToolResult(tr)) = result {
         assert_eq!(
             tr.payload.content, "结果",
@@ -220,12 +198,12 @@ async fn user_message_fully_resets_state() {
 #[tokio::test]
 async fn plugin_injected_message_only_clears_pending() {
     // 插件注入消息（source=Plugin）仅 clear_pending，保留检测器历史（保持"热"状态）
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     // 制造工具历史
     for _ in 0..3 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.lock().await.hook_output_observe(event).await;
+        hooks.hook_output_observe(event).await;
     }
 
     // 插件注入消息事件
@@ -240,12 +218,12 @@ async fn plugin_injected_message_only_clears_pending() {
             }),
         },
     });
-    hooks.lock().await.hook_output_observe(plugin_msg).await;
+    hooks.hook_output_observe(plugin_msg).await;
 
     // 再次喂入同一工具调用，应立即触发检测（历史保留 → 热状态）
     for _ in 0..3 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.lock().await.hook_output_observe(event).await;
+        hooks.hook_output_observe(event).await;
     }
     // 不硬断言级别，只验证链路不 panic（插件注入后检测仍热）
 }
@@ -257,7 +235,7 @@ async fn plugin_injected_message_only_clears_pending() {
 #[tokio::test]
 async fn intercept_passes_through_non_tool_result() {
     // 非 ToolResult 事件（如 Assistant）应直接 Pass 不修改
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     let event = OutputEvent::Assistant(fuyao_api::message::output::AssistantMessage {
         base: EventBase::default(),
@@ -273,7 +251,7 @@ async fn intercept_passes_through_non_tool_result() {
             cached_tokens: 0,
         },
     });
-    let result = hooks.lock().await.hook_output_intercept(&event);
+    let result = hooks.hook_output_intercept(&event);
     match result {
         InterceptResult::Pass(e) => {
             assert!(matches!(e, OutputEvent::Assistant(_)), "应原样放行");
@@ -285,12 +263,9 @@ async fn intercept_passes_through_non_tool_result() {
 #[tokio::test]
 async fn intercept_tool_result_without_pending_passes_original() {
     // 无 pending 时，intercept 放行原始 ToolResult
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
     let tr = make_tool_result("read", "干净的结果");
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::ToolResult(tr));
+    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
     if let InterceptResult::Pass(OutputEvent::ToolResult(tr)) = result {
         assert_eq!(tr.payload.content, "干净的结果");
     } else {
@@ -305,27 +280,19 @@ async fn intercept_tool_result_without_pending_passes_original() {
 #[tokio::test]
 async fn full_assembly_handles_mixed_event_stream() {
     // 混合事件流：用户消息 → 工具调用 → 文本块 → 工具结果，整条链路不 panic
-    let hooks = assembled_guard().await;
+    let hooks = assembled_guard();
 
     // 1. 用户消息（重置）
-    hooks
-        .lock()
-        .await
-        .hook_output_observe(make_user_event_from_user())
-        .await;
+    hooks.hook_output_observe(make_user_event_from_user()).await;
 
     // 2. 几个不重复的工具调用
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::ToolCall(make_tool_call(
             "read",
             r#"{"path":"a"}"#,
         )))
         .await;
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::ToolCall(make_tool_call(
             "write",
             r#"{"path":"b"}"#,
@@ -334,17 +301,12 @@ async fn full_assembly_handles_mixed_event_stream() {
 
     // 3. 文本块
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::Chunk(make_chunk(Some("正常输出"), None)))
         .await;
 
     // 4. 工具结果经 intercept
     let tr = make_tool_result("read", "a 的内容");
-    let _ = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::ToolResult(tr));
+    let _ = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
 
     // 不 panic 即通过——混合正常事件流不应误触发检测
 }

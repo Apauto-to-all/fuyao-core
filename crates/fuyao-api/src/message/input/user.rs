@@ -40,8 +40,7 @@ pub struct SystemSource {
 /// 插件注入来源详情（用户消息来源用）
 ///
 /// 携带插件名称，便于追踪是哪个插件注入的消息。
-/// 注：此类型仅用于 `UserMessageSource::Plugin`，与插件事件来源 `PluginEventSource`（见 plugin.rs）
-/// 语义不同，故意区分命名，不合并。
+/// 此类型仅用于 `UserMessageSource::Plugin`，标记「这条 user 消息由插件注入」。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginSource {
     /// 插件名称（如 "loop_guard"）

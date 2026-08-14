@@ -2,12 +2,13 @@
 //!
 //! 单元测试（src/plugin/tests.rs）已密集覆盖单个 API 行为：
 //! create_instances 一对一、重名拒绝、create_instance panic 跳过、dispose LIFO、
-//! SessionSender 三通道分流等。本文件聚焦**跨模块/跨阶段协作链路**——单元测试的空白带：
+//! SessionSender 两通道分流等。本文件聚焦**跨模块/跨阶段协作链路**——单元测试的空白带：
 //!
-//! - 完整装配链路：PluginHost.create_instances → 逐个 register → init_send_inputs → 触发钩子
+//! - 完整装配链路：PluginHost.create_instances → 逐个 register（sender 绑插件名）→
+//!   finalize 冻结 → 触发钩子
 //! - 跨阶段 panic 恢复：create_instance 崩溃的插件被跳过后，其余插件仍正常 register/触发
-//! - send_input hook 端到端：插件在 hook 回调里拿到 sender 发消息，消息真的落到对应通道
-//! - 三类 hook 共存：同一 registry 上同时挂 intercept + observe + send_input，喂真实事件流
+//! - sender 端到端：插件在 register 时拿到 sender 发消息，消息真的落到对应通道
+//! - 多类 hook 共存：同一 registry 上同时挂 intercept + observe + sender 能力，喂真实事件流
 //!
 //! 全部使用默认配置（不调 set_config），走 get_config 未 set 返回 default 的兜底。
 
@@ -15,19 +16,20 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use common::{FakePlugin, FakePluginConfig, HookAction, assemble, make_chunk, make_sender};
+use common::{FakePlugin, FakePluginConfig, HookAction, assemble, make_channels, make_chunk};
 use fuyao_api::message::OutputEvent;
 use fuyao_hooks::{InterceptResult, Plugin, PluginHost};
 
 /// 用日志驱动的 helper：构造单插件 + 装配，返回 hooks 与日志
-async fn single_plugin_assemble(
-    cfg: FakePluginConfig,
-) -> (fuyao_hooks::SharedHooks, common::ExecLog) {
+fn single_plugin_assemble(cfg: FakePluginConfig) -> (fuyao_hooks::SharedHooks, common::ExecLog) {
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let plugin = FakePlugin::new(cfg, log.clone());
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let instances = vec![plugin.create_instance()];
-    let hooks = assemble(instances, sender).await;
+    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(
+        vec![("single".to_string(), plugin.create_instance())],
+        tx_user,
+        tx_interrupt,
+    );
     (hooks, log)
 }
 
@@ -37,7 +39,7 @@ async fn single_plugin_assemble(
 
 #[tokio::test]
 async fn full_assembly_registers_and_invokes_observe() {
-    // 完整链路：PluginHost → create_instances → register observe → init_send_inputs →
+    // 完整链路：PluginHost → create_instances → register observe → finalize →
     // hook_output_observe 真实触发，observe 钩子被调用并记录
     let cfg = FakePluginConfig {
         name: "observer".into(),
@@ -47,37 +49,27 @@ async fn full_assembly_registers_and_invokes_observe() {
         create_instance_panic: false,
         register_panic: false,
     };
-    let (hooks, _log) = single_plugin_assemble(cfg).await;
+    let (hooks, _log) = single_plugin_assemble(cfg);
 
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::Chunk(make_chunk("hello")))
         .await;
 
     // 仅注册了 observe，intercept 为空应原样放行
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::Chunk(make_chunk("hello")));
+    let result = hooks.hook_output_intercept(&OutputEvent::Chunk(make_chunk("hello")));
     assert!(matches!(result, InterceptResult::Pass(_)));
 }
 
 #[tokio::test]
 async fn empty_registry_handles_events_without_panic() {
     // 空 registry（无插件装配）也应能正常处理 observe/intercept 事件，不 panic
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let hooks = assemble(vec![], sender).await;
+    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(vec![], tx_user, tx_interrupt);
 
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::Chunk(make_chunk("x")))
         .await;
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::Chunk(make_chunk("x")));
+    let result = hooks.hook_output_intercept(&OutputEvent::Chunk(make_chunk("x")));
     assert!(matches!(result, InterceptResult::Pass(_)));
 }
 
@@ -88,7 +80,7 @@ async fn empty_registry_handles_events_without_panic() {
 #[tokio::test]
 async fn multiple_plugins_register_and_observe_in_registration_order() {
     // 两个插件按 PluginHost 注册顺序 create_instance + register，
-    // observe 钩子按注册顺序触发（observe priority 固定 0，不参与排序）
+    // observe 钩子按注册顺序触发（observe 无优先级语义，不参与排序）
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let mut host = PluginHost::new();
     host.add(Box::new(FakePlugin::new(
@@ -114,15 +106,13 @@ async fn multiple_plugins_register_and_observe_in_registration_order() {
         log.clone(),
     )));
 
-    // create_instances 顺序 = add 顺序
+    // create_instances 顺序 = add 顺序（(名, 实例) 配对）
     let instances = host.create_instances().expect("无重名应成功");
     assert_eq!(instances.len(), 2);
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let hooks = assemble(instances, sender).await;
+    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(instances, tx_user, tx_interrupt);
 
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::Chunk(make_chunk("e")))
         .await;
 
@@ -181,11 +171,9 @@ async fn create_instance_panic_skipped_others_proceed() {
     // boom 被跳过：只拿到 healthy + trailing 两个实例
     assert_eq!(instances.len(), 2, "崩溃插件应被跳过");
 
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let hooks = assemble(instances, sender).await;
+    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(instances, tx_user, tx_interrupt);
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::Chunk(make_chunk("e")))
         .await;
 
@@ -231,11 +219,9 @@ async fn register_panic_isolated_others_proceed() {
     )));
 
     let instances = host.create_instances().expect("应成功");
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let hooks = assemble(instances, sender).await;
+    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(instances, tx_user, tx_interrupt);
     hooks
-        .lock()
-        .await
         .hook_output_observe(OutputEvent::Chunk(make_chunk("e")))
         .await;
 
@@ -251,19 +237,19 @@ async fn register_panic_isolated_others_proceed() {
 }
 
 // ============================================================================
-// send_input hook 端到端
+// sender 端到端
 // ============================================================================
 
 #[tokio::test]
-async fn send_input_hook_delivers_user_message_to_channel() {
-    // 插件在 send_input hook 回调里用 sender.send_user 发消息，
-    // 消息应真的落到 rx_user 通道（跨 PluginHost→register→init_send_inputs→sender 的完整路径）
+async fn register_sender_delivers_user_message_to_channel() {
+    // 插件在 register 时拿到 sender 立即 send_user，
+    // 消息应真的落到 rx_user 通道（跨 PluginHost→register→sender 的完整路径）
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let plugin = FakePlugin::new(
         FakePluginConfig {
             name: "sender_plugin".into(),
-            actions: vec![HookAction::SendInputUser {
-                log_tag: "send_input_fired".into(),
+            actions: vec![HookAction::SendUserOnRegister {
+                log_tag: "register_send_fired".into(),
                 content: "主动投递的消息".into(),
             }],
             create_instance_panic: false,
@@ -271,26 +257,33 @@ async fn send_input_hook_delivers_user_message_to_channel() {
         },
         log.clone(),
     );
-    let (sender, mut rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let _hooks = assemble(vec![plugin.create_instance()], sender).await;
+    let (tx_user, mut rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let _hooks = assemble(
+        vec![("sender_plugin".to_string(), plugin.create_instance())],
+        tx_user,
+        tx_interrupt,
+    );
 
-    // init_send_inputs 已在 assemble 内完成；验证消息已投递
+    // register 已在 assemble 内完成；验证消息已投递
     let received = rx_user.recv().await.expect("应收到插件投递的 User 消息");
     assert_eq!(received.payload.content, "主动投递的消息");
-    assert!(matches!(
-        received.payload.source,
-        fuyao_api::message::UserMessageSource::Plugin(_)
-    ));
+    // sender 绑定插件名：source 应为 Plugin 且携带该插件名
+    match received.payload.source {
+        fuyao_api::UserMessageSource::Plugin(src) => {
+            assert_eq!(src.name, "sender_plugin");
+        }
+        other => panic!("source 应为 Plugin，实际 {other:?}"),
+    }
 }
 
 // ============================================================================
-// 三类 hook 共存
+// 多类 hook 共存
 // ============================================================================
 
 #[tokio::test]
-async fn three_hook_types_coexist_on_single_registry() {
-    // 同一插件同时注册 intercept + observe + send_input（仿 fuyao-guard 实际用法），
-    // 喂一个事件，三类钩子都应被触发且互不干扰
+async fn observe_intercept_and_sender_coexist_on_single_plugin() {
+    // 同一插件同时注册 intercept + observe，并在 register 时用 sender 发消息
+    // （仿 fuyao-guard 实际用法），喂一个事件，各钩子都应被触发且互不干扰
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let plugin = FakePlugin::new(
         FakePluginConfig {
@@ -303,8 +296,8 @@ async fn three_hook_types_coexist_on_single_registry() {
                     priority: 0,
                     log_tag: "intercept_fired".into(),
                 },
-                HookAction::SendInputUser {
-                    log_tag: "send_input_fired".into(),
+                HookAction::SendUserOnRegister {
+                    log_tag: "register_send_fired".into(),
                     content: "combo_msg".into(),
                 },
             ],
@@ -313,24 +306,25 @@ async fn three_hook_types_coexist_on_single_registry() {
         },
         log.clone(),
     );
-    let (sender, mut rx_user, _rx_interrupt, _rx_plugin) = make_sender();
-    let hooks = assemble(vec![plugin.create_instance()], sender).await;
+    let (tx_user, mut rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(
+        vec![("combo".to_string(), plugin.create_instance())],
+        tx_user,
+        tx_interrupt,
+    );
 
-    // send_input 在装配时已触发（投递了 combo_msg）
-    let received = rx_user.recv().await.expect("send_input 应已投递");
+    // register 时已投递 combo_msg
+    let received = rx_user.recv().await.expect("register 应已投递");
     assert_eq!(received.payload.content, "combo_msg");
 
     // 喂一个事件：observe + intercept 都应记录
     let event = OutputEvent::Chunk(make_chunk("payload"));
-    hooks.lock().await.hook_output_observe(event).await;
-    let result = hooks
-        .lock()
-        .await
-        .hook_output_intercept(&OutputEvent::Chunk(make_chunk("payload")));
+    hooks.hook_output_observe(event).await;
+    let result = hooks.hook_output_intercept(&OutputEvent::Chunk(make_chunk("payload")));
     assert!(matches!(result, InterceptResult::Pass(_)));
 
     let recorded = log.lock().unwrap().clone();
-    assert!(recorded.contains(&"send_input_fired".to_string()));
+    assert!(recorded.contains(&"register_send_fired".to_string()));
     assert!(recorded.contains(&"observe_fired".to_string()));
     assert!(recorded.contains(&"intercept_fired".to_string()));
 }
@@ -339,8 +333,8 @@ async fn three_hook_types_coexist_on_single_registry() {
 // dispose LIFO（装配生命周期收尾）
 // ============================================================================
 
-#[tokio::test]
-async fn plugin_host_dispose_all_runs_in_reverse_order() {
+#[test]
+fn plugin_host_dispose_all_runs_in_reverse_order() {
     // dispose_all 按注册逆序调用（LIFO），与 create_instances 的正序对称。
     // 单测已覆盖 dispose_all LIFO 本身，这里验证它在「多插件装配后」仍成立。
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));

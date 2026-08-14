@@ -16,7 +16,7 @@
 //! - AI 不调用工具（最终回复，一轮 ReAct 结束）：先 pending 全倒 guide，再 guide 全消费
 //!
 //! 中断通道与队列分离：Interrupt 走独立 `rx_interrupt`（mpsc），
-//! select! 中断点只监听它——不会误取 User/Plugin。
+//! select! 中断点只监听它——不会误取 User。
 //!
 //! 工具结果不走队列：它是 ReAct 循环内部中间产物，产生即落 DB（事件级落库）。
 
@@ -30,15 +30,12 @@ mod rollback;
 mod tests;
 pub(crate) mod turn;
 
-use crate::dispatch;
 use crate::emit::Emitter;
 use crate::engine::types::SharedQueue;
 use crate::interrupt::emit_interrupt_event;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
-use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
-use fuyao_api::message::output::PluginMessage as OutputPluginMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::{AgentDefinition, CompressionConfig, ControlCommand, SessionParams};
 use fuyao_hooks::SharedHooks;
@@ -114,20 +111,18 @@ pub(crate) struct SessionCtx {
 
 /// session 执行流的入站通道集合
 ///
-/// 聚合喂给 session task 的四条接收端，由 Engine 的 assemble_session 一次性构造、
-/// 整个 task 期间由 run_session 独占消费：plugin 接收端 move 进独立转发 task，
-/// inbound / interrupt / control 在主循环 select! 与 run_turn 间 `&mut` 借用。
+/// 聚合喂给 session task 的三条接收端，由 Engine 的 assemble_session 一次性构造、
+/// 整个 task 期间由 run_session 独占消费：inbound / interrupt / control 在主循环
+/// select! 与 run_turn 间 `&mut` 借用。
 ///
 /// 与 [`SessionCtx`]（共享依赖视图）正交：ctx 是所有 turn 复用的只读依赖，rx 是本 task
 /// 独占消费的入站通道——两者一并构成 [`run_session`] 的全部入参，取代原先 18 个位置
-/// 参数（调用方拆包、入口再打包成 ctx 的两份需手动同步的参数表）。
+/// 参数（调用方拆包、入口再打包的 ctx 的两份需手动同步的参数表）。
 pub(crate) struct SessionRx {
     /// 入站用户消息（经管道分流入 guide / pending 队列）
     pub inbound: Receiver<OutputUserMessage>,
     /// 中断信号（idle 段与流式 / 工具执行段的中断点）
     pub interrupt: Receiver<OutputInterruptMessage>,
-    /// 插件通知（独立转发 task 消费，不阻塞主循环 turn）
-    pub plugin: Receiver<OutputPluginMessage>,
     /// 控制命令（手动压缩 / 回退等 B 类信号，turn 边界消费）
     pub control: Receiver<ControlCommand>,
 }
@@ -154,51 +149,13 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
         "session 执行流启动"
     );
 
-    // 拆出入站四通道：plugin 接收端 move 进独立转发 task，inbound / interrupt / control
-    // 在主循环 select! 与 run_turn 间 &mut 借用。四个绑定均 mut——recv/try_recv 需 &mut self。
+    // 拆出入站三通道：inbound / interrupt / control 在主循环 select! 与 run_turn 间
+    // &mut 借用。三个绑定均 mut——recv/try_recv 需 &mut self。
     let SessionRx {
         inbound: mut rx_inbound,
         interrupt: mut rx_interrupt,
-        plugin: mut rx_plugin,
         control: mut rx_control,
     } = rx;
-
-    // Plugin 转发独立 task：通知一到就转发，不阻塞在主循环的 turn 上
-    //
-    // Plugin 消息是纯通知：仅过 dispatch 管道转发（拦截 → 发送 → 观察），不碰 session
-    // 可变状态、不碰 guide/pending 队列、不参与 ReAct，故可与活跃 turn 安全并发。
-    // 修复前 Plugin 仅在主循环 idle select! 消费，turn 运行期间（pre-turn 压缩 +
-    // 注入 + LLM 流式 + 工具执行，可能很久）通知堆在通道里，延迟整轮才转发。
-    //
-    // 退出条件（双重，任一满足即退）：① shutdown_token 取消（Engine::shutdown 联动）；
-    // ② 所有 tx_plugin drop 致 recv 返 None（SessionHandle drop 时其 tx_plugin 随之 drop）。
-    // 无需追踪 forwarder 的 JoinHandle——靠 tx drop + shutdown_token 自然收尾，不过度设计。
-    {
-        let emitter = ctx.emitter.clone();
-        let hooks = ctx.hooks.clone();
-        let shutdown_token = ctx.shutdown_token.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    biased;
-                    // shutdown 优先：取消即退，不等通道排空
-                    _ = shutdown_token.cancelled() => break,
-                    plugin_msg = rx_plugin.recv() => match plugin_msg {
-                        Some(msg) => {
-                            dispatch::dispatch(
-                                &emitter,
-                                &hooks,
-                                OutputEvent::Plugin(msg),
-                            )
-                            .await;
-                        }
-                        // 所有 tx_plugin 已 drop（session 结束）→ 退
-                        None => break,
-                    },
-                }
-            }
-        });
-    }
 
     // 主循环：从 guide 全取消息 → 注入 → 跑 ReAct（自包含循环）。
     //
@@ -271,8 +228,6 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
         // 停止消费：非 Completed 时 guide 剩余不跑，落这里等。
         // 恢复消费：inbound 收到新用户消息 → 重置 outcome=Completed → 回顶部 consume，
         // 旧剩余 + 新消息一起跑（忠实消费，不清队列）。
-        // （Plugin 通知由 run_session 顶部 spawn 的独立 forwarder task 并发转发，
-        // 不在主循环消费——避免 turn 运行期间通知被阻塞延迟整轮）
         tokio::select! {
             biased;
             // shutdown 优先胜出（即使有消息积压也先退出）

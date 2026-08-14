@@ -41,8 +41,8 @@ pub use control::{ControlCommand, TurnDirective};
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
-    EventBase, InputEvent, InterruptSource, OutputEvent, PluginEventSource, PluginSource,
-    SystemSource, UserMessageMode, UserMessageSource,
+    EventBase, InputEvent, InterruptSource, OutputEvent, PluginSource, SystemSource,
+    UserMessageMode, UserMessageSource,
 };
 pub use pagination::{EventPage, MessagePage, SessionPage};
 pub use paths::{

@@ -38,6 +38,12 @@ pub fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// 插件实例配对：`(插件名, 该 session 的实例)`
+///
+/// 插件名供装配方构造绑定该插件身份的 [`SessionSender`](crate::SessionSender)
+/// （注入消息 source 可追溯）。
+pub type NamedPluginInstance = (String, Box<dyn PluginInstance>);
+
 /// 插件装配宿主
 ///
 /// 收集插件工厂（[`Plugin`](crate::Plugin)），引擎启动时持有 `Arc<PluginHost>`，
@@ -92,12 +98,15 @@ impl PluginHost {
     /// 批量生成所有插件的实例（每个插件调用一次 create_instance）
     ///
     /// 调用前会先做重名校验（重名硬失败）。生成顺序 = 插件注册顺序。
+    /// 返回 `(插件名, 实例)` 配对——插件名供装配方构造绑定该插件身份的
+    /// [`SessionSender`](crate::SessionSender)（注入消息 source 可追溯）。
     ///
     /// **panic 防护**：单个插件 create_instance 崩溃不阻塞其他插件（tracing warn + 继续）。
     /// 该崩溃插件的实例会被跳过（不在返回的 Vec 里）。
     ///
-    /// 返回的实例 Vec 由调用方逐个 `instance.register(&mut hooks)` 注册到该 session 的 registry。
-    pub fn create_instances(&self) -> Result<Vec<Box<dyn PluginInstance>>, PluginInstallError> {
+    /// 返回的实例 Vec 由调用方逐个 `instance.register(&mut hooks, &sender)`
+    /// 注册到该 session 的 registry。
+    pub fn create_instances(&self) -> Result<Vec<NamedPluginInstance>, PluginInstallError> {
         // 先做重名校验（在生成实例前，避免半途中断残留状态）
         self.validate_unique_names()?;
 
@@ -106,7 +115,7 @@ impl PluginHost {
             let name = plugin.name().to_string();
             // 同步 panic 防护：create_instance 是同步调用
             match std::panic::catch_unwind(AssertUnwindSafe(|| plugin.create_instance())) {
-                Ok(instance) => instances.push(instance),
+                Ok(instance) => instances.push((name, instance)),
                 Err(payload) => {
                     tracing::warn!(
                         plugin = %name,

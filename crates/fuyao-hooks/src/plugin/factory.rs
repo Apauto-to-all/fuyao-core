@@ -12,8 +12,6 @@
 //! Rust 不支持继承，trait 是接口约定（类似 Java interface），不是基类。
 //! 插件作者完全自由设计 struct 内部、自由选择注册几个 hook、自由决定是否持状态。
 
-use fuyao_api::message::input::PluginEventSource;
-
 use crate::plugin::PluginInstance;
 
 /// Plugin —— 引擎级插件工厂
@@ -28,22 +26,12 @@ use crate::plugin::PluginInstance;
 ///
 /// 实现示例见模块文档。
 pub trait Plugin: Send + Sync {
-    /// 插件唯一标识（调试、日志、配置开关匹配用）
+    /// 插件唯一标识（调试、日志、配置开关匹配、实例 sender 身份绑定用）
     ///
     /// **必须全局唯一**：PluginHost 装配时会校验重名，重名硬失败。
+    /// session 装配时以此为名构造该插件实例专属的
+    /// [`SessionSender`](crate::SessionSender)（注入消息的 source 据此可追溯）。
     fn name(&self) -> &str;
-
-    /// 插件结构化身份（默认从 [`name`](Self::name)() 桥接）
-    ///
-    /// 返回 [`PluginEventSource`]，用作生成的 [`SessionSender`](crate::SessionSender)
-    /// 的身份绑定（自动填 Plugin 消息的 source 字段）。
-    ///
-    /// 默认实现桥接 `name()`，现有插件零改动；未来需要更丰富身份（version 等）可 override。
-    fn identity(&self) -> PluginEventSource {
-        PluginEventSource {
-            name: self.name().to_string(),
-        }
-    }
 
     /// 工厂方法：生成该 session 的独立实例
     ///

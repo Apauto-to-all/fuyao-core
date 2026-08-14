@@ -31,13 +31,12 @@ use fuyao_session::SessionStore;
 /// 返回 `Some(event)` 表示 Pass（事件可能被插件修改）；
 /// 返回 `None` 表示 Block，调用方应丢弃该事件。
 ///
-/// 锁仅在拦截期间持有，不跨 await 边界（拦截是同步调用）。
+/// registry 装配后只读（无锁共享），拦截是同步调用。
 pub(crate) async fn intercept(
     _emitter: &Emitter,
     hooks: &SharedHooks,
     event: OutputEvent,
 ) -> Option<OutputEvent> {
-    let hooks = hooks.lock().await;
     match hooks.hook_output_intercept(&event) {
         InterceptResult::Pass(modified) => Some(modified),
         InterceptResult::Block(reason) => {
@@ -55,7 +54,7 @@ pub(crate) async fn intercept(
 /// 发送事件到出口通道 + 触发观察钩子
 ///
 /// 顺序：先 `Emitter::emit`（盖 session_id + tx.send），后 `hook_output_observe`。
-/// 发送与观察各自独立拿锁，不持锁跨 tx.send（比归档更安全，避免死锁）。
+/// registry 装配后只读（无锁共享），观察钩子自行内部同步。
 ///
 /// observe 钩子按注册顺序串行执行，单个 panic 或超时不阻塞后续（见 HooksRegistry）。
 ///
@@ -77,8 +76,7 @@ pub(crate) async fn deliver(
     // 出站通道无界，emit 同步返回——但本函数仍保留 async 因 observe hook 可能跨 await
     emitter.emit(event);
 
-    // 再观察（独立拿锁，不持锁跨 tx.send）
-    let hooks = hooks.lock().await;
+    // 再观察
     hooks.hook_output_observe(observe_event.clone()).await;
 
     observe_event
@@ -165,15 +163,19 @@ mod tests {
     use super::*;
     use fuyao_api::message::output::{AssistantMessage, AssistantPayload};
     use fuyao_hooks::{HooksRegistry, InterceptResult};
+    use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    /// 构造测试用 Emitter + 空 hooks
-    fn make_emitter_hooks() -> (Emitter, SharedHooks, mpsc::UnboundedReceiver<OutputEvent>) {
+    /// 构造测试用 Emitter + 出站接收端
+    fn make_emitter() -> (Emitter, mpsc::UnboundedReceiver<OutputEvent>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let emitter = Emitter::new(tx, "test-session".to_string());
-        let hooks: SharedHooks =
-            std::sync::Arc::new(tokio::sync::Mutex::new(HooksRegistry::default()));
-        (emitter, hooks, rx)
+        (emitter, rx)
+    }
+
+    /// 把已注册好钩子的 registry 冻结包 Arc（复刻装配期语义：register → finalize → 共享）
+    fn freeze_hooks(registry: HooksRegistry) -> SharedHooks {
+        Arc::new(registry)
     }
 
     /// 构造一个简单的 Assistant 事件
@@ -197,7 +199,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_passes_event_through_when_no_hooks() {
         // 空 hooks、无处理：事件直通，接收端能收到
-        let (emitter, hooks, mut rx) = make_emitter_hooks();
+        let (emitter, mut rx) = make_emitter();
+        let hooks = freeze_hooks(HooksRegistry::default());
         dispatch(&emitter, &hooks, make_assistant_event("hello")).await;
 
         let received = rx.recv().await.expect("应收到事件");
@@ -213,24 +216,23 @@ mod tests {
     #[tokio::test]
     async fn intercept_returns_modified_event() {
         // 拦截器修改 content：intercept 返回修改后的事件
-        let (emitter, hooks, _rx) = make_emitter_hooks();
-        {
-            let mut reg = hooks.lock().await;
-            reg.register_output_intercept(
-                0,
-                std::sync::Arc::new(|ev| {
-                    if let OutputEvent::Assistant(m) = ev {
-                        let mut modified = m.clone();
-                        if let Some(c) = &mut modified.payload.content {
-                            *c = c.to_uppercase();
-                        }
-                        InterceptResult::Pass(OutputEvent::Assistant(modified))
-                    } else {
-                        InterceptResult::Pass(ev.clone())
+        let (emitter, _rx) = make_emitter();
+        let mut reg = HooksRegistry::default();
+        reg.register_output_intercept(
+            0,
+            Arc::new(|ev: &OutputEvent| {
+                if let OutputEvent::Assistant(m) = ev {
+                    let mut modified = m.clone();
+                    if let Some(c) = &mut modified.payload.content {
+                        *c = c.to_uppercase();
                     }
-                }),
-            );
-        }
+                    InterceptResult::Pass(OutputEvent::Assistant(modified))
+                } else {
+                    InterceptResult::Pass(ev.clone())
+                }
+            }),
+        );
+        let hooks = freeze_hooks(reg);
 
         let result = intercept(&emitter, &hooks, make_assistant_event("hi")).await;
         match result {
@@ -244,14 +246,13 @@ mod tests {
     #[tokio::test]
     async fn intercept_returns_none_on_block() {
         // 拦截器 Block：返回 None，事件被丢弃
-        let (emitter, hooks, _rx) = make_emitter_hooks();
-        {
-            let mut reg = hooks.lock().await;
-            reg.register_output_intercept(
-                0,
-                std::sync::Arc::new(|_| InterceptResult::Block("插件拦截".to_string())),
-            );
-        }
+        let (emitter, _rx) = make_emitter();
+        let mut reg = HooksRegistry::default();
+        reg.register_output_intercept(
+            0,
+            Arc::new(|_: &OutputEvent| InterceptResult::Block("插件拦截".to_string())),
+        );
+        let hooks = freeze_hooks(reg);
 
         let result = intercept(&emitter, &hooks, make_assistant_event("hi")).await;
         assert!(result.is_none(), "Block 应返回 None");
@@ -260,14 +261,13 @@ mod tests {
     #[tokio::test]
     async fn dispatch_drops_event_on_block() {
         // Block 时 dispatch 整条丢弃，不发送、不观察
-        let (emitter, hooks, mut rx) = make_emitter_hooks();
-        {
-            let mut reg = hooks.lock().await;
-            reg.register_output_intercept(
-                0,
-                std::sync::Arc::new(|_| InterceptResult::Block("拦截丢弃".to_string())),
-            );
-        }
+        let (emitter, mut rx) = make_emitter();
+        let mut reg = HooksRegistry::default();
+        reg.register_output_intercept(
+            0,
+            Arc::new(|_: &OutputEvent| InterceptResult::Block("拦截丢弃".to_string())),
+        );
+        let hooks = freeze_hooks(reg);
         dispatch(&emitter, &hooks, make_assistant_event("dropped")).await;
 
         assert!(rx.try_recv().is_err(), "Block 后不应有事件发出");
@@ -276,12 +276,12 @@ mod tests {
     #[tokio::test]
     async fn deliver_runs_observe_hooks() {
         // deliver 之后 observe 被调用
-        let (emitter, hooks, mut rx) = make_emitter_hooks();
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let (emitter, mut rx) = make_emitter();
+        let observed = Arc::new(std::sync::Mutex::new(false));
+        let mut reg = HooksRegistry::default();
         {
             let observed = observed.clone();
-            let mut reg = hooks.lock().await;
-            reg.register_output_observe(std::sync::Arc::new(move |_ev| {
+            reg.register_output_observe(Arc::new(move |_ev| {
                 Box::pin({
                     let observed = observed.clone();
                     async move {
@@ -290,6 +290,7 @@ mod tests {
                 })
             }));
         }
+        let hooks = freeze_hooks(reg);
 
         deliver(&emitter, &hooks, make_assistant_event("observed")).await;
         assert!(rx.try_recv().is_ok(), "deliver 应发出事件");
@@ -299,7 +300,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_stamps_session_id() {
         // 经管道发送的事件带 session_id 标签
-        let (emitter, hooks, mut rx) = make_emitter_hooks();
+        let (emitter, mut rx) = make_emitter();
+        let hooks = freeze_hooks(HooksRegistry::default());
         deliver(&emitter, &hooks, make_assistant_event("tagged")).await;
         let received = rx.recv().await.expect("应收到事件");
         match received {

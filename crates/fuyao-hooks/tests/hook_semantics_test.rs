@@ -1,15 +1,16 @@
 //! fuyao-hooks 集成测试：钩子执行语义（优先级、短路、panic 防护）
 //!
-//! registry.rs 单元测试覆盖了 observe/send_input 的 panic 防护与超时。
+//! registry.rs 单元测试覆盖了 observe 的 panic 防护与超时。
 //! 本文件聚焦 intercept 执行语义的公共 API 契约——单测的空白带：
 //!
-//! - **intercept 优先级排序**：多 intercept 按 priority 降序执行（需先触发 ensure_sorted）
-//! - **惰性排序契约**（隐藏契约，需钉死）：ensure_sorted 仅由 init_send_inputs 触发，
-//!   hook_output_intercept 不触发排序。不经 init_send_inputs 直接 intercept 时，
-//!   执行顺序 = 注册顺序而非 priority 顺序
+//! - **intercept 优先级排序**：多 intercept 经 [`HooksRegistry::finalize`] 排定后
+//!   按 priority 降序执行
+//! - **冻结契约**（隐藏契约，需钉死）：finalize 是唯一排序点，
+//!   hook_output_intercept 不触发排序。不经 finalize 直接 intercept 时，
+//!   执行顺序 = 注册顺序而非 priority 顺序——调用方必须先 finalize
 //! - **Block 短路**：任一 intercept 返回 Block 立即终止，后续 intercept 不执行
 //! - **intercept panic 防护**：单测完全未覆盖 intercept 的 catch_unwind 路径（registry.rs
-//!   只测了 observe/send_input 的 panic），此处补足
+//!   只测了 observe 的 panic），此处补足
 //! - **intercept 串联修改**：多个 Pass 的 intercept 链式 transform 同一事件
 //!
 //! 全部使用默认配置（不调 set_config），走 get_config 未 set 返回 default 的兜底。
@@ -68,12 +69,12 @@ fn panic_intercept(reg: &mut HooksRegistry, priority: i32, log: &common::ExecLog
 }
 
 // ============================================================================
-// 优先级排序（经 init_send_inputs 触发 ensure_sorted 后）
+// 优先级排序（经 finalize 排定后）
 // ============================================================================
 
-#[tokio::test]
-async fn intercept_runs_in_priority_descending_after_sort() {
-    // 经 init_send_inputs 触发 ensure_sorted 后，intercept 按 priority 降序执行。
+#[test]
+fn intercept_runs_in_priority_descending_after_finalize() {
+    // 经 finalize 排定后，intercept 按 priority 降序执行。
     // 注册顺序故意与优先级相反（低优先级先注册），验证排序生效。
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let mut reg = new_registry();
@@ -81,64 +82,58 @@ async fn intercept_runs_in_priority_descending_after_sort() {
     record_intercept(&mut reg, 10, &log, "high"); // priority=10
     record_intercept(&mut reg, 5, &log, "mid"); // priority=5
 
-    // 触发排序：init_send_inputs 内部调 ensure_sorted
-    let (_sender, _rx_user, _rx_interrupt, _rx_plugin) = common::make_sender();
-    reg.init_send_inputs(_sender).await;
-
+    reg.finalize();
     reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("e")));
 
     let recorded = log.lock().unwrap().clone();
     assert_eq!(
         recorded,
         vec!["high", "mid", "low"],
-        "排序后应按 priority 降序：high(10) → mid(5) → low(1)"
+        "finalize 后应按 priority 降序：high(10) → mid(5) → low(1)"
     );
 }
 
 // ============================================================================
-// 惰性排序契约（隐藏契约，钉死）
+// 冻结契约（隐藏契约，钉死）
 // ============================================================================
 
-#[tokio::test]
-async fn intercept_without_init_runs_in_registration_order() {
-    // 隐藏契约：hook_output_intercept 不调 ensure_sorted。
-    // 不经 init_send_inputs 直接 intercept 时，执行顺序 = 注册顺序（非 priority 顺序）。
-    // 钉死此契约：调用方必须先 init_send_inputs 才能享受优先级排序。
+#[test]
+fn intercept_without_finalize_runs_in_registration_order() {
+    // 隐藏契约：hook_output_intercept 不排序，finalize 是唯一排序点。
+    // 不经 finalize 直接 intercept 时，执行顺序 = 注册顺序（非 priority 顺序）。
+    // 钉死此契约：调用方必须先 finalize 才能享受优先级排序。
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let mut reg = new_registry();
     record_intercept(&mut reg, 1, &log, "low"); // 注册第 1
     record_intercept(&mut reg, 10, &log, "high"); // 注册第 2
 
-    // 关键：不调 init_send_inputs，直接 intercept
+    // 关键：不调 finalize，直接 intercept
     reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("e")));
 
     let recorded = log.lock().unwrap().clone();
     assert_eq!(
         recorded,
         vec!["low", "high"],
-        "未经排序时执行顺序 = 注册顺序（非 priority 顺序）"
+        "未经 finalize 时执行顺序 = 注册顺序（非 priority 顺序）"
     );
 }
 
-#[tokio::test]
-async fn init_send_inputs_sorts_once_subsequent_intercept_respects_priority() {
-    // ensure_sorted 用 dirty 标记，只排一次。init_send_inputs 排序后，
-    // 后续注册的新 intercept 会重置 dirty，但未再次 init 时仍按「上次排序结果 + 追加」执行。
-    // 验证排序的惰性：一次排序后 registry 保持稳定。
+#[test]
+fn finalize_sorts_once_subsequent_intercept_respects_priority() {
+    // finalize 排定一次后 registry 冻结只读，重复 intercept 保持同样顺序（排序稳定）。
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let mut reg = new_registry();
     record_intercept(&mut reg, 1, &log, "low");
     record_intercept(&mut reg, 10, &log, "high");
 
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = common::make_sender();
-    reg.init_send_inputs(sender).await; // 排序：high, low
+    reg.finalize(); // 排序：high, low
 
     // 第一次 intercept 走排序后顺序
     reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("e1")));
     let first = log.lock().unwrap().clone();
     assert_eq!(first, vec!["high", "low"]);
 
-    // 第二次 intercept 应保持同样的排序顺序（dirty 已清，不重排）
+    // 第二次 intercept 应保持同样的排序顺序（冻结后不重排）
     log.lock().unwrap().clear();
     reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("e2")));
     let second = log.lock().unwrap().clone();
@@ -153,8 +148,8 @@ async fn init_send_inputs_sorts_once_subsequent_intercept_respects_priority() {
 // Block 短路
 // ============================================================================
 
-#[tokio::test]
-async fn intercept_block_short_circuits_remaining_handlers() {
+#[test]
+fn intercept_block_short_circuits_remaining_handlers() {
     // 任一 intercept 返回 Block 立即终止，后续 intercept 不执行。
     // 即使高优先级的 intercept 放行，中间一个 Block 也应短路。
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
@@ -163,8 +158,7 @@ async fn intercept_block_short_circuits_remaining_handlers() {
     block_intercept(&mut reg, 5, &log, "mid_block", "被阻止"); // priority=5 Block
     record_intercept(&mut reg, 1, &log, "low_never"); // 不应执行
 
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = common::make_sender();
-    reg.init_send_inputs(sender).await; // 排序：high_pass, mid_block, low_never
+    reg.finalize(); // 排序：high_pass, mid_block, low_never
 
     let result = reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("e")));
 
@@ -184,8 +178,8 @@ async fn intercept_block_short_circuits_remaining_handlers() {
 // intercept 串联修改
 // ============================================================================
 
-#[tokio::test]
-async fn intercept_chain_pass_modifies_event_in_sequence() {
+#[test]
+fn intercept_chain_pass_modifies_event_in_sequence() {
     // 多个 Pass 的 intercept 链式 transform 同一事件：每个拿到前一个的修改结果。
     // 用 content 字段串联追加，验证 current = modified 的传递。
     let mut reg = new_registry();
@@ -216,8 +210,7 @@ async fn intercept_chain_pass_modifies_event_in_sequence() {
         }),
     );
 
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = common::make_sender();
-    reg.init_send_inputs(sender).await; // 排序：priority 2 先，1 后
+    reg.finalize(); // 排序：priority 2 先，1 后
 
     let result = reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("base")));
 
@@ -237,8 +230,8 @@ async fn intercept_chain_pass_modifies_event_in_sequence() {
 // intercept panic 防护（单测空白，补足）
 // ============================================================================
 
-#[tokio::test]
-async fn intercept_panic_does_not_block_subsequent_handlers() {
+#[test]
+fn intercept_panic_does_not_block_subsequent_handlers() {
     // intercept 的 catch_unwind 路径在 registry.rs 单测中完全未覆盖。
     // 单个 intercept panic 应被恢复，后续 intercept 仍执行。
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
@@ -246,8 +239,7 @@ async fn intercept_panic_does_not_block_subsequent_handlers() {
     panic_intercept(&mut reg, 10, &log, "boom"); // 高优先级 panic
     record_intercept(&mut reg, 1, &log, "survivor"); // 应继续执行
 
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = common::make_sender();
-    reg.init_send_inputs(sender).await; // 排序：boom, survivor
+    reg.finalize(); // 排序：boom, survivor
 
     // panic 被恢复，不应传播；survivor 仍执行
     let result = reg.hook_output_intercept(&OutputEvent::Chunk(make_chunk("e")));
@@ -264,16 +256,15 @@ async fn intercept_panic_does_not_block_subsequent_handlers() {
     );
 }
 
-#[tokio::test]
-async fn intercept_all_panic_returns_original_event() {
+#[test]
+fn intercept_all_panic_returns_original_event() {
     // 所有 intercept 都 panic：全部被恢复，返回原始事件（current 从未被修改）
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let mut reg = new_registry();
     panic_intercept(&mut reg, 5, &log, "boom1");
     panic_intercept(&mut reg, 3, &log, "boom2");
 
-    let (sender, _rx_user, _rx_interrupt, _rx_plugin) = common::make_sender();
-    reg.init_send_inputs(sender).await;
+    reg.finalize();
 
     let original = OutputEvent::Chunk(make_chunk("untouched"));
     let result = reg.hook_output_intercept(&original);

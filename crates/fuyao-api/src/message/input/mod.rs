@@ -5,21 +5,18 @@
 //!
 //! - `User`: 用户消息（envelope {base, payload}）
 //! - `Interrupt`: 中断信号（envelope {base, payload}）
-//! - `Plugin`: 插件通知（envelope {base, payload}）
 //! - `Compress`: 手动压缩请求（envelope {base}，无业务载荷）
 //! - `Rollback`: 对话回退请求（envelope {base, payload}）
 
 // 子模块：每种事件类型独立文件管理
 mod compress_request;
 mod interrupt;
-mod plugin;
 mod rollback_request;
 mod user;
 
 // envelope / payload 在 input 层导出（外部通过 input::UserMessage 等路径访问）
 pub use compress_request::CompressRequest;
 pub use interrupt::{InterruptMessage, InterruptPayload, InterruptSource};
-pub use plugin::{PluginEventSource, PluginMessage, PluginPayload};
 pub use rollback_request::{RollbackPayload, RollbackRequest};
 pub use user::{
     PluginSource, SystemSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
@@ -35,9 +32,6 @@ pub enum InputEvent {
     User(UserMessage),
     /// 中断：用户取消或中断当前操作
     Interrupt(InterruptMessage),
-    /// 插件通知：插件通过 SendInputFn 发送的通知（警告、状态等）
-    /// 引擎收到后转发为 OutputEvent::Plugin 通知 UI
-    Plugin(PluginMessage),
     /// 手动压缩请求：用户 / 上层应用主动请求一次上下文压缩
     ///
     /// 经引擎入口送入控制通道，在 turn 边界触发压缩（跳过阈值与反抖动，
@@ -93,30 +87,6 @@ mod tests {
                 assert_eq!(msg.payload.source, InterruptSource::User);
             }
             _ => panic!("应为 Interrupt 变体"),
-        }
-    }
-
-    #[test]
-    fn plugin_event_contains_source_and_type() {
-        let event = InputEvent::Plugin(PluginMessage {
-            base: EventBase::default(),
-            payload: PluginPayload {
-                source: PluginEventSource {
-                    name: "loop_guard".into(),
-                },
-                event_type: "loop_warn".into(),
-                data: None,
-                error: None,
-                message: Some("检测到循环".into()),
-            },
-        });
-        match &event {
-            InputEvent::Plugin(msg) => {
-                assert_eq!(msg.payload.source.name, "loop_guard");
-                assert_eq!(msg.payload.event_type, "loop_warn");
-                assert_eq!(msg.payload.message, Some("检测到循环".to_string()));
-            }
-            _ => panic!("应为 Plugin 变体"),
         }
     }
 

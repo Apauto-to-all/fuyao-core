@@ -325,9 +325,7 @@ mod tests {
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let emitter = Emitter::new(tx, "sess1".to_string());
-        let hooks: SharedHooks = Arc::new(tokio::sync::Mutex::new(
-            fuyao_hooks::HooksRegistry::default(),
-        ));
+        let hooks: SharedHooks = Arc::new(fuyao_hooks::HooksRegistry::default());
         let interrupt = OutputInterruptPayload::new("用户取消", InterruptSource::User);
 
         // 构造临时 store + session（消息进 DB）

@@ -3,8 +3,7 @@
 //! 集中放引擎模块间共享的类型别名、状态类型。
 
 use fuyao_api::message::output::{
-    InterruptMessage as OutputInterruptMessage, PluginMessage as OutputPluginMessage,
-    UserMessage as OutputUserMessage,
+    InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
 };
 use fuyao_api::{ControlCommand, SessionParams};
 use std::collections::VecDeque;
@@ -31,12 +30,11 @@ pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<OutputUserMessage>>>;
 /// 活跃 session 的句柄
 ///
 /// Engine 的调度表（session_id → SessionHandle）持有它。
-/// 双队列 + 入站通道 + 中断通道 + Plugin 通道 + SessionParams 共享句柄 + 关闭信号分离：
+/// 双队列 + 入站通道 + 中断通道 + SessionParams 共享句柄 + 关闭信号分离：
 /// - `guide`：引导队列，直接消费，驱动 ReAct 循环
 /// - `pending`：排队队列，AI 不再调工具（最终回复）后才解禁转入 guide
 /// - `tx_inbound`：入站通道（User 消息送进 session task 过管道）
 /// - `tx_interrupt`：中断通道，select! 中断点监听（与队列正交）
-/// - `tx_plugin`：Plugin 通道，插件通知送进 session task 过 dispatch 管道（不参与 ReAct）
 /// - `tx_control`：控制通道，承载命令主循环做事的信号（手动压缩等），turn 边界消费
 /// - `session_params`：对话级参数共享句柄，Engine 写（update_session_params）、task 现读现用
 /// - `task`：session 独立执行流任务句柄（shutdown 时 await 等退出 / 超时 abort 兜底）
@@ -51,8 +49,6 @@ pub(crate) struct SessionHandle {
     pub tx_inbound: Sender<OutputUserMessage>,
     /// 中断通道发送端（output 侧 InterruptMessage，入口转化后承载）
     pub tx_interrupt: Sender<OutputInterruptMessage>,
-    /// Plugin 通道发送端（output 侧 PluginMessage，入口转化后承载）
-    pub tx_plugin: Sender<OutputPluginMessage>,
     /// 控制通道发送端（承载 ControlCommand，主循环 turn 边界消费）
     ///
     /// 承载「命令主循环做事」的信号（手动压缩等）。主循环在 turn 边界消费，

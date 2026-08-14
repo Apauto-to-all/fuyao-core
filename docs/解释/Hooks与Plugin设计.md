@@ -1,14 +1,14 @@
 # Hooks 与 Plugin 设计
 
-> 本文解释钩子系统的三类钩子、Plugin 两层模型（工厂 + session 实例）、SessionSender 三通道分流、执行引擎与安全防护。API 签名见 `cargo doc --workspace`。
+> 本文解释钩子系统的两类钩子（拦截 + 观察）、Plugin 两层模型（工厂 + session 实例）、SessionSender 两通道分流、注册表装配后冻结与安全防护。API 签名见 `cargo doc --workspace`。
 
 ## 设计目标
 
 提供 Agent 行为的扩展点，不修改引擎内核即可：
 
-- 拦截 / 修改 / 取消 Agent 的输入输出
+- 拦截 / 修改 / 阻止 Agent 的输出
 - 观察 Agent 的行为（只读副作用）
-- 主动向 Agent 注入消息
+- 主动向 Agent 注入消息或发出中断（经 session 装配期注入的 `SessionSender`，不走钩子）
 
 ## 统一消息处理管道（dispatch）
 
@@ -37,7 +37,7 @@ OutputEvent（输入转化的、引擎内部产生的）
 | **发送** | 推到该 session 出站通道 | Emitter::emit，盖 session_id 后 `tx_event.send`（per-session 通道；fan-in 由 App 承担） |
 | **观察** | 插件只读副作用 | 不能改数据、不能阻；发送在前、观察在后（串行） |
 
-## 三类钩子
+## 两类钩子
 
 ### 拦截型（可修改 / 阻止）
 
@@ -51,21 +51,19 @@ InterceptResult<T> = Pass(T) | Block(String)
 
 Block 短路后续钩子——拦截失败但不丢失信息（Block 带原因字符串）。
 
+拦截钩子带优先级（`register_output_intercept(priority, handler)`）：高优先级先执行，同优先级按注册顺序（装配期 `finalize` 稳定排序保证）。
+
 ### 观察型（只读副作用）
 
 | 钩子签名 | 作用 | 执行方式 |
 |---------|------|---------|
 | `OutputObserveFn` | 持久化 / 日志 / 统计 | 异步，串行，OutputEvent 发送后执行 |
 
-观察钩子不能修改事件，只做副作用。
+观察钩子不能修改事件，只做副作用。无优先级语义，按注册顺序串行执行；单个钩子可配置执行超时（`[hooks] timeout_secs`，0 表示不超时），超时跳过不阻塞后续。
 
-### 主动型（插件自主发送）
+### 发消息不是钩子
 
-| 钩子签名 | 作用 | 执行方式 |
-|---------|------|---------|
-| `SendInputFn` | 拿 `SessionSender`，插件随时发 User / Interrupt / Plugin | 每 session 装配时调一次 |
-
-这是"真·主动"——插件拿到 `SessionSender` 后可在任何时机发消息（不依赖 emit 频率）。
+插件主动发消息的能力（注入 User、发 Interrupt）**不通过钩子表达**——钩子只有拦截 / 观察两类，分别是「改数据」与「看数据」的扩展点。发消息是持句柄的能力，经 session 装配期的 `register` 参数注入（见下文 SessionSender 一节）：需要发消息的插件在 `register` 时保存 `SessionSender`，此后任何时机都可调用。
 
 ## Plugin 两层模型（工厂 + session 实例）
 
@@ -75,20 +73,20 @@ Block 短路后续钩子——拦截失败但不丢失信息（Block 带原因�
 引擎级（启动一次注册）：
   PluginHost 持有若干 Plugin（工厂模板）
          │ 只持有配置/共享依赖，无 per-session 状态
-         ↓ 每个 session 启动时调 create_instance()
+         ↓ 每个 session 启动时调 create_instances()
 session 级（每 session 独立）：
-  PluginInstance（实例）持该 session 独立状态
-         ↓ register(&mut HooksRegistry) 把 hook 注册到该 session 私有 registry
-  HooksRegistry → 绑定到该 session 的 dispatch 管道
+  (插件名, PluginInstance) 配对（实例持该 session 独立状态）
+         ↓ 逐个 instance.register(&mut HooksRegistry, &SessionSender)
+  HooksRegistry → finalize() 冻结 → 绑定到该 session 的 dispatch 管道
 ```
 
 ### Plugin trait（工厂模板）
 
 ```text
 trait Plugin {
-    fn name(&self) -> &str;
-    fn identity(&self) -> PluginEventSource;            // 默认桥接 name
+    fn name(&self) -> &str;                            // 插件唯一标识
     fn create_instance(&self) -> Box<dyn PluginInstance>;  // 每 session 调一次，生成独立实例
+    fn dispose(&self) {}                               // 引擎卸载时清理（默认空）
 }
 ```
 
@@ -101,96 +99,85 @@ Plugin 是**编译期**扩展点——`impl Plugin` 后编译进二进制，运�
 
 ```text
 trait PluginInstance {
-    fn register(&self, hooks: &mut HooksRegistry);  // 把 hook 注册到该 session 私有 registry
+    fn register(&self, hooks: &mut HooksRegistry, sender: &SessionSender);  // 注册 hook + 接收发送器
+    fn dispose(&self) {}                                                    // session 卸载时清理（默认空）
 }
 ```
 
-每 session 装配时 `assemble_session_hooks` 调 `create_instances` 生成实例集，每个 `instance.register(&mut registry)` 注册到该 session 私有的 `HooksRegistry`。
+每 session 装配时引擎调 `create_instances` 生成 `(插件名, 实例)` 配对，逐个 `instance.register(&mut registry, &sender)` 注册到该 session 私有的 `HooksRegistry`——`sender` 绑定该插件名（注入消息的 source 据此可追溯），需要发消息的插件在此 clone 保存，不需要的可忽略。
+
+`register` 是**同步**方法：只做注册闭包与保存发送器两个动作，不执行异步操作；注册的观察闭包内部可以是异步的（执行时被 await）。
 
 ### PluginHost
 
 | API | 说明 |
 |-----|------|
 | `add(plugin: Box<dyn Plugin>)` | 添加工厂（不立即创建实例） |
-| `create_instances() -> Result<Vec<Box<dyn PluginInstance>>, PluginInstallError>` | 每 session 调一次，生成所有插件的独立实例（含重名检查 + create_instance panic 防护） |
+| `create_instances() -> Result<Vec<(String, Box<dyn PluginInstance>)>, PluginInstallError>` | 每 session 调一次，生成所有插件的 `(插件名, 实例)` 配对（含重名检查 + create_instance panic 防护；崩溃插件的实例被跳过） |
 | `list()` | 列出已注册工厂名 |
+| `validate_unique_names()` | 单独校验名称唯一性 |
+| `dispose_all()` | 逆序销毁所有工厂（LIFO，单个 panic 不阻塞） |
 
-重名硬失败（`PluginInstallError::DuplicateName`）——防止两个插件同名导致行为不确定。
+重名硬失败（`PluginInstallError::DuplicateName`）——防止两个插件同名导致行为不确定。返回 `(名, 实例)` 配对而非裸实例，是为了让装配方不必反向查询身份就能构造每个实例专属的 `SessionSender`。
 
-## SessionSender：三通道分流
+## SessionSender：两通道分流
 
-`SessionSender` 封装"往**这个 session** 发消息"的能力，三种消息类型自动分流到该 session 的三条独立通道：
+`SessionSender` 封装"往**这个 session** 发消息"的能力，两种消息类型自动分流到该 session 的两条既有通道：
 
-| 消息类型 | 走向 | 复用的通道 |
-|---------|------|-----------|
-| User | 该 session 的入站通道 → dispatch 管道 → 触发 ReAct | `tx_inbound`（已存在） |
-| Interrupt | 该 session 的中断通道 → select! 中断点 | `tx_interrupt`（已存在） |
-| Plugin | 该 session 的 Plugin 通道 → dispatch 管道 → 直接发外部（不参与 ReAct） | `tx_plugin`（新增） |
+| 消息类型 | 走向 | 复用的通道 | source 自动填充 |
+|---------|------|-----------|----------------|
+| User | 该 session 的入站通道 → 入 guide/pending 队列 → 触发 ReAct | `tx_inbound`（已存在） | `Plugin(PluginSource { name })` |
+| Interrupt | 该 session 的中断通道 → select! 中断点 | `tx_interrupt`（已存在） | `Hook` |
 
-`SessionSender` 在 `send_input` hook 回调里由引擎注入（`assemble_session_hooks` 的步骤 4：`registry.init_send_inputs(sender).await`），绑定一个插件身份（自动填充 Plugin 消息的 source 字段）。所有发送方法用 `try_send`（非阻塞），失败仅记 warn。
+`SessionSender` 在 session 装配期由引擎构造（绑定一个插件名 + 该 session 的两条通道），经 `register` 参数传给插件。插件 clone 后保存（已实现 `Clone`）。所有发送方法用 `try_send`（非阻塞），通道满或关闭时仅记 warn 日志，不阻塞钩子执行。
 
 ### SessionSender 方法
 
 | 方法 | 用途 |
 |------|------|
-| `send_user(content)` | 注入 User 消息（默认 Guide 模式，source 自动填 `Plugin(identity)`） |
+| `send_user(content)` | 注入 User 消息（默认 Guide 模式，source 自动填 `Plugin(插件名)`） |
 | `send_user_with_mode(content, mode)` | 指定消息模式（Guide / Pending） |
-| `send_interrupt(reason)` | 发中断信号 |
-| `send_plugin(event_type, message)` | 发 Plugin 通知（带 identity） |
-| `send_plugin_data(event_type, data)` | 发 Plugin 通知（带任意 JSON data） |
-| `send_plugin_full(source, event_type, data, error, message)` | 完全自定义所有字段 |
+| `send_interrupt(reason)` | 发中断信号（source 自动填 `Hook`） |
 
-## Plugin 消息也走 dispatch 管道
-
-外部 `InputEvent::Plugin`（插件通知）**不在 Engine 层直接转 `OutputEvent::Plugin` 发外部**——那样会绕过 dispatch 管道，无法被 intercept/observe。
-
-正确链路：
-
-```text
-InputEvent::Plugin → Engine::send 路由到该 session 的 tx_plugin 通道
-                  → session task 的 select! 收到 → handle_inbound_plugin
-                  → 转成 OutputEvent::Plugin 过完整 dispatch 管道
-                  → Emitter 自动盖 session_id 标签发外部
-```
-
-这样所有消息（User/Interrupt/Plugin）统一经 dispatch 管道，拦截/观察机制对它们都生效。
+两条通道的载荷统一为 output 侧类型——插件是内核内组件，直接产出 output 侧消息，不经 input 中间态（与外部 `InputEvent` 经 `Engine::send` 入口转化的路径在地基上统一）。User 消息注入后走与其他用户消息完全相同的链路（入站 → 队列 → 注入时刻过 dispatch 管道），拦截 / 观察机制对它同样生效。
 
 ## 执行引擎（HooksRegistry）
 
 ```text
 registry.rs:
-  HooksRegistry 持有所有注册的钩子函数（该 session 私有）
-  init_send_inputs(sender) → 把 SessionSender 传给所有 send_input hook
+  HooksRegistry 持有该 session 的全部钩子（装配期注册，finalize 后冻结）
+  finalize() → 按 priority 稳定排序拦截钩子（高优先级先执行）
 ```
 
 执行规则：
 
-- 拦截钩子：串行执行，任一 Block 短路
-- 观察钩子：串行执行（发送后）
-- 所有钩子带 **panic 防护**（`catch_unwind` + `panic_payload_to_string`）——单个钩子 panic 只影响自身
-- panic 防护双层：`PluginHost::create_instances` 防 `create_instance` panic；Engine 再加一层 `catch_unwind` 防 `register` panic（单个实例崩溃不阻塞其他）
+- 拦截钩子：串行执行（priority 降序），任一 Block 短路
+- 观察钩子：串行执行（注册顺序，发送后），单个超时跳过（`[hooks] timeout_secs`，0 表示不超时）
+- 钩子执行期带 **panic 防护**（拦截 / 观察都在 HooksRegistry 内 catch_unwind；观察钩子另带超时防护）——单个钩子 panic 或超时只影响自身，记 warn 后继续
+- 装配期 panic 防护双层：`PluginHost::create_instances` 防 `create_instance` panic；引擎装配处再 catch_unwind 防 `register` panic（单个实例崩溃不阻塞其他实例注册）
 
-### SharedHooks
+### SharedHooks：装配后冻结
 
 ```text
-SharedHooks = Arc<tokio::sync::Mutex<HooksRegistry>>
+SharedHooks = Arc<HooksRegistry>
 ```
 
-每 session 装配时新建一份（per-session 独立），通过 dispatch 管道使用。定义在 L1 的 fuyao-hooks 是为了让 Plugin trait 等签名能引用它，而不产生对 fuyao-core 的环依赖。
+注册只发生在 session 装配期（`register_*` 需 `&mut self`）。装配方在所有 register 完成后调一次 `finalize()` 排定拦截钩子优先级，随后包进 `Arc` 冻结——运行期 registry 只读共享给该 session 的所有 dispatch 调用点，**无锁**。hook 闭包如持共享状态（如插件 state），需自行内部同步（如 `std::sync::Mutex`）。
+
+定义在 fuyao-hooks 是为了让 Plugin trait 等签名能引用它，而不产生对 fuyao-core 的环依赖。
 
 ## 类型层级归属
 
 层级约束：`fuyao-guard`(L2) 不能依赖 `fuyao-core`(L3)。因此：
 
 - `SessionSender` + `Plugin` + `PluginInstance` + `PluginHost` trait 定义在 **fuyao-hooks**(L1)
-- `SessionSender` 持有的通道载荷类型用 **fuyao-api**(L0) 的类型（如 `InboundUser`、`InterruptMessage`、`PluginMessage`）
-- 为此把 `InboundUser`（原 core 的 `pub(crate)` 类型）**提升到 fuyao-api**，让 hooks 能引用
+- `SessionSender` 持有的通道载荷类型用 **fuyao-api**(L0) 的 output 侧类型（`UserMessage`、`InterruptMessage`）
 
 ## 内置插件
 
 | 插件 | crate | 注册的钩子 | 作用 |
 |------|-------|-----------|------|
-| `LoopGuardPlugin` | fuyao-guard | output_observe / output_intercept / send_input | 循环检测（工厂 + 每 session 独立 LoopGuardInstance） |
+| `LoopGuardPlugin` | fuyao-guard | output_observe + output_intercept（并存 sender） | 循环检测（工厂 + 每 session 独立 LoopGuardInstance） |
 
 按 `[plugins.enabled]` 配置过滤，未列出默认启用。
 
@@ -204,21 +191,37 @@ SharedHooks = Arc<tokio::sync::Mutex<HooksRegistry>>
 - 无状态插件 `create_instance` 返回无字段实例，零开销
 - 引擎层只持工厂集合，不感知实例细节
 
-### 为什么统一原则是「插件一切能力都是 hook」？
+### 为什么发消息能力经 register 注入而非 hook？
 
-铁律：插件的所有能力（观察/拦截/发消息）都只能是 hook。**没有 hook 之外的"特殊注入通道"**。新增能力 = 新增 hook 类型。
+发消息是「持句柄、随时可用」的能力，而 hook 是「在特定时机被回调」的扩展点——两者生命周期语义不同。若发消息也做成 hook（引擎启动时回调一次、传入 sender），会引入一个只被调用一次、却承担持续能力的伪 hook：它既不拦截也不观察，只是参数投递通道。
 
-这条原则的具体体现：发消息能力**不通过** register 参数注入，而是通过 `send_input` hook 获得。插件注册 send_input hook → 引擎在 session 启动时调用该 hook，传入 `SessionSender` → 插件保存后随时调用。
+经 `register(&mut hooks, &sender)` 注入则把能力交付合并进插件本就要参与的装配阶段：注册钩子与拿发送器是同一次调用，插件要么两者都要、要么忽略 sender 只注册钩子，没有多余的钩子类型。同时 sender 在构造时就绑定插件名，注入消息的 source 自动可追溯，不需要插件自行申报身份。
 
-### 为什么分拦截 / 观察 / 主动三类？
+### 为什么只有拦截 / 观察两类钩子？
 
-三种扩展需求的语义完全不同：
+两类钩子对应输出消息的两类扩展需求，语义边界清晰：
 
-- 拦截：需要修改 / 阻止 → 串行 + 短路
-- 观察：只读副作用 → 不影响主流程
-- 主动：插件自主发消息 → 需要持有 SessionSender
+- 拦截：需要修改 / 阻止 → 同步串行 + 短路
+- 观察：只读副作用 → 异步串行、发送后执行
 
-混在一起会导致执行顺序混乱和职责不清。
+发消息不属此列（它不改也不看正在流经管道的消息，是独立于管道的能力），因此不设第三类钩子。混在一起会导致执行顺序混乱和职责不清。
+
+### 为什么注册表装配后冻结（无锁共享）？
+
+钩子集合是 session 装配期的产物：装配完成后，该 session 会注册哪些钩子就已确定，运行期不会增删。把「注册（可变）」与「执行（只读）」分成两个阶段，运行期就能以 `Arc<HooksRegistry>` 只读共享——dispatch 调用点直接调用，无锁、无 await 竞争。若注册表运行期可变，每个调用点都要过锁或异步互斥，热路径（每条输出事件都过拦截 + 观察）付出无谓的同步成本。
+
+代价是 hook 闭包持有的共享状态（插件 state）需自行内部同步——这把同步成本精确限制在真正有状态的插件上，无状态钩子零开销。
+
+### 为什么砍掉 Plugin 主动通知通道？
+
+此前插件有一条专用的 Plugin 通知通道（session 级独立入口 + 独立转发 task + input/output 两侧的 Plugin 事件变体），用于向外部发「纯通知」信息。砍掉它的依据是：插件需要对外表达的所有语义，都能用既有机制更准确地表达——
+
+- **打断执行** → `SessionSender::send_interrupt`（中断通道，source 标 Hook）
+- **引导 AI 调整策略** → `SessionSender::send_user`（User 通道，注入对话历史，AI 真的能读到）
+- **修正 AI 收到的反馈** → 拦截钩子把警告注入或替换进工具结果内容（LLM 下轮输入即含修正）
+- **纯通知类信息**（人看的运维信息，AI 与流程都不消费）→ tracing 日志（WARN / INFO）
+
+专用通知通道承载的信息三类都不沾：UI 消费它需自行约定 event_type 格式，AI 看不到它，执行流也不受它影响——实际语义就是日志。为「结构化日志」维护一条 session 级通道、两个事件变体与一个转发 task，成本高于收益。砍掉后事件协议更小，session 入口通道只承载真正参与对话流转的消息。
 
 ### 为什么 Plugin 是编译期而非运行时加载？
 
@@ -226,12 +229,8 @@ SharedHooks = Arc<tokio::sync::Mutex<HooksRegistry>>
 
 ### 为什么钩子带 panic 防护？
 
-插件是第三方代码，panic 不应崩溃引擎。`catch_unwind` 确保单个钩子 panic 只影响自身，不影响主流程。双层防护（`create_instance` + `register` 各一层）确保装配阶段的 panic 也不阻塞 session 启动。
+插件是第三方代码，panic 不应崩溃引擎。`catch_unwind` 确保单个钩子 panic 只影响自身，不影响主流程。装配期双层防护（`create_instance` 与 `register` 各一层）确保插件装配阶段的 panic 也不阻塞 session 启动。
 
 ### 为什么重名硬失败？
 
 两个同名插件会导致行为不确定（哪个先注册？哪个的钩子先生效？）。硬失败让开发者在开发阶段就发现问题，而非运行时产生难以排查的行为异常。
-
-### 为什么 SessionSender 三通道？
-
-User 和 Interrupt 通道本来就存在（session task 用），完全复用。只有 Plugin 消息需要新增 session 级入口 `tx_plugin`——因为 Plugin 消息要"直接进 dispatch 管道发外部，不参与 ReAct"。三通道各自独立，消息类型清晰分流。

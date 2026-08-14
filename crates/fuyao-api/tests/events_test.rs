@@ -5,9 +5,8 @@
 //! 全部为纯值类型，零 IO，零全局状态。
 
 use fuyao_api::message::input::{
-    CompressRequest, InputEvent, InterruptMessage, InterruptPayload, InterruptSource,
-    PluginEventSource, PluginMessage, PluginPayload, PluginSource, SystemSource, UserMessage,
-    UserMessageMode, UserMessageSource, UserPayload,
+    CompressRequest, InputEvent, InterruptMessage, InterruptPayload, InterruptSource, PluginSource,
+    SystemSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, CompressionDeltaPayload,
@@ -17,7 +16,6 @@ use fuyao_api::message::output::{
 };
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, InterruptPayload as OutputInterruptPayload,
-    PluginMessage as OutputPluginMessage, PluginPayload as OutputPluginPayload,
     UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
 };
 use fuyao_api::{EventBase, ThinkingType};
@@ -60,7 +58,7 @@ fn event_base_update_timestamp_refreshes_value() {
 }
 
 // ---------------------------------------------------------------------------
-// InputEvent：4 变体穷尽性与 serde 往返
+// InputEvent：3 变体穷尽性与 serde 往返
 // ---------------------------------------------------------------------------
 
 /// 构造全部 InputEvent 变体，用于参数化往返测试
@@ -82,18 +80,6 @@ fn input_event_samples() -> Vec<InputEvent> {
                 source: InterruptSource::User,
             },
         }),
-        InputEvent::Plugin(PluginMessage {
-            base: EventBase::default(),
-            payload: PluginPayload {
-                source: PluginEventSource {
-                    name: "loop_guard".into(),
-                },
-                event_type: "loop_warn".into(),
-                data: Some(serde_json::json!({"count": 3})),
-                error: None,
-                message: Some("检测到循环".into()),
-            },
-        }),
         InputEvent::Compress(CompressRequest {
             base: EventBase::default(),
         }),
@@ -101,7 +87,7 @@ fn input_event_samples() -> Vec<InputEvent> {
 }
 
 #[rstest]
-fn input_event_serde_preserves_variant(#[values(0, 1, 2, 3)] idx: usize) {
+fn input_event_serde_preserves_variant(#[values(0, 1, 2)] idx: usize) {
     let original = input_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: InputEvent = serde_json::from_str(&json).expect("反序列化失败");
@@ -110,14 +96,13 @@ fn input_event_serde_preserves_variant(#[values(0, 1, 2, 3)] idx: usize) {
     match (&original, &restored) {
         (InputEvent::User(_), InputEvent::User(_)) => {}
         (InputEvent::Interrupt(_), InputEvent::Interrupt(_)) => {}
-        (InputEvent::Plugin(_), InputEvent::Plugin(_)) => {}
         (InputEvent::Compress(_), InputEvent::Compress(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// OutputEvent：8 变体穷尽性与 serde 往返
+// OutputEvent：7 基础变体穷尽性与 serde 往返
 // ---------------------------------------------------------------------------
 
 fn output_event_samples() -> Vec<OutputEvent> {
@@ -186,18 +171,6 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 recoverable: true,
             },
         }),
-        OutputEvent::Plugin(OutputPluginMessage {
-            base: EventBase::default(),
-            payload: OutputPluginPayload {
-                source: PluginEventSource {
-                    name: "test".into(),
-                },
-                event_type: "custom".into(),
-                data: None,
-                error: None,
-                message: None,
-            },
-        }),
         // 压缩事件三阶段（Started / Delta / Ended）样本
         OutputEvent::Compression(CompressionMessage {
             base: EventBase::default(),
@@ -226,12 +199,12 @@ fn output_event_samples() -> Vec<OutputEvent> {
 }
 
 #[rstest]
-fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] idx: usize) {
+fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)] idx: usize) {
     let original = output_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: OutputEvent = serde_json::from_str(&json).expect("反序列化失败");
 
-    // 11 样本穷尽匹配（8 基础变体 + 3 压缩 mode），保证 serde 不丢标签
+    // 10 样本穷尽匹配（7 基础变体 + 3 压缩 mode），保证 serde 不丢标签
     match (&original, &restored) {
         (OutputEvent::Chunk(_), OutputEvent::Chunk(_)) => {}
         (OutputEvent::User(_), OutputEvent::User(_)) => {}
@@ -240,7 +213,6 @@ fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 1
         (OutputEvent::Assistant(_), OutputEvent::Assistant(_)) => {}
         (OutputEvent::Interrupt(_), OutputEvent::Interrupt(_)) => {}
         (OutputEvent::Error(_), OutputEvent::Error(_)) => {}
-        (OutputEvent::Plugin(_), OutputEvent::Plugin(_)) => {}
         (OutputEvent::Compression(_), OutputEvent::Compression(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }

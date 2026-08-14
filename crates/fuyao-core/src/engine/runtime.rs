@@ -1,7 +1,7 @@
 //! 会话运行时操作（入站分发 / 参数更新）
 //!
 //! 本模块集中 [`Engine`] 的「运行」相关动作：
-//! - [`Engine::send`]：入站事件单一入口（User / Interrupt / Plugin 分流）
+//! - [`Engine::send`]：入站事件单一入口（User / Interrupt 分流）
 //! - [`Engine::update_session_params`]：运行时调整 session 参数
 //!
 //! 出站事件不再走 Engine——每 session 持自己的 per-session 通道，rx 由创建方法
@@ -23,8 +23,6 @@ enum OutboundAction {
     ),
     /// 中断信号 → 中断通道
     Interrupt(mpsc::Sender<OutputInterruptMessage>, OutputInterruptMessage),
-    /// Plugin 通知 → Plugin 通道
-    Plugin(mpsc::Sender<OutputPluginMessage>, OutputPluginMessage),
     /// 控制命令（手动压缩 / 回退）→ 控制通道
     Control(
         mpsc::Sender<fuyao_api::ControlCommand>,
@@ -34,7 +32,7 @@ enum OutboundAction {
 
 /// 通道投递（send 的统一语义包装）
 ///
-/// 四类分流通道共用同一语义：通道满则背压等待，通道断开（session task 已退出）
+/// 三类分流通道共用同一语义：通道满则背压等待，通道断开（session task 已退出）
 /// 视为引擎已关停，报 `EngineError::Shutdown`。载荷类型不同由泛型吸收。
 async fn deliver<T>(tx: mpsc::Sender<T>, msg: T) -> Result<(), EngineError> {
     tx.send(msg).await.map_err(|_| EngineError::Shutdown)
@@ -46,7 +44,6 @@ impl Engine {
     /// 所有对话级输入事件从一个口进，靠 session id 区分对话，按事件类型分流：
     /// - `User`：入队，触发 ReAct 循环。模型配置从 session 的 `SessionParams` 现读（见 [`update_session_params`](Self::update_session_params)）
     /// - `Interrupt`：发出中断信号，打断对应对话的当前执行
-    /// - `Plugin`：插件发给某对话的通知，转发为 OutputEvent::Plugin 送出
     /// - `Compress` / `Rollback`：控制类命令，转 ControlCommand 投控制通道，task 在 turn 边界自执行；
     ///   结果经 per-session 出口以对应 OutputEvent 流出（Compression / Rollback）
     ///
@@ -96,20 +93,6 @@ impl Engine {
                     );
                     OutboundAction::Interrupt(handle.tx_interrupt.clone(), outbound)
                 }
-                InputEvent::Plugin(plugin_msg) => {
-                    // 入口转化：input 侧 PluginMessage → output 侧 PluginMessage。
-                    // 转化后送 session 的 Plugin 通道，由 session task 过 dispatch 管道：
-                    // 拦截 → 发送（盖 session_id 标签发外部） → 观察。
-                    // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道。
-                    let outbound = OutputPluginMessage::new(
-                        plugin_msg.payload.source,
-                        plugin_msg.payload.event_type,
-                        plugin_msg.payload.data,
-                        plugin_msg.payload.error,
-                        plugin_msg.payload.message,
-                    );
-                    OutboundAction::Plugin(handle.tx_plugin.clone(), outbound)
-                }
                 InputEvent::Compress(_) => {
                     // 控制通道：手动压缩请求转化为 ControlCommand::Compress，送主循环 turn 边界消费
                     //（跳过阈值 / 反抖动，复用自动压缩执行流程，reason=manual）
@@ -133,12 +116,11 @@ impl Engine {
             }
         };
 
-        // 锁外投递：四种通道的 send 语义一致（满则等待，断则 Shutdown），
+        // 锁外投递：三种通道的 send 语义一致（满则等待，断则 Shutdown），
         // 仅载荷类型不同，统一走泛型 deliver
         match action {
             OutboundAction::Inbound(tx, msg) => deliver(tx, msg).await?,
             OutboundAction::Interrupt(tx, msg) => deliver(tx, msg).await?,
-            OutboundAction::Plugin(tx, msg) => deliver(tx, msg).await?,
             OutboundAction::Control(tx, cmd) => deliver(tx, cmd).await?,
         }
 

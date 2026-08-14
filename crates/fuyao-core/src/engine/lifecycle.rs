@@ -55,14 +55,12 @@ impl Engine {
         // SessionParams 整体传下去，不在入口拆包——压缩重建 prompt 等运行时场景
         // 仍需 agent_config，贯穿到 SessionCtx 留存，将来加字段只动 SessionCtx 一处
         // is_child 从新建 session 行的 parent_session_id 派生（新建恒为 None → false）
-        let (handle, rx_event) = self
-            .assemble_session(
-                session_id.clone(),
-                session.parent_session_id.is_some(),
-                params,
-                definition,
-            )
-            .await;
+        let (handle, rx_event) = self.assemble_session(
+            session_id.clone(),
+            session.parent_session_id.is_some(),
+            params,
+            definition,
+        );
         self.sessions
             .lock()
             .await
@@ -112,9 +110,7 @@ impl Engine {
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去（与 create_session 对称）
-        let (handle, rx_event) = self
-            .assemble_session(id.clone(), is_child, params, definition)
-            .await;
+        let (handle, rx_event) = self.assemble_session(id.clone(), is_child, params, definition);
         self.sessions.lock().await.insert(id.clone(), handle);
 
         tracing::info!(session_id = %id, "恢复对话");
@@ -176,9 +172,8 @@ impl Engine {
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表
         // SessionParams 整体传下去（与 create_session / resume_session 对称）
         // fork 出的是独立 session（parent=None）→ is_child=false
-        let (handle, rx_event) = self
-            .assemble_session(new_session_id.clone(), false, params, definition)
-            .await;
+        let (handle, rx_event) =
+            self.assemble_session(new_session_id.clone(), false, params, definition);
         self.sessions
             .lock()
             .await
@@ -284,9 +279,8 @@ impl Engine {
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表（与 create_session 对称）
         // create_child_session 产出的恒为子任务（parent_session_id 非空）→ is_child=true
-        let (handle, rx_event) = self
-            .assemble_session(new_session_id.clone(), true, params, definition)
-            .await;
+        let (handle, rx_event) =
+            self.assemble_session(new_session_id.clone(), true, params, definition);
         self.sessions
             .lock()
             .await
@@ -367,14 +361,11 @@ impl Engine {
 
     /// 装配 session（create_session / resume_session 公共方法）
     ///
-    /// 建该 session 专属的双队列 + 四条通道（inbound/interrupt/plugin + per-session 出站），
+    /// 建该 session 专属的双队列 + 三条通道（inbound/interrupt/control + per-session 出站），
     /// 装配该 session 的 hooks（per-session 独立实例），spawn 执行流 task，
     /// 返回 `(SessionHandle, rx_event)`——rx_event 是该 session 的独立出站通道接收端，
     /// 由调用方（装配层 / detached 调用方）独占消费。
-    ///
-    /// 关键：`assemble_session_hooks` 必须 async（`init_send_inputs` 是 async），
-    /// 故本方法也是 async。
-    async fn assemble_session(
+    fn assemble_session(
         &self,
         session_id: SessionId,
         is_child: bool,
@@ -403,7 +394,6 @@ impl Engine {
         // 三条 session 级入站通道（载荷统一为 output 侧类型——入口转化后内核只认 output 侧）
         let (tx_inbound, rx_inbound) = mpsc::channel::<fuyao_api::message::output::UserMessage>(16);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-        let (tx_plugin, rx_plugin) = mpsc::channel::<OutputPluginMessage>(16);
         // 控制通道：承载 ControlCommand（手动压缩等 B 类信号），主循环 turn 边界消费。
         // 容量小（8）——B 类命令频率低，主循环串行消费天然去重。
         let (tx_control, rx_control) = mpsc::channel::<fuyao_api::ControlCommand>(8);
@@ -417,15 +407,9 @@ impl Engine {
         //   未来扩展「单 session 销毁」时可单独 cancel 这个 child
         let shutdown_token = self.shutdown_token.child_token();
 
-        // 装配该 session 的 hooks（per-session：create_instances + register + SessionSender）
-        let hooks = self
-            .assemble_session_hooks(
-                &session_id,
-                tx_inbound.clone(),
-                tx_interrupt.clone(),
-                tx_plugin.clone(),
-            )
-            .await;
+        // 装配该 session 的 hooks（per-session：create_instances + register + finalize）
+        let hooks =
+            self.assemble_session_hooks(&session_id, tx_inbound.clone(), tx_interrupt.clone());
 
         // 装配 SessionCtx（会话级共享依赖的 owned 视图）+ SessionRx（入站通道集合）。
         // 此前 run_session 接 18 个位置参数、入口内部再打包成 SessionCtx——调用方拆包、
@@ -451,7 +435,6 @@ impl Engine {
         let rx = react::SessionRx {
             inbound: rx_inbound,
             interrupt: rx_interrupt,
-            plugin: rx_plugin,
             control: rx_control,
         };
         let task = tokio::spawn(react::run_session(ctx, rx));
@@ -462,7 +445,6 @@ impl Engine {
                 pending,
                 tx_inbound,
                 tx_interrupt,
-                tx_plugin,
                 tx_control,
                 task,
                 shutdown_token,
@@ -475,19 +457,18 @@ impl Engine {
     /// 装配某 session 的 hooks（per-session，每 session 调用一次）
     ///
     /// 流程：
-    /// 1. `plugin_host.create_instances()` 生成该 session 的所有插件实例（含重名检查 + create_instance panic 防护）
-    /// 2. 每个 `instance.register(&mut registry)` 注册到该 session 私有的 registry（register panic 单独防护）
-    /// 3. 构造 `SessionSender`（绑定该 session 的三条通道）
-    /// 4. `registry.init_send_inputs(sender).await` 把 sender 传给 send_input hook
-    /// 5. 包成 `SharedHooks` 返回
+    /// 1. `plugin_host.create_instances()` 生成该 session 的所有 `(插件名, 实例)` 配对
+    ///    （含重名检查 + create_instance panic 防护）
+    /// 2. 每个 `instance.register(&mut registry, &sender)` 注册到该 session 私有的
+    ///    registry（sender 绑该插件名，register panic 单独防护）
+    /// 3. `registry.finalize()` 排定优先级，冻结后包 `Arc` 只读共享
     ///
     /// 失败容错：插件实例化失败（重名等）该 session 以**空 hooks** 运行（不硬 panic，让 session 还能用）。
-    async fn assemble_session_hooks(
+    fn assemble_session_hooks(
         &self,
         session_id: &SessionId,
         tx_inbound: mpsc::Sender<fuyao_api::message::output::UserMessage>,
         tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
-        tx_plugin: mpsc::Sender<OutputPluginMessage>,
     ) -> SharedHooks {
         let mut registry = HooksRegistry::new();
 
@@ -500,21 +481,22 @@ impl Engine {
                     cause = %e,
                     "插件实例化失败（重名或装配错误），该 session 将以空 hooks 运行"
                 );
-                return Arc::new(Mutex::new(registry));
+                return Arc::new(registry);
             }
         };
 
         // 2. 每个 instance 注册 hook（register 是同步调用，单独 panic 防护）
+        //    每个实例拿到绑定自己插件名的 sender（注入消息 source 可追溯）
         //    单个 instance.register panic 不阻塞其他实例注册
-        for (idx, instance) in instances.iter().enumerate() {
-            let hint = format!("instance-{idx}");
+        for (name, instance) in &instances {
+            let sender = SessionSender::new(name.clone(), tx_inbound.clone(), tx_interrupt.clone());
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                instance.register(&mut registry)
+                instance.register(&mut registry, &sender)
             }));
             if let Err(payload) = result {
                 tracing::warn!(
                     session_id = %session_id,
-                    hint = %hint,
+                    plugin = %name,
                     phase = "register",
                     recovered = true,
                     cause = %fuyao_hooks::panic_payload_to_string(&*payload),
@@ -523,22 +505,8 @@ impl Engine {
             }
         }
 
-        // 3. 构造 SessionSender（identity 用 session_id 占位）
-        //    注：各插件发 Plugin 消息的精确身份由插件通过 send_plugin_full 等方法控制，
-        //    或后续给 SessionSender 加 with_identity 方法优化
-        let sender = SessionSender::new(
-            PluginEventSource {
-                name: format!("session:{session_id}"),
-            },
-            tx_inbound,
-            tx_interrupt,
-            tx_plugin,
-        );
-
-        // 4. 把 sender 传给所有 send_input hook
-        registry.init_send_inputs(sender).await;
-
-        // 5. 包成 SharedHooks
-        Arc::new(Mutex::new(registry))
+        // 3. 排定优先级后冻结，包 Arc 只读共享（运行期无锁）
+        registry.finalize();
+        Arc::new(registry)
     }
 }

@@ -34,8 +34,8 @@ pub use tool_registry::{ToolRegistry, ToolRegistryBuilder};
 /// 装配方从 `fuyao_core` 一处拿插件相关类型（无需直接依赖 `fuyao-hooks`）：
 /// - [`PluginHost`]：构造空 host → `add` 注册插件工厂 → 传入 [`Engine::new`]
 /// - [`Plugin`] / [`PluginInstance`]：实现自定义插件
-/// - [`SessionSender`]：插件通过 send_input hook 拿到，用于发消息
+/// - [`SessionSender`]：插件经 register 参数拿到，用于发消息
 ///
-/// 引擎内部 per-session 装配时调 [`PluginHost::create_instances`] 生成实例，
-/// 各实例 register 到该 session 私有的 HooksRegistry。
+/// 引擎内部 per-session 装配时调 [`PluginHost::create_instances`] 生成 `(名, 实例)` 配对，
+/// 各实例 register 到该 session 私有的 HooksRegistry（sender 绑该插件名）。
 pub use fuyao_hooks::{Plugin, PluginHost, PluginInstance, SessionSender, SharedHooks};

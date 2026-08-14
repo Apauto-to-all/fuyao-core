@@ -307,7 +307,6 @@ async fn child_session_has_independent_channel_from_parent() {
                 OutputEvent::ToolResult(m) => m.base.session_id.as_deref(),
                 OutputEvent::Interrupt(m) => m.base.session_id.as_deref(),
                 OutputEvent::Error(m) => m.base.session_id.as_deref(),
-                OutputEvent::Plugin(m) => m.base.session_id.as_deref(),
                 OutputEvent::Compression(m) => m.base.session_id.as_deref(),
                 OutputEvent::Title(m) => m.base.session_id.as_deref(),
                 OutputEvent::Retry(m) => m.base.session_id.as_deref(),

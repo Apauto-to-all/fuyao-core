@@ -31,7 +31,7 @@ L0  fuyao-api（零内部依赖）
 - **公开 API**：
   - **Params 两件套**：`EngineParams` / `SessionParams`（内层 `ModelConfig` / `AgentConfig`）；`AgentPaths`
   - **配置**：`FuyaoConfig` 及全子配置（`CompressionConfig` / `SessionStorageConfig` / `TitleConfig` / `RetryConfig` / `LlmConfig` / `ToolsConfig` 等）；`get_config` / `set_config` / `load_config` / `load_env` / `load_merged_config`
-  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Plugin / Compress 四变体）/ `OutputEvent`（12 变体）及消息族（`InboundUser` / `InterruptSource` / `PluginEventSource` / `UserMessageMode` / `UserMessageSource` / `ChildSessionOrigin` / `ChildSessionState` / `CompressRequest` 等）
+  - **事件**：`EventBase` / `InputEvent`（User / Interrupt / Compress / Rollback 四变体）/ `OutputEvent`（12 变体）及消息族（`InterruptSource` / `PluginSource` / `SystemSource` / `UserMessageMode` / `UserMessageSource` / `ChildSessionOrigin` / `ChildSessionState` / `CompressRequest` / `RollbackRequest` 等）
   - **Provider 类型**：`Provider` trait / `Model` / `ModelCost` / `ModelLimit` / `ThinkingType` 等
   - **会话类型**：`Session` / `Message`（含多模态图片附件 `images`）/ `MessageKind` / `ImageContent`（`{mime_type, data}`，data 为裸 base64，`from_data_url` 做入站归一）/ `TodoItem`
   - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）
@@ -69,13 +69,13 @@ L0  fuyao-api（零内部依赖）
 
 ## fuyao-hooks（L1 能力）
 
-- **职责**：钩子（拦截 + 观察 + 主动）+ Plugin 两层模型（工厂 + session 实例）
+- **职责**：钩子（拦截 + 观察）+ Plugin 两层模型（工厂 + session 实例）
 - **内部依赖**：api
 - **公开 API**：
-  - **Plugin 两层模型**：`Plugin` trait（工厂模板，`create_instance` 生成 session 独立实例）；`PluginInstance` trait（session 级，`register` 注册 hook 到该 session 私有 HooksRegistry）；`PluginHost`（引擎级工厂集合，`add` / `create_instances` / `list`）；`PluginInstallError`
-  - **发消息能力**：`SessionSender`（绑定该 session 的三条通道 tx_inbound/tx_interrupt/tx_plugin，方法 `send_user` / `send_user_with_mode` / `send_interrupt` / `send_plugin` / `send_plugin_data` / `send_plugin_full`）
-  - **钩子类型**：`HooksRegistry`（`new` / `init_send_inputs`）；`InterceptResult`（`Pass` / `Block`）；钩子签名 `OutputInterceptFn` / `OutputObserveFn` / `SendInputFn`
-  - **`SharedHooks`**：`Arc<tokio::sync::Mutex<HooksRegistry>>`
+  - **Plugin 两层模型**：`Plugin` trait（工厂模板，`name` / `create_instance`（每 session 生成独立实例）/ `dispose`（默认空））；`PluginInstance` trait（session 级，`register(&mut HooksRegistry, &SessionSender)` 注册 hook 并接收绑定插件名的发送器 / `dispose`（默认空））；`PluginHost`（引擎级工厂集合，`add` / `create_instances` 返回 `Vec<(插件名, 实例)>` 配对 / `list` / `validate_unique_names` / `dispose_all`）；`PluginInstallError`
+  - **发消息能力**：`SessionSender`（绑定插件名 + 该 session 的入站 / 中断两条通道，方法 `send_user` / `send_user_with_mode` / `send_interrupt`，全部 try_send 非阻塞、source 自动按插件名追溯）
+  - **钩子类型**：`HooksRegistry`（`new` / `register_output_intercept` / `register_output_observe` / `finalize`（装配期排序冻结））；`InterceptResult`（`Pass` / `Block`）；钩子签名 `OutputInterceptFn` / `OutputObserveFn`
+  - **`SharedHooks`**：`Arc<HooksRegistry>`（注册只发生在 session 装配期，finalize 后只读共享，运行期无锁）
   - **辅助**：`panic_payload_to_string`
 
 ## fuyao-prompt（L2 构建）
@@ -88,7 +88,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：行为防护：循环检测
 - **内部依赖**：api, hooks
-- **公开 API**：`LoopGuardPlugin`（impl `Plugin` 工厂，每 session 生成独立 `LoopGuardInstance` 持 per-session 计数器）；re-export `LoopGuardConfig`
+- **公开 API**：`LoopGuardPlugin`（impl `Plugin` 工厂，每 session 生成独立 `LoopGuardInstance`：register 时注册 output_observe + output_intercept 两个钩子并保存 sender——interrupt 中断 / user 注入引导经 sender 发出，警告注入经 intercept 落进工具结果，通知走 tracing 日志）；re-export `LoopGuardConfig`
 
 ## fuyao-core（L3 内核）
 
