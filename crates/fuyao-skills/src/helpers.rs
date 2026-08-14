@@ -154,7 +154,9 @@ pub fn truncate_str(s: &str, max_len: usize) -> String {
         return String::new();
     }
     if s.len() > max_len {
-        format!("{}...", &s[..max_len - 3])
+        // 截点回退到字符起始边界：多字节字符（如中文，3 字节）中间按字节切会 panic
+        let head_target = max_len.saturating_sub(3);
+        format!("{}...", &s[..s.floor_char_boundary(head_target)])
     } else {
         s.to_string()
     }
@@ -175,7 +177,8 @@ pub fn truncate_skill_fields(
         if c.is_empty() {
             None
         } else if c.len() > 500 {
-            Some(c[..497].to_string() + "...")
+            // 截点回退到字符起始边界：多字节字符中间按字节切会 panic
+            Some(c[..c.floor_char_boundary(497)].to_string() + "...")
         } else {
             Some(c)
         }
@@ -316,6 +319,32 @@ mod tests {
 
         let (_, _, compat) = truncate_skill_fields("test", "desc", Some("   "));
         assert_eq!(compat, None);
+    }
+
+    /// 回归测试：截点落在多字节字符（中文 3 字节）中间时按字节切会 panic
+    #[test]
+    fn truncate_str_multibyte_no_panic() {
+        let long_cn = "你".repeat(600); // 1800 字节，超过 1024 上限
+        let truncated = truncate_str(&long_cn, 1024);
+        assert!(truncated.len() <= 1024);
+        assert!(truncated.ends_with("..."));
+        // 省略号之外必须是完整的中文字符序列
+        let body = truncated.trim_end_matches('.');
+        assert_eq!(body, "你".repeat(body.len() / 3));
+    }
+
+    #[test]
+    fn truncate_skill_fields_multibyte_no_panic() {
+        let (name, desc, compat) = truncate_skill_fields(
+            &"名".repeat(100),
+            &"述".repeat(600),
+            Some(&"兼".repeat(300)),
+        );
+        assert!(name.len() <= 64);
+        assert!(desc.len() <= 1024);
+        let compat = compat.unwrap();
+        assert!(compat.len() <= 500);
+        assert!(compat.ends_with("..."));
     }
 
     #[test]
