@@ -25,6 +25,13 @@ pub enum EngineError {
     #[error("提供者错误: {0}")]
     Provider(String),
 
+    /// Agent 定义解析错误（定义名不存在，或 mode 与用途不符）
+    ///
+    /// 创建 / 恢复 / 派生会话时由 `resolve_definition` 产生，错误信息自带
+    /// 修正所需上下文（未知名附可用列表）。
+    #[error("{0}")]
+    Prompt(#[from] fuyao_prompt::PromptError),
+
     /// 引擎已关闭（`Engine::shutdown` 已调用）
     ///
     /// shutdown 后所有 `send` / `recv` 调用立即返回此错误（或 None）：

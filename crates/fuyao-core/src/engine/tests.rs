@@ -143,7 +143,9 @@ async fn create_child_session_fresh_sets_parent() {
     // 先建父 session：create_child_session 从父继承 model_config，父必须在调度表
     let parent_id = engine
         .create_session(SessionParams {
-            agent_config: AgentConfig::default(),
+            agent_config: AgentConfig {
+                definition: "default".to_string(),
+            },
             model_config: ModelConfig {
                 model_id: "test/model".to_string(),
                 thinking_type: None,
@@ -158,7 +160,9 @@ async fn create_child_session_fresh_sets_parent() {
         .create_child_session(
             &parent_id,
             ChildSessionSource::Fresh,
-            AgentConfig::default(),
+            AgentConfig {
+                definition: "explore".to_string(),
+            },
         )
         .await
         .unwrap();

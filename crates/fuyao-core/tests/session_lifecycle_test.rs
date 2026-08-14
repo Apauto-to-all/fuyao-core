@@ -37,7 +37,9 @@ fn guide_user_message(content: &str) -> InputEvent {
 /// 测试用 SessionParams：携带 `test/model` 形式的 model_id（与各测试的 ProviderRegistry 匹配）
 fn test_session_params() -> SessionParams {
     SessionParams {
-        agent_config: AgentConfig::default(),
+        agent_config: AgentConfig {
+            definition: "default".to_string(),
+        },
         model_config: ModelConfig {
             model_id: "test/model".to_string(),
             thinking_type: None,
@@ -280,7 +282,9 @@ async fn child_session_has_independent_channel_from_parent() {
         .create_child_session(
             &parent_id,
             ChildSessionSource::Fresh,
-            fuyao_api::AgentConfig::default(),
+            fuyao_api::AgentConfig {
+                definition: "explore".to_string(),
+            },
         )
         .await
         .expect("创建 child session 失败");
@@ -368,7 +372,9 @@ async fn child_session_rx_returns_none_after_session_exits() {
         .create_child_session(
             &parent_id,
             ChildSessionSource::Fresh,
-            fuyao_api::AgentConfig::default(),
+            fuyao_api::AgentConfig {
+                definition: "explore".to_string(),
+            },
         )
         .await
         .expect("创建 child session 失败");

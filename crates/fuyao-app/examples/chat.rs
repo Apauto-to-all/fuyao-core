@@ -21,7 +21,9 @@ use std::io::Write;
 use fuyao_api::message::input::{UserMessage, UserMessageMode, UserMessageSource, UserPayload};
 use fuyao_api::message::output::ChildSessionState;
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
-use fuyao_api::{AgentConfig, AgentPaths, EngineParams, ModelConfig, SessionParams};
+use fuyao_api::{
+    AgentConfig, AgentPaths, DEFAULT_DEFINITION_NAME, EngineParams, ModelConfig, SessionParams,
+};
 use fuyao_app::App;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -73,7 +75,9 @@ async fn main() {
 
     let session_a = app
         .create_session(SessionParams {
-            agent_config: AgentConfig::default(),
+            agent_config: AgentConfig {
+                definition: DEFAULT_DEFINITION_NAME.to_string(),
+            },
             model_config: ModelConfig {
                 model_id: MODEL_A.to_string(),
                 thinking_type: None,
@@ -92,7 +96,9 @@ async fn main() {
     if two {
         let session_b = app
             .create_session(SessionParams {
-                agent_config: AgentConfig::default(),
+                agent_config: AgentConfig {
+                    definition: DEFAULT_DEFINITION_NAME.to_string(),
+                },
                 model_config: ModelConfig {
                     model_id: MODEL_B.to_string(),
                     thinking_type: None,

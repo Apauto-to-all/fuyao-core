@@ -24,7 +24,7 @@ EngineParams {                   // 引擎级，启动时定死
 
 SessionParams {                  // 对话级，创建对话时提供（agent_config 定死，model_config 可运行时切）
     agent_config: AgentConfig {
-        definition: Option<String>  // 用哪个定义（加载 agents/{definition}.md，None 时用 default）
+        definition: String          // 用哪个定义（加载 agents/{definition}.md，必填：未知名报错，出厂人格传 default）
     }
     model_config: ModelConfig {
         model_id: String                  // 用哪个模型（provider_id/model_id，必填非空，未指定则拒绝对话）

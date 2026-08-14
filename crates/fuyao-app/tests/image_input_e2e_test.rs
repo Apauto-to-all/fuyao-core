@@ -87,7 +87,9 @@ async fn image_input_described_by_real_llm() {
     // 3. 创建 session，绑定目标模型
     let session_id = app
         .create_session(SessionParams {
-            agent_config: AgentConfig::default(),
+            agent_config: AgentConfig {
+                definition: "default".to_string(),
+            },
             model_config: ModelConfig {
                 model_id: MODEL_ID.to_string(),
                 thinking_type: None,

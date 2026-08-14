@@ -81,7 +81,7 @@ pub async fn subagent_handler(
     let parent_id = ctx.session_id.as_deref().unwrap_or("");
     // 子代理人格配置（definition）；model_config 由引擎从父 session 继承，此处不传
     let child_agent_config = AgentConfig {
-        definition: Some(subagent_type.clone()),
+        definition: subagent_type.clone(),
     };
     let (child_id, mut child_rx) = match ops
         .create_child_session(parent_id, ChildSessionSource::Fresh, child_agent_config)

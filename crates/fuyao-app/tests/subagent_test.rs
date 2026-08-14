@@ -116,7 +116,9 @@ fn guide_msg(content: &str) -> InputEvent {
 /// 测试用 SessionParams：`test/model` 与 MockProvider 注册表匹配
 fn session_params() -> SessionParams {
     SessionParams {
-        agent_config: AgentConfig::default(),
+        agent_config: AgentConfig {
+            definition: "default".to_string(),
+        },
         model_config: ModelConfig {
             model_id: "test/model".to_string(),
             thinking_type: None,

@@ -37,6 +37,13 @@ pub struct ModelConfig {
     pub reasoning_effort: Option<String>,
 }
 
+/// 内置默认主 Agent 的定义名（出厂人格，对应编译期嵌入的 `defaults/primary/default.md`）
+///
+/// 「default」是框架保证恒存在的唯一定义名：无任何用户文件时它仍可用（内置表最低
+/// 优先级注入），用户 `agents/default.md` 可覆盖其内容但不能让这个名字失效。调用方
+/// 需要出厂默认人格时显式使用本常量，禁止散写魔法字符串。
+pub const DEFAULT_DEFINITION_NAME: &str = "default";
+
 /// Agent 运行配置（对话级参数的内层结构）
 ///
 /// 承载 definition 及未来所有「不碰路径」的 agent 配置。
@@ -44,11 +51,12 @@ pub struct ModelConfig {
 ///
 /// 归属：装入 [`SessionParams`]，创建对话时定死且不可变——改了会冲掉前缀缓存，
 /// 代价大。这是前缀缓存红线定的：Agent 配置动不得。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// 定义提示词名（加载 `agents/{definition}.md`）。
-    /// None 时用 `"default"`（系统默认定义）。
-    pub definition: Option<String>,
+    /// 必填：未知名（四层目录与内置表均未命中）引擎直接报错，不静默替换人格；
+    /// 要出厂默认人格显式传 [`DEFAULT_DEFINITION_NAME`]。
+    pub definition: String,
 }
 
 /// 引擎启动参数（引擎级，启动时定死）
@@ -91,23 +99,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn agent_config_default_definition_is_none() {
-        let config = AgentConfig::default();
-        assert!(config.definition.is_none());
+    fn agent_config_holds_definition_name() {
+        let config = AgentConfig {
+            definition: "reviewer".to_string(),
+        };
+        assert_eq!(config.definition, "reviewer");
     }
 
     #[test]
-    fn agent_config_definition_set() {
-        let config = AgentConfig {
-            definition: Some("reviewer".to_string()),
-        };
-        assert_eq!(config.definition.as_deref(), Some("reviewer"));
+    fn default_definition_name_is_default() {
+        assert_eq!(DEFAULT_DEFINITION_NAME, "default");
     }
 
     #[test]
     fn session_params_model_id_set() {
         let params = SessionParams {
-            agent_config: AgentConfig::default(),
+            agent_config: AgentConfig {
+                definition: DEFAULT_DEFINITION_NAME.to_string(),
+            },
             model_config: ModelConfig {
                 model_id: "deepseek/deepseek-v4-flash".to_string(),
                 thinking_type: None,
@@ -121,7 +130,7 @@ mod tests {
     fn session_params_definition_set() {
         let params = SessionParams {
             agent_config: AgentConfig {
-                definition: Some("coder".to_string()),
+                definition: "coder".to_string(),
             },
             model_config: ModelConfig {
                 model_id: "test/model".to_string(),
@@ -129,7 +138,7 @@ mod tests {
                 reasoning_effort: None,
             },
         };
-        assert_eq!(params.agent_config.definition.as_deref(), Some("coder"));
+        assert_eq!(params.agent_config.definition, "coder");
     }
 
     #[test]

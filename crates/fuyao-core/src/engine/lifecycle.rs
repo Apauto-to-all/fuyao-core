@@ -29,10 +29,14 @@ impl Engine {
         &self,
         params: SessionParams,
     ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
-        // 加载完整 Agent 定义一次：同时供系统提示词构建与 per-session 工具过滤（避免重复加载）
+        // 加载完整 Agent 定义一次：同时供系统提示词构建与 per-session 工具过滤（避免重复加载）。
+        // definition 必填，未知名 / mode 不符直接报错返回
         let usage = fuyao_prompt::PromptUsage::Primary;
-        let definition =
-            fuyao_prompt::resolve_definition(&self.params.agent_paths, &params.agent_config, usage);
+        let definition = fuyao_prompt::resolve_definition(
+            &self.params.agent_paths,
+            &params.agent_config,
+            usage,
+        )?;
         // 构建系统提示词（Agent 配置决定人格）
         let system_prompt = build_system_prompt(&self.params.agent_paths, &definition, usage);
 
@@ -100,8 +104,11 @@ impl Engine {
         } else {
             fuyao_prompt::PromptUsage::Primary
         };
-        let definition =
-            fuyao_prompt::resolve_definition(&self.params.agent_paths, &params.agent_config, usage);
+        let definition = fuyao_prompt::resolve_definition(
+            &self.params.agent_paths,
+            &params.agent_config,
+            usage,
+        )?;
 
         // 装配 session（建队列/通道 + 装配 hooks + spawn task + 登记）
         // SessionParams 整体传下去（与 create_session 对称）
@@ -149,6 +156,7 @@ impl Engine {
     /// # 错误
     /// - [`EngineError::SessionNotFound`]：源 session id 在数据库中不存在
     /// - [`EngineError::Storage`]：复制消息或落库失败
+    /// - [`EngineError::Prompt`]：`agent_config.definition` 未知名，或 mode 与主 Agent 用途不符
     pub async fn fork_session(
         &self,
         source_id: &SessionId,
@@ -163,7 +171,7 @@ impl Engine {
             &self.params.agent_paths,
             &params.agent_config,
             fuyao_prompt::PromptUsage::Primary,
-        );
+        )?;
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表
         // SessionParams 整体传下去（与 create_session / resume_session 对称）
@@ -214,6 +222,7 @@ impl Engine {
     /// # 错误
     /// - [`EngineError::SessionNotFound`]：父 session 不在调度表（未创建 / 已结束），或 `Fork` 模式的源 session id 在数据库中不存在
     /// - [`EngineError::Storage`]：落库失败
+    /// - [`EngineError::Prompt`]：`child_agent_config.definition` 未知名，或 mode 与子代理用途不符
     pub async fn create_child_session(
         &self,
         parent_session_id: &SessionId,
@@ -248,7 +257,7 @@ impl Engine {
                     &self.params.agent_paths,
                     &params.agent_config,
                     usage,
-                );
+                )?;
                 let system_prompt =
                     build_system_prompt(&self.params.agent_paths, &definition, usage);
                 let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
@@ -266,7 +275,7 @@ impl Engine {
                     &self.params.agent_paths,
                     &params.agent_config,
                     usage,
-                );
+                )?;
                 (s, definition)
             }
         };

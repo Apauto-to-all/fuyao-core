@@ -75,7 +75,7 @@ pub enum PromptUsage {
 ///
 /// 按顺序调用各层构建函数，返回 (中文标题, 内容) 列表。
 /// `usage` 决定子代理索引层是否注入。`definition` 由调用方事先经
-/// [`resolve_definition`](crate::resolve_definition) 加载（含 mode 校验 + 回退），
+/// [`resolve_definition`](crate::resolve_definition) 加载（含 mode 校验），
 /// Layer 1 直接取其 `system_prompt`，不在本函数内重复加载。
 pub fn build_all_sections(
     agent_paths: &AgentPaths,
@@ -171,13 +171,16 @@ mod tests {
 
     const PRIMARY: PromptUsage = PromptUsage::Primary;
 
-    /// 加载默认 definition（测试 helper：复用 resolve_definition 拿含 "Fuyao" 的默认提示词）
+    /// 加载默认 definition（测试 helper：经 resolve_definition 取内置 default 出厂人格）
     fn default_definition(ctx: &AgentPaths) -> AgentDefinition {
         crate::resolve_definition(
             ctx,
-            &fuyao_api::AgentConfig::default(),
+            &fuyao_api::AgentConfig {
+                definition: fuyao_api::DEFAULT_DEFINITION_NAME.to_string(),
+            },
             PromptUsage::Primary,
         )
+        .expect("内置 default 定义应可解析")
     }
 
     #[test]

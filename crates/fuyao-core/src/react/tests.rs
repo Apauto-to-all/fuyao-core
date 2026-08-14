@@ -264,7 +264,9 @@ fn test_params() -> fuyao_api::ModelConfig {
 /// 测试用 SessionParams（model_id 同 test_params，供 SessionCtx 构造用）
 fn test_session_params() -> fuyao_api::SessionParams {
     fuyao_api::SessionParams {
-        agent_config: fuyao_api::AgentConfig::default(),
+        agent_config: fuyao_api::AgentConfig {
+            definition: "default".to_string(),
+        },
         model_config: test_params(),
     }
 }

@@ -19,13 +19,20 @@ use fuyao_prompt::{
 /// 测试默认用途（主 Agent）
 const PRIMARY: PromptUsage = PromptUsage::Primary;
 
+/// 测试用默认人格配置（内置 default 出厂定义）
+fn default_config() -> AgentConfig {
+    AgentConfig {
+        definition: "default".to_string(),
+    }
+}
+
 /// 组合「定义加载 + 系统提示词构建」两步，对齐引擎真实流程
 ///
-/// `build_system_prompt` 的第二参数已从 `&AgentConfig` 重构为 `&AgentDefinition`
+/// `build_system_prompt` 的第二参数为 `&AgentDefinition`
 /// （定义由调用方先经 `resolve_definition` 加载，一份定义同时供提示词构建与
 /// per-session 工具过滤复用）。这里封装该组合，保持测试用例简洁。
 fn build_prompt(paths: &AgentPaths, config: &AgentConfig, usage: PromptUsage) -> String {
-    let definition: AgentDefinition = resolve_definition(paths, config, usage);
+    let definition: AgentDefinition = resolve_definition(paths, config, usage).unwrap();
     build_system_prompt(paths, &definition, usage)
 }
 
@@ -39,7 +46,7 @@ fn build_system_prompt_empty_home_produces_default_sections() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     assert!(!prompt.is_empty());
     assert!(prompt.contains("# Agent 定义"), "应包含 Agent 定义 section");
@@ -49,7 +56,7 @@ fn build_system_prompt_empty_home_produces_default_sections() {
 
 #[test]
 fn build_system_prompt_custom_default_agent_overrides_builtin() {
-    // fuyao_home/agents/default.md 存在时，覆盖内置 DEFAULT_FUYAO_AGENT
+    // fuyao_home/agents/default.md 存在时，覆盖内置 default 定义
     let home = temp_home();
     write_default_agent(
         home.path(),
@@ -57,7 +64,7 @@ fn build_system_prompt_custom_default_agent_overrides_builtin() {
     );
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     assert!(
         prompt.contains("自定义 Agent"),
@@ -76,7 +83,7 @@ fn build_system_prompt_named_definition_selected_by_config() {
         "---\nname: reviewer\ndescription: 审查\n---\n你是代码审查专家",
     );
     let config = AgentConfig {
-        definition: Some("reviewer".to_string()),
+        definition: "reviewer".to_string(),
     };
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
@@ -98,7 +105,7 @@ fn build_system_prompt_includes_project_context_from_workspace() {
         Vec::new(),
     );
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     assert!(prompt.contains("# 项目上下文"), "应含项目上下文 section");
     assert!(prompt.contains("禁止使用 unsafe"), "应含 AGENTS.md 正文");
@@ -116,7 +123,7 @@ fn build_system_prompt_includes_instructions_from_extra_dirs() {
         vec![plugin.path().to_path_buf()],
     );
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     assert!(prompt.contains("# 补充指令"), "应含补充指令 section");
     assert!(prompt.contains("测试补充规则"), "应含指令正文");
@@ -128,7 +135,7 @@ fn build_system_prompt_section_order_agent_before_env() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     let agent_idx = prompt.find("# Agent 定义").expect("应含 Agent 定义");
     let env_idx = prompt.find("# 环境").expect("应含环境");
@@ -141,7 +148,7 @@ fn build_system_prompt_datetime_is_non_deterministic_but_present() {
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     assert!(
         prompt.contains("当前时间："),
@@ -162,25 +169,26 @@ fn build_system_prompt_workspace_context_layered_subheaders() {
         Vec::new(),
     );
 
-    let prompt = build_prompt(&paths, &AgentConfig::default(), PRIMARY);
+    let prompt = build_prompt(&paths, &default_config(), PRIMARY);
 
     assert!(prompt.contains("项目层上下文"), "应含项目层 AGENTS.md");
     assert!(prompt.contains("全局层上下文"), "应含全局层 AGENTS.md");
 }
 
 // ============================================================================
-// load_agent_definition_from_agent_paths：三层优先级
+// load_agent_definition_from_agent_paths：四层优先级
 // ============================================================================
 
 #[test]
-fn load_definition_falls_back_to_builtin_default_when_no_file() {
-    // 无任何定义文件时，返回内置 DEFAULT_FUYAO_AGENT（name = "fuyao"）
+fn load_definition_hits_builtin_default_when_no_file() {
+    // 无任何定义文件时，命中内置 default（name = "fuyao"）
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default");
+    let def =
+        load_agent_definition_from_agent_paths(&paths, "default").expect("内置 default 应可加载");
 
-    assert_eq!(def.name, "fuyao", "无文件时回退内置默认");
+    assert_eq!(def.name, "fuyao", "无文件时命中内置默认");
     assert_eq!(def.mode, AgentMode::Primary);
 }
 
@@ -194,7 +202,7 @@ fn load_definition_global_default_md_overrides_builtin() {
     );
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default");
+    let def = load_agent_definition_from_agent_paths(&paths, "default").unwrap();
 
     assert_eq!(def.name, "my-agent");
     assert!(def.system_prompt.contains("测试 Agent"));
@@ -202,7 +210,7 @@ fn load_definition_global_default_md_overrides_builtin() {
 
 #[test]
 fn load_definition_workspace_overrides_global() {
-    // 三层优先级：workspace > global > extra
+    // 四层优先级：workspace > agent > global > extra
     let home = temp_home();
     write_agent_def(
         home.path(),
@@ -224,7 +232,7 @@ fn load_definition_workspace_overrides_global() {
         Vec::new(),
     );
 
-    let def = load_agent_definition_from_agent_paths(&paths, "reviewer");
+    let def = load_agent_definition_from_agent_paths(&paths, "reviewer").unwrap();
 
     assert_eq!(def.name, "ws-reviewer", "workspace 层应优先于 global");
     assert!(def.system_prompt.contains("项目层定义"));
@@ -248,21 +256,21 @@ fn load_definition_extra_layer_used_when_no_global_or_workspace() {
         vec![plugin.path().to_path_buf()],
     );
 
-    let def = load_agent_definition_from_agent_paths(&paths, "helper");
+    let def = load_agent_definition_from_agent_paths(&paths, "helper").unwrap();
 
     assert_eq!(def.name, "plugin-helper");
     assert!(def.system_prompt.contains("插件提供的助手"));
 }
 
 #[test]
-fn load_definition_named_not_found_falls_back_to_builtin() {
-    // name 对应文件不存在于任何层 → 回退内置默认（而非报错）
+fn load_definition_unknown_name_returns_none() {
+    // name 对应文件不存在于任何层 → None（错误语义由 resolve_definition 收口）
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "nonexistent");
+    let result = load_agent_definition_from_agent_paths(&paths, "nonexistent");
 
-    assert_eq!(def.name, "fuyao", "命名定义缺失时回退内置默认");
+    assert!(result.is_none(), "未知名不应静默替换为默认人格");
 }
 
 #[test]
@@ -276,7 +284,7 @@ fn load_definition_parses_mode_field() {
     );
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "sub");
+    let def = load_agent_definition_from_agent_paths(&paths, "sub").unwrap();
 
     assert_eq!(def.mode, AgentMode::Subagent);
 }
@@ -292,9 +300,9 @@ fn load_definition_ignores_agent_id() {
         fuyao_home: home.path().to_path_buf(),
     };
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default");
+    let def = load_agent_definition_from_agent_paths(&paths, "default").unwrap();
 
-    // 无 default.md → 回退内置，与 agent_id 无关
+    // 无 default.md → 命中内置，与 agent_id 无关
     assert_eq!(def.name, "fuyao");
 }
 
@@ -305,7 +313,7 @@ fn load_definition_empty_frontmatter_still_loads_body() {
     write_default_agent(home.path(), "---\n---\n仅有正文无元数据");
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 
-    let def = load_agent_definition_from_agent_paths(&paths, "default");
+    let def = load_agent_definition_from_agent_paths(&paths, "default").unwrap();
 
     assert!(
         def.system_prompt.contains("仅有正文"),

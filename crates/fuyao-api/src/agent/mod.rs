@@ -8,5 +8,5 @@
 pub mod params;
 pub mod paths;
 
-pub use params::{AgentConfig, EngineParams, ModelConfig, SessionParams};
+pub use params::{AgentConfig, DEFAULT_DEFINITION_NAME, EngineParams, ModelConfig, SessionParams};
 pub use paths::AgentPaths;

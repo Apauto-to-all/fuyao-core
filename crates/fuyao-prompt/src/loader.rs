@@ -3,7 +3,6 @@
 //! 从 `agents/{name}.md` 文件加载 Agent 定义，支持 frontmatter 解析。
 //! 定义文件集中在 `agents/` 文件夹管理，由 AgentConfig.definition 指定加载哪个定义。
 
-use crate::default::DEFAULT_FUYAO_AGENT;
 use fuyao_api::AgentPaths;
 use fuyao_api::{AgentDefinition, AgentMode};
 use regex::Regex;
@@ -29,8 +28,8 @@ pub fn load_agent_definition(file_path: &Path) -> Option<AgentDefinition> {
 
 /// 从 Markdown 文本解析 Agent 定义
 ///
-/// [`load_agent_definition`]（文件路径）与 [`default::DEFAULT_FUYAO_AGENT`] /
-/// [`load_builtin_definition`]（编译期嵌入文本）共用的解析核心。
+/// [`load_agent_definition`]（文件路径）与 [`load_builtin_definition`]
+/// （编译期嵌入文本）共用的解析核心。
 /// frontmatter 提取元数据，body 作为系统提示词。
 ///
 /// - `content`：完整 Markdown 文本（可含 frontmatter）
@@ -101,42 +100,45 @@ pub(crate) fn parse_definition_from_content(
 /// 加载内置默认 Agent 定义
 ///
 /// 按 name 查 [`default::builtin_definition_md`] 取编译期嵌入的 Markdown，再解析。
-/// 覆盖链：用户 `agents/{name}.md` → 内置默认（本函数）→ [`default::DEFAULT_FUYAO_AGENT`]。
+/// 覆盖链：用户 `agents/{name}.md` → 内置默认（本函数）。
 ///
-/// 返回 `None`：name 不在内置默认表中（未知 name，由调用方决定是否回退到 DEFAULT_FUYAO_AGENT）。
+/// 解析失败（内置文件格式错误）直接 panic：编译期嵌入内容受开发者完全掌控，
+/// 解析失败属开发期 bug，应尽早暴露而非伪装成「未找到」。
+///
+/// 返回 `None`：name 不在内置默认表中（未知 name，由调用方决定错误语义）。
 pub fn load_builtin_definition(name: &str) -> Option<AgentDefinition> {
     let md = crate::default::builtin_definition_md(name)?;
-    parse_definition_from_content(md, None)
+    Some(
+        parse_definition_from_content(md, None)
+            .expect("内置 Agent 定义解析失败：defaults/ 下的 .md 格式错误"),
+    )
 }
 
 /// 从 AgentPaths 加载 Agent 定义
 ///
-/// 从 `agents/` 文件夹按 name 匹配定义文件，三层优先级：workspace → global → extra。
-/// 文件不存在或解析失败时，返回默认定义。
+/// 纯查找函数：按 name 沿 `agents/` 目录四层优先级（workspace > agent > global >
+/// extra）匹配定义文件，用户层未命中再查内置表（default/explore/executor）。
+/// 未命中返回 `None`，不做任何默认人格替换——错误语义（附可用列表的报错）
+/// 由 [`crate::resolve_definition`] 统一收口。
 ///
-/// name 由 AgentConfig.definition 提供（None 时调用方传 `"default"`）。
+/// name 由 AgentConfig.definition 提供（必填）。
 /// 路径方法 `agents_def_paths(&self, name)` 负责解析具体路径。
 pub fn load_agent_definition_from_agent_paths(
     agent_paths: &AgentPaths,
     name: &str,
-) -> AgentDefinition {
+) -> Option<AgentDefinition> {
     let paths = agent_paths.agents_def_paths(name);
 
     for path in paths.all() {
         if path.exists()
             && let Some(def) = load_agent_definition(path)
         {
-            return def;
+            return Some(def);
         }
     }
 
     // 用户文件未命中 → 查内置默认表（default/explore/executor）
-    if let Some(builtin) = load_builtin_definition(name) {
-        return builtin;
-    }
-
-    // 内置也没有该 name → 回退主 Agent 默认定义
-    DEFAULT_FUYAO_AGENT.clone()
+    load_builtin_definition(name)
 }
 
 /// 解析 frontmatter 格式（YAML + Markdown body）
@@ -204,16 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn load_agent_definition_from_agent_paths_returns_default() {
-        // 无 agents/default.md 时回退 DEFAULT_FUYAO_AGENT（name = "fuyao"）
+    fn load_agent_definition_from_agent_paths_hits_builtin_default() {
+        // 无 agents/default.md 时命中内置 default（name = "fuyao"）
         let ctx = AgentPaths::default();
-        let def = load_agent_definition_from_agent_paths(&ctx, "default");
+        let def = load_agent_definition_from_agent_paths(&ctx, "default").unwrap();
         assert_eq!(def.name, "fuyao");
     }
 
     #[test]
     fn load_agent_definition_from_agent_paths_loads_default_md() {
-        // 通过 extra_dirs 注入 agents/default.md，验证覆盖 DEFAULT_FUYAO_AGENT
+        // 通过 extra_dirs 注入 agents/default.md，验证覆盖内置 default
         let temp = std::env::temp_dir().join("fuyao_test_loader_default_extra");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
@@ -224,7 +226,7 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let def = load_agent_definition_from_agent_paths(&ctx, "default");
+        let def = load_agent_definition_from_agent_paths(&ctx, "default").unwrap();
         // extra 层（无 global/workspace 覆盖时）的 default.md 被加载
         assert_eq!(def.name, "my-agent");
         assert!(def.system_prompt.contains("自定义默认"));
@@ -254,22 +256,22 @@ mod tests {
             ..Default::default()
         };
         // name = "reviewer" → 加载 reviewer.md
-        let def = load_agent_definition_from_agent_paths(&ctx, "reviewer");
+        let def = load_agent_definition_from_agent_paths(&ctx, "reviewer").unwrap();
         assert_eq!(def.name, "reviewer-agent");
         assert!(def.system_prompt.contains("代码审查"));
         // name = "default" → 加载 default.md
-        let def = load_agent_definition_from_agent_paths(&ctx, "default");
+        let def = load_agent_definition_from_agent_paths(&ctx, "default").unwrap();
         assert_eq!(def.name, "default-agent");
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn load_agent_definition_from_agent_paths_named_not_found_falls_back() {
-        // name 对应文件不存在 → 回退 DEFAULT_FUYAO_AGENT
+    fn load_agent_definition_from_agent_paths_unknown_name_returns_none() {
+        // name 对应文件不存在 → None（错误语义由 resolve_definition 收口，此处不兜底）
         let ctx = AgentPaths::default();
-        let def = load_agent_definition_from_agent_paths(&ctx, "nonexistent");
-        assert_eq!(def.name, "fuyao");
+        let result = load_agent_definition_from_agent_paths(&ctx, "nonexistent");
+        assert!(result.is_none());
     }
 
     #[test]
@@ -279,8 +281,8 @@ mod tests {
             agent_id: Some("global/coder".to_string()),
             ..Default::default()
         };
-        let def = load_agent_definition_from_agent_paths(&ctx, "default");
-        // 无 agents/default.md → 回退默认，与 agent_id 无关
+        let def = load_agent_definition_from_agent_paths(&ctx, "default").unwrap();
+        // 无 agents/default.md → 命中内置 default，与 agent_id 无关
         assert_eq!(def.name, "fuyao");
     }
 
@@ -339,10 +341,10 @@ mod tests {
     }
 
     #[test]
-    fn load_agent_definition_from_agent_paths_falls_back_to_builtin_subagent() {
-        // 用户无 agents/explore.md → 回退内置 explore（而非 DEFAULT_FUYAO_AGENT）
+    fn load_agent_definition_from_agent_paths_hits_builtin_subagent() {
+        // 用户无 agents/explore.md → 命中内置 explore
         let ctx = AgentPaths::default();
-        let def = load_agent_definition_from_agent_paths(&ctx, "explore");
+        let def = load_agent_definition_from_agent_paths(&ctx, "explore").unwrap();
         assert_eq!(def.name, "explore");
         assert_eq!(def.mode, fuyao_api::AgentMode::Subagent);
     }
@@ -363,7 +365,7 @@ mod tests {
             extra_dirs: vec![plugin.clone()],
             ..Default::default()
         };
-        let def = load_agent_definition_from_agent_paths(&ctx, "explore");
+        let def = load_agent_definition_from_agent_paths(&ctx, "explore").unwrap();
         assert_eq!(def.name, "my-explore");
 
         std::fs::remove_dir_all(&temp).ok();
