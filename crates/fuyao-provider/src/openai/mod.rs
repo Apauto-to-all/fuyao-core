@@ -157,10 +157,9 @@ impl Provider for OpenAIProvider {
 
             // 逐 chunk 消费 SSE 字节流
             let mut bytes_stream = response.bytes_stream();
-            // SSE 行缓冲区
-            let mut line_buf = String::new();
-            // UTF-8 不完整序列缓冲区（处理跨 chunk 的多字节字符）
-            let mut utf8_buf: Vec<u8> = Vec::new();
+            // SSE 行组装器：字节上按 \n 切行，跨 chunk 的半行 / 半个多字节
+            // 字符滞留其内部缓冲等续包，行内非法 UTF-8 以替换字符顶替
+            let mut assembler = sse::LineAssembler::new();
 
             while let Some(item) = bytes_stream.next().await {
                 let bytes = match item {
@@ -173,38 +172,8 @@ impl Provider for OpenAIProvider {
                     }
                 };
 
-                // 处理 UTF-8 编码
-                utf8_buf.extend_from_slice(&bytes);
-                let text = match std::str::from_utf8(&utf8_buf) {
-                    Ok(s) => {
-                        let owned = s.to_string();
-                        utf8_buf.clear();
-                        owned
-                    }
-                    Err(e) => {
-                        let valid_up_to = e.valid_up_to();
-                        if valid_up_to == 0 && utf8_buf.len() < 4 {
-                            // 可能是不完整的多字节字符，等待更多数据
-                            continue;
-                        }
-                        let valid =
-                            String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
-                        utf8_buf.drain(..valid_up_to);
-                        valid
-                    }
-                };
-
-                if text.is_empty() {
-                    continue;
-                }
-
-                line_buf.push_str(&text);
-
-                // 按换行符切割 SSE 行
-                while let Some(pos) = line_buf.find('\n') {
-                    let line = line_buf[..pos].to_string();
-                    line_buf.drain(..=pos);
-
+                // 切出本 chunk 内所有完整行并逐行线解码
+                for line in assembler.push(&bytes) {
                     match sse::parse_sse_line(&line) {
                         Ok(Some(chunk)) => {
                             for event in sse::extract_stream_events(&chunk) {
