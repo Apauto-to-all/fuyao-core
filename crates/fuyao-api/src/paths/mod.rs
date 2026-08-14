@@ -23,7 +23,7 @@ mod workspace;
 pub use layered::LayeredPaths;
 
 // 全局层路径
-pub use global::get_fuyao_home;
+pub use global::{get_fuyao_agents_dir, get_fuyao_home};
 
 // 工作目录层路径
 pub use workspace::{get_agent_root, get_workspace_agents_dir, get_workspace_root};

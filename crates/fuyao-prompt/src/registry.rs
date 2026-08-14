@@ -4,7 +4,7 @@
 //! 所有 agent_id。不读取任何内容文件，不注入合成 default。
 //! 列举元素 [`AgentIdOption`] / [`AgentIdSource`] 定义于 fuyao-api 的 `selection` 模块。
 
-use fuyao_api::{AgentIdOption, AgentIdSource, get_workspace_agents_dir};
+use fuyao_api::{AgentIdOption, AgentIdSource, get_fuyao_agents_dir, get_workspace_agents_dir};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -43,9 +43,10 @@ impl AgentRegistry {
         // key = 文件夹名（纯名），用于项目层覆盖同名全局
         let mut by_name: HashMap<String, AgentIdOption> = HashMap::new();
 
-        // 全局层
+        // 全局层（布局经 fuyao-api 的 get_fuyao_agents_dir 单一来源拼出，
+        // 与 agent_root 定位共用同一布局，禁止散写字面量）
         scan_layer(
-            &self.fuyao_home.join("fuyao-agents"),
+            &get_fuyao_agents_dir(&self.fuyao_home),
             AgentIdSource::Global,
             &mut by_name,
         );

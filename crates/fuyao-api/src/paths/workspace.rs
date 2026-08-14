@@ -4,6 +4,7 @@
 //! - .fuyao 根目录: `{workspace}/.fuyao/`
 //! - Agents 目录: `{workspace}/.fuyao/fuyao-agents/`
 
+use super::global::get_fuyao_agents_dir;
 use crate::selection::AgentIdSource;
 use std::path::{Path, PathBuf};
 
@@ -80,7 +81,7 @@ pub fn get_agent_root(
     let (source, name) = parse_agent_id(agent_id)?;
 
     match source {
-        AgentIdSource::Global => Ok(fuyao_home.join("fuyao-agents").join(name)),
+        AgentIdSource::Global => Ok(get_fuyao_agents_dir(fuyao_home).join(name)),
         AgentIdSource::Workspace => {
             let ws = workspace.ok_or_else(|| {
                 format!(
