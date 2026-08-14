@@ -32,6 +32,14 @@ enum OutboundAction {
     ),
 }
 
+/// 通道投递（send 的统一语义包装）
+///
+/// 四类分流通道共用同一语义：通道满则背压等待，通道断开（session task 已退出）
+/// 视为引擎已关停，报 `EngineError::Shutdown`。载荷类型不同由泛型吸收。
+async fn deliver<T>(tx: mpsc::Sender<T>, msg: T) -> Result<(), EngineError> {
+    tx.send(msg).await.map_err(|_| EngineError::Shutdown)
+}
+
 impl Engine {
     /// 入事件（单一入口）
     ///
@@ -125,20 +133,13 @@ impl Engine {
             }
         };
 
-        // 锁外投递：四种通道的 send 语义一致（满则等待，断则 Shutdown），仅载荷类型不同
+        // 锁外投递：四种通道的 send 语义一致（满则等待，断则 Shutdown），
+        // 仅载荷类型不同，统一走泛型 deliver
         match action {
-            OutboundAction::Inbound(tx, msg) => {
-                tx.send(msg).await.map_err(|_| EngineError::Shutdown)?
-            }
-            OutboundAction::Interrupt(tx, msg) => {
-                tx.send(msg).await.map_err(|_| EngineError::Shutdown)?
-            }
-            OutboundAction::Plugin(tx, msg) => {
-                tx.send(msg).await.map_err(|_| EngineError::Shutdown)?
-            }
-            OutboundAction::Control(tx, cmd) => {
-                tx.send(cmd).await.map_err(|_| EngineError::Shutdown)?
-            }
+            OutboundAction::Inbound(tx, msg) => deliver(tx, msg).await?,
+            OutboundAction::Interrupt(tx, msg) => deliver(tx, msg).await?,
+            OutboundAction::Plugin(tx, msg) => deliver(tx, msg).await?,
+            OutboundAction::Control(tx, cmd) => deliver(tx, cmd).await?,
         }
 
         Ok(())
