@@ -2,9 +2,9 @@
 //!
 //! 纯文件夹扫描：扫描全局层与项目层的 `fuyao-agents/` 目录，按文件夹存在性列举
 //! 所有 agent_id。不读取任何内容文件，不注入合成 default。
-//! 列举元素 [`AgentIdOption`] / [`Source`] 定义于 fuyao-api 的 `selection` 模块。
+//! 列举元素 [`AgentIdOption`] / [`AgentIdSource`] 定义于 fuyao-api 的 `selection` 模块。
 
-use fuyao_api::{AgentIdOption, Source, get_workspace_agents_dir};
+use fuyao_api::{AgentIdOption, AgentIdSource, get_workspace_agents_dir};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,7 @@ impl AgentRegistry {
         // 全局层
         scan_layer(
             &self.fuyao_home.join("fuyao-agents"),
-            Source::Global,
+            AgentIdSource::Global,
             &mut by_name,
         );
 
@@ -54,7 +54,7 @@ impl AgentRegistry {
         if let Some(ref ws) = self.workspace {
             scan_layer(
                 &get_workspace_agents_dir(ws),
-                Source::Workspace,
+                AgentIdSource::Workspace,
                 &mut by_name,
             );
         }
@@ -70,7 +70,7 @@ impl AgentRegistry {
 /// key 为文件夹名（纯名），用于项目层覆盖同名全局；
 /// [`AgentIdOption::id`] 为纯文件夹名，`source` 标记来源层。
 /// 仅按 `is_dir()` 判定，目录不存在或读取失败 → 静默跳过。
-fn scan_layer(dir: &Path, source: Source, by_name: &mut HashMap<String, AgentIdOption>) {
+fn scan_layer(dir: &Path, source: AgentIdSource, by_name: &mut HashMap<String, AgentIdOption>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return; // 目录不存在 → 跳过
     };
@@ -120,7 +120,7 @@ mod tests {
 
         assert_eq!(ids.len(), 2, "仅 2 个文件夹应被列举");
         let coder = ids.iter().find(|a| a.id == "coder").expect("应找到 coder");
-        assert_eq!(coder.source, Source::Global);
+        assert_eq!(coder.source, AgentIdSource::Global);
         // 按纯名排序：coder 在 reviewer 前
         assert_eq!(ids[0].id, "coder");
         assert_eq!(ids[1].id, "reviewer");
@@ -145,7 +145,7 @@ mod tests {
 
         assert_eq!(ids.len(), 1, "同名应被项目层覆盖去重");
         assert_eq!(ids[0].id, "coder");
-        assert_eq!(ids[0].source, Source::Workspace);
+        assert_eq!(ids[0].source, AgentIdSource::Workspace);
 
         std::fs::remove_dir_all(&temp).ok();
     }

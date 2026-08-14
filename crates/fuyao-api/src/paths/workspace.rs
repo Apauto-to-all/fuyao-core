@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn get_agent_root_前缀大小写不敏感() {
-        // PascalCase 前缀（与 Source 枚举序列化值同形）应与小写前缀等价命中层定位，
+        // PascalCase 前缀（与 AgentIdSource 枚举序列化值同形）应与小写前缀等价命中层定位，
         // 上游无需为大小写做额外转换
         let root_global = get_agent_root("Global/coder", None);
         assert!(root_global.to_string_lossy().contains("fuyao-agents"));

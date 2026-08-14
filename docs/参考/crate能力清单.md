@@ -37,7 +37,7 @@ L0  fuyao-api（零内部依赖）
   - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）
   - **工具类型**：`ToolDefinition` / `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn` / `ToolResult` / `ToolCallContext`
   - **其他**：`AgentDefinition` / `AgentMode` / `SkillDefinition` / `SkillMeta` / `MCPServerConfig` / `ApiError` / `ConfigError`
-  - **选择支持类型**：`AgentIdOption`（`{ id, source }`）/ `DefinitionOption`（`{ id, source, definition }`）/ `ModelOption`（`{ id, provider, model }`）/ `Source`（来源层：`Workspace` / `Agent` / `Global` / `Extra` / `Builtin`）——供 fuyao-app 的 `Discovery` / `list_agent_ids` 消费；`id` 为纯身份，来源层独立承载
+  - **选择支持类型**：`AgentIdOption`（`{ id, source }`，source 为 `AgentIdSource`：`Global` / `Workspace`）/ `DefinitionOption`（`{ id, definition }`，无来源字段——定义按文件名做优先级覆盖，同名互斥、高优先级层胜出）/ `ModelOption`（`{ id, provider, model }`）——供 fuyao-app 的 `Discovery` / `list_agent_ids` 消费；`id` 为纯身份，agent_id 的层前缀由 `source` 独立承载
 
 ## fuyao-provider（L1 能力）
 

@@ -105,7 +105,7 @@ mod tests {
 
         assert_eq!(ids.len(), 1, "应列举 1 个 agent_id");
         assert_eq!(ids[0].id, "coder", "id 为纯文件夹名（无前缀）");
-        assert_eq!(ids[0].source, fuyao_api::Source::Global);
+        assert_eq!(ids[0].source, fuyao_api::AgentIdSource::Global);
     }
 
     /// 启动前（无 Provider 注册缓存）列举 model 应返回空列表，不 panic

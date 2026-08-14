@@ -53,7 +53,7 @@ pub use provider::{
     Provider, ProviderOptions, ThinkingType,
 };
 pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
-pub use selection::{AgentIdOption, DefinitionOption, ModelOption, Source};
+pub use selection::{AgentIdOption, AgentIdSource, DefinitionOption, ModelOption};
 pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{

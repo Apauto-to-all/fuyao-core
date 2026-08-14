@@ -18,10 +18,10 @@ use crate::loader::{
     load_agent_definition, load_agent_definition_from_agent_paths, load_builtin_definition,
 };
 use chrono::Local;
-use fuyao_api::{AgentConfig, AgentDefinition, AgentPaths, DefinitionOption, Source};
+use fuyao_api::{AgentConfig, AgentDefinition, AgentPaths, DefinitionOption};
 use fuyao_skills::find_all_skills;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 解析当前 session 使用的完整 Agent 定义
 ///
@@ -252,33 +252,19 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
 ///
 /// 共享扫描器，供 [`list_definitions`]（全模式）与 [`list_subagent_definitions`]（过滤
 /// 子代理模式）复用。返回 [`DefinitionOption`] 列表：`id` = file stem（去重键与对外名），
-/// `definition` = 解析得到的完整定义，`source` = 来源层。
+/// `definition` = 解析得到的完整定义。
 ///
 /// 遍历顺序遵循 [`AgentPaths::agents_def_dirs`] 的优先级（workspace > agent > global > extra），
-/// 同名定义首现胜（高优先级层覆盖低优先级层）；内置定义（default / explore / executor）
+/// 同名定义首现胜（高优先级层覆盖低优先级层）；内置定义（[`crate::default::builtin_definition_names`]）
 /// 作为最低优先级注入，与用户文件同名时用户文件胜。最后按 id 升序排序。
 fn collect_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
-    // id(stem) → (定义, 来源)，首现胜（按优先级顺序插入，已存在则跳过）
-    let mut by_id: HashMap<String, (AgentDefinition, Source)> = HashMap::new();
+    // id(stem) → 定义，首现胜（按优先级顺序插入，已存在则跳过）
+    let mut by_id: HashMap<String, AgentDefinition> = HashMap::new();
 
     let dirs = agent_paths.agents_def_dirs();
 
-    // 按优先级构造 (目录, 来源) 列表（read_dir 自身处理目录不存在）
-    let mut layered: Vec<(&Path, Source)> = Vec::new();
-    if let Some(d) = dirs.workspace.as_deref() {
-        layered.push((d, Source::Workspace));
-    }
-    if let Some(d) = dirs.agent.as_deref() {
-        layered.push((d, Source::Agent));
-    }
-    if let Some(d) = dirs.global_.as_deref() {
-        layered.push((d, Source::Global));
-    }
-    for d in &dirs.extra {
-        layered.push((d.as_path(), Source::Extra));
-    }
-
-    for (dir, source) in layered {
+    // all() 按优先级排序（workspace > agent > global > extra），read_dir 自身处理目录不存在
+    for dir in dirs.all() {
         let mut md_files: Vec<PathBuf> = match std::fs::read_dir(dir) {
             Ok(rd) => rd
                 .filter_map(|e| e.ok())
@@ -299,28 +285,25 @@ fn collect_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
                 continue;
             }
             if let Some(def) = load_agent_definition(&file_path) {
-                by_id.insert(stem.to_string(), (def, source));
+                by_id.insert(stem.to_string(), def);
             }
         }
     }
 
     // 内置定义（最低优先级）：与用户文件同名时用户文件胜
-    for builtin_name in ["default", "explore", "executor"] {
-        if by_id.contains_key(builtin_name) {
+    for builtin_name in crate::default::builtin_definition_names() {
+        // 清单元素为 &str，contains_key 的泛型参数不做自动解引用，需显式解一层
+        if by_id.contains_key(*builtin_name) {
             continue;
         }
         if let Some(def) = load_builtin_definition(builtin_name) {
-            by_id.insert(builtin_name.to_string(), (def, Source::Builtin));
+            by_id.insert(builtin_name.to_string(), def);
         }
     }
 
     let mut entries: Vec<DefinitionOption> = by_id
         .into_iter()
-        .map(|(id, (definition, source))| DefinitionOption {
-            id,
-            source,
-            definition,
-        })
+        .map(|(id, definition)| DefinitionOption { id, definition })
         .collect();
     entries.sort_by(|a, b| a.id.cmp(&b.id));
     entries
@@ -647,26 +630,23 @@ mod tests {
             .find(|d| d.id == "default")
             .expect("应注入内置 default");
         assert_eq!(default.definition.mode, AgentMode::Primary);
-        assert_eq!(default.source, Source::Builtin);
 
         let explore = defs
             .iter()
             .find(|d| d.id == "explore")
             .expect("应注入内置 explore");
         assert_eq!(explore.definition.mode, AgentMode::Subagent);
-        assert_eq!(explore.source, Source::Builtin);
 
         let executor = defs
             .iter()
             .find(|d| d.id == "executor")
             .expect("应注入内置 executor");
         assert_eq!(executor.definition.mode, AgentMode::Subagent);
-        assert_eq!(executor.source, Source::Builtin);
     }
 
     #[test]
     fn list_definitions_user_file_overrides_builtin() {
-        // 用户 agents/explore.md 覆盖内置 explore（同名首现胜，source 跟随用户层）
+        // 用户 agents/explore.md 覆盖内置 explore（同名首现胜，用户文件生效）
         let temp = std::env::temp_dir().join("fuyao_test_list_defs_override");
         let plugin = temp.join("plugin");
         std::fs::create_dir_all(plugin.join("agents")).unwrap();
@@ -687,13 +667,12 @@ mod tests {
             .find(|d| d.id == "explore")
             .expect("应含 explore");
         assert_eq!(explore.definition.description, "我的自定义探索");
-        assert_eq!(explore.source, Source::Extra);
-        // 内置 explore 描述被覆盖，不再出现
+        // 同名去重后只剩一份，内置描述不再出现
+        assert_eq!(defs.iter().filter(|d| d.id == "explore").count(), 1);
         assert!(
             !defs
                 .iter()
-                .any(|d| d.definition.description.contains("只读探索")
-                    && d.source == Source::Builtin)
+                .any(|d| d.definition.description.contains("只读探索"))
         );
 
         std::fs::remove_dir_all(&temp).ok();

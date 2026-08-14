@@ -19,6 +19,15 @@ const SUBAGENT_EXPLORE_MD: &str = include_str!("defaults/subagent/explore.md");
 /// 内置执行子代理默认定义（`defaults/subagent/executor.md`）
 const SUBAGENT_EXECUTOR_MD: &str = include_str!("defaults/subagent/executor.md");
 
+/// 内置定义名全集（`default` / `explore` / `executor`）
+///
+/// 「遍历所有内置名」的调用方（定义列举的最低优先级注入等）一律取本清单，
+/// 禁止另写硬编码列表。清单与 [`builtin_definition_md`] 的 match 表由测试
+/// `builtin_definition_names_match_lookup_table` 保证一致。
+pub(crate) fn builtin_definition_names() -> &'static [&'static str] {
+    &["default", "explore", "executor"]
+}
+
 /// 按 name 取内置默认定义的原始 Markdown 文本
 ///
 /// 覆盖链的最后一环：用户 `agents/{name}.md` 不存在时，先查内置默认；
@@ -78,5 +87,17 @@ mod tests {
     #[test]
     fn builtin_definition_md_unknown_name() {
         assert!(builtin_definition_md("nonexistent").is_none());
+    }
+
+    /// 内置名清单与 match 表一致性：清单里的每个名字都能查到内置 Markdown，
+    /// 新增内置定义时两处必须同步，否则本测试失败。
+    #[test]
+    fn builtin_definition_names_match_lookup_table() {
+        for name in builtin_definition_names() {
+            assert!(
+                builtin_definition_md(name).is_some(),
+                "清单中的名字 {name} 应能查到内置定义"
+            );
+        }
     }
 }
