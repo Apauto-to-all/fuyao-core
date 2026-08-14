@@ -9,9 +9,6 @@ pub const MAX_READ_CHARS: usize = 100_000;
 /// 大文件提示字节数
 pub const LARGE_FILE_HINT_BYTES: u64 = 512_000;
 
-/// 读取历史记录缓存大小
-pub const READ_HISTORY_CAP: usize = 500;
-
 /// 去重缓存大小
 pub const DEDUP_CAP: usize = 1000;
 

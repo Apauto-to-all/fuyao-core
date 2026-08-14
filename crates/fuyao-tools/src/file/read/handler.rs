@@ -207,7 +207,7 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
         return common::tool_result(dedup);
     }
 
-    record_read(path, &resolved_path, offset, limit, &task_id);
+    record_read(&resolved_path, offset, limit, &task_id);
 
     let file_size = match resolved_path_obj.metadata() {
         Ok(m) => m.len(),
