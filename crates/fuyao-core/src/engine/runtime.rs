@@ -9,6 +9,29 @@
 
 use super::*;
 
+/// [`Engine::send`] 的分流产物：目标通道 + 载荷
+///
+/// 调度表锁作用域内只做查表与消息转化，取出 sender（clone 廉价）即释放锁，
+/// 通道 send 的背压等待发生在锁外——session 通道均有界，通道满时 send 会挂起，
+/// 若此时仍持引擎级 sessions 锁，会把 send / create / shutdown 全部排队，
+/// 一个 session 的背压拖死所有 session（跨 session 队头阻塞）。
+enum OutboundAction {
+    /// User 消息 → 入站通道
+    Inbound(
+        mpsc::Sender<fuyao_api::message::output::UserMessage>,
+        fuyao_api::message::output::UserMessage,
+    ),
+    /// 中断信号 → 中断通道
+    Interrupt(mpsc::Sender<OutputInterruptMessage>, OutputInterruptMessage),
+    /// Plugin 通知 → Plugin 通道
+    Plugin(mpsc::Sender<OutputPluginMessage>, OutputPluginMessage),
+    /// 控制命令（手动压缩 / 回退）→ 控制通道
+    Control(
+        mpsc::Sender<fuyao_api::ControlCommand>,
+        fuyao_api::ControlCommand,
+    ),
+}
+
 impl Engine {
     /// 入事件（单一入口）
     ///
@@ -29,86 +52,92 @@ impl Engine {
             return Err(EngineError::Shutdown);
         }
 
-        let sessions = self.sessions.lock().await;
-        let handle = sessions
-            .get(id)
-            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+        // 锁作用域内完成查表与消息转化，取出目标 sender 后释放调度表锁；
+        // 通道 send 的背压等待移到锁外（见 OutboundAction 文档），入队即返回语义不变。
+        let action = {
+            let sessions = self.sessions.lock().await;
+            let handle = sessions
+                .get(id)
+                .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
 
-        match event {
-            InputEvent::User(user_msg) => {
-                // 立即把 input 侧 UserMessage 字段照搬转化为 output 侧 UserMessage
-                // （base + payload 完整保留，含 source），直接送进 session task。
-                // 模型/思考等运行时配置挂在 session 级（SessionParams.model_config），
-                // 消费点（跑 turn、压缩）现读现用，不随消息携带。
-                // 后续 handle_inbound_user 纯入队，inject_messages 消费时统一过管道。
-                let outbound = fuyao_api::message::output::UserMessage {
-                    base: user_msg.base,
-                    payload: fuyao_api::message::output::UserPayload {
-                        content: user_msg.payload.content,
-                        images: user_msg.payload.images,
-                        mode: user_msg.payload.mode,
-                        source: user_msg.payload.source,
-                    },
-                };
-                handle
-                    .tx_inbound
-                    .send(outbound)
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+            match event {
+                InputEvent::User(user_msg) => {
+                    // 立即把 input 侧 UserMessage 字段照搬转化为 output 侧 UserMessage
+                    // （base + payload 完整保留，含 source），直接送进 session task。
+                    // 模型/思考等运行时配置挂在 session 级（SessionParams.model_config），
+                    // 消费点（跑 turn、压缩）现读现用，不随消息携带。
+                    // 后续 handle_inbound_user 纯入队，inject_messages 消费时统一过管道。
+                    let outbound = fuyao_api::message::output::UserMessage {
+                        base: user_msg.base,
+                        payload: fuyao_api::message::output::UserPayload {
+                            content: user_msg.payload.content,
+                            images: user_msg.payload.images,
+                            mode: user_msg.payload.mode,
+                            source: user_msg.payload.source,
+                        },
+                    };
+                    OutboundAction::Inbound(handle.tx_inbound.clone(), outbound)
+                }
+                InputEvent::Interrupt(interrupt_msg) => {
+                    // 入口转化：input 侧 InterruptMessage → output 侧 InterruptMessage。
+                    // input 侧消息的唯一职责就是在此被转化，之后内核链路（通道、select!、
+                    // emit_interrupt_event）全程只认 output 侧类型。
+                    let outbound = OutputInterruptMessage::new(
+                        interrupt_msg.payload.reason,
+                        interrupt_msg.payload.source,
+                    );
+                    OutboundAction::Interrupt(handle.tx_interrupt.clone(), outbound)
+                }
+                InputEvent::Plugin(plugin_msg) => {
+                    // 入口转化：input 侧 PluginMessage → output 侧 PluginMessage。
+                    // 转化后送 session 的 Plugin 通道，由 session task 过 dispatch 管道：
+                    // 拦截 → 发送（盖 session_id 标签发外部） → 观察。
+                    // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道。
+                    let outbound = OutputPluginMessage::new(
+                        plugin_msg.payload.source,
+                        plugin_msg.payload.event_type,
+                        plugin_msg.payload.data,
+                        plugin_msg.payload.error,
+                        plugin_msg.payload.message,
+                    );
+                    OutboundAction::Plugin(handle.tx_plugin.clone(), outbound)
+                }
+                InputEvent::Compress(_) => {
+                    // 控制通道：手动压缩请求转化为 ControlCommand::Compress，送主循环 turn 边界消费
+                    //（跳过阈值 / 反抖动，复用自动压缩执行流程，reason=manual）
+                    OutboundAction::Control(
+                        handle.tx_control.clone(),
+                        fuyao_api::ControlCommand::Compress,
+                    )
+                }
+                InputEvent::Rollback(req) => {
+                    // 控制通道：对话回退请求转化为 ControlCommand::Rollback，送主循环 turn 边界消费。
+                    // task 在 turn 边界自执行回退（删目标 seq 之后的消息 + 重算会话状态），
+                    // 结果经 per-session 出口以 OutputEvent::Rollback 事件流出。
+                    // 与 Compress 同构——控制通道是 fire-and-forget 载体，回执由事件出口承担。
+                    OutboundAction::Control(
+                        handle.tx_control.clone(),
+                        fuyao_api::ControlCommand::Rollback {
+                            target_seq: req.payload.target_seq,
+                        },
+                    )
+                }
             }
-            InputEvent::Interrupt(interrupt_msg) => {
-                // 入口转化：input 侧 InterruptMessage → output 侧 InterruptMessage。
-                // input 侧消息的唯一职责就是在此被转化，之后内核链路（通道、select!、
-                // emit_interrupt_event）全程只认 output 侧类型。
-                let outbound = OutputInterruptMessage::new(
-                    interrupt_msg.payload.reason,
-                    interrupt_msg.payload.source,
-                );
-                handle
-                    .tx_interrupt
-                    .send(outbound)
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+        };
+
+        // 锁外投递：四种通道的 send 语义一致（满则等待，断则 Shutdown），仅载荷类型不同
+        match action {
+            OutboundAction::Inbound(tx, msg) => {
+                tx.send(msg).await.map_err(|_| EngineError::Shutdown)?
             }
-            InputEvent::Plugin(plugin_msg) => {
-                // 入口转化：input 侧 PluginMessage → output 侧 PluginMessage。
-                // 转化后送 session 的 Plugin 通道，由 session task 过 dispatch 管道：
-                // 拦截 → 发送（盖 session_id 标签发外部） → 观察。
-                // 不在 Engine 层直接发 OutputEvent::Plugin——所有消息统一经 session task 的管道。
-                let outbound = OutputPluginMessage::new(
-                    plugin_msg.payload.source,
-                    plugin_msg.payload.event_type,
-                    plugin_msg.payload.data,
-                    plugin_msg.payload.error,
-                    plugin_msg.payload.message,
-                );
-                handle
-                    .tx_plugin
-                    .send(outbound)
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+            OutboundAction::Interrupt(tx, msg) => {
+                tx.send(msg).await.map_err(|_| EngineError::Shutdown)?
             }
-            InputEvent::Compress(_) => {
-                // 控制通道：手动压缩请求转化为 ControlCommand::Compress，送主循环 turn 边界消费
-                //（跳过阈值 / 反抖动，复用自动压缩执行流程，reason=manual）
-                handle
-                    .tx_control
-                    .send(fuyao_api::ControlCommand::Compress)
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+            OutboundAction::Plugin(tx, msg) => {
+                tx.send(msg).await.map_err(|_| EngineError::Shutdown)?
             }
-            InputEvent::Rollback(req) => {
-                // 控制通道：对话回退请求转化为 ControlCommand::Rollback，送主循环 turn 边界消费。
-                // task 在 turn 边界自执行回退（删目标 seq 之后的消息 + 重算会话状态），
-                // 结果经 per-session 出口以 OutputEvent::Rollback 事件流出。
-                // 与 Compress 同构——控制通道是 fire-and-forget 载体，回执由事件出口承担。
-                handle
-                    .tx_control
-                    .send(fuyao_api::ControlCommand::Rollback {
-                        target_seq: req.payload.target_seq,
-                    })
-                    .await
-                    .map_err(|_| EngineError::Shutdown)?;
+            OutboundAction::Control(tx, cmd) => {
+                tx.send(cmd).await.map_err(|_| EngineError::Shutdown)?
             }
         }
 
@@ -137,13 +166,18 @@ impl Engine {
         id: &SessionId,
         params: SessionParams,
     ) -> Result<(), EngineError> {
-        let sessions = self.sessions.lock().await;
-        let handle = sessions
-            .get(id)
-            .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?;
+        // sessions 锁作用域内仅取出参数共享句柄，锁外再锁写——
+        // 持调度表锁等待 session_params 锁会形成嵌套锁，session task
+        // 锁参数期间全引擎 session 操作都被拖住
+        let params_handle = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .get(id)
+                .map(|handle| Arc::clone(&handle.session_params))
+                .ok_or_else(|| EngineError::SessionNotFound(id.clone()))?
+        };
         // 全量直接替代：调用方给什么 SessionParams 就用什么，不做任何字段拦截。
-        let mut current = handle.session_params.lock().await;
-        *current = params;
+        *params_handle.lock().await = params;
         tracing::info!(session_id = %id, "对话参数已更新");
         Ok(())
     }
