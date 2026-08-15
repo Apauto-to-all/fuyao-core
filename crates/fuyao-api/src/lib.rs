@@ -20,7 +20,6 @@ mod pagination;
 mod paths;
 mod prompt_types;
 mod provider;
-mod queue_snapshot;
 mod selection;
 mod session_types;
 mod skill_types;
@@ -46,15 +45,14 @@ pub use message::{
 };
 pub use pagination::{EventPage, MessagePage, SessionPage};
 pub use paths::{
-    LayeredPaths, get_agent_root, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
-    get_workspace_root, normalize_workspace, normalize_workspace_str,
+    LayeredPaths, get_fuyao_agents_dir, get_fuyao_home, get_workspace_agents_dir,
+    get_workspace_root, normalize_workspace,
 };
 pub use prompt_types::{AgentDefinition, AgentMode};
 pub use provider::{
     InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
     Provider, ProviderOptions, ThinkingType,
 };
-pub use queue_snapshot::{QueueSnapshot, QueueSnapshotItem};
 pub use selection::{AgentIdOption, AgentIdSource, DefinitionOption, ModelOption};
 pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};

@@ -43,7 +43,7 @@ UI 层只需在对应动作时提供对应 Params：
 
 ## agent_id 解析
 
-两种格式（入口：`get_agent_root(agent_id, fuyao_home, workspace)`）：
+两种格式：
 
 | 格式 | 语义 | agent_root |
 |------|------|-----------|

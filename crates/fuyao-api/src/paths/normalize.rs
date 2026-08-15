@@ -1,11 +1,8 @@
 //! 工作目录路径归一化
 //!
 //! 把工作目录路径统一为正斜杠 `/` 形态，用于持久化存储与跨平台比对。
-//! 两种入参形态：
-//! - `Option<PathBuf>`（core 内部数据流持有该形态）走 [`normalize_workspace`]
-//! - `&str`（消费方从 IPC 等渠道收到裸字符串）走 [`normalize_workspace_str`]
-//!
-//! 两个函数同一归一逻辑，只是适配不同入参类型——所有路径归一化的真相源集中在此模块。
+//! 入参为 `Option<PathBuf>`（core 内部数据流持有该形态），
+//! 所有路径归一化的真相源集中在此模块。
 
 use std::path::PathBuf;
 
@@ -22,16 +19,6 @@ pub fn normalize_workspace(workspace: &Option<PathBuf>) -> Option<String> {
     workspace
         .as_ref()
         .map(|p| p.to_string_lossy().replace('\\', "/"))
-}
-
-/// 把 `&str` 工作目录路径归一为正斜杠形态，返回 `String`
-///
-/// 与 [`normalize_workspace`] 同一归一逻辑，面向字符串入参的消费方。内部委托
-/// [`normalize_workspace`]，保证两个入口永不漂移。
-///
-/// 空入参返空串——调用方负责非空校验（写入侧应做边界校验，空路径不应到达此处）。
-pub fn normalize_workspace_str(workspace: &str) -> String {
-    normalize_workspace(&Some(PathBuf::from(workspace))).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -60,27 +47,8 @@ mod tests {
     }
 
     #[test]
-    fn option_版_混用分隔符统一为正斜杠() {
+    fn option_版混用分隔符统一为正斜杠() {
         let ws = Some(PathBuf::from(r"C:\a/b\c"));
         assert_eq!(normalize_workspace(&ws).as_deref(), Some("C:/a/b/c"));
-    }
-
-    #[test]
-    fn str_版与_option_版结果一致() {
-        // 同一路径，&str 入参与 Option<PathBuf> 入参归一结果必须一致
-        let path = r"C:\Users\TF\proj";
-        let via_opt = normalize_workspace(&Some(PathBuf::from(path)));
-        let via_str = normalize_workspace_str(path);
-        assert_eq!(via_str, via_opt.unwrap_or_default());
-    }
-
-    #[test]
-    fn str_版空入参返空串() {
-        assert_eq!(normalize_workspace_str(""), "");
-    }
-
-    #[test]
-    fn str_版混用分隔符统一为正斜杠() {
-        assert_eq!(normalize_workspace_str(r"C:\a/b\c"), "C:/a/b/c");
     }
 }

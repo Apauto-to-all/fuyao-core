@@ -1,7 +1,7 @@
 //! 路径系统集成测试
 //!
-//! 钉死 `AgentPaths` 与路径解析函数的公共 API 契约：
-//! - agent_id 两形式（global/{名} / workspace/{名}，前缀大小写不敏感）× workspace 有无
+//! 钉死 `AgentPaths` 的公共 API 契约：
+//! - agent_id 两形式（global/{名} / workspace/{名}）× workspace 有无
 //!   的解析组合，及非法格式（裸名 / 未知来源 / 嵌套斜杠）的报错
 //! - 各纯函数路径方法（config_paths / env_paths / sessions_db_path / logs_dir / cache_key 等）
 //! - extra_dirs 过滤分支（skills_paths / instructions_paths / agents_def_paths）
@@ -11,81 +11,10 @@
 
 mod common;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use fuyao_api::AgentPaths;
 use rstest::rstest;
-
-// ---------------------------------------------------------------------------
-// get_agent_root：agent_id 两形式 × workspace 有无 + 非法格式报错（核心解析规则）
-// ---------------------------------------------------------------------------
-
-/// `global/{名}`：强制全局层，用注入的 fuyao_home，忽略 workspace 参数
-#[test]
-fn get_agent_root_global_prefix_ignores_workspace() {
-    let home = PathBuf::from("/tmp/home");
-    let root = fuyao_api::get_agent_root("global/coder", &home, None).unwrap();
-    assert_eq!(root, home.join("fuyao-agents").join("coder"));
-
-    // 提供 workspace 也不影响：global 前缀强制全局层
-    let ws = PathBuf::from("/tmp/project");
-    let root_with_ws = fuyao_api::get_agent_root("global/coder", &home, Some(&ws)).unwrap();
-    assert_eq!(root_with_ws, home.join("fuyao-agents").join("coder"));
-}
-
-/// `workspace/{名}` + workspace=Some：强制工作目录层 `{ws}/.fuyao/fuyao-agents/{名}`
-#[test]
-fn get_agent_root_workspace_prefix_with_workspace() {
-    let home = PathBuf::from("/tmp/home");
-    let ws = PathBuf::from("/tmp/project");
-    let root = fuyao_api::get_agent_root("workspace/coder", &home, Some(&ws)).unwrap();
-    assert_eq!(root, ws.join(".fuyao").join("fuyao-agents").join("coder"));
-}
-
-/// `workspace/{名}` + workspace=None：报错（不再隐式回退），信息含修正建议
-#[test]
-fn get_agent_root_workspace_prefix_without_workspace_errors() {
-    let err =
-        fuyao_api::get_agent_root("workspace/coder", Path::new("/tmp/home"), None).unwrap_err();
-    assert!(err.contains("workspace/coder"), "{err}");
-    assert!(err.contains("global"), "应建议改用 global 来源：{err}");
-}
-
-/// 前缀大小写不敏感：PascalCase / 全大写等价命中对应层（列举侧序列化值可直接用）
-#[test]
-fn get_agent_root_prefix_case_insensitive() {
-    let home = PathBuf::from("/tmp/home");
-    let ws = PathBuf::from("/tmp/project");
-
-    let pascal = fuyao_api::get_agent_root("Global/coder", &home, Some(&ws)).unwrap();
-    assert_eq!(pascal, home.join("fuyao-agents").join("coder"));
-
-    let upper = fuyao_api::get_agent_root("WORKSPACE/coder", &home, Some(&ws)).unwrap();
-    assert_eq!(upper, ws.join(".fuyao").join("fuyao-agents").join("coder"));
-}
-
-/// 裸名（无斜杠）：格式错误，信息含正确格式建议
-#[test]
-fn get_agent_root_bare_name_errors() {
-    let err = fuyao_api::get_agent_root("coder", Path::new("/tmp/home"), None).unwrap_err();
-    assert!(err.contains("格式错误"), "{err}");
-    assert!(err.contains("global/{名}"), "{err}");
-}
-
-/// 未知来源 / 空目录名 / 嵌套斜杠：报错，不隐式落全局层
-#[test]
-fn get_agent_root_illegal_forms_error() {
-    let home = Path::new("/tmp/home");
-
-    let unknown = fuyao_api::get_agent_root("test/coder", home, None).unwrap_err();
-    assert!(unknown.contains("来源未知"), "{unknown}");
-
-    let empty = fuyao_api::get_agent_root("global/", home, None).unwrap_err();
-    assert!(empty.contains("格式错误"), "{empty}");
-
-    let nested = fuyao_api::get_agent_root("global/a/b", home, None).unwrap_err();
-    assert!(nested.contains("目录名非法"), "{nested}");
-}
 
 /// agent_root 读注入的 fuyao_home（纯函数），不落进程全局 home
 #[test]
