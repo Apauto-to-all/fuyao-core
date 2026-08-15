@@ -28,7 +28,7 @@ MCPManager（lib.rs）       ← 编排器：管理多 Server 生命周期、工
 | `from_config()` | 从 `[mcp_servers]` 配置创建管理器 |
 | `start_all()` | 批量启动，单个失败不阻塞其他，返回 (成功数, 失败数, 失败详情) |
 | `stop_all()` | 断开所有连接 + 清空工具（每个连接执行 rmcp 的 `close_with_timeout` 优雅关闭） |
-| `get_tool_entries()` | 产出 (name, schema, handler) 三元组，供 `fuyao-app::build_tool_registry` 收集进 `ToolRegistry` |
+| `get_tool_entries()` | 直返 `Vec<ToolEntry>`（schema + handler + 可见性），供 `fuyao-app::build_tool_registry` 零转换收集进 `ToolRegistry` |
 | `disconnect()` | 单连接优雅关闭（用 rmcp 的 `close_with_timeout`：先关 transport 让 server 退出、超时 kill 子进程） |
 
 工具发现是连接的副产物——连接成功即调 `list_all_tools()` 拉取工具列表，不需要额外步骤。
@@ -38,8 +38,8 @@ MCPManager（lib.rs）       ← 编排器：管理多 Server 生命周期、工
 ```text
 build_tool_registry():
   1. collect_builtin_tools()                ← 内置工具（按 [tools.enabled] 过滤）
-  2. collect_mcp_tools()                    ← MCP 工具（有配置时 start_all + get_tool_entries）
-     │   └─ 反序列化 schema 成 ToolDefinition 包成 ToolEntry
+  2. collect_mcp_tools()                    ← MCP 工具（有配置时 start_all + get_tool_entries 直返 ToolEntry）
+     │   └─ 工具发现时（连接的副产物）已把 server 的 JSON schema 转成强类型 ToolDefinition，装配层零序列化往返
   3. ToolRegistryBuilder::register_all(...) ← 全部注入
   4. 返回 (ToolRegistry, Option<Arc<MCPManager>>)
 ```
@@ -89,20 +89,20 @@ RegisteredTool {
 经 `make_tool_call_handler` 注册到引擎的工具，每次调用都走四层防护：
 
 ```text
-handler(args, ctx)
+handler(args, ctx, cancel)
   │
-  ├─ 1. check_breaker(server) ─── 熔断中？直接返回 {"error": msg}
+  ├─ 1. check_breaker(server) ─── 熔断中？直接返回错误信封 {"error": msg}
   │
   ├─ 2. tokio::time::timeout ──── 超时保护
   │
-  ├─ 3. do_call ─── 实际 MCP 调用
+  ├─ 3. do_call ─── 实际 MCP 调用（结果统一装进 ToolOutput 信封）
   │    │
   │    └── 失败时：
   │        ├─ is_auth_error → notify_reconnect + wait_and_retry
   │        ├─ is_session_expired → notify_reconnect + wait_and_retry
-  │        └─ 其他 → bump_error + 返回脱敏错误
+  │        └── 其他 → bump_error + 返回脱敏错误
   │
-  └─ 4. 结果处理（is_error 检测 + text/structured 提取 + sanitize_error 脱敏）
+  └─ 4. 结果处理（信封类型判定 is_error 驱动熔断计数 + text/structured 提取 + sanitize_error 脱敏）
 ```
 
 > **双路径行为差异**（重要）：

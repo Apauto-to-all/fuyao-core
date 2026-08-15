@@ -35,7 +35,9 @@ L0  fuyao-api（零内部依赖）
   - **Provider 类型**：`Provider` trait / `Model` / `ModelCost` / `ModelLimit` / `ThinkingType` 等
   - **会话类型**：`Session` / `Message`（含多模态图片附件 `images`）/ `MessageKind` / `ImageContent`（`{mime_type, data}`，data 为裸 base64，`from_data_url` 做入站归一）/ `TodoItem`
   - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）
-  - **工具类型**：`ToolDefinition` / `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn` / `ToolResult` / `ToolCallContext`
+  - **工具类型**：`ToolDefinition`（配 `ToolDefinitionBuilder` 链式构造）/ `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn`（返回统一结果信封）/ `ToolOutput`（结果信封：`Value` JSON 对象 / `Text` 纯文本 / `Err` 错误）/ `ToolError`（错误主信息 + 附加字段，wire 恒有 `"error"` 键）/ `ToolCallContext`
+  - **工具条目**：`ToolEntry`（`new` 组装 schema + handler + 可见性 / `name` 取 schema 名——工具名单一来源）+ `insert_tool`（以 schema 名为 key 注册进 map，重名 panic）
+  - **handler 侧辅助**：`tool_handler`（规范签名异步函数一步包装成 `ToolFn`，吸收 `Arc` / `Box::pin` 闭包体操）/ `parse_args`（JSON 参数类型化解析为结构体，常见 serde 错误中文化）
   - **其他**：`AgentDefinition` / `AgentMode` / `SkillDefinition` / `SkillMeta` / `MCPServerConfig` / `ApiError` / `ConfigError`
   - **选择支持类型**：`AgentIdOption`（`{ id, source }`，source 为 `AgentIdSource`：`Global` / `Workspace`）/ `DefinitionOption`（`{ id, definition }`，无来源字段——定义按文件名做优先级覆盖，同名互斥、高优先级层胜出）/ `ModelOption`（`{ id, provider, model }`）——供 fuyao-app 的 `Discovery` / `list_agent_ids` 消费；`id` 为纯身份，agent_id 的层前缀由 `source` 独立承载
 
@@ -59,7 +61,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：MCP 集成：MCPManager 管理多 Server
 - **内部依赖**：api（+ rmcp 官方 SDK）
-- **公开 API**：`MCPManager`（`new` / `from_config` / `start_all` / `stop_all` / `call_tool` / `refresh_tools` / `get_tool_definitions` / `get_server_status` / `get_tool_entries` / `disconnect`）；`RegisteredTool`；`MCPManagerError`
+- **公开 API**：`MCPManager`（`new` / `from_config` / `start_all` / `stop_all` / `call_tool`（返回 `Result<ToolOutput, MCPManagerError>`）/ `refresh_tools` / `get_tool_definitions` / `get_server_status` / `get_tool_entries`（直返 `Vec<ToolEntry>`，装配层零转换注入注册表）/ `disconnect`）；`RegisteredTool`；`MCPManagerError`
 
 ## fuyao-skills（L1 能力）
 
@@ -100,7 +102,7 @@ L0  fuyao-api（零内部依赖）
   - **`SessionId`**：`String` 别名
   - **`EngineError`**：`SessionNotFound` / `Storage` / `Provider` / `Shutdown`
   - **历史回放投影**：`messages_to_events(Vec<Message>) -> Vec<OutputEvent>`——存储 Message → 与实时流同构的事件流（seq 正序），上层会话历史查询接口消费
-  - **工具注册**：`ToolRegistry` / `ToolRegistryBuilder` / `ToolEntry`
+  - **工具注册**：`ToolRegistry` / `ToolRegistryBuilder`（条目类型 `ToolEntry` 由 fuyao-api 提供，见上文工具条目）
   - **插件相关重导出**：`Plugin` / `PluginHost` / `PluginInstance` / `SessionSender` / `SharedHooks`
 
 > 引擎内核内部的 dispatch 管道（拦截→发送→观察）、history 模块（事件↔Message 双向映射 + 计费 + 进历史统一入口）、ReAct 循环（双队列 + 中断 + 重试）、tool_exec（智能调度）等模块为 crate 私有，仅通过上述根层 API 暴露。
@@ -120,7 +122,7 @@ L0  fuyao-api（零内部依赖）
 
 - **职责**：内置工具集 + 安全防护 + todo 持久化（自建 TodoStore）
 - **内部依赖**：api, prompt, skills, sqlx
-- **公开 API**：`all_tools` / `all_tool_names` / `get_tool`；`ToolEntry`
+- **公开 API**：`all_tools` / `all_tool_names` / `get_tool`（静态注册表 `HashMap<String, ToolEntry>`，key 取 schema 名）
 - **内置工具**：read / write / edit / bash / grep / glob / webfetch / skill / todowrite / **subagent**（子代理工具，派生子 session 执行独立子任务，`child_invisible = true` 递归防护）
 
 ## fuyao-app（L4 装配）
