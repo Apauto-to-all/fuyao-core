@@ -299,7 +299,11 @@ mod tests {
         tool_call_id: &str,
         content: &str,
     ) -> i64 {
-        let mut msg = Message::tool_result(tool_call_id.to_string(), content.to_string());
+        let mut msg = Message::tool_result(
+            tool_call_id.to_string(),
+            "echo".to_string(),
+            content.to_string(),
+        );
         store.insert_message(sid, &mut msg).await.unwrap()
     }
 

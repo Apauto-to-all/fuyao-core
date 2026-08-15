@@ -178,7 +178,7 @@ async fn insert_message_accumulates_metadata_roundtrip() {
         .unwrap();
     // 7 条 tool 结果 → message_count = 11,tool_call_count = 7
     for i in 0..7 {
-        let mut msg = Message::tool_result(format!("c{i}"), "结果".to_string());
+        let mut msg = Message::tool_result(format!("c{i}"), "echo".to_string(), "结果".to_string());
         store.insert_message(&session.id, &mut msg).await.unwrap();
     }
 
@@ -270,7 +270,8 @@ async fn insert_message_only_counts_assistant_tokens_and_cost() {
         .await
         .unwrap();
 
-    let mut tool_msg = Message::tool_result("c1".to_string(), "result".to_string());
+    let mut tool_msg =
+        Message::tool_result("c1".to_string(), "echo".to_string(), "result".to_string());
     store
         .insert_message(&session.id, &mut tool_msg)
         .await

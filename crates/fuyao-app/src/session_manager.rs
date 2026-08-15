@@ -21,8 +21,6 @@ use std::sync::Arc;
 
 use fuyao_session::SessionStore;
 
-use crate::history_replay;
-
 /// 会话管理器：持有会话存储句柄，对外提供会话检索 / 浏览 / 元数据编辑接口
 ///
 /// 与 [`App`](crate::App) 平级正交：
@@ -182,8 +180,9 @@ impl SessionManager {
     ///
     /// 与 [`list_messages`](Self::list_messages) 同源取数（同游标、同分页），但把存储
     /// [`Message`] 投影成与实时流同构的 [`OutputEvent`]——前端历史回放与实时流共用一套
-    /// 渲染逻辑，无需区分数据来源。转换由 [`history_replay`] 承担（含 tool_calls 嵌套 →
-    /// 扁平的逆向、seq 倒序翻正序），详见该模块。
+    /// 渲染逻辑，无需区分数据来源。转换由 [`fuyao_core::messages_to_events`] 承担
+    /// （含 tool_calls 嵌套 → 扁平的逆向、seq 倒序翻正序），映射知识归 core 的
+    /// history 模块——与「事件 → Message 落库」的正向映射同居一处，双向单点同步。
     ///
     /// 返回 [`EventPage`](fuyao_api::EventPage) 信封：`has_more` / `next_cursor` 直接复用
     /// [`list_messages`](Self::list_messages) 的推导（同源同游标），仅把 `items` 投影成
@@ -199,7 +198,7 @@ impl SessionManager {
     ) -> Result<fuyao_api::EventPage, fuyao_session::SessionError> {
         // 复用 list_messages 的取数 + 游标推导，避免两处重复实现 limit/has_more/cursor 逻辑。
         let page = self.list_messages(session_id, before_seq, limit).await?;
-        let events = history_replay::messages_to_events(page.items);
+        let events = fuyao_core::messages_to_events(page.items);
         Ok(fuyao_api::EventPage {
             events,
             has_more: page.has_more,

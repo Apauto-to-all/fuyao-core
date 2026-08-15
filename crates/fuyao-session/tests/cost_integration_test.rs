@@ -1,12 +1,12 @@
 //! fuyao-session 集成测试：费用计算与全局 model 注册表的真实集成
 //!
-//! src/cost.rs 的单元测试覆盖了 calculate_amount / accumulate_session_total 的纯逻辑（用私有
+//! src/cost.rs 的单元测试覆盖了 calculate_amount 的纯逻辑（用私有
 //! calculate_amount 绕过全局注册表）。本文件聚焦**跨 crate 的真实集成**——单测的空白带：
 //!
 //! - calculate_cost 通过 fuyao_provider::get_model 查全局 MODEL_CACHE 算价（真实集成）
 //! - register_model 注入价格表后，calculate_cost 返回非零费用（验证注册表联动）
 //! - 全局 MODEL_CACHE 的隔离契约：不同 agent_paths_key 不串扰
-//! - fill_message_cost 端到端：填 token + 算 cost 一步到位
+//! - fill_message_cost 端到端：按 msg 已填 token 字段算出 cost 填入
 //!
 //! 全局状态规避：用唯一 agent_id 隔离 MODEL_CACHE，测完 clear_cache 收尾。
 
@@ -14,7 +14,6 @@ mod common;
 
 use common::{priced_model, unique_paths};
 use fuyao_api::Message;
-use fuyao_provider::StreamUsage;
 use fuyao_provider::{agent_paths_cache_key, clear_cache, get_model, register_model};
 use fuyao_session::{calculate_cost, fill_message_cost};
 use rust_decimal::Decimal;
@@ -142,20 +141,18 @@ fn clear_cache_removes_registered_model() {
 
 #[test]
 fn fill_message_cost_sets_tokens_and_cost() {
-    // fill_message_cost 一步完成：填 token 字段 + 算 cost 填进 msg.cost
+    // fill_message_cost 读 msg 已填的 token 字段算 cost 填进 msg.cost
+    //（token 字段由调用方——history 映射——自事件 payload 先行填好）
     let reg = register_priced_model("fill");
     let mut msg = Message::assistant(Some("resp".to_string()));
+    msg.prompt_tokens = 1000;
+    msg.completion_tokens = 500;
+    msg.reasoning_tokens = 0;
+    msg.cached_tokens = 0;
 
-    let usage = StreamUsage {
-        prompt_tokens: 1000,
-        completion_tokens: 500,
-        total_tokens: 1500,
-        completion_reasoning_tokens: Some(0),
-        prompt_cached_tokens: Some(0),
-    };
-    fill_message_cost(&mut msg, &usage, &reg.full_id, &reg.paths);
+    fill_message_cost(&mut msg, &reg.full_id, &reg.paths);
 
-    // token 字段已填
+    // token 字段保持调用方所填
     assert_eq!(msg.prompt_tokens, 1000);
     assert_eq!(msg.completion_tokens, 500);
     assert_eq!(msg.reasoning_tokens, 0);

@@ -8,28 +8,27 @@
 //! 本模块负责：
 //! - [`TurnState`]：单轮共享状态，stream 写、中断分支读（部分结果）。
 //! - [`classify`]：集中判断中断场景（避开归档 phase 散落在循环三处的债）。
-//! - [`handle_interrupt`]：经 emit_to_history 把补发的 AssistantMessage + 中断式
-//!   ToolResult 落进 DB（拦截 → insert_message → 发送）。
+//! - [`handle_interrupt`]：经统一历史入口（[`crate::history`]）把补发的
+//!   AssistantMessage + 中断式 ToolResult 落进 DB（拦截 → insert_message → 发送）。
 //!
 //! 锁安全：用 `std::sync::Mutex` + block scope 包裹，**不跨 await 持锁**。
 //! 中断分支先 clone 出所需数据再释放锁，然后才 await 发事件。
 //!
 //! 中断事件 vs 增量结果分离：`OutputEvent::Interrupt`（用户可见通知）由调用方
 //! 在 select! 命中时就发；本模块只补增量结果（部分内容、中断式工具结果）。
+//! 中断补发走不计费路径：token 全 0（模型中断时未给用量），不填 model_id。
 
 use crate::dispatch;
 use crate::emit::Emitter;
+use crate::react::SessionCtx;
 use fuyao_api::InterruptSource;
-use fuyao_api::Message;
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, ToolResultMessage, ToolResultPayload,
-    build_nested_tool_call,
 };
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
 use fuyao_provider::ToolCallData;
-use fuyao_session::SessionStore;
 use std::sync::{Arc, Mutex};
 
 /// 单轮共享状态
@@ -90,7 +89,7 @@ pub(crate) fn classify(state: &TurnState) -> InterruptKind {
     }
 }
 
-/// 处理中断：经 emit_to_history 把补发消息落进 DB
+/// 处理中断：经统一历史入口把补发消息落进 DB
 ///
 /// 中断通知事件（`OutputEvent::Interrupt`）已由调用方在 select! 命中时发出，
 /// 此处只补增量结果（拦截 → 单条落 DB → 发送事件 → 观察）：
@@ -100,13 +99,14 @@ pub(crate) fn classify(state: &TurnState) -> InterruptKind {
 ///
 /// 补发的消息落 DB 后，下轮 build_chat_request 会从 DB 自然看到
 /// 「assistant 调了工具 → 工具结果（中断式）」的完整上下文。
+///
+/// 投影 / 落库细节（含 tool_calls 嵌套构造、tool_name 落库）由 history 模块内化，
+/// 本函数只负责「从 TurnState 取部分结果、构造事件」。
 pub(crate) async fn handle_interrupt(
     state: &SharedTurnState,
     kind: InterruptKind,
     interrupt: &OutputInterruptPayload,
-    emitter: &Emitter,
-    hooks: &SharedHooks,
-    store: &SessionStore,
+    ctx: &SessionCtx,
 ) {
     // 先 clone 出所需数据再释放锁（不跨 await 持锁）
     let (text, reasoning, tool_calls) = {
@@ -125,42 +125,9 @@ pub(crate) async fn handle_interrupt(
             // 1. 补发中断 AssistantMessage（含累积的 tool_calls）→ 落 DB
             let event = OutputEvent::Assistant(AssistantMessage {
                 base: EventBase::default(),
-                payload: AssistantPayload {
-                    content: if text.is_empty() {
-                        None
-                    } else {
-                        Some(text.clone())
-                    },
-                    reasoning: if reasoning.is_empty() {
-                        None
-                    } else {
-                        Some(reasoning.clone())
-                    },
-                    tool_calls: Some(
-                        valid_tool_calls
-                            .iter()
-                            .map(|tc| fuyao_api::message::output::ToolCallPayload {
-                                tool_call_id: tc.id.clone(),
-                                tool_name: tc.name.clone(),
-                                tool_args: serde_json::from_str(&tc.arguments)
-                                    .unwrap_or(serde_json::Value::Null),
-                            })
-                            .collect(),
-                    ),
-                    finish_reason: Some("interrupted".to_string()),
-                    // 中断时模型未给出用量，token 统一记 0
-                    completion_tokens: 0,
-                    prompt_tokens: 0,
-                    total_tokens: 0,
-                    reasoning_tokens: 0,
-                    cached_tokens: 0,
-                },
+                payload: interrupted_assistant_payload(&text, &reasoning, Some(&valid_tool_calls)),
             });
-            // 闭包借用 valid_tool_calls：tool_calls 字段以累积的为准（与事件 payload 一致）
-            let _ = dispatch::emit_to_history(emitter, hooks, store, event, |ev| {
-                build_interrupted_assistant_msg(ev, &valid_tool_calls)
-            })
-            .await;
+            let _ = crate::history::emit_to_history(ctx, event).await;
 
             // 2. 为每个有效 tool_call 补发中断式 ToolResult → 落 DB
             for tc in valid_tool_calls {
@@ -170,10 +137,7 @@ pub(crate) async fn handle_interrupt(
                     &interrupt.source,
                     &interrupt.reason,
                 );
-                let _ = dispatch::emit_to_history(emitter, hooks, store, event, |ev| {
-                    build_tool_result_msg(ev)
-                })
-                .await;
+                let _ = crate::history::emit_to_history(ctx, event).await;
             }
         }
         InterruptKind::Streaming => {
@@ -181,74 +145,52 @@ pub(crate) async fn handle_interrupt(
             if !text.is_empty() || !reasoning.is_empty() {
                 let event = OutputEvent::Assistant(AssistantMessage {
                     base: EventBase::default(),
-                    payload: AssistantPayload {
-                        content: if text.is_empty() {
-                            None
-                        } else {
-                            Some(text.clone())
-                        },
-                        reasoning: if reasoning.is_empty() {
-                            None
-                        } else {
-                            Some(reasoning.clone())
-                        },
-                        tool_calls: None,
-                        finish_reason: Some("interrupted".to_string()),
-                        // 中断时模型未给出用量，token 统一记 0
-                        completion_tokens: 0,
-                        prompt_tokens: 0,
-                        total_tokens: 0,
-                        reasoning_tokens: 0,
-                        cached_tokens: 0,
-                    },
+                    payload: interrupted_assistant_payload(&text, &reasoning, None),
                 });
-                let _ = dispatch::emit_to_history(emitter, hooks, store, event, |ev| match ev {
-                    OutputEvent::Assistant(m) => {
-                        let mut msg = Message::assistant(m.payload.content.clone());
-                        msg.reasoning = m.payload.reasoning.clone();
-                        msg.finish_reason = Some("interrupted".to_string());
-                        Some(msg)
-                    }
-                    _ => None,
-                })
-                .await;
+                let _ = crate::history::emit_to_history(ctx, event).await;
             }
         }
     }
 }
 
-/// 从拦截后的 AssistantMessage 事件构造 interrupted Message（tool_calls 字段以累积的为准）
-fn build_interrupted_assistant_msg(
-    ev: &OutputEvent,
-    valid_tool_calls: &[&ToolCallData],
-) -> Option<Message> {
-    match ev {
-        OutputEvent::Assistant(m) => {
-            // schema 构造集中到 build_nested_tool_call，此处不再硬编码字段名
-            let tool_calls_json: Vec<serde_json::Value> = valid_tool_calls
+/// 构造中断补发的 AssistantPayload（token 全 0 约定的唯一出处）
+///
+/// 两个分支（有 / 无工具调用累积）共用：content / reasoning 空串归 None，
+/// finish_reason=interrupted，token 五字段全 0（模型中断时未给用量）。
+fn interrupted_assistant_payload(
+    text: &str,
+    reasoning: &str,
+    tool_calls: Option<&[&ToolCallData]>,
+) -> AssistantPayload {
+    AssistantPayload {
+        content: if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        },
+        reasoning: if reasoning.is_empty() {
+            None
+        } else {
+            Some(reasoning.to_string())
+        },
+        tool_calls: tool_calls.map(|calls| {
+            calls
                 .iter()
-                .map(|tc| build_nested_tool_call(&tc.id, &tc.name, &tc.arguments))
-                .collect();
-            let mut msg = Message::assistant(m.payload.content.clone());
-            msg.reasoning = m.payload.reasoning.clone();
-            if !tool_calls_json.is_empty() {
-                msg.tool_calls = Some(serde_json::Value::Array(tool_calls_json));
-            }
-            msg.finish_reason = Some("interrupted".to_string());
-            Some(msg)
-        }
-        _ => None,
-    }
-}
-
-/// 从拦截后的 ToolResult 事件构造 Message::tool_result
-fn build_tool_result_msg(ev: &OutputEvent) -> Option<Message> {
-    match ev {
-        OutputEvent::ToolResult(m) => Some(Message::tool_result(
-            m.payload.tool_call_id.clone(),
-            m.payload.content.clone(),
-        )),
-        _ => None,
+                .map(|tc| fuyao_api::message::output::ToolCallPayload {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    tool_args: serde_json::from_str(&tc.arguments)
+                        .unwrap_or(serde_json::Value::Null),
+                })
+                .collect()
+        }),
+        finish_reason: Some("interrupted".to_string()),
+        // 中断时模型未给出用量，token 统一记 0
+        completion_tokens: 0,
+        prompt_tokens: 0,
+        total_tokens: 0,
+        reasoning_tokens: 0,
+        cached_tokens: 0,
     }
 }
 
@@ -313,56 +255,47 @@ mod tests {
         assert_eq!(classify(&state), InterruptKind::Streaming);
     }
 
-    /// 验证 Streaming 中断补发的 AssistantMessage 经 emit_to_history 落进 DB
-    ///
-    /// 消息已不在内存（事件级落库），通过 load_visible_messages 验证。
-    #[tokio::test]
-    async fn handle_interrupt_streaming_emits_partial_assistant() {
-        let state = Arc::new(Mutex::new(TurnState::new()));
-        {
-            let mut s = state.lock().unwrap();
-            s.text = "部分回复".into();
-        }
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let emitter = Emitter::new(tx, "sess1".to_string());
-        let hooks: SharedHooks = Arc::new(fuyao_hooks::HooksRegistry::default());
-        let interrupt = OutputInterruptPayload::new("用户取消", InterruptSource::User);
-
-        // 构造临时 store + session（消息进 DB）
-        let dir =
-            std::env::temp_dir().join(format!("fuyao_interrupt_test_{}", uuid::Uuid::new_v4()));
-        let store = fuyao_session::SessionStore::new(dir.join("test.db"))
-            .await
-            .expect("构造 SessionStore 失败");
-        let mut session = fuyao_api::Session::new(None, None, None);
-        session.id = "sess1".to_string();
-        store.create(&session).await.unwrap();
-        drop(session);
-
-        handle_interrupt(
-            &state,
-            InterruptKind::Streaming,
-            &interrupt,
-            &emitter,
-            &hooks,
-            &store,
-        )
-        .await;
-        let ev = rx.recv().await.expect("应有事件");
-        match ev {
-            OutputEvent::Assistant(m) => {
-                assert_eq!(m.payload.content.as_deref(), Some("部分回复"));
-                assert_eq!(m.payload.finish_reason.as_deref(), Some("interrupted"));
-            }
-            _ => panic!("应为 Assistant 事件"),
-        }
-        // 补发的 assistant 消息应进 DB
-        let visible = store
-            .load_visible_messages("sess1", usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(visible.len(), 1, "中断补发应落 DB");
-        assert_eq!(visible[0].content.as_deref(), Some("部分回复"));
-        assert_eq!(visible[0].finish_reason.as_deref(), Some("interrupted"));
+    /// 中断 payload 的 token 约定：五字段全 0、finish_reason=interrupted
+    #[test]
+    fn interrupted_assistant_payload_zero_tokens() {
+        let p = interrupted_assistant_payload("部分回复", "思考", None);
+        assert_eq!(p.content.as_deref(), Some("部分回复"));
+        assert_eq!(p.reasoning.as_deref(), Some("思考"));
+        assert_eq!(p.finish_reason.as_deref(), Some("interrupted"));
+        assert_eq!(p.prompt_tokens, 0);
+        assert_eq!(p.completion_tokens, 0);
+        assert!(p.tool_calls.is_none());
     }
+
+    /// 空文本 + 空推理时 content / reasoning 归 None（不落空串）
+    #[test]
+    fn interrupted_assistant_payload_empty_text_is_none() {
+        let p = interrupted_assistant_payload("", "", None);
+        assert_eq!(p.content, None);
+        assert_eq!(p.reasoning, None);
+    }
+
+    /// 有工具调用累积时 payload 携带扁平 tool_calls（arguments 解析失败归 Null）
+    #[test]
+    fn interrupted_assistant_payload_carries_tool_calls() {
+        let tc = ToolCallData {
+            id: "call_1".into(),
+            name: "search".into(),
+            arguments: "{\"q\":\"rust\"}".into(),
+        };
+        let bad = ToolCallData {
+            id: "call_2".into(),
+            name: "bad".into(),
+            arguments: "not-json".into(),
+        };
+        let p = interrupted_assistant_payload("", "", Some(&[&tc, &bad]));
+        let calls = p.tool_calls.expect("应携带 tool_calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool_name, "search");
+        assert_eq!(calls[0].tool_args, serde_json::json!({"q": "rust"}));
+        assert_eq!(calls[1].tool_args, serde_json::Value::Null);
+    }
+
+    // handle_interrupt 端到端（TurnState → DB 落库）由 react/tests.rs 的
+    // interrupt_during_streaming 集成测试覆盖（断言事件流 + load_visible_messages）。
 }

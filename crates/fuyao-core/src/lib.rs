@@ -17,6 +17,7 @@ mod dispatch;
 mod emit;
 mod engine;
 mod error;
+mod history;
 mod interrupt;
 mod react;
 mod stream;
@@ -26,7 +27,10 @@ mod tool_registry;
 pub use engine::{Engine, SessionId};
 // ChildSessionSource 由 fuyao-api 定义并导出；这里重导出让上层从 fuyao-core 一处拿
 pub use error::EngineError;
+// 历史回放投影：存储 Message → OutputEvent 的对外唯一出口。上层查询接口用它把
+// 会话历史投影成与实时流同构的事件；映射细节（含 tool_calls 嵌套解析）归 history 模块内化
 pub use fuyao_api::ChildSessionSource;
+pub use history::messages_to_events;
 pub use tool_registry::{ToolRegistry, ToolRegistryBuilder};
 
 /// 插件相关类型的便捷重导出

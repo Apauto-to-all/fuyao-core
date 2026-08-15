@@ -99,10 +99,11 @@ L0  fuyao-api（零内部依赖）
   - **`ChildSessionSource`**：`Fresh`（空上下文）/ `Fork(SessionId)`（复制源可见消息 + system_prompt）
   - **`SessionId`**：`String` 别名
   - **`EngineError`**：`SessionNotFound` / `Storage` / `Provider` / `Shutdown`
+  - **历史回放投影**：`messages_to_events(Vec<Message>) -> Vec<OutputEvent>`——存储 Message → 与实时流同构的事件流（seq 正序），上层会话历史查询接口消费
   - **工具注册**：`ToolRegistry` / `ToolRegistryBuilder` / `ToolEntry`
   - **插件相关重导出**：`Plugin` / `PluginHost` / `PluginInstance` / `SessionSender` / `SharedHooks`
 
-> 引擎内核内部的 dispatch 管道（拦截→处理→发送→观察）、ReAct 循环（双队列 + 中断 + 重试）、tool_exec（智能调度）等模块为 crate 私有，仅通过上述根层 API 暴露。
+> 引擎内核内部的 dispatch 管道（拦截→发送→观察）、history 模块（事件↔Message 双向映射 + 计费 + 进历史统一入口）、ReAct 循环（双队列 + 中断 + 重试）、tool_exec（智能调度）等模块为 crate 私有，仅通过上述根层 API 暴露。
 
 ## fuyao-session（L3 内核）
 
@@ -111,7 +112,7 @@ L0  fuyao-api（零内部依赖）
 - **公开 API**：
   - **存储层**：`SessionStore`（`new(db_path)` / `pool()` 共享连接池 / `create` / `get` / `update`（落库时经 `unixepoch()` 刷新 `last_active_at`）/ `delete` / `list_all(workspace_filter, limit, offset)`（按 `last_active_at` 倒序 + 可选按 workspace 过滤）/ `count` / `count_with_filter(workspace_filter)` / `insert_message` / `count_messages` / `load_full_history`（全量审计，seq 升序）/ `list_messages_before(session_id, before_seq, limit)`（游标分页浏览，seq 倒序）/ `load_visible_messages`（LLM 可见窗口，压缩感知动态拼接）/ `mark_compaction` / `rollback_to(session_id, target_seq)`（对话回退，删目标 seq 之后消息 + 重算 count 类与压缩元数据，返回 `RollbackPayload`）/ `update_system_prompt` / `update_title` / `end_session`）
   - **压缩模块**：`should_compress` / `generate_summary` / `apply`
-  - **费用统计**：`calculate_cost` / `fill_message_cost` / `accumulate_session_total`
+  - **费用统计**：`calculate_cost`（单条消息费用，Decimal 精确）/ `fill_message_cost`（按 msg 已填 token 字段算 cost 填入——token 字段由 history 映射自事件 payload 先行填好）
   - **标题生成**：`maybe_generate_title`
   - **错误**：`SessionError`（`IoError` / `SqlxError` / `InvalidState` / `NotFound`）
 
@@ -130,7 +131,7 @@ L0  fuyao-api（零内部依赖）
   - **`start(EngineParams)`**：一行启动（`init_engine` → `build_tool_registry` → 装配 `LoopGuardPlugin` → 创建 `SessionStore` → `Engine::new`（注入 store）→ `App::new` → `SessionManager::new` → `Discovery::new`），返回 `FuyaoApp { app, sessions, discovery }`——上层同时拿到运行时入口（`app`）、查询入口（`sessions`）、选择支持入口（`discovery`）；`app` 与 `sessions` 共享同一份 `Arc<SessionStore>`
   - **`FuyaoApp`**（`start` 的聚合产物）：`app: App`（运行时交互：create/send/recv/end）+ `sessions: SessionManager`（会话检索：list/count）+ `discovery: Discovery`（选择支持：列 Agent 定义 / model），平级正交、互不依赖
   - **`App`**（运行时交互门面，持 `Engine` + fan-in 出口）：`new(engine, mcp_manager, log_guard)` / `create_session(SessionParams)` → `SessionId`（rx 由内部 forwarder 消费进 fan_out）/ `resume_session` / `fork_session` / `create_child_session(parent, source, params)` → `(SessionId, rx)`（**rx 不进 fan_out**，返调用方独占消费）/ `send` / `recv()` → `Option<OutputEvent>`（单一出口）/ `end_session` / `shutdown(self)`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop log_guard）
-  - **`SessionManager`**（会话检索门面，持同一份 `Arc<SessionStore>`，与 `App` 平级正交）：`new(store)` / `list_sessions(workspace_filter, limit, offset)` → `Vec<Session>`（按 `last_active_at` 倒序，可选按 workspace 过滤）/ `session_count(workspace_filter)` → `i64` / `list_messages(session_id, before_seq: Option<i64>, limit: Option<i64>)` → `Vec<Message>`（游标分页，seq 倒序；`before_seq=None` 取最新一页，`Some(N)` 向前翻；`limit=None` 用默认 50；compaction 消息正常显示不过滤；不提供总数，下一页用返回条数 == limit 判断）
+  - **`SessionManager`**（会话检索门面，持同一份 `Arc<SessionStore>`，与 `App` 平级正交）：`new(store)` / `list_sessions(workspace_filter, limit, offset)` → `Vec<Session>`（按 `last_active_at` 倒序，可选按 workspace 过滤）/ `session_count(workspace_filter)` → `i64` / `list_messages(session_id, before_seq: Option<i64>, limit: Option<i64>)` → `Vec<Message>`（游标分页，seq 倒序；`before_seq=None` 取最新一页，`Some(N)` 向前翻；`limit=None` 用默认 50；compaction 消息正常显示不过滤；不提供总数，下一页用返回条数 == limit 判断）/ `list_events(session_id, before_seq, limit)` → `EventPage`（与 list_messages 同源取数同游标，经 `fuyao_core::messages_to_events` 把 Message 投影成与实时流同构的 `OutputEvent`，前端历史回放与实时流共用一套渲染；`has_more` / `next_cursor` 复用 list_messages 推导）
   - **`init_engine(EngineParams)`**：配置 / 日志 / Provider 准备，返回 `InitResult { provider: ProviderRegistry, log_guard }`；入口先做 agent_id 校验（来源前缀必须显式：`global/{名}` / `workspace/{名}`，大小写不敏感；workspace 来源须配 workspace 参数），非法即 fail-fast 报错
   - **`build_tool_registry()`**：收集内置 + MCP 工具，返回 `(ToolRegistry, Option<Arc<MCPManager>>)`
   - **`list_agent_ids(&AgentPaths)`**：列举可选 agent_id（启动前可用，不依赖引擎）。接收应用层构造的 `AgentPaths`，按其 workspace / fuyao_home 扫描 `fuyao-agents/`，返回 `Vec<AgentIdOption>`（纯名 id + 来源层 `source`，项目层同名覆盖全局层，按 id 升序）。应用层用同一份 `AgentPaths` 先列 id、再造 `EngineParams` 启动，保证列举基准与启动基准一致

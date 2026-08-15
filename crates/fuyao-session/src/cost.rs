@@ -5,14 +5,14 @@
 //!
 //! 提供：
 //! - [`calculate_cost`]：单条消息费用（Decimal 精确，按模型价格表算）
-//! - [`fill_message_cost`]：填 Message 的 token + cost 字段（算 + 填一步到位）
+//! - [`fill_message_cost`]：按 msg 已填的 token 字段算出 cost 并填入
 //!
 //! session 总计（total_* / total_cost）的累积不再由本模块负责——已下沉到
 //! [`SessionStore::insert_message`] 的事务内（DB 唯一数据源，SQL 原子自增）。
 //! 需要精确总额时从 `messages.cost` 列 `SUM` 重算。
 
 use fuyao_api::{AgentPaths, Message, PriceTier};
-use fuyao_provider::{StreamUsage, get_model};
+use fuyao_provider::get_model;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 
@@ -147,10 +147,12 @@ pub fn calculate_cost(
     )
 }
 
-/// 填 assistant Message 的 token + cost 字段
+/// 填 assistant Message 的 cost 字段（token 字段由调用方先行填好）
 ///
-/// 由 emit_to_history 闭包调用——闭包构造 Message 时一步完成"填 token + 算 cost"。
-/// 拦截不改 usage（token 是模型给的客观值），计费用原始 result.usage。
+/// 「何时计费」的知识归 history 模块（进历史统一入口）——本函数只负责
+/// 「怎么算」：读 msg 已填的四个 token 字段，按模型价格表算出 cost 并填入。
+/// token 字段不再经本函数转填：事件 payload 的 token 字段与 usage 同源
+///（拦截不改 usage），映射器直接从事件取值。
 ///
 /// model_id 必填（会话级 ModelConfig.model_id 已是 String，跑 turn 时经 resolve_model
 /// 校验非空），故本函数收到的 model_id 恒非空——不再有「缺失跳过」的分支。
@@ -158,19 +160,8 @@ pub fn calculate_cost(
 /// 注：`msg.cost` 字段是 f64（DB schema 决定），Decimal → f64 转换在这一步发生。
 /// session 总计的累积由 `insert_message` 事务内 SQL 原子自增完成（DB 唯一数据源）；
 /// 需要精确总额时从 `messages.cost` 列 `SUM` 重算，避免 f64 多次相加漂移。
-pub fn fill_message_cost(
-    msg: &mut Message,
-    usage: &StreamUsage,
-    model_id: &str,
-    agent_paths: &AgentPaths,
-) {
-    // 1. 填 token 字段（整数，无精度问题）
-    msg.prompt_tokens = usage.prompt_tokens as i64;
-    msg.completion_tokens = usage.completion_tokens as i64;
-    msg.reasoning_tokens = usage.completion_reasoning_tokens.unwrap_or(0) as i64;
-    msg.cached_tokens = usage.prompt_cached_tokens.unwrap_or(0) as i64;
-
-    // 2. 算 cost 并填进 msg.cost（Decimal 精确算，落 f64 时损失在所难免——DB schema 决定）
+pub fn fill_message_cost(msg: &mut Message, model_id: &str, agent_paths: &AgentPaths) {
+    // 算 cost 并填进 msg.cost（Decimal 精确算，落 f64 时损失在所难免——DB schema 决定）
     let cost = calculate_cost(
         model_id,
         msg.prompt_tokens,

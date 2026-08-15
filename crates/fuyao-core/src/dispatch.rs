@@ -9,20 +9,15 @@
 //! 2. **发送（deliver）**：经 `Emitter::emit` 推到出口通道（全引擎唯一发送出口）
 //! 3. **观察（observe）**：插件只读副作用（持久化/日志/统计）
 //!
-//! 调用方式：
-//! - **进历史的消息**（User 回显后的入队、Assistant、ToolResult 等）用
-//!   [`emit_to_history`]：拦截 → 用拦截后事件构造 Message 经 `store.insert_message`
-//!   单条落 DB → 发送事件 → 观察。**所有要落到 DB 的消息必经此入口**，保证
-//!   拦截→存储→消费三者一致。消息产生即落库（事件级落库），不进任何内存数组——
-//!   单个 session 内存占用恒定（不随历史增长）。
+//! 本模块只提供管道原语，不感知「进历史」语义：
 //! - 不进历史的纯事件（Chunk/Error/Compression/Interrupt 通知等）用 [`dispatch`]
+//! - 进历史的消息（要落 DB、参与计费）统一走 [`crate::history`] 的入口——
+//!   那里在管道之上叠加「事件投影 Message 落库 + seq 回填 + 计费」
 //! - 工具调用需要拿拦截结果回灌时，用 [`intercept`] 单独拦截
 
 use crate::emit::Emitter;
-use fuyao_api::Message;
 use fuyao_api::message::OutputEvent;
 use fuyao_hooks::{InterceptResult, SharedHooks};
-use fuyao_session::SessionStore;
 
 // ===== 管道各段：intercept / deliver =====
 
@@ -88,8 +83,8 @@ pub(crate) async fn deliver(
 ///
 /// Block 时整条丢弃（不发送、不观察）。
 ///
-/// 注意：本函数**不 push session.messages**——只走管道。如需把拦截后的消息落到
-/// 历史（进 DB + 下轮 LLM 输入），用 [`emit_to_history`]。
+/// 注意：本函数**不落 DB**——只走管道。如需把拦截后的消息落到历史
+/// （进 DB + 下轮 LLM 输入），用 [`crate::history::emit_to_history`]。
 pub(crate) async fn dispatch(emitter: &Emitter, hooks: &SharedHooks, event: OutputEvent) {
     // 1. 拦截
     let Some(intercepted) = intercept(emitter, hooks, event).await else {
@@ -98,64 +93,6 @@ pub(crate) async fn dispatch(emitter: &Emitter, hooks: &SharedHooks, event: Outp
 
     // 2. 发送 + 3. 观察
     deliver(emitter, hooks, intercepted).await;
-}
-
-/// 进历史消息的统一出口：拦截 → 构造 Message 单条落 DB → 发送事件 → 观察
-///
-/// 所有要进历史的消息（影响下轮 LLM 输入）必经此入口。保证「拦截 → 存储 → 消费」
-/// 三者数据一致——拦截后的事件既用来构造 Message 落 DB，又用来发送给 UI，同源不分裂。
-///
-/// **事件级落库**：消息产生即调 `store.insert_message` 单条 INSERT 进 DB，
-/// 不进任何内存数组。下轮 LLM 调用前用 `store.load_visible_messages` 按需查询。
-///
-/// `msg_from_event` 闭包从拦截后的 OutputEvent 提取字段构造 Message。
-/// 返回 `None` 表示该事件不应进历史（如转换失败或不匹配的事件类型）。
-///
-/// **计数 / 费用随落库自动累加**：闭包返回的 Message 应已填好 token + cost 字段
-/// （由调用方在闭包内用 `fuyao_session::fill_message_cost` 填充）。`insert_message`
-/// 在事务内把 token/cost/message_count/tool_call_count 原子累加到 sessions 表——
-/// DB 唯一数据源，落库与计费强绑定，未来新增产出点不会漏算 cost / 计数。
-///
-/// Block 时：不落库、不发，返回 None（调用方据此跳过后续动作，如入队）。
-/// 与现有 ToolCall Block 语义一致——消息不进历史、UI 看不到，是插件的责任。
-///
-/// 返回拦截后事件供调用方做后续动作（如入队、计费）。
-pub(crate) async fn emit_to_history(
-    emitter: &Emitter,
-    hooks: &SharedHooks,
-    store: &SessionStore,
-    event: OutputEvent,
-    msg_from_event: impl FnOnce(&OutputEvent) -> Option<Message>,
-) -> Option<OutputEvent> {
-    // 1. 拦截
-    let mut intercepted = intercept(emitter, hooks, event).await?;
-
-    // 2. 用拦截后事件构造 Message 后落 DB。
-    //    sessions 表的计数 / 费用累加由 insert_message 事务内原子完成（单一数据源，
-    //    不再维护内存 Session 镜像）。
-    if let Some(mut msg) = msg_from_event(&intercepted) {
-        // 事件级落库：单条 INSERT 进 DB（事务内一并累加 sessions 计数 / 费用）
-        // 失败仅 warn——保证拦截→发送→观察管道不被 DB 写失败阻塞；
-        // 调用方继续推进（消息可能丢失但 turn 流程不卡死，对齐 fail-loud 但不崩原则）
-        if let Err(e) = store.insert_message(emitter.session_id(), &mut msg).await {
-            tracing::warn!(
-                session_id = emitter.session_id(),
-                cause = %e,
-                role = msg.role.as_str(),
-                "消息落库失败（已丢弃，不影响 turn 推进）"
-            );
-        } else {
-            // 落库成功：seq 已回填到 msg，反写进事件 base，使实时事件与历史回放同构。
-            // 前端游标分页据此连续定位，实时 / 历史 id 不再分裂。
-            intercepted.base_mut().seq = Some(msg.seq);
-        }
-    }
-
-    // 3. 发送事件给 UI + 4. 观察钩子
-    //    move intercepted 进 deliver（避免 clone）；deliver 返回同一份 event 供本函数返回
-    let delivered = deliver(emitter, hooks, intercepted).await;
-
-    Some(delivered)
 }
 
 #[cfg(test)]
@@ -309,23 +246,6 @@ mod tests {
                 assert_eq!(m.base.session_id.as_deref(), Some("test-session"));
             }
             _ => panic!("应为 Assistant 事件"),
-        }
-    }
-
-    // ===== emit_to_history 测试 =====
-    //
-    // emit_to_history 改造后消息走 DB 落库，纯 dispatch 模块的单测不再覆盖它
-    // （需要 SessionStore + 真实 DB，由 fuyao-core 集成测试 react/tests.rs 覆盖）。
-    // 这里保留 assistant_msg_from_event 供未来需要时复用。
-    #[allow(dead_code)]
-    fn assistant_msg_from_event(ev: &OutputEvent) -> Option<Message> {
-        match ev {
-            OutputEvent::Assistant(m) => {
-                let mut msg = Message::assistant(m.payload.content.clone());
-                msg.reasoning = m.payload.reasoning.clone();
-                Some(msg)
-            }
-            _ => None,
         }
     }
 }

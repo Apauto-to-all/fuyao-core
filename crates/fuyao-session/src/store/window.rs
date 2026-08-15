@@ -218,7 +218,7 @@ mod tests {
         let msgs = vec![
             Message::user("u1".to_string()),
             assistant_with_tc,
-            Message::tool_result("call_1".into(), "结果".into()),
+            Message::tool_result("call_1".into(), "echo".into(), "结果".into()),
             Message::user("u2".to_string()),
         ];
         assert_eq!(expand_for_integrity(&msgs, 2), 1);

@@ -22,7 +22,6 @@
 
 mod builders;
 mod compression;
-mod normalize;
 pub(crate) mod queue;
 pub(crate) mod retry;
 mod rollback;
@@ -209,8 +208,8 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                     let p = ctx.session_params.lock().await;
                     p.model_config.clone()
                 };
-                // 一次性全部注入：每条经 emit_to_history（拦截 → insert_message 落 DB → 发送 → 观察）
-                queue::inject_messages(&ctx, msgs).await;
+                // 一次性全部注入：每条经统一历史入口（拦截 → 投影落 DB → 发送 → 观察）
+                crate::history::inject_user_messages(&ctx, msgs).await;
                 // 首轮 user 消息落库后立即触发标题生成（fire-and-forget，不等 AI 回复）：
                 // 在 run_turn 之前判定，解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤。
                 // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
@@ -261,11 +260,11 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
 /// 处理入站 User 消息：**纯入队**（无任何 side effect）
 ///
 /// 入队只负责按 mode 分流到 guide / pending 队列，**不做**拦截、不发事件、不触发钩子。
-/// 所有处理（拦截 / push / 发送 / 观察）推迟到 `inject_messages` 消费时统一过
-/// `emit_to_history` 管道——与 assistant / tool_result 走完全相同的路径。
+/// 所有处理（拦截 / 落库 / 发送 / 观察）推迟到消费时刻统一过
+/// `crate::history::inject_user_messages`——与 assistant / tool_result 走完全相同的路径。
 ///
-/// 这样保证 user 消息的拦截/push/发送三个时机**对齐**（都在消费时刻），
-/// 修复"以输入消息为核心组织"导致的三时机错位（拦截提前、发送提前、push 延迟）。
+/// 这样保证 user 消息的拦截/落库/发送三个时机**对齐**（都在消费时刻），
+/// 修复"以输入消息为核心组织"导致的三时机错位（拦截提前、发送提前、落库延迟）。
 async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
     let mode = inbound.payload.mode;
     match mode {

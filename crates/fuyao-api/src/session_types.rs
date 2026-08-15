@@ -332,10 +332,14 @@ impl Message {
     }
 
     /// 创建工具结果消息
-    pub fn tool_result(tool_call_id: String, content: String) -> Self {
+    ///
+    /// `tool_name` 随消息一并落库：历史回放投影 ToolResult 事件时据此还原工具名，
+    /// 不落库则回放侧永远拿不到工具名（实时事件有、回放事件无，两端分裂）。
+    pub fn tool_result(tool_call_id: String, tool_name: String, content: String) -> Self {
         Self {
             role: MessageRole::Tool,
             tool_call_id: Some(tool_call_id),
+            tool_name: Some(tool_name),
             content: Some(content),
             timestamp: current_timestamp(),
             ..Self::default()
@@ -508,9 +512,14 @@ mod tests {
 
     #[test]
     fn message_tool_result_creates_tool_role() {
-        let msg = Message::tool_result("call_123".to_string(), "结果".to_string());
+        let msg = Message::tool_result(
+            "call_123".to_string(),
+            "read".to_string(),
+            "结果".to_string(),
+        );
         assert_eq!(msg.role, MessageRole::Tool);
         assert_eq!(msg.tool_call_id, Some("call_123".to_string()));
+        assert_eq!(msg.tool_name, Some("read".to_string()));
     }
 
     #[test]

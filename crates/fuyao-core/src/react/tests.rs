@@ -962,6 +962,23 @@ async fn interrupt_during_streaming() {
         Some("你好"),
         "部分 AssistantMessage 应含已累积的文本"
     );
+
+    // 部分结果经统一历史入口落 DB：assistant 行携带 finish_reason=interrupted 与累积文本；
+    // 中断补发走不计费路径（token 全 0、不填 model_id）。
+    // 直取 ctx.store（字段级借用）——turn_fut 的 PinMut 仍持有 h.rx_interrupt 的可变借用
+    let visible: Vec<_> = h
+        .ctx
+        .store
+        .load_visible_messages(&h.session_id, usize::MAX)
+        .await
+        .unwrap();
+    let interrupted_row = visible
+        .iter()
+        .find(|m| m.finish_reason.as_deref() == Some("interrupted"))
+        .expect("中断补发的 assistant 消息应落 DB");
+    assert_eq!(interrupted_row.content.as_deref(), Some("你好"));
+    assert_eq!(interrupted_row.model_id, None);
+    assert_eq!(interrupted_row.cost, 0.0);
 }
 
 /// 中断-工具执行期间：工具 handler 阻塞时发 Interrupt → 产出 Interrupt + 中断式 ToolResult
@@ -1616,10 +1633,10 @@ async fn intercept_block_skips_final_assistant_in_history() {
     assert_eq!(db_session.total_cost, 0.0, "Block 时不应累积任何费用");
 }
 
-/// 用户消息经 inject_messages 时走 emit_to_history：插件可在**消费时刻**拦截改写。
+/// 用户消息经 inject_user_messages 时走统一历史入口：插件可在**消费时刻**拦截改写。
 ///
-/// 验证拦截/push/发送三时机对齐在消费时刻，与 assistant / tool_result 完全对称。
-/// 修复前 inject_messages 是裸 push，插件无法在 user 消息进历史时介入（拦截裂缝）。
+/// 验证拦截/落库/发送三时机对齐在消费时刻，与 assistant / tool_result 完全对称。
+/// 修复前注入是裸 push，插件无法在 user 消息进历史时介入（拦截裂缝）。
 #[tokio::test]
 async fn inject_messages_intercepts_user_at_consume_time() {
     let (tx_event, _rx_event) = mpsc::unbounded_channel::<OutputEvent>();
@@ -1670,7 +1687,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
 
     // 投两条消息进队列，注入后应都被拦截改写
     let msgs = vec![make_inbound("秘密1"), make_inbound("秘密2")];
-    queue::inject_messages(&ctx, msgs).await;
+    crate::history::inject_user_messages(&ctx, msgs).await;
 
     // 验证：DB 里的 content 是拦截后的（带 [脱敏] 前缀）
     let visible: Vec<_> = ctx
@@ -1693,7 +1710,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
 
 /// 插件/系统来源的 source 字段完整流到 DB 的产出事件（消费时刻发 UI）
 ///
-/// 验证修复错误①：source 字段不再丢失。检查 inject_messages 走 emit_to_history 后
+/// 验证修复错误①：source 字段不再丢失。检查 inject_user_messages 走统一历史入口后
 /// 发出的事件携带原始 source（含 Plugin 名称）。
 #[tokio::test]
 async fn inject_messages_preserves_plugin_source_in_event() {
@@ -1740,7 +1757,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
             }),
         },
     };
-    queue::inject_messages(&ctx, vec![inbound]).await;
+    crate::history::inject_user_messages(&ctx, vec![inbound]).await;
 
     // 收到的事件应是 OutputEvent::User 且 source = Plugin(loop_guard)
     let received = rx_event.try_recv().expect("应收到 User 事件");
@@ -1782,7 +1799,7 @@ async fn inject_images_persisted_faithfully() {
     // harness 不注册任何模型（注册表为空）——落库路径不查模型注册表
     let provider = Arc::new(MockProvider::new(vec![]));
     let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    queue::inject_messages(&h.ctx, vec![make_inbound_with_images("看图")]).await;
+    crate::history::inject_user_messages(&h.ctx, vec![make_inbound_with_images("看图")]).await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(visible.len(), 1);
@@ -1795,11 +1812,12 @@ async fn inject_images_persisted_faithfully() {
 #[tokio::test]
 async fn inject_images_failed_processing_appends_placeholder() {
     // 图片处理失败（超限且非法 base64，解码必败）：失败图省略，content 附加占位文本
-    // ——处理失败容错分支，与模型能力无关
+    // ——处理失败容错分支，与模型能力无关。
+    // 节流结果预写进事件：UI 收到的 User 事件与 DB 落库内容一致（同源同构）
     let bad_image = "!!!not-base64!!!".repeat(1_000_000); // 约 16MB，远超 5MB 上限
     let provider = Arc::new(MockProvider::new(vec![]));
-    let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    queue::inject_messages(
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    crate::history::inject_user_messages(
         &h.ctx,
         vec![make_inbound_with_image_data("看图", bad_image)],
     )
@@ -1814,6 +1832,28 @@ async fn inject_images_failed_processing_appends_placeholder() {
         content.contains("[图片已省略：图片处理失败]"),
         "content 应含处理失败占位文本，实际：{content}"
     );
+
+    // UI 侧事件与 DB 同一份：content 含占位文本、images 为空（预写进事件的结果）
+    let events = collect_events(&mut h.rx_event).await;
+    let user_event = events
+        .iter()
+        .find_map(|e| match e {
+            OutputEvent::User(m) => Some(m),
+            _ => None,
+        })
+        .expect("应发出 User 事件");
+    assert!(
+        user_event
+            .payload
+            .content
+            .contains("[图片已省略：图片处理失败]"),
+        "UI 事件 content 应与 DB 一致（含占位文本），实际：{}",
+        user_event.payload.content
+    );
+    assert!(
+        user_event.payload.images.is_empty(),
+        "UI 事件不应携带处理失败的图"
+    );
 }
 
 #[tokio::test]
@@ -1822,7 +1862,8 @@ async fn inject_images_failed_processing_empty_text_placeholder_only() {
     let bad_image = "!!!not-base64!!!".repeat(1_000_000);
     let provider = Arc::new(MockProvider::new(vec![]));
     let h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    queue::inject_messages(&h.ctx, vec![make_inbound_with_image_data("", bad_image)]).await;
+    crate::history::inject_user_messages(&h.ctx, vec![make_inbound_with_image_data("", bad_image)])
+        .await;
 
     let visible = visible_messages(&h).await;
     assert_eq!(

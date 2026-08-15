@@ -1,8 +1,9 @@
-//! 入站图片节流（normalize）
+//! 入站图片节流（history 子模块）
 //!
 //! 图片字节以 base64 内联进 DB，存储膨胀靠**入站源头节流**控制：
 //! 落库前对超限图片解码 → 等比缩放到 ≤2000px 最大边长 → JPEG 多档质量压缩，
-//! 首个达标档即用。落库即压缩成品，一次压缩同时服务存储与发送。
+//! 首个达标档即用。节流结果由 [`super::inject_user_messages`] 预写进事件，
+//! 落库即压缩成品，一次压缩同时服务存储与发送。
 //!
 //! 容错取舍：
 //! - 字节达标的图**原样保留**（压缩有损，不重复动）——不检查像素维度，
@@ -29,7 +30,7 @@ fn scaled_dimensions(w: u32, h: u32, max_pixels: u32) -> (u32, u32) {
 /// 入站节流：超限图压缩为达标 JPEG，达标图原样保留
 ///
 /// 返回 `None` 表示无法得到达标图（解码失败 / 全档压缩仍超限），调用方降级。
-pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
+fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
     let cfg = fuyao_api::get_config();
 
     // 入站归一：data URL → 裸 base64（统一后续处理基准与落库形态）
@@ -89,7 +90,7 @@ pub(crate) fn normalize_image(img: &ImageContent) -> Option<ImageContent> {
 /// 失败 = 解码失败 / 压缩后仍超限；失败图不进达标列表，调用方按 `failed` 计数
 /// 决定是否附加占位文本。整批在同一阻塞线程内处理（由调用方经 `spawn_blocking` 调入），
 /// 避免每张图各自 spawn 一次任务。
-pub(crate) fn normalize_images(images: &[ImageContent]) -> (Vec<ImageContent>, usize) {
+pub(super) fn normalize_images(images: &[ImageContent]) -> (Vec<ImageContent>, usize) {
     let mut kept = Vec::with_capacity(images.len());
     let mut failed = 0usize;
     for img in images {

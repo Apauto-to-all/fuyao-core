@@ -5,10 +5,9 @@
 //! - [`resolve_model`]：从 ModelConfig 解析 model + provider_id + StreamOptions
 //! - 各类 Assistant Payload 构造器（事件用）
 //! - 工具调用拦截回灌用的双向转换函数
-//! - [`fill_assistant_message_usage_and_cost`]：填 assistant Message 的 token + cost 字段
 //!
-//! 注：Message 主体构造由 turn.rs 的 emit_to_history 闭包内联完成（因每种事件的字段映射不同，
-//! 集中成 trait 反而过度抽象）。本模块只留 payload 构造、请求构造与 token/cost 填充。
+//! 注：Message 主体构造（事件 → 落库投影，含 token / cost 填充）归 history 模块统一
+//! 持有。本模块只留 payload 构造与请求构造。
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
@@ -373,7 +372,7 @@ mod tests {
         insert(
             &store,
             &session.id,
-            Message::tool_result("c2".into(), "结果2".into()),
+            Message::tool_result("c2".into(), "echo".into(), "结果2".into()),
         )
         .await;
 
@@ -408,13 +407,13 @@ mod tests {
         insert(
             &store,
             &session.id,
-            Message::tool_result("c1".into(), "结果1".into()),
+            Message::tool_result("c1".into(), "echo".into(), "结果1".into()),
         )
         .await;
         insert(
             &store,
             &session.id,
-            Message::tool_result("c2".into(), "结果2".into()),
+            Message::tool_result("c2".into(), "echo".into(), "结果2".into()),
         )
         .await;
 

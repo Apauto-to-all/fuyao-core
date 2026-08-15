@@ -13,7 +13,6 @@
 
 mod app;
 mod discovery;
-mod history_replay;
 mod init;
 mod logging;
 mod mcp;

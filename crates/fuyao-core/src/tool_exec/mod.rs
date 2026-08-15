@@ -4,14 +4,14 @@
 //! 工具执行是 session 级——各 task 在自己的 ReAct 循环里查 handler 执行，互不等。
 //!
 //! 工具结果不走队列：它是 ReAct 循环的内部中间产物，产生时 task 正握着控制权，
-//! 通过 `result_tx` 通知调用方，调用方立即走 `emit_to_history`（拦截 → push messages → 发事件）。
+//! 通过 `result_tx` 通知调用方，调用方立即走统一历史入口（拦截 → 落 DB → 发事件）。
 //!
 //! 关键设计：
 //! - **完成一个通知一个**：每执行完一个工具就立即通过 `result_tx` 发送结果，
 //!   不等所有工具都跑完才批量发出（避开归档「收齐再 emit、中断丢已完成结果」的结构债）。
 //!   并行版用 `JoinSet::join_next` 逐个收，完成即通知；串行版在循环里逐个通知。
-//! - **本模块不再 emit 事件**：emit/拦截/push session.messages 是调用方（turn.rs）的职责，
-//!   经 `emit_to_history` 统一入口完成。本模块只负责"执行 + 通知"。
+//! - **本模块不再 emit 事件**：emit/拦截/落库是调用方（turn.rs）的职责，
+//!   经 `crate::history` 统一入口完成。本模块只负责"执行 + 通知"。
 //! - **智能调度**：`should_parallelize` 判定批次能否并行（never_parallel / 路径重叠 /
 //!   parallel_safe），能并行走 `execute_parallel`（JoinSet + Semaphore），否则走 `execute_sequential`。
 //! - **容错降级**：未知工具不报错（返回提示字符串），参数解析失败用 `Value::Null`。
@@ -82,7 +82,7 @@ pub(crate) struct ToolExecCtx {
 ///
 /// 空批次直接返回。否则读 `[tools.runner]` 配置，`should_parallelize` 判定走并行还是串行。
 /// 两种路径都遵循「完成一个通知一个」——通过 `result_tx` 发送结果，调用方据此立即
-/// 走 `emit_to_history`（拦截 → push session.messages → 发送事件 → 观察）。
+/// 走统一历史入口（拦截 → 落 DB → 发送事件 → 观察）。
 ///
 /// 工具事件（ToolResult OutputEvent）的 emit 与拦截不在本模块做——归调用方统一处理，
 /// 保证「拦截 → 存储 → 消费」三者数据一致。
@@ -134,7 +134,7 @@ async fn execute_sequential(
 ) {
     for tc in tool_calls {
         let result = execute_single(tc, ctx).await;
-        // 完成一个通知一个：调用方据此立即走 emit_to_history
+        // 完成一个通知一个：调用方据此立即走统一历史入口
         if result_tx.send(result).await.is_err() {
             tracing::warn!(
                 session_id = ctx.emitter.session_id(),
@@ -149,7 +149,7 @@ async fn execute_sequential(
 ///
 /// 使用 JoinSet + Semaphore 控制并发数。
 /// - **通知顺序 = 完成顺序**：`join_next` 逐个收，完成即通过 `result_tx` 通知调用方
-///   （UX 上调用方立即走 emit_to_history，UI 先看到先完成的工具结果）。
+///   （UX 上调用方立即落库发事件，UI 先看到先完成的工具结果）。
 /// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误日志，不连坐兄弟任务。
 ///   JoinSet drop 时自动 abort 所有未完成任务（中断取消语义由调用方的 select! drop 触发）。
 async fn execute_parallel(
@@ -174,7 +174,7 @@ async fn execute_parallel(
         });
     }
 
-    // join_next 逐个收：完成一个通知一个（调用方据此 emit_to_history）
+    // join_next 逐个收：完成一个通知一个（调用方据此落库发事件）
     while let Some(joined) = join_set.join_next().await {
         match joined {
             Ok(result) => {
