@@ -12,7 +12,7 @@
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
 use crate::common::resolve_path;
-use crate::file::grep::types::{GrepArgs, GrepMatch, GrepResult, MAX_LIMIT};
+use crate::file::grep::types::{GrepArgs, GrepMatch, GrepResult};
 use crate::redact::redact_sensitive_text;
 use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
 use grep_regex::RegexMatcherBuilder;
@@ -47,14 +47,12 @@ fn redact_content_in_result(matches: &mut [GrepMatch]) {
 /// - `path`: 搜索根路径
 /// - `include`: 文件过滤模式（如 `*.py`、`*.{ts,tsx}`）
 /// - `limit`: 最大返回数量
-/// - `offset`: 跳过前 N 个结果
 /// - `context`: 匹配行的上下文行数
 fn search_content(
     pattern: &str,
     path: &str,
     include: Option<&str>,
     limit: usize,
-    offset: usize,
     context: usize,
     cancel: &AtomicBool,
 ) -> GrepResult {
@@ -111,6 +109,10 @@ fn search_content(
         if cancel.load(Ordering::Acquire) {
             break;
         }
+        // 已收集满且确认存在更多匹配，无需继续遍历
+        if total_count > limit {
+            break;
+        }
         let file_type = match entry.file_type() {
             Some(ft) => ft,
             None => continue,
@@ -135,7 +137,7 @@ fn search_content(
             UTF8(|line_num, line| {
                 total_count += 1;
 
-                if matches.len() < limit && total_count > offset {
+                if matches.len() < limit {
                     matches.push(GrepMatch {
                         file: file_path_str.clone(),
                         line: line_num,
@@ -148,7 +150,8 @@ fn search_content(
                     });
                 }
 
-                Ok(matches.len() < limit + offset)
+                // 收集满后再统计一条额外匹配即可确认截断，随后停止当前文件扫描
+                Ok(total_count <= limit)
             }),
         );
 
@@ -158,10 +161,12 @@ fn search_content(
         }
     }
 
+    // 截断判定：跳过收集后仍存在更多匹配（总数超过已收集数）
+    let truncated = total_count > matches.len();
     GrepResult {
         matches,
         total_count,
-        truncated: total_count > offset + limit,
+        truncated,
         pattern: pattern.to_string(),
         path: path.to_string(),
         error: None,
@@ -205,14 +210,16 @@ pub async fn grep_impl(
         path,
         include,
         limit,
-        offset,
         context,
     } = match parse_args(args) {
         Ok(a) => a,
         Err(e) => return ToolOutput::Err(e),
     };
-    let limit = limit.clamp(1, MAX_LIMIT) as usize;
-    let offset = offset.max(0) as usize;
+    // limit 硬上限由配置 search_max_results 驱动（usize → i64 防御性转换，防溢出；
+    // 上限钳到至少 1，避免配置为 0 时 clamp 区间非法 panic）
+    let config_limit =
+        i64::try_from(fuyao_api::get_config().tools.limits.search_max_results).unwrap_or(i64::MAX);
+    let limit = limit.clamp(1, config_limit.max(1)) as usize;
     let context_lines = context.max(0) as usize;
 
     if pattern.is_empty() {
@@ -236,7 +243,6 @@ pub async fn grep_impl(
                 &resolved_path,
                 include.as_deref(),
                 limit,
-                offset,
                 context_lines,
                 &cancel_clone,
             )
@@ -278,10 +284,8 @@ pub async fn grep_impl(
     redact_content_in_result(&mut result.matches);
 
     if result.truncated {
-        let next_offset = offset + limit;
-        result._hint = Some(format!(
-            "结果已截断。使用 offset={next_offset} 查看更多，或使用更具体的 pattern 或 include 缩小范围。"
-        ));
+        result._hint =
+            Some("结果已截断。请使用更具体的 pattern 或 include 参数缩小搜索范围。".to_string());
     }
 
     ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
@@ -358,5 +362,37 @@ mod tests {
         }];
         redact_content_in_result(&mut matches);
         assert_eq!(matches[0].content, "fn main() {}");
+    }
+
+    /// limit 超过配置上限（tools.limits.search_max_results）时被钳制截断
+    #[tokio::test]
+    async fn grep_limit_clamped_to_config_max() {
+        let dir = std::env::temp_dir().join("fuyao_test_grep_limit_clamp");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 写入超过配置默认上限（500）的匹配行，用远超上限的 limit 验证钳制生效
+        let content = (0..600)
+            .map(|i| format!("needle line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let file_path = dir.join("big.txt");
+        std::fs::write(&file_path, content).unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": file_path.to_string_lossy().to_string(),
+            "limit": 100000
+        });
+        let output = grep_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        let max = fuyao_api::get_config().tools.limits.search_max_results;
+        assert_eq!(json["matches"].as_array().map(Vec::len), Some(max));
+        assert_eq!(json["truncated"], serde_json::json!(true));
+        assert_eq!(json["total_count"], serde_json::json!(max + 1));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

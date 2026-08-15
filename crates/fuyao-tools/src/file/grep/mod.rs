@@ -34,10 +34,11 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
             .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))
             .default(json!(DEFAULT_PATH))
             .string("include", "文件过滤模式（如 *.py、*.{ts,tsx}）")
-            .integer("limit", format!("最大结果数（默认 {DEFAULT_LIMIT}）"))
+            .integer(
+                "limit",
+                format!("最大结果数（默认 {DEFAULT_LIMIT}，有硬上限，超出自动截断）"),
+            )
             .default(json!(DEFAULT_LIMIT))
-            .integer("offset", "跳过前 N 个结果（分页用）")
-            .default(json!(0))
             .integer("context", "显示匹配行的上下文行数")
             .default(json!(0))
             .build(),

@@ -17,6 +17,9 @@ use serde::Deserialize;
 pub struct ToolsLimitsConfig {
     /// 搜索命令超时（秒），原 `SEARCH_TIMEOUT=60`
     pub search_timeout_secs: u64,
+    /// 搜索工具（glob/grep）单次返回结果数的硬上限。
+    /// limit 参数超出此值会被静默截断——防大值请求撑爆上下文，需要更大批量时由用户上调
+    pub search_max_results: usize,
     /// 默认终端超时（秒），原 `TERMINAL_DEFAULT_TIMEOUT=120`
     pub terminal_default_timeout_secs: u64,
     /// 最大终端超时（秒），原 `TERMINAL_MAX_TIMEOUT=6000`
@@ -37,6 +40,7 @@ impl Default for ToolsLimitsConfig {
     fn default() -> Self {
         Self {
             search_timeout_secs: 60,
+            search_max_results: 500,
             terminal_default_timeout_secs: 120,
             terminal_max_timeout_secs: 6000,
             terminal_max_output_chars: 50_000,
@@ -163,6 +167,7 @@ mod tests {
     fn tools_limits_config_defaults_match_hardcoded() {
         let c = ToolsLimitsConfig::default();
         assert_eq!(c.search_timeout_secs, 60);
+        assert_eq!(c.search_max_results, 500);
         assert_eq!(c.terminal_default_timeout_secs, 120);
         assert_eq!(c.terminal_max_timeout_secs, 6000);
         assert_eq!(c.terminal_max_output_chars, 50_000);

@@ -7,10 +7,10 @@
 //!
 //! 使用 `ignore::WalkBuilder` 遍历目录树，`glob::Pattern` 匹配文件名。
 //! 自动跳过隐藏文件和 .gitignore 排除的文件。
-//! 搜索结果按修改时间排序（最新优先），支持 offset/limit 分页。
+//! 搜索结果按修改时间排序（最新优先），结果数受配置硬上限约束，超出自动截断。
 
 use crate::common::resolve_path;
-use crate::file::glob::types::{GlobArgs, GlobMatch, GlobResult, MAX_LIMIT};
+use crate::file::glob::types::{GlobArgs, GlobMatch, GlobResult};
 use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
 use glob::Pattern;
 use ignore::WalkBuilder;
@@ -23,21 +23,14 @@ use std::time::Duration;
 /// 搜索文件的核心实现
 ///
 /// 使用 `ignore::WalkBuilder` 遍历目录树，`glob::Pattern` 匹配文件名。
-/// 结果按修改时间排序（最新优先），支持 offset/limit 分页。
+/// 结果按修改时间排序（最新优先），超过 limit 的部分自动截断。
 ///
 /// # 参数
 ///
 /// - `pattern`: glob 模式（如 `*.rs`、`*.{ts,tsx}`）
 /// - `path`: 搜索根路径
 /// - `limit`: 最大返回数量
-/// - `offset`: 跳过前 N 个结果
-fn search_files(
-    pattern: &str,
-    path: &str,
-    limit: usize,
-    offset: usize,
-    cancel: &AtomicBool,
-) -> GlobResult {
+fn search_files(pattern: &str, path: &str, limit: usize, cancel: &AtomicBool) -> GlobResult {
     let search_path = crate::common::expand_tilde(path);
 
     if !search_path.exists() {
@@ -116,7 +109,7 @@ fn search_files(
     all_files.sort_by_key(|b| std::cmp::Reverse(b.2));
 
     let total = all_files.len();
-    let page: Vec<_> = all_files.into_iter().skip(offset).take(limit).collect();
+    let page: Vec<_> = all_files.into_iter().take(limit).collect();
 
     let matches: Vec<GlobMatch> = page
         .into_iter()
@@ -130,12 +123,22 @@ fn search_files(
     GlobResult {
         matches,
         total_count: total,
-        truncated: total > offset + limit,
+        truncated: total > limit,
         pattern: pattern.to_string(),
         path: path.to_string(),
         error: None,
         _hint: None,
     }
+}
+
+/// 将 limit 钳制到 `[1, 配置硬上限]` 区间
+///
+/// 上限来自 `[tools.limits] search_max_results`（usize），此处转换为 i64 参与钳制：
+/// 配置值超出 i64 表示范围时退化为 `i64::MAX`（即不设上限），防御异常配置。
+fn clamp_limit(limit: i64) -> usize {
+    let max =
+        i64::try_from(fuyao_api::get_config().tools.limits.search_max_results).unwrap_or(i64::MAX);
+    limit.clamp(1, max) as usize
 }
 
 /// glob 工具的异步入口
@@ -150,13 +153,11 @@ pub async fn glob_impl(
         pattern,
         path,
         limit,
-        offset,
     } = match parse_args(args) {
         Ok(a) => a,
         Err(e) => return ToolOutput::Err(e),
     };
-    let limit = limit.clamp(1, MAX_LIMIT) as usize;
-    let offset = offset.max(0) as usize;
+    let limit = clamp_limit(limit);
 
     if pattern.is_empty() {
         return ToolOutput::error("搜索模式不能为空");
@@ -174,13 +175,7 @@ pub async fn glob_impl(
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_clone = cancel.clone();
     let join = tokio::task::spawn_blocking(move || {
-        search_files(
-            &pattern_owned,
-            &resolved_path_clone,
-            limit,
-            offset,
-            &cancel_clone,
-        )
+        search_files(&pattern_owned, &resolved_path_clone, limit, &cancel_clone)
     });
     let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), join).await {
         Ok(Ok(r)) => r,
@@ -216,10 +211,7 @@ pub async fn glob_impl(
 
     let mut result = result;
     if result.truncated {
-        let next_offset = offset + limit;
-        result._hint = Some(format!(
-            "结果已截断。使用 offset={next_offset} 查看更多，或使用更具体的 pattern 缩小范围。"
-        ));
+        result._hint = Some("结果已截断。请使用更具体的 pattern 缩小搜索范围。".to_string());
     }
 
     ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
@@ -328,5 +320,18 @@ mod tests {
             _hint: None,
         };
         assert!(result.truncated);
+    }
+
+    #[test]
+    fn limit_exceeding_config_cap_is_clamped() {
+        // 未注入配置时 get_config 返回默认值（search_max_results = 500）
+        let cap = fuyao_api::get_config().tools.limits.search_max_results;
+        // 超大 limit 被压到配置硬上限
+        assert_eq!(clamp_limit(10_000_000), cap);
+        assert_eq!(clamp_limit(i64::MAX), cap);
+        // 超大负值 / 零钳制到下界 1，普通值原样保留
+        assert_eq!(clamp_limit(i64::MIN), 1);
+        assert_eq!(clamp_limit(0), 1);
+        assert_eq!(clamp_limit(50), 50);
     }
 }

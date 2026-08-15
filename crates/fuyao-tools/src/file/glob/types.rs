@@ -6,8 +6,6 @@
 pub const DEFAULT_PATH: &str = ".";
 /// 默认最大结果数
 pub const DEFAULT_LIMIT: i64 = 100;
-/// 最大结果数上限
-pub const MAX_LIMIT: i64 = 100;
 
 /// glob 工具参数（类型化解析）
 #[derive(Debug, serde::Deserialize)]
@@ -17,12 +15,9 @@ pub struct GlobArgs {
     /// 搜索路径
     #[serde(default = "default_path")]
     pub path: String,
-    /// 最大结果数
+    /// 最大结果数（钳制到配置硬上限内）
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// 跳过前 N 个结果（分页用）
-    #[serde(default)]
-    pub offset: i64,
 }
 
 fn default_path() -> String {

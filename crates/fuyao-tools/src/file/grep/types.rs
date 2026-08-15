@@ -6,8 +6,6 @@
 pub const DEFAULT_PATH: &str = ".";
 /// 默认最大结果数
 pub const DEFAULT_LIMIT: i64 = 50;
-/// 最大结果数上限
-pub const MAX_LIMIT: i64 = 100;
 
 /// grep 工具参数（类型化解析）
 #[derive(Debug, serde::Deserialize)]
@@ -22,9 +20,6 @@ pub struct GrepArgs {
     /// 最大结果数
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// 跳过前 N 个结果（分页用）
-    #[serde(default)]
-    pub offset: i64,
     /// 显示匹配行的上下文行数
     #[serde(default)]
     pub context: i64,
