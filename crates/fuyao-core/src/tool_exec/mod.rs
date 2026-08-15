@@ -15,6 +15,8 @@
 //! - **智能调度**：`should_parallelize` 判定批次能否并行（never_parallel / 路径重叠 /
 //!   parallel_safe），能并行走 `execute_parallel`（JoinSet + Semaphore），否则走 `execute_sequential`。
 //! - **容错降级**：未知工具不报错（返回提示字符串），参数解析失败用 `Value::Null`。
+//! - **panic 防护**：handler 调用包一层 catch_unwind——工具内部 panic 降级为该工具的
+//!   错误输出（模型可据此重试或换路径继续工作），不沿 session task 传播中断整个会话。
 //! - **工具的并发安全是工具自己的责任**：引擎只负责「让多个 session 能同时调同一个工具」，
 //!   不介入排序/加锁。Semaphore/JoinSet 是每次调用的局部对象，session 间互不可见、互不协调。
 //!
@@ -28,8 +30,10 @@ mod parallel;
 
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
+use futures_util::FutureExt;
 use fuyao_api::{CancellationToken, ToolCallContext, ToolCapabilities, ToolOutput};
 use fuyao_provider::ToolCallData;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
@@ -150,7 +154,9 @@ async fn execute_sequential(
 /// 使用 JoinSet + Semaphore 控制并发数。
 /// - **通知顺序 = 完成顺序**：`join_next` 逐个收，完成即通过 `result_tx` 通知调用方
 ///   （UX 上调用方立即落库发事件，UI 先看到先完成的工具结果）。
-/// - **panic 隔离**：单个工具 task panic 产生 JoinError，降级为错误日志，不连坐兄弟任务。
+/// - **panic 隔离**：handler panic 已在 [`execute_single`] 内降级为错误输出（第一层防护），
+///   正常不会传播到 task 边界。task 级异常（如 handler 调用之外的 panic）产生 JoinError，
+///   降级为错误日志，不连坐兄弟任务（第二层防护）。
 ///   JoinSet drop 时自动 abort 所有未完成任务（中断取消语义由调用方的 select! drop 触发）。
 async fn execute_parallel(
     tool_calls: &[ToolCallData],
@@ -188,6 +194,7 @@ async fn execute_parallel(
             }
             Err(join_err) => {
                 // task panic / 被取消：不连坐兄弟任务，降级为错误日志
+                // （handler panic 已在 execute_single 内降级为错误输出，此处是第二层兜底）
                 tracing::error!(
                     session_id = ctx.emitter.session_id(),
                     cause = %join_err,
@@ -201,7 +208,8 @@ async fn execute_parallel(
 /// 执行单个工具调用
 ///
 /// 查注册表拿 handler → 解析参数 → 构建 `ToolCallContext` → 调 handler。
-/// 容错：未知工具返回提示字符串；参数解析失败用 `Value::Null`。
+/// 容错：未知工具返回提示字符串；参数解析失败用 `Value::Null`；
+/// handler 内部 panic 降级为该工具的错误输出，不沿 session task 传播。
 ///
 /// 串行与并行共用本函数。注入句柄全部从 `ctx`（[`ToolExecCtx`]）取：
 /// `session_id` 取 `ctx.emitter.session_id()`，能力句柄整体取 `ctx.capabilities`。
@@ -234,7 +242,31 @@ async fn execute_single(tc: &ToolCallData, ctx: &ToolExecCtx) -> ToolExecResult 
     };
 
     let started = std::time::Instant::now();
-    let output = (entry.handler)(args, tool_ctx, ctx.cancel.clone()).await;
+    // panic 防护：handler 是任意第三方代码，内部 panic 不允许炸掉 session task。
+    // async 上下文不能用 std::panic::catch_unwind（不能跨 await 点），改用
+    // FutureExt::catch_unwind。AssertUnwindSafe 越过 unwind 安全检查的依据：
+    // panic 后原 future 的全部中间状态就地丢弃，不从 unwind 处恢复任何引用。
+    let output = match AssertUnwindSafe((entry.handler)(args, tool_ctx, ctx.cancel.clone()))
+        .catch_unwind()
+        .await
+    {
+        Ok(output) => output,
+        Err(payload) => {
+            // panic 分支在 match 内单独记耗时与错误日志（完成日志无法表达「panic 降级」语义）
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let cause = fuyao_hooks::panic_payload_to_string(&*payload);
+            tracing::error!(
+                tool_name = %tool_name,
+                cause = %cause,
+                elapsed_ms,
+                "工具 handler panic，已降级为错误输出"
+            );
+            // 错误文案面向模型：告知本次调用内部失败、可重试或换路径，让 ReAct 循环能继续推进
+            ToolOutput::error(format!(
+                "工具 {tool_name} 本次调用发生内部错误（panic: {cause}），本次执行未完成。可重试一次，或改用其他工具继续任务"
+            ))
+        }
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
     tracing::info!(tool_name = %tool_name, ok = !output.is_error(), elapsed_ms, "工具执行完成");

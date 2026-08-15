@@ -1,14 +1,16 @@
 //! 工具执行编排的单元测试
 //!
 //! 测逻辑分支（调度路径选择、通知顺序），不测运行时调度（无 sleep/计时）。
-//! 测试 handler 全部为瞬时 echo，毫秒级完成。
+//! 测试 handler 全部为瞬时 echo / 瞬时 panic，毫秒级完成。
 //!
 //! 注意：本模块不 emit 事件（emit 由调用方 turn.rs 经 emit_to_history 统一处理）。
 //! 测试只验证 `result_tx` 收到的 ToolExecResult。
 
 use super::*;
 use crate::tool_registry::ToolRegistryBuilder;
+use futures_util::FutureExt;
 use fuyao_api::{AgentPaths, CancellationToken, ToolDefinition, ToolEntry, ToolFn};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -62,6 +64,27 @@ fn echo_name_tool(name: &str) -> ToolEntry {
         definition: ToolDefinition::new(name, "测试工具"),
         handler,
         child_invisible: false,
+    }
+}
+
+/// 构造一个首次 poll 即 panic 的工具条目（验证 panic 防护降级）
+fn panic_tool(name: &str) -> ToolEntry {
+    let handler: ToolFn = Arc::new(|_args, _ctx, _cancel| Box::pin(async { panic!("boom") }));
+    ToolEntry {
+        definition: ToolDefinition::new(name, "测试工具"),
+        handler,
+        child_invisible: false,
+    }
+}
+
+/// 静音默认 panic hook（被测代码会捕获 panic，但默认 hook 仍向 stderr 打噪音）
+///
+/// 返回恢复函数：调用方在 panic 触发点结束后必须调用，避免影响其他测试的 panic 输出。
+fn silence_panic_hook() -> impl FnOnce() {
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    move || {
+        std::panic::set_hook(prev_hook);
     }
 }
 
@@ -241,4 +264,136 @@ async fn parallel_notify_count_matches_calls() {
     let results = collect_results(&tx, &mut rx, expected).await;
 
     assert_eq!(results.len(), expected, "通知次数应等于工具调用数");
+}
+
+// ---- panic 防护（handler 内部 panic 降级为错误输出，不沿 session task 传播） ----
+
+#[tokio::test]
+async fn execute_single_handler_panic_degrades_to_error_output() {
+    let restore_hook = silence_panic_hook();
+
+    let tools = Arc::new(
+        ToolRegistryBuilder::default()
+            .register(panic_tool("boom_tool"))
+            .build(),
+    );
+    let ctx = test_ctx(tools);
+    let tc = make_tool_call("1", "boom_tool", "{}");
+
+    // 外层再包一层 catch_unwind：若降级逻辑回归（panic 向外传播），测试以明确断言消息失败，
+    // 而不是让 panic 炸掉测试本身；两种结局都先恢复 hook
+    let outcome = AssertUnwindSafe(execute_single(&tc, &ctx))
+        .catch_unwind()
+        .await;
+    restore_hook();
+
+    let result = match outcome {
+        Ok(result) => result,
+        Err(_) => panic!("handler panic 应被降级为错误输出，而不是向外传播"),
+    };
+
+    assert_eq!(result.tool_name, "boom_tool");
+    assert_eq!(result.tool_call_id, "1");
+    assert!(
+        result.content.contains("内部错误"),
+        "应含「内部错误」提示，实际：{}",
+        result.content
+    );
+    assert!(
+        result.content.contains("panic") && result.content.contains("boom"),
+        "应透传 panic 消息帮助定位，实际：{}",
+        result.content
+    );
+}
+
+#[tokio::test]
+async fn sequential_batch_panic_notifies_error_and_continues() {
+    // bash 在 never_parallel 默认列表 → 整批串行；
+    // 首个工具 panic 降级为错误输出并正常通知，后续工具继续执行
+    let restore_hook = silence_panic_hook();
+
+    let tools = Arc::new(
+        ToolRegistryBuilder::default()
+            .register(panic_tool("bash"))
+            .register(echo_name_tool("read"))
+            .build(),
+    );
+    let ctx = test_ctx(tools);
+    let calls = vec![
+        make_tool_call("1", "bash", "{}"),
+        make_tool_call("2", "read", r#"{"name":"a"}"#),
+    ];
+    let (tx, mut rx) = mpsc::channel(8);
+
+    let outcome = AssertUnwindSafe(execute_tools(&calls, &tx, &ctx))
+        .catch_unwind()
+        .await;
+    restore_hook();
+
+    match outcome {
+        Ok(()) => {}
+        Err(_) => panic!("串行批次中单个工具 panic 应降级为错误输出，而不是炸掉整批"),
+    }
+
+    let results = collect_results(&tx, &mut rx, calls.len()).await;
+    assert_eq!(results.len(), 2, "panic 工具与正常工具都应产出结果");
+    assert_eq!(results[0].tool_name, "bash");
+    assert!(
+        results[0].content.contains("内部错误"),
+        "panic 应降级为错误输出，实际：{}",
+        results[0].content
+    );
+    assert_eq!(results[1].tool_name, "read");
+    assert_eq!(
+        results[1].content, "result_a",
+        "panic 后的后续工具应正常执行"
+    );
+}
+
+#[tokio::test]
+async fn parallel_batch_panic_degrades_and_siblings_complete() {
+    // glob/grep 在 parallel_safe 默认列表 → 并行；
+    // panic 工具在 spawn task 内降级为错误输出，兄弟任务不受连坐
+    let restore_hook = silence_panic_hook();
+
+    let tools = Arc::new(
+        ToolRegistryBuilder::default()
+            .register(panic_tool("grep"))
+            .register(echo_name_tool("glob"))
+            .build(),
+    );
+    let ctx = test_ctx(tools);
+    let calls = vec![
+        make_tool_call("1", "grep", "{}"),
+        make_tool_call("2", "glob", r#"{"name":"a"}"#),
+    ];
+    let (tx, mut rx) = mpsc::channel(8);
+
+    let outcome = AssertUnwindSafe(execute_tools(&calls, &tx, &ctx))
+        .catch_unwind()
+        .await;
+    restore_hook();
+
+    match outcome {
+        Ok(()) => {}
+        Err(_) => panic!("并行批次中单个工具 panic 应降级为错误输出，而不是炸掉整批"),
+    }
+
+    let results = collect_results(&tx, &mut rx, calls.len()).await;
+    assert_eq!(results.len(), 2, "panic 工具与正常工具都应产出结果");
+    // 完成顺序不确定，按工具名匹配断言
+    let degraded = results
+        .iter()
+        .find(|r| r.tool_name == "grep")
+        .expect("panic 工具应有降级结果");
+    assert!(
+        degraded.content.contains("内部错误"),
+        "panic 应降级为错误输出，实际：{}",
+        degraded.content
+    );
+    let sibling = results
+        .iter()
+        .find(|r| r.tool_name == "glob")
+        .expect("兄弟工具应正常完成");
+    assert_eq!(sibling.content, "result_a", "panic 不应连坐兄弟任务");
 }
