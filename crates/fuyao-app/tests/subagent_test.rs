@@ -8,7 +8,7 @@
 //! - 子 session 的 Chunk 等中间事件经父 forwarder 进 fan_out（session_id 标 child）
 //!
 //! 仅覆盖端到端主干路径：
-//! - 递归防护（`definitions_json_for(true)` 排除 subagent）已有单测（`tool_registry.rs`）
+//! - 递归防护（`definitions_for(true)` 排除 subagent）已有单测（`tool_registry.rs`）
 //! - 子 session 一次性（end_session 后 rx 返 None）已有单测（`child_session_test.rs`）
 
 mod common;

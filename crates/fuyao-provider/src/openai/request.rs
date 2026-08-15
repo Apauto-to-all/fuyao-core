@@ -145,7 +145,14 @@ pub(crate) fn build_request_body(
     if let Some(tools) = &options.tools
         && !tools.is_empty()
     {
-        body["tools"] = serde_json::Value::Array(tools.clone());
+        // 中立工具定义逐个包壳为协议 wire 形态：
+        // {"type":"function","function":{name, description, parameters}}
+        let wire_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .filter_map(|def| serde_json::to_value(def).ok())
+            .map(|function| serde_json::json!({ "type": "function", "function": function }))
+            .collect();
+        body["tools"] = serde_json::Value::Array(wire_tools);
     }
 
     // 思考字段独立注入：thinking_type 与 reasoning_effort 是两个正交字段，
@@ -417,14 +424,7 @@ mod tests {
     fn build_request_body_with_tools() {
         let request = ChatRequest::default();
         let options = ProviderStreamOptions {
-            tools: Some(vec![serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": "bash",
-                    "description": "执行命令",
-                    "parameters": {}
-                }
-            })]),
+            tools: Some(vec![fuyao_api::ToolDefinition::new("bash", "执行命令")]),
             ..Default::default()
         };
         let body = build_request_body(request, "qwen3.6-plus", &options, false);

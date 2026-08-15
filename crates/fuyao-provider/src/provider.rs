@@ -63,7 +63,8 @@ pub enum FinishReason {
 /// 流式选项
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
-    pub tools: Option<Vec<serde_json::Value>>,
+    /// 工具定义列表（中立形态，wire 编码归协议实现层）
+    pub tools: Option<Vec<fuyao_api::ToolDefinition>>,
     /// 思考开关（对应 thinking.type 字段）。None 时不发，走模型默认
     ///
     /// **与 reasoning_effort 正交独立**：两者各自为 Some 时各自发送，互不压制。

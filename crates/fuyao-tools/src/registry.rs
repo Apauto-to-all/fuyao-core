@@ -7,7 +7,7 @@
 //!
 //! 使用 `LazyLock<HashMap>` 实现编译时注册，零运行时开销。
 //! Agent 通过 `get_tool()` 获取工具条目，通过 `all_tools()` 获取全部工具定义。
-//! key 为 schema 定义里的工具名（`definition.function.name`，单一来源）。
+//! key 为 schema 定义里的工具名（`definition.name`，单一来源）。
 
 use fuyao_api::ToolEntry;
 use std::collections::HashMap;
@@ -72,7 +72,7 @@ mod tests {
     #[test]
     fn get_tool_returns_correct_definition() {
         let entry = get_tool("read").unwrap();
-        assert_eq!(entry.definition.function.name, "read");
+        assert_eq!(entry.definition.name, "read");
     }
 
     #[test]

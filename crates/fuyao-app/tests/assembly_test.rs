@@ -33,26 +33,18 @@ async fn build_registry_includes_core_tools() {
     // 无 mcp 配置 → mcp_manager 为 None
     assert!(mcp_manager.is_none(), "无 MCP 配置时 mcp_manager 应为 None");
 
-    let defs = registry.definitions_json_for(false, &std::collections::HashMap::new());
+    let defs = registry.definitions_for(false, &std::collections::HashMap::new());
     assert!(
         defs.len() >= 5,
         "应注入至少 5 个内置工具，实际：{}",
         defs.len()
     );
 
-    // 序列化后含 function.name，校验核心工具存在
-    let names: Vec<String> = defs
-        .iter()
-        .filter_map(|s| {
-            s.get("function")
-                .and_then(|f| f.get("name"))
-                .and_then(|n| n.as_str())
-                .map(String::from)
-        })
-        .collect();
+    // 定义直接携带名称，校验核心工具存在
+    let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     for expected in ["read", "write", "glob", "grep", "bash"] {
         assert!(
-            names.iter().any(|n| n == expected),
+            names.contains(&expected),
             "应注入工具 {expected}，实际：{names:?}"
         );
     }

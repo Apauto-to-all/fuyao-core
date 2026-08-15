@@ -7,11 +7,11 @@
 //! （内置工具、MCP 工具、外部注册的工具）收集 [`ToolEntry`] 注入进来。
 //! 这样核心保持轻量，同时支持未来动态注册外部工具。
 
-use fuyao_api::ToolEntry;
+use fuyao_api::{ToolDefinition, ToolEntry};
 use std::collections::HashMap;
 
 #[cfg(test)]
-use fuyao_api::{ToolDefinition, ToolFn};
+use fuyao_api::ToolFn;
 
 /// 工具注册表（引擎级共享）
 ///
@@ -47,7 +47,7 @@ impl ToolRegistry {
         self.inner.keys().map(String::as_str)
     }
 
-    /// 序列化工具定义为 JSON Value 数组，按 session 上下文过滤可见子集
+    /// 收集工具定义为 typed 数组，按 session 上下文过滤可见子集
     ///
     /// 两层过滤叠加（交集语义）：
     /// - `is_child=true` 时跳过 [`ToolEntry::child_invisible`] 为 `true` 的工具
@@ -57,18 +57,17 @@ impl ToolRegistry {
     ///
     /// 工具集改变会冲掉 LLM 前缀缓存，故 `definition_tools` 取自创建时定死的 `AgentDefinition`。
     ///
-    /// `ToolDefinition` 已实现 `Serialize`，直接 `to_value` 即可。
     /// 空注册表返回空 Vec（调用方据此决定是否带 tools 字段）。
-    pub fn definitions_json_for(
+    pub fn definitions_for(
         &self,
         is_child: bool,
         definition_tools: &HashMap<String, bool>,
-    ) -> Vec<serde_json::Value> {
+    ) -> Vec<ToolDefinition> {
         self.inner
             .values()
             .filter(|e| !is_child || !e.child_invisible)
-            .filter(|e| definition_tools.get(&e.definition.function.name) != Some(&false))
-            .filter_map(|e| serde_json::to_value(&e.definition).ok())
+            .filter(|e| definition_tools.get(&e.definition.name) != Some(&false))
+            .map(|e| e.definition.clone())
             .collect()
     }
 }
@@ -84,7 +83,7 @@ pub struct ToolRegistryBuilder {
 impl ToolRegistryBuilder {
     /// 注册一个工具
     pub fn register(mut self, entry: ToolEntry) -> Self {
-        let name = entry.definition.function.name.clone();
+        let name = entry.definition.name.clone();
         self.inner.insert(name, entry);
         self
     }
@@ -92,7 +91,7 @@ impl ToolRegistryBuilder {
     /// 批量注册工具
     pub fn register_all(mut self, entries: impl IntoIterator<Item = ToolEntry>) -> Self {
         for entry in entries {
-            let name = entry.definition.function.name.clone();
+            let name = entry.definition.name.clone();
             self.inner.insert(name, entry);
         }
         self
@@ -137,8 +136,8 @@ mod tests {
         assert!(reg.is_empty());
         assert_eq!(reg.len(), 0);
         assert!(reg.get("any").is_none());
-        assert!(reg.definitions_json_for(false, &no_restrict).is_empty());
-        assert!(reg.definitions_json_for(true, &no_restrict).is_empty());
+        assert!(reg.definitions_for(false, &no_restrict).is_empty());
+        assert!(reg.definitions_for(true, &no_restrict).is_empty());
     }
 
     #[test]
@@ -162,23 +161,23 @@ mod tests {
     }
 
     #[test]
-    fn definitions_json_for_serializes_all_for_main_session() {
+    fn definitions_for_lists_all_for_main_session() {
         let reg = ToolRegistry::builder()
             .register_all([make_entry("read"), make_entry("write")])
             .build();
         // 主 session（is_child=false）看到全部工具
         let no_restrict = HashMap::new();
-        let defs = reg.definitions_json_for(false, &no_restrict);
+        let defs = reg.definitions_for(false, &no_restrict);
         assert_eq!(defs.len(), 2);
-        // 每个都是 {type:"function", function:{name, description, parameters}}
+        // 每个定义都直接携带名称与参数 schema
         for d in &defs {
-            assert_eq!(d["type"], "function");
-            assert!(d["function"]["name"].is_string());
+            assert!(!d.name.is_empty());
+            assert_eq!(d.parameters.kind, "object");
         }
     }
 
     #[test]
-    fn definitions_json_for_hides_child_invisible_for_child_session() {
+    fn definitions_for_hides_child_invisible_for_child_session() {
         // 注册 2 个普通工具 + 1 个对子 session 隐藏的工具
         let reg = ToolRegistry::builder()
             .register_all([
@@ -191,23 +190,20 @@ mod tests {
         assert_eq!(reg.len(), 3);
 
         // 主 session（is_child=false）：看到全部 3 个
-        let main_defs = reg.definitions_json_for(false, &no_restrict);
+        let main_defs = reg.definitions_for(false, &no_restrict);
         assert_eq!(main_defs.len(), 3);
 
         // 子 session（is_child=true）：只看到 2 个（subagent 被过滤）
-        let child_defs = reg.definitions_json_for(true, &no_restrict);
+        let child_defs = reg.definitions_for(true, &no_restrict);
         assert_eq!(child_defs.len(), 2);
-        let child_names: Vec<&str> = child_defs
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap_or(""))
-            .collect();
+        let child_names: Vec<&str> = child_defs.iter().map(|d| d.name.as_str()).collect();
         assert!(child_names.contains(&"read"));
         assert!(child_names.contains(&"write"));
         assert!(!child_names.contains(&"subagent"));
     }
 
     #[test]
-    fn definitions_json_for_applies_definition_tools_filter() {
+    fn definitions_for_applies_definition_tools_filter() {
         // 定义层 tools 收窄：显式 false 的工具不出现在 schema（与全局 [tools.enabled] 同款语义）
         let reg = ToolRegistry::builder()
             .register_all([make_entry("read"), make_entry("write"), make_entry("bash")])
@@ -219,25 +215,22 @@ mod tests {
         definition_tools.insert("bash".to_string(), false);
         definition_tools.insert("read".to_string(), true); // 显式 true 仍启用
 
-        let defs = reg.definitions_json_for(false, &definition_tools);
+        let defs = reg.definitions_for(false, &definition_tools);
         assert_eq!(defs.len(), 1, "只读场景仅 read 可见");
-        let names: Vec<&str> = defs
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap_or(""))
-            .collect();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"read"));
         assert!(!names.contains(&"write"));
         assert!(!names.contains(&"bash"));
     }
 
     #[test]
-    fn definitions_json_for_empty_definition_tools_means_all_enabled() {
-        // 空 definition_tools = 无限制（全部启用，向后兼容）
+    fn definitions_for_empty_definition_tools_means_all_enabled() {
+        // 空 definition_tools = 无限制（全部启用）
         let reg = ToolRegistry::builder()
             .register_all([make_entry("read"), make_entry("write")])
             .build();
         let no_restrict = HashMap::new();
-        let defs = reg.definitions_json_for(false, &no_restrict);
+        let defs = reg.definitions_for(false, &no_restrict);
         assert_eq!(defs.len(), 2);
     }
 

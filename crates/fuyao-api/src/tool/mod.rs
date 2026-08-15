@@ -1,8 +1,8 @@
 //! 工具模块
 //!
-//! 定义工具系统相关的类型，遵循 OpenAI Function Calling 规范。
+//! 定义工具系统相关的类型（中立形态，wire 编码归供应商适配层）。
 //! - `call`: 工具调用数据（ToolCallData，一次工具调用的中立表示）
-//! - `definition`: 工具定义（ToolDefinition、ToolSchema、ToolParameters、ToolParameterProperty）
+//! - `definition`: 工具定义（ToolDefinition、ToolParameters、ToolParameterProperty）
 //! - `entry`: 工具条目（ToolEntry = schema + handler + 可见性元数据 + insert_tool 注册）
 //! - `output`: 工具执行结果信封（ToolOutput / ToolError，"error" 键约定类型化）
 //! - `func`: 工具执行器函数类型（ToolFn）与 handler 侧辅助（tool_handler / parse_args）
@@ -20,7 +20,7 @@ pub mod output;
 pub use call::ToolCallData;
 pub use context::{ToolCallContext, ToolCapabilities};
 pub use definition::{
-    ToolDefinition, ToolDefinitionBuilder, ToolParameterProperty, ToolParameters, ToolSchema,
+    ToolDefinition, ToolDefinitionBuilder, ToolParameterProperty, ToolParameters,
 };
 pub use entry::{ToolEntry, insert_tool};
 pub use func::{ToolFn, parse_args, tool_handler};

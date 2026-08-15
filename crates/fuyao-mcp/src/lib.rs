@@ -50,7 +50,7 @@ pub struct RegisteredTool {
     pub server_name: String,
     /// 工具描述
     pub description: String,
-    /// OpenAI function schema
+    /// 工具 schema 定义（中立形态）
     pub schema: fuyao_api::ToolDefinition,
 }
 
@@ -478,15 +478,12 @@ fn build_tool_schema_from_info(
     }
 
     fuyao_api::ToolDefinition {
-        kind: "function".to_string(),
-        function: fuyao_api::ToolSchema {
-            name: prefixed_name.to_string(),
-            description: description.to_string(),
-            parameters: fuyao_api::ToolParameters {
-                kind: "object".to_string(),
-                properties,
-                required,
-            },
+        name: prefixed_name.to_string(),
+        description: description.to_string(),
+        parameters: fuyao_api::ToolParameters {
+            kind: "object".to_string(),
+            properties,
+            required,
         },
     }
 }
@@ -609,8 +606,8 @@ mod tests {
                 }
             }),
         );
-        assert_eq!(schema.function.name, "mcp_server_tool");
-        assert!(schema.function.parameters.properties.contains_key("input"));
+        assert_eq!(schema.name, "mcp_server_tool");
+        assert!(schema.parameters.properties.contains_key("input"));
     }
 
     #[test]

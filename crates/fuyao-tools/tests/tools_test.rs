@@ -39,11 +39,12 @@ fn registry_contains_expected_builtin_tools() {
 #[test]
 fn get_tool_returns_entry_with_definition() {
     let entry = get_tool("read").expect("read 工具应存在");
-    // definition 可序列化为 JSON schema
+    // definition 可序列化为 JSON schema，且序列化后为扁平形态（无协议包装层）
     let schema = serde_json::to_value(&entry.definition).expect("definition 应可序列化");
+    assert!(schema.get("name").is_some(), "schema 应含 name 字段");
     assert!(
-        schema.get("function").is_some(),
-        "schema 应含 function 字段"
+        schema.get("function").is_none(),
+        "schema 不应含 function 包装字段"
     );
 }
 

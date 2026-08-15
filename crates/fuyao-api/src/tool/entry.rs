@@ -36,15 +36,15 @@ impl ToolEntry {
         }
     }
 
-    /// 工具名（单一来源：schema 定义里的 `function.name`，与 LLM 可见名一致）
+    /// 工具名（单一来源：schema 定义里的 `name`，与 LLM 可见名一致）
     pub fn name(&self) -> &str {
-        &self.definition.function.name
+        &self.definition.name
     }
 }
 
 /// 以 schema 名为 key 注册工具条目进注册表
 ///
-/// 工具名只认 schema 定义里的 `function.name`（单一来源，不在注册处重复书写）。
+/// 工具名只认 schema 定义里的 `name`（单一来源，不在注册处重复书写）。
 /// 静态注册表在模块初始化期构建，重名属于编程错误，立即 panic 暴露。
 pub fn insert_tool(map: &mut HashMap<String, ToolEntry>, entry: ToolEntry) {
     let name = entry.name().to_string();

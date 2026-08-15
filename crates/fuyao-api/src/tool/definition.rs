@@ -1,7 +1,7 @@
 //! 工具定义类型
 //!
-//! 遵循 OpenAI Function Calling 规范的工具定义。
-//! 包含工具参数属性、参数定义、Schema 和完整定义。
+//! 工具定义的中立形态：名称 / 描述 / 参数 schema 三要素。
+//! 供应商适配层负责把中立形态编码为各自协议的 wire 形态后发送。
 
 use std::collections::HashMap;
 
@@ -68,11 +68,12 @@ impl Default for ToolParameters {
     }
 }
 
-/// 工具 Schema 定义
+/// 工具定义
 ///
-/// 遵循 OpenAI Function Calling 规范的工具定义。
+/// 中立形态：名称 / 描述 / 参数 schema 三要素平铺，
+/// 供供应商适配层编码为各自协议形态。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolSchema {
+pub struct ToolDefinition {
     /// 工具名称，唯一标识
     pub name: String,
 
@@ -83,29 +84,13 @@ pub struct ToolSchema {
     pub parameters: ToolParameters,
 }
 
-/// 工具完整定义
-///
-/// OpenAI API 调用时使用的工具定义格式。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ToolDefinition {
-    /// 工具类型，固定为 function
-    #[serde(rename = "type")]
-    pub kind: String,
-
-    /// 工具函数定义
-    pub function: ToolSchema,
-}
-
 impl ToolDefinition {
     /// 创建新的工具定义
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
-            kind: "function".to_string(),
-            function: ToolSchema {
-                name: name.into(),
-                description: description.into(),
-                parameters: ToolParameters::default(),
-            },
+            name: name.into(),
+            description: description.into(),
+            parameters: ToolParameters::default(),
         }
     }
 
@@ -152,7 +137,7 @@ impl ToolDefinitionBuilder {
 
     /// 追加一个参数（显式指定类型 `kind`）
     pub fn param(mut self, name: &str, kind: &str, description: impl Into<String>) -> Self {
-        self.def.function.parameters.properties.insert(
+        self.def.parameters.properties.insert(
             name.to_string(),
             ToolParameterProperty {
                 kind: kind.to_string(),
@@ -195,7 +180,6 @@ impl ToolDefinitionBuilder {
     pub fn default(mut self, value: serde_json::Value) -> Self {
         let name = self.last_param_name();
         self.def
-            .function
             .parameters
             .properties
             .get_mut(&name)
@@ -208,7 +192,6 @@ impl ToolDefinitionBuilder {
     pub fn enum_values(mut self, values: impl IntoIterator<Item = impl Into<String>>) -> Self {
         let name = self.last_param_name();
         self.def
-            .function
             .parameters
             .properties
             .get_mut(&name)
@@ -221,7 +204,6 @@ impl ToolDefinitionBuilder {
     pub fn items(mut self, items: HashMap<String, serde_json::Value>) -> Self {
         let name = self.last_param_name();
         self.def
-            .function
             .parameters
             .properties
             .get_mut(&name)
@@ -233,7 +215,7 @@ impl ToolDefinitionBuilder {
     /// 标记最近追加的参数为必填
     pub fn required(mut self) -> Self {
         let name = self.last_param_name();
-        self.def.function.parameters.required.push(name);
+        self.def.parameters.required.push(name);
         self
     }
 
@@ -255,11 +237,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_definition_new_creates_function_tool() {
+    fn tool_definition_new_creates_named_tool() {
         let tool = ToolDefinition::new("read_file", "读取文件内容");
-        assert_eq!(tool.kind, "function");
-        assert_eq!(tool.function.name, "read_file");
-        assert_eq!(tool.function.description, "读取文件内容");
+        assert_eq!(tool.name, "read_file");
+        assert_eq!(tool.description, "读取文件内容");
+        assert_eq!(tool.parameters.kind, "object");
+        assert!(tool.parameters.properties.is_empty());
+        assert!(tool.parameters.required.is_empty());
     }
 
     #[test]
@@ -282,7 +266,7 @@ mod tests {
     fn tool_definition_roundtrip_serialize_deserialize() {
         let mut def = ToolDefinition::new("read", "读取文件");
         // 填入一个参数，验证嵌套结构（properties / required / enum）往返保真
-        def.function.parameters.properties.insert(
+        def.parameters.properties.insert(
             "path".to_string(),
             ToolParameterProperty {
                 kind: "string".to_string(),
@@ -292,18 +276,16 @@ mod tests {
                 items: None,
             },
         );
-        def.function.parameters.required.push("path".to_string());
+        def.parameters.required.push("path".to_string());
 
         let json = serde_json::to_value(&def).expect("序列化失败");
         let back: ToolDefinition =
             serde_json::from_value(json).expect("反序列化失败（缺少 Deserialize）");
 
-        assert_eq!(back.kind, "function");
-        assert_eq!(back.function.name, "read");
-        assert_eq!(back.function.description, "读取文件");
-        assert_eq!(back.function.parameters.required, vec!["path".to_string()]);
+        assert_eq!(back.name, "read");
+        assert_eq!(back.description, "读取文件");
+        assert_eq!(back.parameters.required, vec!["path".to_string()]);
         let prop = back
-            .function
             .parameters
             .properties
             .get("path")
@@ -325,10 +307,9 @@ mod tests {
             .default(json!(500))
             .build();
 
-        assert_eq!(def.function.name, "read");
-        assert_eq!(def.function.parameters.required, vec!["path".to_string()]);
+        assert_eq!(def.name, "read");
+        assert_eq!(def.parameters.required, vec!["path".to_string()]);
         let path = def
-            .function
             .parameters
             .properties
             .get("path")
@@ -336,7 +317,6 @@ mod tests {
         assert_eq!(path.kind, "string");
         assert!(path.default.is_none());
         let limit = def
-            .function
             .parameters
             .properties
             .get("limit")
@@ -362,7 +342,6 @@ mod tests {
             .build();
 
         let mode = def
-            .function
             .parameters
             .properties
             .get("mode")
@@ -373,7 +352,6 @@ mod tests {
         );
         assert_eq!(mode.default, Some(json!("fast")));
         let list = def
-            .function
             .parameters
             .properties
             .get("list")

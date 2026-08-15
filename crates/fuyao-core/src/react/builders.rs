@@ -175,7 +175,7 @@ pub(crate) fn resolve_context_length(model_id: &str, agent_paths: &AgentPaths) -
 /// `context_length` 一并由 [`resolve_context_length`] 算出填进返回值——模型未注册
 /// 时为 `None`（不编造数字，各消费点从返回值取同一份口径，无需自行解析）。
 ///
-/// 工具定义按 `is_child`（递归防护）+ `definition_tools`（定义层收窄）双重过滤后序列化，
+/// 工具定义按 `is_child`（递归防护）+ `definition_tools`（定义层收窄）双重过滤，
 /// 两者取交集。
 ///
 /// 返回的 `ResolvedModel` 由调用方（turn.rs）继续从 `ctx.providers.get(provider_id)`
@@ -208,7 +208,7 @@ pub(crate) fn resolve_model(
     let reasoning_effort = model_config.reasoning_effort.clone();
 
     // 构造 StreamOptions（工具定义按 is_child + definition_tools 过滤——递归防护 + 定义层收窄）
-    let tool_defs = tools.definitions_json_for(is_child, definition_tools);
+    let tool_defs = tools.definitions_for(is_child, definition_tools);
     let options = StreamOptions {
         tools: if tool_defs.is_empty() {
             None
