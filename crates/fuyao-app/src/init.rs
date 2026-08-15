@@ -3,9 +3,10 @@
 //! 负责从 [`EngineParams`](fuyao_api::EngineParams) 出发完成引擎装配前的所有准备：
 //! 1. 加载 `.env` 环境变量（三层目录）
 //! 2. 加载三层 TOML 配置
-//! 3. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
-//! 4. 注册 Provider/Model 到注册表（带缓存，重复调用幂等）
-//! 5. 批量构造所有已注册 Provider 的实例（`ProviderRegistry::from_registered`）
+//! 3. 校验 `[tools.terminal].shell`（显式名非法 / 二进制定位失败即拒绝启动）
+//! 4. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
+//! 5. 注册 Provider/Model 到注册表（带缓存，重复调用幂等）
+//! 6. 批量构造所有已注册 Provider 的实例（`ProviderRegistry::from_registered`）
 //!
 //! 返回 `(ProviderRegistry, 日志 guard)`，
 //! 由 [`crate::start`] 组装进 `Engine::new`。工具注册表
@@ -44,6 +45,10 @@ pub enum InitError {
     /// agent_id 非法（格式错误 / workspace 来源缺 workspace 参数）
     #[error("agent_id 非法: {0}")]
     InvalidAgentId(String),
+
+    /// 终端 shell 配置非法（名字不在合法值内 / 对应可执行文件未找到）
+    #[error("终端 shell 配置非法: {0}")]
+    InvalidTerminalShell(String),
 }
 
 /// 引擎装配准备产物
@@ -76,6 +81,8 @@ pub struct InitResult {
 /// # 错误
 /// - [`InitError::InvalidAgentId`]：agent_id 格式非法（裸名 / 未知来源）或
 ///   workspace 来源缺 workspace 参数
+/// - [`InitError::InvalidTerminalShell`]：[tools.terminal].shell 显式名不在合法值内
+///   或对应可执行文件未找到
 /// - [`InitError::NoProviderAvailable`]：所有 Provider 实例创建失败
 /// - [`InitError::ConfigError`]：配置文件加载失败
 pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError> {
@@ -105,7 +112,14 @@ pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError>
         }
     }
 
-    // 3. 初始化日志：配置加载后 subscriber 尽早接管，guard 随返回值传出供 AppContext 持有。
+    // 3. [tools.terminal].shell 启动校验：显式名必须在合法值内且二进制可定位。
+    //    显式配置是用户强意图，非法即拒绝启动（fail loud），不静默换 shell。
+    //    经 get_config 读取与 shell 解析（LazyLock）同一份全局配置，校验结果
+    //    与运行时实际解析一致；无配置文件时读 default（auto），天然通过。
+    fuyao_tools::validate_shell_name(&fuyao_api::get_config().tools.terminal.shell)
+        .map_err(InitError::InvalidTerminalShell)?;
+
+    // 4. 初始化日志：配置加载后 subscriber 尽早接管，guard 随返回值传出供 AppContext 持有。
     //    文件层失败时自动降级为纯 stderr，不阻断启动（日志是辅助设施）。
     let logging_config = config
         .as_ref()
@@ -113,10 +127,10 @@ pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError>
         .unwrap_or_default();
     let log_guard = crate::logging::init_logging(&logging_config, agent_paths);
 
-    // 4. 注册 Provider/Model 配置到注册表（带缓存，重复调用幂等）
+    // 5. 注册 Provider/Model 配置到注册表（带缓存，重复调用幂等）
     ensure_registered(agent_paths, config.as_ref())?;
 
-    // 5. 批量构造所有已注册 Provider 的实例（单个失败仅 WARN 跳过）
+    // 6. 批量构造所有已注册 Provider 的实例（单个失败仅 WARN 跳过）
     let provider = ProviderRegistry::from_registered(agent_paths);
     if provider.is_empty() {
         return Err(InitError::NoProviderAvailable);
@@ -201,5 +215,17 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("agent_id 非法"), "{msg}");
         assert!(msg.contains("global/{名}"), "{msg}");
+    }
+
+    /// InitError::InvalidTerminalShell 透传校验错误信息（含合法值提示）
+    #[test]
+    fn init_error_invalid_terminal_shell_passes_message() {
+        let err = InitError::InvalidTerminalShell(
+            "shell = \"zsh\" 不在合法值内（合法值：auto | git_bash | powershell | cmd | bash | sh）".to_string(),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("终端 shell 配置非法"), "{msg}");
+        assert!(msg.contains("zsh"), "{msg}");
+        assert!(msg.contains("合法值"), "{msg}");
     }
 }

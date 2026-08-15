@@ -1,8 +1,9 @@
-//! 工具系统配置（开关 + 运行器 + 高频限制）
+//! 工具系统配置（开关 + 运行器 + 高频限制 + 终端）
 //!
 //! - `enabled`：原 `FuyaoConfig.tools` 的扁平开关迁移至此子表
 //! - `runner`：工具并发策略（`ToolRunnerConfig`，本模块定义）
 //! - `limits`：迁移自 `fuyao-tools/src/config.rs` 的高频可调项
+//! - `terminal`：终端工具行为（bash 工具的 shell 选择）
 //!
 //! 非高频项（`MAX_READ_CHARS`、各类缓存容量、`REDACT_SECRETS`、`SEARCH_EXCLUDE_DIRS`、
 //! `WEBFETCH_USER_AGENT`、`WEBFETCH_CACHE_*` 等）保持 const，不纳入。
@@ -112,6 +113,28 @@ impl Default for ToolRunnerConfig {
     }
 }
 
+/// 终端工具配置（bash 工具的 shell 选择），对应 TOML `[tools.terminal]`
+///
+/// `shell` 为字符串而非枚举：未知值在 serde 层放行（避免配置文件因一个字段整体解析失败），
+/// 由引擎启动校验统一拦截报错（fail loud，见 fuyao-tools 的 shell 启动校验）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TerminalConfig {
+    /// bash 工具使用的 shell：
+    /// - `"auto"`（默认）：自动探测（Windows: Git Bash > PowerShell > cmd；Unix: bash > sh）
+    /// - 显式名（与 shell_type 词表同名）：`git_bash` / `powershell` / `cmd` / `bash` / `sh`，
+    ///   按名定位二进制；名字非法或二进制不存在时引擎启动期报错拒绝启动
+    pub shell: String,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            shell: "auto".to_string(),
+        }
+    }
+}
+
 /// 工具系统聚合配置
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -123,6 +146,8 @@ pub struct ToolsConfig {
     pub runner: ToolRunnerConfig,
     /// 高频可调限制，对应 TOML `[tools.limits]`
     pub limits: ToolsLimitsConfig,
+    /// 终端工具配置（bash 的 shell 选择），对应 TOML `[tools.terminal]`
+    pub terminal: TerminalConfig,
 }
 
 impl ToolsConfig {
@@ -266,6 +291,47 @@ path_scoped = ["read", "write"]
         assert!(config.path_scoped_tools.contains("read"));
         assert!(config.path_scoped_tools.contains("write"));
         assert!(config.path_scoped_tools.contains("edit"));
+    }
+
+    /// TerminalConfig 默认 shell 为 auto
+    #[test]
+    fn terminal_config_default_shell_is_auto() {
+        assert_eq!(TerminalConfig::default().shell, "auto");
+        // 聚合配置缺省时连带取子默认
+        assert_eq!(ToolsConfig::default().terminal.shell, "auto");
+    }
+
+    /// [tools.terminal] 反序列化：显式 shell 名 + 缺省回退 auto
+    #[test]
+    fn deserialize_tools_terminal_shell() {
+        let toml_str = r#"
+[tools.terminal]
+shell = "powershell"
+"#;
+        #[derive(Deserialize)]
+        struct Wrap {
+            tools: ToolsConfig,
+        }
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.tools.terminal.shell, "powershell");
+        // 整段缺省时回退 auto
+        assert_eq!(ToolsConfig::default().terminal.shell, "auto");
+    }
+
+    /// 未知 shell 值在 serde 层放行：拦截职责在引擎启动校验（fail loud），
+    /// 配置文件不因单个字段值非法而整体解析失败
+    #[test]
+    fn deserialize_tools_terminal_unknown_shell_parses() {
+        let toml_str = r#"
+[tools.terminal]
+shell = "zsh"
+"#;
+        #[derive(Deserialize)]
+        struct Wrap {
+            tools: ToolsConfig,
+        }
+        let w: Wrap = toml::from_str(toml_str).unwrap();
+        assert_eq!(w.tools.terminal.shell, "zsh");
     }
 
     /// unknown_tool_names：返回不在已知集合内的配置 key

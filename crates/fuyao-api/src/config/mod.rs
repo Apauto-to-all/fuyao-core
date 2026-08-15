@@ -54,7 +54,9 @@ pub use mcp::McpGlobalConfig;
 pub use models::{ModelRef, ModelSelection};
 pub use plugins::PluginsConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig, TitleConfig};
-pub use tools::{ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, unknown_tool_names};
+pub use tools::{
+    TerminalConfig, ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, unknown_tool_names,
+};
 
 // 加载相关
 pub use env::load_env;
@@ -162,6 +164,7 @@ mod tests {
         assert!(c.mcp_servers.is_empty());
         assert!(c.tools.enabled.is_empty());
         assert_eq!(c.tools.limits.terminal_max_timeout_secs, 6000);
+        assert_eq!(c.tools.terminal.shell, "auto");
         assert_eq!(c.guard.loop_.tool_repeat_threshold, 4);
         assert_eq!(c.llm.request_timeout_secs, 300);
         assert_eq!(c.image.max_pixels, 2000);

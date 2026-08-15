@@ -33,9 +33,9 @@ pub use agent::{
 pub use config::{
     CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig,
     ImageConfig, LlmConfig, LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef,
-    ModelSelection, PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig, TitleConfig,
-    ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config, is_config_set, load_config,
-    load_env, load_merged_config, set_config, unknown_tool_names,
+    ModelSelection, PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig,
+    TerminalConfig, TitleConfig, ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config,
+    is_config_set, load_config, load_env, load_merged_config, set_config, unknown_tool_names,
 };
 pub use control::{ControlCommand, TurnDirective};
 pub use error::ApiError;
