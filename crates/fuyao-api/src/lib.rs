@@ -58,7 +58,7 @@ pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{
     CancellationToken, ChildSessionSource, SubagentOps, TodoStoreOps, ToolCallContext,
-    ToolCapabilities, ToolDefinition, ToolDefinitionBuilder, ToolEntry, ToolError, ToolFn,
-    ToolOutput, ToolParameterProperty, ToolParameters, ToolSchema, insert_tool, parse_args,
+    ToolCallData, ToolCapabilities, ToolDefinition, ToolDefinitionBuilder, ToolEntry, ToolError,
+    ToolFn, ToolOutput, ToolParameterProperty, ToolParameters, ToolSchema, insert_tool, parse_args,
     tool_handler,
 };

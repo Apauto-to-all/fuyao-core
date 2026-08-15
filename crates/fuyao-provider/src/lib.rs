@@ -14,7 +14,7 @@ pub use error::ProviderError;
 pub use openai::OpenAIProvider;
 pub use provider::{
     BoxStream, ChatMessage, ChatRequest, ChatResponse, FinishReason, Provider, StreamError,
-    StreamEvent, StreamOptions, StreamUsage, ToolCallData,
+    StreamEvent, StreamOptions, StreamUsage,
 };
 pub use registry::{
     ProviderRegistry, agent_paths_cache_key, clear_cache, get_model, get_provider, list_models,

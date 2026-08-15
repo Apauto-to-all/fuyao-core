@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use futures_util::Stream;
-use fuyao_api::{MessageRole, ThinkingType, get_config};
+use fuyao_api::{MessageRole, ThinkingType, ToolCallData, get_config};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 
@@ -93,8 +93,9 @@ pub struct ChatMessage {
     pub images: Vec<fuyao_api::ImageContent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// 工具调用列表（assistant 消息专用，中立 typed 形态；wire 适配在协议实现层）
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<serde_json::Value>>,
+    pub tool_calls: Option<Vec<ToolCallData>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,14 +124,6 @@ pub struct ChatResponse {
     pub tool_calls: Option<Vec<ToolCallData>>,
     pub usage: StreamUsage,
     pub finish_reason: FinishReason,
-}
-
-/// 工具调用数据
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCallData {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
 }
 
 /// 流类型别名

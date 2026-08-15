@@ -11,12 +11,10 @@
 
 use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::message::output::{
-    AssistantPayload, ToolCallMessage, ToolCallPayload, extract_id_name_pairs,
-};
+use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{AgentPaths, MessageRole, ModelConfig};
-use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions, ToolCallData};
+use fuyao_api::{AgentPaths, MessageRole, ModelConfig, ToolCallData};
+use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions};
 use fuyao_session::SessionStore;
 use std::collections::HashMap;
 
@@ -115,7 +113,7 @@ pub(crate) async fn build_chat_request(
             content: m.content.clone(),
             images: m.images.clone(),
             reasoning: m.reasoning.clone(),
-            tool_calls: m.tool_calls.as_ref().and_then(|tc| tc.as_array().cloned()),
+            tool_calls: m.tool_calls.clone(),
             tool_call_id: m.tool_call_id.clone(),
             tool_name: m.tool_name.clone(),
         });
@@ -124,9 +122,9 @@ pub(crate) async fn build_chat_request(
         if matches!(m.role, MessageRole::Assistant)
             && let Some(tool_calls) = m.tool_calls.as_ref()
         {
-            // schema 解析集中到 extract_id_name_pairs，此处不再硬编码字段名
-            for (id, name) in extract_id_name_pairs(tool_calls) {
-                if !id.is_empty() && !answered_ids.contains(id.as_str()) {
+            // typed 直接迭代，id / name 即字段
+            for tc in tool_calls {
+                if !tc.id.is_empty() && !answered_ids.contains(tc.id.as_str()) {
                     // 缺结果：补 error tool_result
                     messages.push(ChatMessage {
                         role: MessageRole::Tool,
@@ -134,8 +132,8 @@ pub(crate) async fn build_chat_request(
                         images: vec![],
                         reasoning: None,
                         tool_calls: None,
-                        tool_call_id: Some(id),
-                        tool_name: Some(name),
+                        tool_call_id: Some(tc.id.clone()),
+                        tool_name: Some(tc.name.clone()),
                     });
                 }
             }
@@ -320,18 +318,16 @@ mod tests {
 
     /// 构造带工具调用的 assistant Message
     fn assistant_with_calls(ids: &[&str]) -> Message {
-        let tool_calls: Vec<serde_json::Value> = ids
+        let tool_calls: Vec<ToolCallData> = ids
             .iter()
-            .map(|id| {
-                serde_json::json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {"name": "echo", "arguments": "{}"}
-                })
+            .map(|id| ToolCallData {
+                id: id.to_string(),
+                name: "echo".to_string(),
+                arguments: "{}".to_string(),
             })
             .collect();
         let mut msg = Message::assistant(Some("调用工具".to_string()));
-        msg.tool_calls = Some(serde_json::Value::Array(tool_calls));
+        msg.tool_calls = Some(tool_calls);
         msg.finish_reason = Some("tool_calls".to_string());
         msg
     }

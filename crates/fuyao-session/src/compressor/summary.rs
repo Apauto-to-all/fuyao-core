@@ -100,7 +100,7 @@ fn to_chat_message(m: &Message) -> ChatMessage {
         content: m.content.clone(),
         images: m.images.clone(),
         reasoning: m.reasoning.clone(),
-        tool_calls: m.tool_calls.as_ref().and_then(|tc| tc.as_array().cloned()),
+        tool_calls: m.tool_calls.clone(),
         tool_call_id: m.tool_call_id.clone(),
         tool_name: m.tool_name.clone(),
     }
@@ -342,7 +342,11 @@ mod tests {
     fn to_chat_message_preserves_all_fields() {
         let mut msg = Message::assistant(Some("回复".to_string()));
         msg.reasoning = Some("思考".to_string());
-        msg.tool_calls = Some(serde_json::json!([{"id": "call_1"}]));
+        msg.tool_calls = Some(vec![fuyao_api::ToolCallData {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]);
         msg.tool_call_id = Some("call_1".to_string());
         msg.tool_name = Some("bash".to_string());
 
@@ -350,7 +354,8 @@ mod tests {
         assert_eq!(cm.role, MessageRole::Assistant);
         assert_eq!(cm.content.as_deref(), Some("回复"));
         assert_eq!(cm.reasoning.as_deref(), Some("思考"));
-        assert!(cm.tool_calls.is_some());
+        let calls = cm.tool_calls.as_ref().expect("tool_calls 应透传");
+        assert_eq!(calls[0].id, "call_1");
         assert_eq!(cm.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(cm.tool_name.as_deref(), Some("bash"));
     }

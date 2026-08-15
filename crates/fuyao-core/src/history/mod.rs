@@ -8,8 +8,8 @@
 //!
 //! # 为何收敛
 //!
-//! 事件 payload 与 Message 落库形态的映射知识（含 OpenAI 嵌套 tool_calls 的
-//! 构造与解析）曾经散在各 emit 闭包与 app 侧的反向手写映射里，费用计算的
+//! 事件 payload 与 Message 落库形态的映射知识（含 tool_calls 的双向 typed
+//! 直映射）曾经散在各 emit 闭包与 app 侧的反向手写映射里，费用计算的
 //! 「何时调用」靠每个产出点自觉。收敛后：调用方只声明「发生了什么事件」，
 //! 映射、计费、seq 回填成为不可遗忘的实现细节；双向投影同居一模块，
 //! 落库格式一改，正反两个方向单点同步。
@@ -39,9 +39,9 @@ use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ToolCallPayload, ToolResultMessage, ToolResultPayload,
-    UserPayload, build_nested_tool_call, parse_nested_tool_call,
+    UserPayload,
 };
-use fuyao_api::{AgentPaths, Message, MessageRole};
+use fuyao_api::{AgentPaths, Message, MessageRole, ToolCallData};
 
 // ===== 正向：事件 → Message → 落库 =====
 
@@ -134,23 +134,22 @@ fn event_to_message(
             let p = &m.payload;
             let mut msg = Message::assistant(p.content.clone());
             msg.reasoning = p.reasoning.clone();
-            // tool_calls：事件扁平形态 → OpenAI 嵌套落库形态，与拦截后事件严格同源。
-            // arguments 取 tool_args 序列化（非法 JSON 的极端入参归一为 "null"，
-            // 回放侧解析失败有原串兜底，语义不受影响）
-            if let Some(calls) = &p.tool_calls {
-                let nested: Vec<serde_json::Value> = calls
-                    .iter()
-                    .map(|tc| {
-                        build_nested_tool_call(
-                            &tc.tool_call_id,
-                            &tc.tool_name,
-                            &tc.tool_args.to_string(),
-                        )
-                    })
-                    .collect();
-                if !nested.is_empty() {
-                    msg.tool_calls = Some(serde_json::Value::Array(nested));
-                }
+            // tool_calls：事件 payload → typed 直映射，与拦截后事件严格同源。
+            // arguments 取 tool_args 序列化（Value 序列化恒为合法 JSON 串），
+            // 空列表归 None（与「无工具调用」语义一致）
+            if let Some(calls) = &p.tool_calls
+                && !calls.is_empty()
+            {
+                msg.tool_calls = Some(
+                    calls
+                        .iter()
+                        .map(|tc| ToolCallData {
+                            id: tc.tool_call_id.clone(),
+                            name: tc.tool_name.clone(),
+                            arguments: tc.tool_args.to_string(),
+                        })
+                        .collect(),
+                );
             }
             msg.finish_reason = p.finish_reason.clone();
             // token 五字段：事件 payload 即权威（构造时自 usage 填入，拦截不改）
@@ -281,7 +280,7 @@ fn message_to_event(msg: &Message) -> Option<OutputEvent> {
             payload: AssistantPayload {
                 content: msg.content.clone(),
                 reasoning: msg.reasoning.clone(),
-                tool_calls: parse_tool_calls(msg.tool_calls.as_ref()),
+                tool_calls: parse_tool_calls(msg.tool_calls.as_deref()),
                 finish_reason: msg.finish_reason.clone(),
                 completion_tokens: msg.completion_tokens,
                 prompt_tokens: msg.prompt_tokens,
@@ -304,15 +303,21 @@ fn message_to_event(msg: &Message) -> Option<OutputEvent> {
     }
 }
 
-/// OpenAI 嵌套 tool_calls → 扁平 ToolCallPayload 列表
+/// typed tool_calls → 扁平 ToolCallPayload 列表
 ///
-/// 单条嵌套 schema 的字段拆解集中到 [`parse_nested_tool_call`]（`fuyao_api`），
-/// 本函数只管「数组遍历 + 空结果归 None」的外层逻辑。
-///
-/// 非数组 / 元素缺字段时跳过该元素（容错），不整体失败——单条工具调用损坏不应阻断整段历史。
-fn parse_tool_calls(tool_calls: Option<&serde_json::Value>) -> Option<Vec<ToolCallPayload>> {
-    let arr = tool_calls?.as_array()?;
-    let parsed: Vec<_> = arr.iter().filter_map(parse_nested_tool_call).collect();
+/// 字段直映射：`id → tool_call_id`、`name → tool_name`、
+/// `arguments`（JSON 字符串）解析为 `tool_args`（`Value`）。
+/// 解析失败兜底 `Value::Null`（外部脏数据容错，不阻断整段历史回放）；
+/// 空列表归 None（与流式事件「无工具调用」语义一致）。
+fn parse_tool_calls(tool_calls: Option<&[ToolCallData]>) -> Option<Vec<ToolCallPayload>> {
+    let parsed: Vec<_> = tool_calls?
+        .iter()
+        .map(|tc| ToolCallPayload {
+            tool_call_id: tc.id.clone(),
+            tool_name: tc.name.clone(),
+            tool_args: serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
     if parsed.is_empty() {
         None
     } else {
@@ -463,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_tool_calls_flat_to_nested() {
+    fn assistant_tool_calls_payload_maps_to_typed() {
         let ev = make_assistant_event(&|p| {
             p.finish_reason = Some("tool_calls".into());
             p.tool_calls = Some(vec![
@@ -481,19 +486,16 @@ mod tests {
         });
         let paths = AgentPaths::default();
         let msg = event_to_message(&ev, None, &paths).expect("应投影成功");
-        let calls = msg.tool_calls.expect("应落库嵌套 tool_calls");
-        let arr = calls.as_array().expect("应为 JSON 数组");
-        assert_eq!(arr.len(), 2);
-        // 嵌套形态：{id, type:function, function:{name, arguments}}
-        assert_eq!(arr[0]["id"], "call_1");
-        assert_eq!(arr[0]["function"]["name"], "search");
-        // arguments 是合法 JSON 字符串，内容与扁平 tool_args 语义一致
+        let calls = msg.tool_calls.expect("应落库 tool_calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "search");
+        // arguments 是合法 JSON 字符串，内容与 payload tool_args 语义一致
         assert_eq!(
-            arr[0]["function"]["arguments"]
-                .as_str()
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            serde_json::from_str::<serde_json::Value>(&calls[0].arguments).ok(),
             Some(serde_json::json!({"q": "rust"}))
         );
+        assert_eq!(calls[1].name, "read");
     }
 
     #[test]
@@ -673,20 +675,20 @@ mod tests {
     }
 
     #[test]
-    fn assistant_tool_calls_openai_nested_to_flat() {
-        // 落库形态：OpenAI 嵌套，arguments 是 JSON 字符串
-        let tool_calls = serde_json::json!([
-            {
-                "id": "call_1",
-                "type": "function",
-                "function": { "name": "search", "arguments": "{\"q\":\"rust\"}" }
+    fn assistant_tool_calls_typed_to_flat() {
+        // 落库形态：typed 直存，arguments 是 JSON 字符串
+        let tool_calls = vec![
+            ToolCallData {
+                id: "call_1".into(),
+                name: "search".into(),
+                arguments: "{\"q\":\"rust\"}".into(),
             },
-            {
-                "id": "call_2",
-                "type": "function",
-                "function": { "name": "read", "arguments": "{\"path\":\"/a.rs\"}" }
-            }
-        ]);
+            ToolCallData {
+                id: "call_2".into(),
+                name: "read".into(),
+                arguments: "{\"path\":\"/a.rs\"}".into(),
+            },
+        ];
         let msg = make_msg(MessageRole::Assistant, 5, &|m| {
             m.tool_calls = Some(tool_calls.clone());
         });
@@ -710,15 +712,14 @@ mod tests {
     }
 
     #[test]
-    fn assistant_invalid_arguments_string_falls_back_to_raw() {
-        // arguments 非 JSON（解析失败）→ 兜底成原字符串 Value，信息不丢
-        let tool_calls = serde_json::json!([{
-            "id": "call_x",
-            "type": "function",
-            "function": { "name": "bad", "arguments": "not-json" }
-        }]);
+    fn assistant_invalid_arguments_string_falls_back_to_null() {
+        // arguments 非 JSON（外部脏数据）→ tool_args 兜底 Null，不阻断回放
         let msg = make_msg(MessageRole::Assistant, 6, &|m| {
-            m.tool_calls = Some(tool_calls.clone());
+            m.tool_calls = Some(vec![ToolCallData {
+                id: "call_x".into(),
+                name: "bad".into(),
+                arguments: "not-json".into(),
+            }]);
         });
 
         let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
@@ -728,37 +729,14 @@ mod tests {
         };
         let call = &payload.tool_calls.expect("应有 tool_calls")[0];
         assert_eq!(call.tool_name, "bad");
-        // 解析失败兜底：原字符串作为 Value::String
-        assert_eq!(call.tool_args, serde_json::Value::String("not-json".into()));
-    }
-
-    #[test]
-    fn assistant_malformed_tool_call_element_skipped() {
-        // 缺 id 的元素应被跳过，不阻断其余合法元素
-        let tool_calls = serde_json::json!([
-            { "type": "function", "function": { "name": "no_id", "arguments": "{}" } },
-            { "id": "call_ok", "type": "function",
-              "function": { "name": "ok", "arguments": "{}" } }
-        ]);
-        let msg = make_msg(MessageRole::Assistant, 7, &|m| {
-            m.tool_calls = Some(tool_calls.clone());
-        });
-
-        let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
-            message_to_event(&msg).expect("assistant 应投影")
-        else {
-            panic!("变体类型不符");
-        };
-        let calls = payload.tool_calls.expect("应有 tool_calls");
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].tool_call_id, "call_ok");
+        assert_eq!(call.tool_args, serde_json::Value::Null);
     }
 
     #[test]
     fn assistant_empty_tool_calls_array_becomes_none() {
         // 空数组投影成 None（而非空 Vec），与流式事件「无工具调用」语义一致
         let msg = make_msg(MessageRole::Assistant, 8, &|m| {
-            m.tool_calls = Some(serde_json::json!([]));
+            m.tool_calls = Some(vec![]);
         });
         let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
             message_to_event(&msg).expect("assistant 应投影")

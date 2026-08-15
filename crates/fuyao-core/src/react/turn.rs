@@ -313,7 +313,7 @@ async fn handle_tool_calls(
 ) -> bool {
     // 步骤1：逐个拦截 ToolCall 事件，构造 effective_tool_calls
     // 整批 tool_calls 拆成单个 ToolCall 事件各自拦截；Block 的跳过。
-    let mut effective_tool_calls: Vec<fuyao_provider::ToolCallData> =
+    let mut effective_tool_calls: Vec<fuyao_api::ToolCallData> =
         Vec::with_capacity(result.tool_calls.len());
     for tc in &result.tool_calls {
         let event = tool_call_data_to_event(tc);

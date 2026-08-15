@@ -370,16 +370,20 @@ mod tests {
 
         insert_user(&store, &session.id, "u1").await; // seq 1
         let mut a1 = Message::assistant(None);
-        a1.tool_calls = Some(
-            serde_json::json!([{"id": "call_1", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]),
-        );
+        a1.tool_calls = Some(vec![fuyao_api::ToolCallData {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]);
         store.insert_message(&session.id, &mut a1).await.unwrap(); // seq 2
         insert_tool(&store, &session.id, "call_1", "结果1").await; // seq 3
         let u2 = insert_user(&store, &session.id, "u2").await; // seq 4
         let mut a2 = Message::assistant(None);
-        a2.tool_calls = Some(
-            serde_json::json!([{"id": "call_2", "type": "function", "function": {"name": "bash", "arguments": "{}"}}]),
-        );
+        a2.tool_calls = Some(vec![fuyao_api::ToolCallData {
+            id: "call_2".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]);
         store.insert_message(&session.id, &mut a2).await.unwrap(); // seq 5
         insert_tool(&store, &session.id, "call_2", "结果2").await; // seq 6
 

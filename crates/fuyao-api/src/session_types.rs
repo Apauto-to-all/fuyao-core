@@ -2,6 +2,7 @@
 //!
 //! Session、Message、TodoItem 类型。
 
+use crate::tool::ToolCallData;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn current_timestamp() -> f64 {
@@ -273,8 +274,8 @@ pub struct Message {
     pub reasoning: Option<String>,
     /// 工具调用 ID
     pub tool_call_id: Option<String>,
-    /// 工具调用列表（JSON）
-    pub tool_calls: Option<serde_json::Value>,
+    /// 工具调用列表（中立 typed 形态：id / 名称 / 参数 JSON 字符串）
+    pub tool_calls: Option<Vec<ToolCallData>>,
     /// 工具名称
     pub tool_name: Option<String>,
     /// 完成原因

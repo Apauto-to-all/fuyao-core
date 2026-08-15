@@ -65,6 +65,7 @@ impl super::SessionStore {
         .fetch_one(&mut *tx)
         .await?;
 
+        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
         let tool_calls_json = msg
             .tool_calls
             .as_ref()
@@ -243,7 +244,7 @@ impl super::SessionStore {
 mod tests {
     use super::super::SessionStore;
     use crate::store::compaction::CompressionReason;
-    use fuyao_api::{Message, MessageKind};
+    use fuyao_api::{Message, MessageKind, ToolCallData};
 
     /// 构造临时存储(隔离的临时目录)
     async fn temp_store() -> SessionStore {
@@ -285,17 +286,22 @@ mod tests {
         store.create(&session).await.unwrap();
 
         let mut msg = Message::assistant(None);
-        msg.tool_calls = Some(serde_json::json!([{
-            "id": "call_1",
-            "type": "function",
-            "function": { "name": "bash", "arguments": "{}" }
-        }]));
+        msg.tool_calls = Some(vec![ToolCallData {
+            id: "call_1".to_string(),
+            name: "bash".to_string(),
+            arguments: "{}".to_string(),
+        }]);
         store.insert_message(&session.id, &mut msg).await.unwrap();
 
         let full = store.load_full_history(&session.id).await.unwrap();
         assert_eq!(full.len(), 1);
-        assert!(full[0].tool_calls.is_some());
-        assert_eq!(full[0].tool_calls.as_ref().unwrap()[0]["id"], "call_1");
+        let calls = full[0].tool_calls.as_ref().expect("tool_calls 应落库");
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, "{}");
+        // DB 列为 flat 数组形态：id / name / arguments 三字段平铺，无嵌套 function 层
+        let flat = serde_json::to_string(calls).unwrap();
+        assert_eq!(flat, r#"[{"id":"call_1","name":"bash","arguments":"{}"}]"#);
     }
 
     #[tokio::test]

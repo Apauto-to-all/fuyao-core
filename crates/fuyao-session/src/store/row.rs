@@ -1,6 +1,6 @@
 //! 数据库行映射：sessions / messages 表 ↔ 领域类型（Session / Message）
 
-use fuyao_api::{Message, MessageKind, MessageRole, Session};
+use fuyao_api::{Message, MessageKind, MessageRole, Session, ToolCallData};
 use sqlx::FromRow;
 
 /// 会话行（数据库列映射，字段顺序与 sessions 表一致）
@@ -77,13 +77,16 @@ pub(super) struct MessageRow {
 
 impl From<MessageRow> for Message {
     fn from(r: MessageRow) -> Self {
-        let tool_calls = r.tool_calls.and_then(|s| match serde_json::from_str(&s) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!(cause = %e, "tool_calls 反序列化失败，已丢弃");
-                None
-            }
-        });
+        // tool_calls 列为 flat 数组形态（id / name / arguments 三字段平铺），直接反序列化为 typed
+        let tool_calls =
+            r.tool_calls
+                .and_then(|s| match serde_json::from_str::<Vec<ToolCallData>>(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(cause = %e, "tool_calls 反序列化失败，已丢弃");
+                        None
+                    }
+                });
         // 未知 role 兜底为 User 并记可观测日志（DB 历史脏数据：首字母大写、旧版本残留等）
         if !MessageRole::is_known(&r.role) {
             tracing::warn!(role = %r.role, "未知消息角色，兜底为 User");

@@ -18,11 +18,11 @@ mod sse;
 
 use crate::provider::{
     BoxStream, ChatRequest, ChatResponse, FinishReason as ProviderFinishReason, Provider,
-    StreamError, StreamEvent, StreamOptions as ProviderStreamOptions, StreamUsage, ToolCallData,
+    StreamError, StreamEvent, StreamOptions as ProviderStreamOptions, StreamUsage,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use fuyao_api::AgentPaths;
+use fuyao_api::{AgentPaths, ToolCallData};
 use reqwest::Client;
 use std::time::Duration;
 

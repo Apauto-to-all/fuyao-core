@@ -29,13 +29,13 @@ use crate::dispatch;
 use crate::emit::Emitter;
 use crate::react::SessionCtx;
 use fuyao_api::InterruptSource;
+use fuyao_api::ToolCallData;
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, InterruptMessage as OutputInterruptMessage,
     InterruptPayload as OutputInterruptPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::SharedHooks;
-use fuyao_provider::ToolCallData;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 

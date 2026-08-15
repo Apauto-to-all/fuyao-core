@@ -22,11 +22,16 @@ fn estimate_message_tokens(msg: &Message) -> usize {
     let tokens_per_image = fuyao_api::get_config().session.compression.tokens_per_image;
     let text_len =
         msg.content.as_deref().unwrap_or("").len() + msg.reasoning.as_deref().unwrap_or("").len();
-    // 不解析 tool_calls JSON 深度估算——保留粗估，压缩触发偏保守没问题
-    let tool_len = msg
+    // 不逐字段精确估算 tool_calls——按三字段长度求和粗估，压缩触发偏保守没问题
+    let tool_len: usize = msg
         .tool_calls
         .as_ref()
-        .map(|v| v.to_string().len())
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|tc| tc.id.len() + tc.name.len() + tc.arguments.len())
+                .sum()
+        })
         .unwrap_or(0);
     text_len.div_ceil(CHARS_PER_TOKEN)
         + tool_len.div_ceil(CHARS_PER_TOKEN)
@@ -107,21 +112,8 @@ pub fn expand_for_integrity(messages: &[Message], cut: usize) -> usize {
         if matches!(msg.role, MessageRole::Assistant) {
             if let Some(ref tool_calls) = msg.tool_calls {
                 // 检查这个 assistant 的所有 tool_call_id 是否在后续消息中都有 result
-                // 解析出 owned id 列表避免借用冲突
-                let call_ids: Vec<String> =
-                    serde_json::from_value::<Vec<serde_json::Value>>(tool_calls.clone())
-                        .map(|calls| {
-                            calls
-                                .iter()
-                                .filter_map(|tc| {
-                                    tc.get("id").and_then(|v| v.as_str()).map(String::from)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-
                 let call_id_refs: std::collections::HashSet<&str> =
-                    call_ids.iter().map(String::as_str).collect();
+                    tool_calls.iter().map(|tc| tc.id.as_str()).collect();
 
                 // 收集 cut 之后的 tool result id
                 let result_ids: std::collections::HashSet<&str> = messages[scan + 1..total]
@@ -214,7 +206,11 @@ mod tests {
     #[test]
     fn expand_for_integrity_moves_past_tool_result() {
         let mut assistant_with_tc = Message::assistant(None);
-        assistant_with_tc.tool_calls = Some(serde_json::json!([{"id": "call_1"}]));
+        assistant_with_tc.tool_calls = Some(vec![fuyao_api::ToolCallData {
+            id: "call_1".into(),
+            name: "echo".into(),
+            arguments: "{}".into(),
+        }]);
         let msgs = vec![
             Message::user("u1".to_string()),
             assistant_with_tc,

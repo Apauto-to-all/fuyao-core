@@ -7,6 +7,7 @@
 //! 本模块做「StreamEvent → OutputEvent」的事件累加，两者正交、不重叠。
 
 use crate::{StreamEvent, StreamUsage};
+use fuyao_api::ToolCallData;
 use fuyao_api::message::output::{ChunkMessage, ChunkPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
 
@@ -115,7 +116,7 @@ impl StreamAggregator {
     }
 
     /// 取出有效的工具调用数据（id 和 name 非空才视为有效）
-    pub fn take_tool_calls(&mut self) -> Vec<crate::ToolCallData> {
+    pub fn take_tool_calls(&mut self) -> Vec<ToolCallData> {
         let mut calls: Vec<_> = self
             .tool_calls
             .drain()
@@ -123,7 +124,7 @@ impl StreamAggregator {
                 if state.id.is_empty() || state.name.is_empty() {
                     return None;
                 }
-                Some(crate::ToolCallData {
+                Some(ToolCallData {
                     id: state.id,
                     name: state.name,
                     arguments: state.args_buffer,
@@ -135,7 +136,7 @@ impl StreamAggregator {
     }
 
     /// 查看当前有效的工具调用数据（不消费，用于中断时读取部分结果）
-    pub fn peek_tool_calls(&self) -> Vec<crate::ToolCallData> {
+    pub fn peek_tool_calls(&self) -> Vec<ToolCallData> {
         let mut calls: Vec<_> = self
             .tool_calls
             .values()
@@ -143,7 +144,7 @@ impl StreamAggregator {
                 if state.id.is_empty() || state.name.is_empty() {
                     return None;
                 }
-                Some(crate::ToolCallData {
+                Some(ToolCallData {
                     id: state.id.clone(),
                     name: state.name.clone(),
                     arguments: state.args_buffer.clone(),

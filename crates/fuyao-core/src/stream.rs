@@ -10,9 +10,10 @@
 use crate::dispatch;
 use crate::interrupt::SharedTurnState;
 use crate::react::SessionCtx;
+use fuyao_api::ToolCallData;
 use fuyao_provider::{
     BoxStream, ChatRequest, Provider, StreamAggregator, StreamError, StreamEvent, StreamOptions,
-    StreamUsage, ToolCallData,
+    StreamUsage,
 };
 use std::sync::Arc;
 

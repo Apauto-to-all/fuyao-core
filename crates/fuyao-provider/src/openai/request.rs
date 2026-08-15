@@ -101,25 +101,20 @@ pub(crate) fn build_request_body(
             msg_value["reasoning_content"] = serde_json::Value::String(reasoning.clone());
         }
 
-        // 工具调用
+        // 工具调用：typed 字段直接构造 OpenAI 嵌套 wire 形态（id / type / function 三层）
         if let Some(tool_calls) = &msg.tool_calls {
             msg_value["tool_calls"] = serde_json::Value::Array(
                 tool_calls
                     .iter()
                     .map(|tc| {
-                        let mut tc_val = serde_json::json!({
-                            "id": tc.get("id"),
+                        serde_json::json!({
+                            "id": tc.id,
                             "type": "function",
                             "function": {
-                                "name": tc.get("function").and_then(|f| f.get("name")),
-                                "arguments": tc.get("function").and_then(|f| f.get("arguments")),
+                                "name": tc.name,
+                                "arguments": tc.arguments,
                             }
-                        });
-                        // 保留 extra_content 等扩展字段
-                        if let Some(id) = tc.get("id") {
-                            tc_val["id"] = id.clone();
-                        }
-                        tc_val
+                        })
                     })
                     .collect(),
             );
@@ -176,7 +171,7 @@ pub(crate) fn build_request_body(
 mod tests {
     use super::*;
     use crate::provider::{ChatMessage, ChatRequest, StreamOptions as ProviderStreamOptions};
-    use fuyao_api::{ImageContent, MessageRole, ThinkingType};
+    use fuyao_api::{ImageContent, MessageRole, ThinkingType, ToolCallData};
 
     #[test]
     fn build_request_body_image_message_uses_parts_array() {
@@ -380,6 +375,42 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], "你是助手");
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn build_request_body_tool_calls_wire_shape() {
+        // typed ToolCallData → OpenAI 嵌套 wire 形态：id / type / function.{name,arguments}
+        // 层级与字段逐项锁定（协议形状的唯一栖息地在本模块，此处钉死输出形态）
+        let request = ChatRequest {
+            messages: vec![ChatMessage {
+                role: MessageRole::Assistant,
+                content: None,
+                tool_calls: Some(vec![ToolCallData {
+                    id: "call_1".to_string(),
+                    name: "bash".to_string(),
+                    arguments: "{}".to_string(),
+                }]),
+                ..Default::default()
+            }],
+            system: None,
+        };
+        let body = build_request_body(
+            request,
+            "qwen3.6-plus",
+            &ProviderStreamOptions::default(),
+            false,
+        );
+
+        assert_eq!(
+            body["messages"][0]["tool_calls"],
+            serde_json::json!([{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }])
+        );
+        // 纯工具调用消息 content=None，不注入 content 字段
+        assert!(body["messages"][0].get("content").is_none());
     }
 
     #[test]
