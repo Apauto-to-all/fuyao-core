@@ -5,12 +5,13 @@
 //!
 //! ## 文件读取
 //!
-//! 返回带行号的内容，使用 offset/limit 分页。自动遵守以下安全规则：
+//! 返回带行号的内容，使用 offset/limit 分页。行数无上限，字符预算在收集循环内
+//! 增量执行（内存天然有界）。自动遵守以下安全规则：
 //! - 设备文件（/dev/zero 等）→ 拒绝
 //! - 框架内部路径（.fuyao/.env）→ 拒绝
 //! - 二进制文件（.exe、.png 等）→ 拒绝
 //! - 文件不存在 → 建议相似文件名
-//! - 内容超限（> MAX_READ_CHARS 字符）→ 拒绝并提示分页
+//! - 内容超出字符预算（> MAX_READ_CHARS 字节）→ 收集期自动截断并提示分段读取
 //! - 读取结果自动脱敏 API Key 等敏感信息
 //!
 //! ## 目录读取
@@ -21,7 +22,7 @@
 use crate::common::resolve_path;
 use crate::config::{MAX_READ_CHARS, SEARCH_EXCLUDE_DIRS};
 use crate::file::helpers::suggest_similar_files;
-use crate::file::read::types::{DirectoryEntry, DirectoryResult, MAX_LIMIT, ReadArgs, ReadResult};
+use crate::file::read::types::{DirectoryEntry, DirectoryResult, ReadArgs, ReadResult};
 use crate::file::safety::{has_binary_extension, is_blocked_device, is_internal_path};
 use crate::file::tracker::record_read;
 use crate::redact::redact_sensitive_text;
@@ -136,7 +137,7 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
 /// 2. 框架内部路径检查（.fuyao/.env）
 /// 3. 文件存在性检查（不存在则建议相似文件名）
 /// 4. 二进制文件检查
-/// 5. 内容大小检查（> MAX_READ_CHARS 则拒绝）
+/// 5. 字符预算增量执行（收集期达到 MAX_READ_CHARS 即截断，不报错）
 pub async fn read_file_impl(
     args: Value,
     ctx: ToolCallContext,
@@ -151,7 +152,8 @@ pub async fn read_file_impl(
         Err(e) => return ToolOutput::Err(e),
     };
     let offset = offset.max(1) as usize;
-    let limit = limit.clamp(1, MAX_LIMIT) as usize;
+    // 行数不再设上限：内存与上下文均由收集期的字符预算兜底，此处只防零/负数
+    let limit = limit.max(1) as usize;
     let task_id = ctx.task_id().to_string();
     let workspace = ctx.workspace().map(Path::to_path_buf);
 
@@ -228,7 +230,13 @@ pub async fn read_file_impl(
 
     let mut raw_line: Vec<u8> = Vec::new();
     let mut line_no: usize = 0;
-    let mut content_lines: Vec<String> = Vec::with_capacity(limit);
+    // 预分配有界：limit 已无上限，不能按 limit 预分配，按小窗口起步即可
+    let mut content_lines: Vec<String> = Vec::with_capacity(limit.min(1024));
+    // 已收集内容的字节累计（含换行分隔符）。字符预算的执行变量：
+    // 计量口径与 String::len 一致（UTF-8 字节数），作为上下文成本的代理而非精确字符数
+    let mut collected_bytes: usize = 0;
+    // 是否因字符预算提前停止收集（区别于行窗口收满 / EOF）
+    let mut char_capped = false;
     loop {
         raw_line.clear();
         match reader.read_until(b'\n', &mut raw_line) {
@@ -239,37 +247,47 @@ pub async fn read_file_impl(
             }
         }
         line_no += 1;
-        // 只解码并格式化窗口内的行；窗口外仅推进行号
-        if line_no >= offset && content_lines.len() < limit {
-            let line = match std::str::from_utf8(&raw_line) {
-                Ok(s) => s.trim_end_matches(['\n', '\r']),
-                // 区分 UTF-8 编码错误（InvalidData）和其他 IO 错误：编码错误给用户明确的修复提示
-                Err(_) => {
-                    return ToolOutput::error(format!(
-                        "文件编码无法解析: {path}。文件可能包含非 UTF-8 字节，请用二进制编辑器查看。"
-                    ));
-                }
-            };
-            content_lines.push(format!("{:>6}\t{line}", line_no));
+        // 只解码并格式化窗口内的行；窗口外（或已达任一边界后）仅推进行号计数，不解码不存储
+        if char_capped || line_no < offset || content_lines.len() >= limit {
+            continue;
         }
+        let line = match std::str::from_utf8(&raw_line) {
+            Ok(s) => s.trim_end_matches(['\n', '\r']),
+            // 区分 UTF-8 编码错误（InvalidData）和其他 IO 错误：编码错误给用户明确的修复提示
+            Err(_) => {
+                return ToolOutput::error(format!(
+                    "文件编码无法解析: {path}。文件可能包含非 UTF-8 字节，请用二进制编辑器查看。"
+                ));
+            }
+        };
+        let formatted = format!("{:>6}\t{line}", line_no);
+        // 行成本 = 格式化行字节长 + 1（换行分隔符），先到先停的第二个边界
+        let line_cost = formatted.len() + 1;
+        if collected_bytes + line_cost > MAX_READ_CHARS {
+            if content_lines.is_empty() {
+                // 窗口内首行即单独超预算（如压缩产物的单行文件）：
+                // 截断到预算内的 UTF-8 安全边界并加省略标记，保证至少有内容可看
+                let budget = MAX_READ_CHARS.saturating_sub('…'.len_utf8());
+                content_lines.push(format!(
+                    "{}…",
+                    truncate_at_char_boundary(&formatted, budget)
+                ));
+            }
+            // 触达字符预算不报错：保留已收集内容，后续行只计数不解码
+            char_capped = true;
+            continue;
+        }
+        collected_bytes += line_cost;
+        content_lines.push(formatted);
     }
     let total_lines = line_no;
-    let start_idx = offset - 1;
-    let end_idx = std::cmp::min(start_idx + limit, total_lines);
+    // 实际收集窗口的末行行号（窗口从 offset 起逐行连续收集，故等于 offset-1+收集数）
+    let last_collected = offset.saturating_sub(1) + content_lines.len();
 
     let output = content_lines.join("\n");
-
-    if output.len() > MAX_READ_CHARS {
-        return ToolOutput::error(format!(
-            "读取内容超过安全限制 ({} > {} 字符)。请使用 offset 和 limit 参数读取更小的范围。文件共 {} 行。",
-            output.len(),
-            MAX_READ_CHARS,
-            total_lines
-        ));
-    }
-
     let output = redact_sensitive_text(&output);
-    let truncated = end_idx < total_lines;
+    // 截断判定：实际收集窗口末行未到文件末尾，或字符预算在中途/行内触发
+    let truncated = char_capped || last_collected < total_lines;
 
     let result = ReadResult {
         result: output,
@@ -277,13 +295,21 @@ pub async fn read_file_impl(
         total_lines,
         file_size,
         offset,
-        limit,
+        limit: content_lines.len(),
         truncated: if truncated { Some(true) } else { None },
         hint: if truncated {
-            Some(format!(
-                "使用 offset={} 继续读取（显示第 {offset}-{end_idx} 行，共 {total_lines} 行）",
-                end_idx + 1
-            ))
+            if char_capped {
+                Some(format!(
+                    "已达字符上限（{} 字节），内容已截断。建议减小 limit 分段读取，或使用 offset={} 继续读取",
+                    MAX_READ_CHARS,
+                    last_collected + 1
+                ))
+            } else {
+                Some(format!(
+                    "使用 offset={} 继续读取（显示第 {offset}-{last_collected} 行，共 {total_lines} 行）",
+                    last_collected + 1
+                ))
+            }
         } else {
             None
         },
@@ -292,9 +318,179 @@ pub async fn read_file_impl(
     ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
+/// 将字符串按字节预算截断到 UTF-8 字符边界
+///
+/// 从预算位置向后回退（至多 3 字节，UTF-8 最长序列的续字节长度）直到落在
+/// 合法字符边界，保证不切断多字节字符。预算不小于字符串长度时原样返回。
+fn truncate_at_char_boundary(s: &str, budget: usize) -> &str {
+    if budget >= s.len() {
+        return s;
+    }
+    let mut end = budget;
+    // UTF-8 续字节形如 10xxxxxx，回退到非续字节位置即字符边界
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 执行读取并把 wire JSON 解析为 Value，便于按字段断言
+    async fn run_read(args: serde_json::Value) -> serde_json::Value {
+        let wire = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        serde_json::from_str(&wire).expect("wire 应为合法 JSON")
+    }
+
+    /// 截断辅助：字节预算落在多字节字符内部时回退到字符边界
+    #[test]
+    fn truncate_at_char_boundary_cuts_safely() {
+        let s = "abc汉def"; // 汉占 3 字节，位于字节 3..6
+        assert_eq!(truncate_at_char_boundary(s, 4), "abc");
+        assert_eq!(truncate_at_char_boundary(s, 6), "abc汉");
+        assert_eq!(truncate_at_char_boundary(s, 0), "");
+        assert_eq!(truncate_at_char_boundary(s, 100), s);
+        assert_eq!(truncate_at_char_boundary("", 5), "");
+    }
+
+    /// 超大 limit 读多行长文件：不报错，内容不超字符预算，截断并提示续读起点
+    #[tokio::test]
+    async fn read_huge_limit_multiline_file() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_huge_limit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("big.txt");
+        // 6000 行 × 每行 30 字节内容（格式化后每行成本 38 字节），总量远超预算。
+        // 行内容含空格分隔的词组，贴近真实文本形状
+        let content: String = (1..=6000)
+            .map(|i| format!("data row {i:06} alpha beta gamma delta\n", i = i))
+            .collect();
+        std::fs::write(&file_path, content).unwrap();
+
+        let parsed = run_read(serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "limit": 1_000_000
+        }))
+        .await;
+
+        assert!(
+            parsed.get("error").is_none(),
+            "超大 limit 不应报错：{parsed}"
+        );
+        let result = parsed["result"].as_str().unwrap();
+        // 每行成本 46 字节（38 字节内容 + 7 字节行号前缀 + 1 换行）：
+        // 100000/46 = 2173 行（余 42 字节），第 2174 行触顶停止
+        assert!(result.contains("data row 000001"), "首行应被收集");
+        assert!(result.contains("data row 002173"), "预算内末行应被收集");
+        assert!(
+            !result.contains("data row 002174"),
+            "触顶后的行不应进入结果"
+        );
+        assert!(
+            result.len() <= MAX_READ_CHARS,
+            "结果不应超过字符预算：{}",
+            result.len()
+        );
+        assert_eq!(parsed["total_lines"], 6000);
+        assert_eq!(parsed["limit"], 2173, "limit 字段应为实际收集行数");
+        assert_eq!(parsed["truncated"], true);
+        let hint = parsed["hint"].as_str().unwrap();
+        assert!(hint.contains("字符上限"), "提示应说明字符上限：{hint}");
+        assert!(hint.contains("offset=2174"), "提示应给出续读起点：{hint}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 长行文件中途触达字符预算：前几行完整收集，到预算即停、不含触发行
+    #[tokio::test]
+    async fn read_long_lines_stop_at_char_budget() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_long_lines");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("long.txt");
+        // 5 行 × 30000 字节/行（格式化后每行成本 30007）：
+        // 3 行累计 90021，第 4 行达 120028 超预算 → 收满 3 行停止
+        let long_line = "x".repeat(29_999);
+        let content = format!("{long_line}\n{long_line}\n{long_line}\n{long_line}\n{long_line}\n");
+        std::fs::write(&file_path, content).unwrap();
+
+        let parsed = run_read(serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "limit": 10
+        }))
+        .await;
+
+        assert!(parsed.get("error").is_none(), "触达预算不应报错：{parsed}");
+        let result = parsed["result"].as_str().unwrap();
+        // 前三行完整收集（含完整长行内容），第四行整体不进入结果
+        assert!(result.contains(&long_line), "已收集的长行内容应完整保留");
+        assert!(result.contains("\n     2\t"));
+        assert!(result.contains("\n     3\t"));
+        assert!(!result.contains("\n     4\t"), "触发行的下一行不应进入结果");
+        assert!(result.len() <= MAX_READ_CHARS);
+        assert_eq!(parsed["total_lines"], 5);
+        assert_eq!(parsed["limit"], 3);
+        assert_eq!(parsed["truncated"], true);
+        let hint = parsed["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("offset=4"),
+            "续读起点应为实际收集末行 + 1：{hint}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 单行超预算（含中文，验证 UTF-8 截断边界安全）：截断加省略标记、无 panic
+    #[tokio::test]
+    async fn read_single_line_over_budget_truncated_safely() {
+        let dir = std::env::temp_dir().join("fuyao_test_read_single_huge_line");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("minified.txt");
+        // 构造 >100k 字节的单行：ASCII 段 + 中文段（3 字节/字），
+        // 使预算切点恰好落在某个汉字内部，验证回退到字符边界不切断多字节字符
+        let line = format!("{}{}", "a".repeat(33_329), "汉".repeat(22_300));
+        assert!(line.len() > MAX_READ_CHARS, "测试前提：单行自身超预算");
+        let content = format!("{line}\ntail\n");
+        std::fs::write(&file_path, content).unwrap();
+
+        let parsed = run_read(serde_json::json!({
+            "path": file_path.to_string_lossy().to_string()
+        }))
+        .await;
+
+        assert!(
+            parsed.get("error").is_none(),
+            "单行超预算不应报错：{parsed}"
+        );
+        let result = parsed["result"].as_str().unwrap();
+        assert!(
+            result.len() <= MAX_READ_CHARS,
+            "截断后不应超预算：{}",
+            result.len()
+        );
+        assert!(result.starts_with("     1\t"), "截断行应保留行号前缀");
+        assert!(result.ends_with('…'), "截断行应以省略标记结尾");
+        // 省略号前应是完整的汉字（而非被切断的半个字符）
+        assert_eq!(
+            result.chars().rev().nth(1),
+            Some('汉'),
+            "截断点应落在字符边界"
+        );
+        assert!(!result.contains("tail"), "后续行不应进入结果");
+        assert_eq!(parsed["total_lines"], 2);
+        assert_eq!(parsed["limit"], 1);
+        assert_eq!(parsed["truncated"], true);
+        let hint = parsed["hint"].as_str().unwrap();
+        assert!(hint.contains("字符上限"), "提示应说明字符上限：{hint}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[tokio::test]
     async fn read_existing_file() {

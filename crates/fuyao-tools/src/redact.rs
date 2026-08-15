@@ -71,54 +71,106 @@ fn mask_token(token: &str) -> String {
     }
 }
 
+/// 各脱敏模式的必备字面量（ASCII 大小写不敏感预筛）
+///
+/// 每条正则命中时必然包含对应片段之一；全部缺席时正则不可能命中，直接跳过执行。
+/// 预筛防的是回溯引擎的失效扫描：超长无命中文本上，逐起点的失败尝试会累积耗尽
+/// 回溯预算导致执行报错。片段按 ASCII 大小写不敏感口径给出——预筛误放行只会
+/// 多跑一次正则（无害方向）；Unicode 折叠等极端形态不在预筛口径内
+const PREFIX_NEEDLES: &[&str] = &[
+    "sk-",
+    "ghp_",
+    "github_pat_",
+    "aiza",
+    "akia",
+    "xox",
+    "hf_",
+    "pypi-",
+    "npm_",
+    "gsk_",
+    "pplx-",
+];
+const ENV_ASSIGN_NEEDLES: &[&str] = &[
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "auth",
+];
+const JSON_FIELD_NEEDLES: &[&str] = &["api_key", "apikey", "token", "secret", "password", "bearer"];
+const AUTH_HEADER_NEEDLES: &[&str] = &["authorization"];
+const PRIVATE_KEY_NEEDLES: &[&str] = &["-----begin"];
+const DB_CONNSTR_NEEDLES: &[&str] = &["postgres", "mysql", "mongodb", "redis", "amqp"];
+const JWT_NEEDLES: &[&str] = &["eyj"];
+
+/// ASCII 大小写不敏感的子串探测（任一命中即真，无分配）
+///
+/// 针串均为 ASCII 字面量：多字节 UTF-8 字节经 ASCII 折叠后不会与针串字节相等，
+/// 按字节窗口比较即安全
+fn contains_any_ascii_ci(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| {
+        let n = needle.as_bytes();
+        if n.is_empty() {
+            return true;
+        }
+        text.as_bytes()
+            .windows(n.len())
+            .any(|w| w.iter().zip(n).all(|(a, b)| a.eq_ignore_ascii_case(b)))
+    })
+}
+
+/// 执行单条脱敏：预筛未命中直接跳过；正则执行出错（如回溯超限）降级保留原文并告警
+///
+/// 降级取向：脱敏是尽力而为的输出净化，引擎级故障不应放大为整个工具调用失败；
+/// 保留原文存在泄密风险，故必须 WARN 留痕供事后审计
+fn try_redact(
+    re: &Regex,
+    text: &str,
+    needles: &[&str],
+    rep: impl Fn(&fancy_regex::Captures) -> String,
+) -> String {
+    if !contains_any_ascii_ci(text, needles) {
+        return text.to_string();
+    }
+    match re.try_replacen(text, 0, rep) {
+        Ok(replaced) => replaced.into_owned(),
+        Err(e) => {
+            tracing::warn!(cause = %e, text_len = text.len(), "脱敏正则执行失败，本轮保留原文");
+            text.to_string()
+        }
+    }
+}
+
 /// 脱敏文本中的敏感信息
 pub fn redact_sensitive_text(text: &str) -> String {
     if text.is_empty() || !crate::config::REDACT_SECRETS {
         return text.to_string();
     }
 
-    let text = PATTERNS
-        .prefix
-        .replace_all(text, |caps: &fancy_regex::Captures| mask_token(&caps[1]))
-        .to_string();
-
-    let text = PATTERNS
-        .env_assign
-        .replace_all(&text, |caps: &fancy_regex::Captures| {
-            format!("{}={}{}", &caps[1], &caps[2], mask_token(&caps[3]))
-        })
-        .to_string();
-
-    let text = PATTERNS
-        .json_field
-        .replace_all(&text, |caps: &fancy_regex::Captures| {
-            format!(r#"{}: "{}""#, &caps[1], mask_token(&caps[2]))
-        })
-        .to_string();
-
-    let text = PATTERNS
-        .auth_header
-        .replace_all(&text, |caps: &fancy_regex::Captures| {
-            format!("{}{}", &caps[1], mask_token(&caps[2]))
-        })
-        .to_string();
-
-    let text = PATTERNS
-        .private_key
-        .replace_all(&text, "[REDACTED PRIVATE KEY]")
-        .to_string();
-
-    let text = PATTERNS
-        .db_connstr
-        .replace_all(&text, |caps: &fancy_regex::Captures| {
-            format!("{}***{}", &caps[1], &caps[3])
-        })
-        .to_string();
-
-    PATTERNS
-        .jwt
-        .replace_all(&text, |caps: &fancy_regex::Captures| mask_token(&caps[0]))
-        .to_string()
+    let text = try_redact(&PATTERNS.prefix, text, PREFIX_NEEDLES, |caps| {
+        mask_token(&caps[1])
+    });
+    let text = try_redact(&PATTERNS.env_assign, &text, ENV_ASSIGN_NEEDLES, |caps| {
+        format!("{}={}{}", &caps[1], &caps[2], mask_token(&caps[3]))
+    });
+    let text = try_redact(&PATTERNS.json_field, &text, JSON_FIELD_NEEDLES, |caps| {
+        format!(r#"{}: "{}""#, &caps[1], mask_token(&caps[2]))
+    });
+    let text = try_redact(&PATTERNS.auth_header, &text, AUTH_HEADER_NEEDLES, |caps| {
+        format!("{}{}", &caps[1], mask_token(&caps[2]))
+    });
+    let text = try_redact(&PATTERNS.private_key, &text, PRIVATE_KEY_NEEDLES, |_| {
+        "[REDACTED PRIVATE KEY]".to_string()
+    });
+    let text = try_redact(&PATTERNS.db_connstr, &text, DB_CONNSTR_NEEDLES, |caps| {
+        format!("{}***{}", &caps[1], &caps[3])
+    });
+    try_redact(&PATTERNS.jwt, &text, JWT_NEEDLES, |caps| {
+        mask_token(&caps[0])
+    })
 }
 
 #[cfg(test)]
@@ -173,5 +225,26 @@ mod tests {
     fn redact_empty_string() {
         let result = redact_sensitive_text("");
         assert_eq!(result, "");
+    }
+
+    /// 超长重复文本（含大量数字 run）不触发回溯超限 panic：
+    /// 预筛缺席直接跳过正则，即使误入也会降级保留原文
+    #[test]
+    fn redact_huge_repetitive_text_no_panic() {
+        let text: String = (1..=3000)
+            .map(|i| format!("data row {i:06} alpha beta gamma delta\n"))
+            .collect();
+        assert!(text.len() > 100_000, "测试前提：文本规模达到回溯危险区");
+        let result = redact_sensitive_text(&text);
+        assert!(result.contains("data row 000001"));
+        assert_eq!(result.len(), text.len(), "无敏感内容时应原样保留");
+    }
+
+    /// 预筛命中但正则无匹配：内容原样返回
+    #[test]
+    fn redact_prefilter_hit_but_no_match() {
+        let text = "an author wrote tokens of gratitude"; // 含 "auth"/"token" 字面量但无赋值形态
+        let result = redact_sensitive_text(text);
+        assert_eq!(result, text);
     }
 }

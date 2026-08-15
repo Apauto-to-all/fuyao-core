@@ -27,7 +27,7 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
             .default(json!(DEFAULT_OFFSET))
             .integer(
                 "limit",
-                format!("最大读取数量（默认: {DEFAULT_LIMIT}，最大: {}）。文件：行数；目录：条目数", types::MAX_LIMIT),
+                format!("最大读取数量（默认: {DEFAULT_LIMIT}）。文件：行数（无上限，超出字符预算自动截断并提示续读）；目录：条目数"),
             )
             .default(json!(DEFAULT_LIMIT))
             .build(),

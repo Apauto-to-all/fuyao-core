@@ -8,8 +8,6 @@
 pub const DEFAULT_OFFSET: i64 = 1;
 /// 默认读取数量
 pub const DEFAULT_LIMIT: i64 = 500;
-/// 读取数量上限
-pub const MAX_LIMIT: i64 = 2000;
 
 /// read 工具参数（类型化解析）
 #[derive(Debug, serde::Deserialize)]
@@ -45,7 +43,7 @@ pub struct ReadResult {
     pub file_size: u64,
     /// 起始位置
     pub offset: usize,
-    /// 读取数量
+    /// 实际返回的读取数量（文件为实际收集行数；受行窗口与字符预算双边界约束，可小于请求值）
     pub limit: usize,
     /// 是否截断
     #[serde(skip_serializing_if = "Option::is_none")]
