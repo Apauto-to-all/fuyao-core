@@ -313,18 +313,13 @@ fn empty_hooks() -> fuyao_hooks::SharedHooks {
 
 /// 构造测试用 SessionCtx + session + rx_interrupt + 收事件的 rx
 ///
-/// `tx_interrupt` 不发中断，但必须随 harness 存活以保持中断通道打开：
-/// 若 tx 提前 drop，`rx_interrupt.recv()` 会立即就绪返回 None，在
-/// `run_turn` 工具执行 select! 中随机抢占 exec_fut 分支，导致工具结果
-/// 丢失、turn 提前结束（flaky 失败）。保留 tx 让 recv() 挂起等待，
-/// 从而 stream/exec 分支稳定胜出。
-#[allow(dead_code)]
+/// `tx_interrupt` 仅供测试主动发中断用——turn 的中断分支是 `Some(...)` 模式，
+/// 通道关闭只是禁用分支，无需为「保活」而持有 tx（drop 也不影响 turn 语义）。
 struct TestHarness {
     ctx: SessionCtx,
     /// 本 harness 关联的 session_id（DB 唯一数据源，内核不再常驻内存 Session）
     session_id: String,
     rx_interrupt: Receiver<OutputInterruptMessage>,
-    #[allow(dead_code)]
     tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
     /// 控制通道接收端：run_turn 间隙检查点消费它
     rx_control: Receiver<ControlCommand>,
@@ -344,6 +339,32 @@ async fn make_harness_with_hooks(
     hooks: fuyao_hooks::SharedHooks,
 ) -> TestHarness {
     make_harness_full(provider, tools, hooks, fuyao_api::AgentPaths::default()).await
+}
+
+/// 构造测试用 SessionCtx 构造器（统一走生产同款 builder，消除字段级镜像）
+///
+/// 必填字段给测试默认（default 定义 / test 模型参数 / is_child=false），调用方按需
+/// 链式覆盖可选字段（guide / pending / shutdown_token 等）后 build。
+/// SessionCtx 增删字段时本工厂自动跟随 builder，各构造点不再各自维护字面量。
+fn test_ctx_builder(
+    store: Arc<fuyao_session::SessionStore>,
+    providers: Arc<fuyao_provider::ProviderRegistry>,
+    tools: Arc<ToolRegistry>,
+    hooks: fuyao_hooks::SharedHooks,
+    emitter: Emitter,
+    agent_paths: fuyao_api::AgentPaths,
+) -> SessionCtxBuilder {
+    SessionCtx::builder(
+        store,
+        providers,
+        tools,
+        hooks,
+        agent_paths,
+        fuyao_api::AgentDefinition::default(),
+        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        emitter,
+        false,
+    )
 }
 
 /// 同 make_harness_with_hooks，但可指定 agent_paths
@@ -374,23 +395,15 @@ async fn make_harness_full(
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
     ));
-    let ctx = SessionCtx {
-        is_child: false,
+    let ctx = test_ctx_builder(
         store,
         providers,
         tools,
         hooks,
+        Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
         agent_paths,
-        definition: fuyao_api::AgentDefinition::default(),
-        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
-        emitter: Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
-        guide: empty_queue(),
-        pending: empty_queue(),
-        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_config: fuyao_api::CompressionConfig::default(),
-        shutdown_token: tokio_util::sync::CancellationToken::new(),
-        subagent_ops: None,
-    };
+    )
+    .build();
     TestHarness {
         ctx,
         session_id: TEST_SESSION_ID.to_string(),
@@ -399,41 +412,6 @@ async fn make_harness_full(
         rx_control,
         tx_control,
         rx_event,
-    }
-}
-
-/// 构造 run_session 测试用 SessionCtx（生产 assemble_session 的测试镜像）
-///
-/// run_session 收敛为 (ctx, rx) 后，run_session 级测试不再手搓 18 个位置参数——
-/// 调用方一次性构造 ctx（此处）+ SessionRx（各测试自行建通道）。默认 tools / hooks /
-/// definition / compression_config；各测试按需对 store / guide / pending 传 Arc::clone
-/// 以便 spawn 后仍可访问。shutdown_token 显式传入——需在 spawn 后 cancel 的测试
-/// 传同一个 token，cancel 才能真正抵达 session（不再有失效 cancel 的隐患）。
-fn make_run_session_ctx(
-    store: Arc<fuyao_session::SessionStore>,
-    providers: Arc<fuyao_provider::ProviderRegistry>,
-    session_id: &str,
-    tx_event: mpsc::UnboundedSender<OutputEvent>,
-    guide: SharedQueue,
-    pending: SharedQueue,
-    shutdown_token: CancellationToken,
-) -> SessionCtx {
-    SessionCtx {
-        is_child: false,
-        store,
-        providers,
-        tools: Arc::new(ToolRegistry::builder().build()),
-        hooks: empty_hooks(),
-        agent_paths: fuyao_api::AgentPaths::default(),
-        definition: fuyao_api::AgentDefinition::default(),
-        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
-        emitter: Emitter::new(tx_event, session_id.to_string()),
-        guide,
-        pending,
-        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_config: fuyao_api::CompressionConfig::default(),
-        shutdown_token,
-        subagent_ops: None,
     }
 }
 
@@ -713,6 +691,91 @@ async fn both_empty_turn_ends() {
     assert_eq!(msgs.len(), 2);
 }
 
+/// TurnOutcome 消费许可状态机：四态许可判定 + 任意非 Completed 态经新用户消息恢复
+///
+/// 守护主循环「停消费 / 恢复消费」的全部语义迁移——历史上最贵的队列死信 bug
+/// 都藏在这些迁移上，语义表在此钉死。
+#[test]
+fn turn_outcome_consumption_state_machine() {
+    // 许可判定：仅 Completed 允许消费 guide/pending
+    assert!(turn::TurnOutcome::Completed.may_consume());
+    assert!(!turn::TurnOutcome::HaltedByCommand.may_consume());
+    assert!(!turn::TurnOutcome::Interrupted.may_consume());
+    assert!(!turn::TurnOutcome::Failed.may_consume());
+
+    // 恢复迁移：任意非 Completed 态经新用户消息恢复为可消费
+    for outcome in [
+        turn::TurnOutcome::HaltedByCommand,
+        turn::TurnOutcome::Interrupted,
+        turn::TurnOutcome::Failed,
+    ] {
+        let mut o = outcome;
+        o.resume_on_new_intent();
+        assert!(o.may_consume(), "{outcome:?} 恢复后应允许消费");
+    }
+
+    // Completed 自恢复无变化
+    let mut completed = turn::TurnOutcome::Completed;
+    completed.resume_on_new_intent();
+    assert!(completed.may_consume());
+}
+
+/// 中断通道关闭不影响 turn 正常执行（Some 模式：关闭 = 分支禁用，不当作事件）
+///
+/// 关闭后流继续等 Done、最终回复正常产出、不产生任何 Interrupt 事件——
+/// 调用方无需为保证通道打开而持有 tx（旧语义下此处会 false 中断 / 忙循环）。
+#[tokio::test]
+async fn closed_interrupt_channel_does_not_disturb_turn() {
+    let (provider, txs) = ControllableProvider::with_batches(1);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "test").await;
+
+    // 预喂一个 TextDelta：流启动后挂起在第二个事件上
+    txs[0]
+        .send(Ok(StreamEvent::TextDelta {
+            content: "你好".to_string(),
+        }))
+        .unwrap();
+    // 关闭中断通道（drop 全部 tx）
+    drop(h.tx_interrupt);
+    // 50ms 后补 Done——期间通道已关闭，若关闭被当作事件处理（旧语义），
+    // 流式段会立即「中断/continue」，正常收尾不可能发生
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = txs[0].send(Ok(StreamEvent::Done {
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::Stop,
+        }));
+    });
+
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "通道关闭不应打断 turn，实际退出原因: {outcome:?}"
+    );
+
+    let events = collect_events(&mut h.rx_event).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, OutputEvent::Assistant(m) if m.payload.content.as_deref() == Some("你好"))),
+        "应正常产出最终回复"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, OutputEvent::Interrupt(_))),
+        "通道关闭不应模拟出 Interrupt 事件"
+    );
+}
+
 /// 回归：task 空闲时只发 pending 也能触发新 turn（pending 不应死信）
 ///
 /// 覆盖 main 循环的 drain_pending 补丁：task 空闲 = 无活跃 ReAct 链，
@@ -733,11 +796,9 @@ async fn pending_consumed_when_task_idle() {
     let pending = empty_queue();
     // 入站通道（User 消息经此送进 session task 过管道入队）
     let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
-    // tx 必须随测试存活以保持中断通道打开（rx_interrupt.recv() 不提前返回 None）
-    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
-    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    std::mem::forget(rx_interrupt_tx);
-    // 控制通道（保持打开，避免 rx_control.recv() 提前返回 None）
+    // 中断 / 控制通道：tx 直接 drop 即关闭——select! 的 Some 模式下关闭 = 分支禁用，
+    // 无需保活（通道关闭语义的活验证：session 只靠 inbound / shutdown 驱动）
+    let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
@@ -745,15 +806,18 @@ async fn pending_consumed_when_task_idle() {
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
     ));
-    let ctx = make_run_session_ctx(
+    let ctx = test_ctx_builder(
         Arc::clone(&store),
         providers,
-        "test_session",
-        tx_event,
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        tokio_util::sync::CancellationToken::new(),
-    );
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, "test_session".to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .guide(Arc::clone(&guide))
+    .pending(Arc::clone(&pending))
+    .shutdown_token(tokio_util::sync::CancellationToken::new())
+    .build();
     let task = tokio::spawn(run_session(
         ctx,
         SessionRx {
@@ -821,24 +885,26 @@ async fn turn_restart_on_new_inbound_after_drained() {
     let guide = empty_queue();
     let pending = empty_queue();
     let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
-    let _tx_interrupt = mpsc::channel::<OutputInterruptMessage>(8).0;
-    let (rx_interrupt_tx, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    std::mem::forget(rx_interrupt_tx);
+    // 中断 / 控制通道：tx 直接 drop 即关闭（关闭 = 分支禁用，无需保活）
+    let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
     let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
         "test", provider,
     ));
-    let ctx = make_run_session_ctx(
+    let ctx = test_ctx_builder(
         Arc::clone(&store),
         providers,
-        "test_session",
-        tx_event,
-        Arc::clone(&guide),
-        Arc::clone(&pending),
-        tokio_util::sync::CancellationToken::new(),
-    );
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, "test_session".to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .guide(Arc::clone(&guide))
+    .pending(Arc::clone(&pending))
+    .shutdown_token(tokio_util::sync::CancellationToken::new())
+    .build();
     let task = tokio::spawn(run_session(
         ctx,
         SessionRx {
@@ -883,6 +949,158 @@ async fn turn_restart_on_new_inbound_after_drained() {
     assert!(
         got_second.unwrap_or(false),
         "停止后发新消息应重新启动 turn 并收到「回复2」"
+    );
+}
+
+/// 中断退出保留 guide 剩余；新用户消息恢复消费，旧剩余 + 新消息一起跑
+///
+/// 验证 TurnOutcome 消费许可状态机最贵的迁移链：
+/// 中断 → Interrupted（guide 剩余不消费、原样保留）→ 新 inbound 恢复许可 →
+/// 一起消费跑完。历史上「非 Completed 剩余被误消费 / 恢复后丢消息」都藏在这条链上。
+#[tokio::test]
+async fn interrupted_turn_preserves_guide_until_new_inbound() {
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
+
+    // 批 0：吐一个 TextDelta 后挂起（等中断）；批 1：恢复后的最终回复（预喂进 unbounded 通道缓冲）
+    let (provider, mut txs) = ControllableProvider::with_batches(2);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+
+    let store = temp_store().await;
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
+    session.id = "test_session".to_string();
+    store.create(&session).await.unwrap();
+
+    let guide = empty_queue();
+    let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
+    // 中断通道：本测试要发中断，tx 保留发送用（不再是为保活）
+    let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
+
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
+    let ctx = test_ctx_builder(
+        Arc::clone(&store),
+        providers,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, "test_session".to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .guide(Arc::clone(&guide))
+    .build();
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            control: rx_control,
+        },
+    ));
+
+    txs[0]
+        .send(Ok(StreamEvent::TextDelta {
+            content: "你好".to_string(),
+        }))
+        .unwrap();
+    // 批 1（恢复后的最终回复）：预喂完立即 drop 发送端——流读到通道关闭即结束，
+    // turn 2 才能正常收尾（txs[0] 保留，让 turn 1 的流挂在第二个事件上等中断）
+    {
+        let tx1 = txs.pop().unwrap();
+        tx1.send(Ok(StreamEvent::TextDelta {
+            content: "ok".to_string(),
+        }))
+        .unwrap();
+        tx1.send(Ok(StreamEvent::Done {
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::Stop,
+        }))
+        .unwrap();
+    }
+
+    // 第一条消息 → turn 1（流挂起在批 0 的第二个事件上）
+    tx_inbound.send(make_inbound("问题1")).await.unwrap();
+    let got_chunk = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = rx_event.recv().await {
+            if matches!(ev, OutputEvent::Chunk(m) if m.payload.content.as_deref() == Some("你好"))
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(
+        got_chunk.unwrap_or(false),
+        "turn 1 应消费到 TextDelta 并挂起在流上"
+    );
+
+    // 中断 → turn 1 以 Interrupted 结束
+    tx_interrupt
+        .send(InterruptMessage::new("用户取消", InterruptSource::User))
+        .await
+        .unwrap();
+    let got_interrupt = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = rx_event.recv().await {
+            if matches!(ev, OutputEvent::Interrupt(_)) {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    assert!(got_interrupt.unwrap_or(false), "应收到 Interrupt 事件");
+    // 等 run_session 回到 idle select（turn 返回后），再直塞一条 guide 剩余
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    guide.lock().unwrap().push_back(make_inbound("保留消息B"));
+
+    // Interrupted 期间 guide 剩余不被消费（主循环跳过 consume，落 select! 等待）
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !guide.lock().unwrap().is_empty(),
+        "Interrupted 后 guide 剩余应原样保留，不被消费"
+    );
+
+    // 新用户消息 → 恢复许可 → 「旧剩余 B + 新消息 C」一起消费跑 turn 2
+    tx_inbound.send(make_inbound("新消息C")).await.unwrap();
+    let got_final = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = rx_event.recv().await {
+            if matches!(ev, OutputEvent::Assistant(m) if m.payload.content.as_deref() == Some("ok"))
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+
+    task.abort();
+
+    assert!(
+        got_final.unwrap_or(false),
+        "恢复消费后应跑完 turn 2 并收到最终回复「ok」"
+    );
+    assert!(guide.lock().unwrap().is_empty(), "恢复消费后 guide 应跑空");
+
+    // B 与 C 都应进 DB（旧剩余 + 新消息一起跑，不丢）
+    let msgs = store
+        .load_visible_messages("test_session", usize::MAX)
+        .await
+        .unwrap();
+    let users: Vec<_> = msgs
+        .iter()
+        .filter(|m| matches!(m.role, MessageRole::User))
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        users.contains(&"保留消息B".to_string()),
+        "旧剩余应被消费进 DB"
+    );
+    assert!(
+        users.contains(&"新消息C".to_string()),
+        "新消息应被消费进 DB"
     );
 }
 
@@ -1657,26 +1875,18 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     reg.finalize();
     let hooks: fuyao_hooks::SharedHooks = Arc::new(reg);
     let store = temp_store().await;
-    let ctx = SessionCtx {
-        is_child: false,
+    let ctx = test_ctx_builder(
         store,
-        providers: Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        Arc::new(fuyao_provider::ProviderRegistry::with_instance(
             "test",
             Arc::new(MockProvider::new(vec![])),
         )),
-        tools: Arc::new(ToolRegistry::builder().build()),
+        Arc::new(ToolRegistry::builder().build()),
         hooks,
-        agent_paths: fuyao_api::AgentPaths::default(),
-        definition: fuyao_api::AgentDefinition::default(),
-        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
         emitter,
-        guide: empty_queue(),
-        pending: empty_queue(),
-        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_config: fuyao_api::CompressionConfig::default(),
-        shutdown_token: tokio_util::sync::CancellationToken::new(),
-        subagent_ops: None,
-    };
+        fuyao_api::AgentPaths::default(),
+    )
+    .build();
     // DB 唯一数据源：构造 Session 仅用于落库，之后只凭 session_id 查 DB
     let session = Session {
         id: "test_session".to_string(),
@@ -1718,26 +1928,18 @@ async fn inject_messages_preserves_plugin_source_in_event() {
     let emitter = Emitter::new(tx_event, "test_session".to_string());
     let hooks: fuyao_hooks::SharedHooks = Arc::new(HooksRegistry::default());
     let store = temp_store().await;
-    let ctx = SessionCtx {
-        is_child: false,
+    let ctx = test_ctx_builder(
         store,
-        providers: Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        Arc::new(fuyao_provider::ProviderRegistry::with_instance(
             "test",
             Arc::new(MockProvider::new(vec![])),
         )),
-        tools: Arc::new(ToolRegistry::builder().build()),
+        Arc::new(ToolRegistry::builder().build()),
         hooks,
-        agent_paths: fuyao_api::AgentPaths::default(),
-        definition: fuyao_api::AgentDefinition::default(),
-        session_params: Arc::new(tokio::sync::Mutex::new(test_session_params())),
         emitter,
-        guide: empty_queue(),
-        pending: empty_queue(),
-        last_usage: Arc::new(tokio::sync::Mutex::new(None)),
-        compression_config: fuyao_api::CompressionConfig::default(),
-        shutdown_token: tokio_util::sync::CancellationToken::new(),
-        subagent_ops: None,
-    };
+        fuyao_api::AgentPaths::default(),
+    )
+    .build();
     // DB 唯一数据源：构造 Session 仅用于落库，之后只凭 session_id 查 DB
     let session = Session {
         id: "test_session".to_string(),
@@ -2268,5 +2470,139 @@ async fn run_turn_returns_failed_on_llm_error() {
     assert!(
         matches!(outcome, turn::TurnOutcome::Failed),
         "LLM 调用失败应让 run_turn 返回 Failed"
+    );
+}
+
+// ===== 标题生成判定门测试 =====
+
+/// chat 可用的 Provider：标题生成走非流式 chat，返回固定标题
+struct TitleProvider;
+
+#[async_trait]
+impl Provider for TitleProvider {
+    fn stream_chat(
+        &self,
+        _request: fuyao_provider::ChatRequest,
+        _model: &str,
+        _options: fuyao_provider::StreamOptions,
+    ) -> BoxStream<Result<StreamEvent, StreamError>> {
+        // 标题路径不调流式；返回空流兜底
+        Box::pin(stream::iter(vec![]))
+    }
+
+    async fn chat(
+        &self,
+        _request: fuyao_provider::ChatRequest,
+        _model: &str,
+        _options: fuyao_provider::StreamOptions,
+    ) -> Result<ChatResponse, StreamError> {
+        Ok(ChatResponse {
+            content: Some("测试标题".to_string()),
+            reasoning: None,
+            tool_calls: None,
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::Stop,
+        })
+    }
+}
+
+/// 首轮注入触发标题生成；判定门每 session 只开一次，第二次调用零成本跳过
+#[tokio::test]
+async fn title_spawns_once_on_first_injection() {
+    let provider: Arc<dyn Provider> = Arc::new(TitleProvider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "第一个问题").await;
+
+    // 首次调用：首轮判定通过（DB 恰 1 条 user）→ spawn 标题生成
+    super::title::maybe_spawn_title(&h.ctx, Some("第一个问题")).await;
+    assert!(
+        h.ctx.title_gate.load(std::sync::atomic::Ordering::Relaxed),
+        "首次判定应消耗判定门"
+    );
+
+    // 等 Title 事件（fire-and-forget task 落库 + 发事件）
+    let title = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = h.rx_event.recv().await {
+            if let OutputEvent::Title(m) = ev {
+                return Some(m.payload.title);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(
+        title.expect("2 秒内应收到 Title 事件").as_deref(),
+        Some("测试标题"),
+        "标题事件应携带 chat 返回的标题"
+    );
+
+    // 第二次调用：判定门已消耗，不再触发（无新 Title 事件）
+    super::title::maybe_spawn_title(&h.ctx, Some("第二个问题")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !matches!(h.rx_event.try_recv(), Ok(OutputEvent::Title(_))),
+        "判定门消耗后二次调用不应再发 Title 事件"
+    );
+}
+
+/// 非首轮会话（user 数 > 1）不触发标题生成，判定门仍被消耗（首次判定即终局）
+#[tokio::test]
+async fn title_skipped_for_non_first_session() {
+    let provider: Arc<dyn Provider> = Arc::new(TitleProvider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "第一问").await;
+    preload_user(&h, "第二问").await;
+
+    super::title::maybe_spawn_title(&h.ctx, Some("第二问")).await;
+    assert!(
+        h.ctx.title_gate.load(std::sync::atomic::Ordering::Relaxed),
+        "首次判定（即使跳过）也应消耗判定门"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !matches!(h.rx_event.try_recv(), Ok(OutputEvent::Title(_))),
+        "user 数 != 1 不应触发标题生成"
+    );
+}
+
+/// 子 session（is_child=true 且默认 skip_child=true）豁免标题生成
+#[tokio::test]
+async fn title_skipped_for_child_session() {
+    let provider: Arc<dyn Provider> = Arc::new(TitleProvider);
+    // harness 只为借它的 session 落库流程；豁免判定在 provider 使用前短路，注册表内容无关紧要
+    let h = make_harness(
+        Arc::clone(&provider),
+        Arc::new(ToolRegistry::builder().build()),
+    )
+    .await;
+    preload_user(&h, "子会话首问").await;
+
+    // 子 session 上下文：is_child 必填字段直接经 builder 入口传入（生产同款构造）
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel::<OutputEvent>();
+    let ctx = SessionCtx::builder(
+        h.ctx.store.clone(),
+        providers,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        fuyao_api::AgentDefinition::default(),
+        Arc::new(tokio::sync::Mutex::new(test_session_params())),
+        Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
+        true,
+    )
+    .build();
+
+    super::title::maybe_spawn_title(&ctx, Some("子会话首问")).await;
+    assert!(
+        ctx.title_gate.load(std::sync::atomic::Ordering::Relaxed),
+        "豁免判定也应消耗判定门"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !matches!(rx_event.try_recv(), Ok(OutputEvent::Title(_))),
+        "子 session 默认豁免，不应触发标题生成"
     );
 }

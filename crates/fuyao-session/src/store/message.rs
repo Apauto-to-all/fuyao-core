@@ -155,6 +155,20 @@ impl super::SessionStore {
         Ok(count)
     }
 
+    /// 统计 session 的 user 消息数(只数普通消息,排除 compaction 边界)
+    ///
+    /// 用于会话标题的首轮判定(user 消息数严格等于 1 ⇔ 全新会话且刚注入首条)。
+    /// 走 `idx_messages_session` 索引,COUNT 只返回单值,不加载消息体。
+    pub async fn count_user_messages(&self, session_id: &str) -> Result<i64, SessionError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = 'message' AND role = 'user'",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
     // ── 查询 ───────────────────────────────────────────────────
 
     /// 加载全量历史(含被压缩掉的旧消息)
@@ -303,6 +317,39 @@ mod tests {
             store.count_messages(&session.id).await.unwrap(),
             2,
             "count_messages 应排除 compaction 边界"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_user_messages_only_counts_user_role() {
+        // 只数 role=user 的普通消息:assistant / tool 不计,compaction 边界不计
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        insert_user(&store, &session.id, "首个问题").await;
+        let mut assistant = Message::assistant(Some("回复".to_string()));
+        store
+            .insert_message(&session.id, &mut assistant)
+            .await
+            .unwrap();
+        let mut tool = Message::tool_result("c1".into(), "echo".into(), "结果".into());
+        store.insert_message(&session.id, &mut tool).await.unwrap();
+        assert_eq!(
+            store.count_user_messages(&session.id).await.unwrap(),
+            1,
+            "只有 1 条 user 消息,assistant/tool 不计入"
+        );
+
+        insert_user(&store, &session.id, "追问").await;
+        store
+            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.count_user_messages(&session.id).await.unwrap(),
+            2,
+            "compaction 边界不影响 user 计数"
         );
     }
 

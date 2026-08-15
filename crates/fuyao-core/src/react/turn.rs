@@ -10,6 +10,8 @@
 //!   ① pending 全部倒进 guide ② guide 全部消费注入 messages → 都空才结束 turn。
 //!
 //! 中断：两段 select!——流式期间、工具执行期间。idle 段在 run_session 外层。
+//! 中断分支用 `Some(...)` 模式：中断通道关闭（所有 tx drop）时分支禁用而非当作事件，
+//! 调用方无需为保证通道打开而持有 tx。
 //! 中断时保存部分结果（发增量事件），经统一历史入口（`crate::history`）即时落库
 //! 每条消息，结束本轮。
 //!
@@ -21,8 +23,8 @@
 
 use super::SessionCtx;
 use super::builders::{
-    ResolvedModel, assistant_payload, build_chat_request, resolve_context_length, resolve_model,
-    tool_call_data_to_event, tool_call_event_to_data,
+    ResolvedModel, assistant_payload, build_chat_request, resolve_model, tool_call_data_to_event,
+    tool_call_event_to_data,
 };
 use super::handle_control;
 use crate::interrupt::{
@@ -37,7 +39,7 @@ use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{
     AssistantMessage, InterruptMessage as OutputInterruptMessage,
-    InterruptPayload as OutputInterruptPayload, TitleMessage, TitlePayload,
+    InterruptPayload as OutputInterruptPayload,
 };
 use fuyao_api::{MessageRole, ModelConfig};
 use fuyao_provider::Provider;
@@ -79,16 +81,26 @@ async fn handle_stream_interrupt(
     handle_interrupt(state, kind, payload, ctx).await;
 }
 
-/// run_turn 退出原因——主循环据此决定是否继续消费队列
+/// run_turn 退出原因——自带主循环的消费许可状态机
 ///
 /// 只传决策，不传消息：错误 / 中断的具体内容已通过 `OutputEvent`（Error / Interrupt）
 /// 流给上层，本枚举只表达「主循环要不要继续消费 guide/pending」这一决策。
 ///
-/// - `Completed`：双队列跑空、AI 给最终回复。主循环可继续 consume（本就空）或落 select! 等
-/// - `HaltedByCommand`：间隙检查点取到 StopTurn 命令（回退 / 手动压缩）。主循环停消费，
-///   保留队列剩余，等用户新消息入队触发恢复
-/// - `Interrupted`：被用户中断打断。主循环停消费，保留队列剩余
-/// - `Failed`：配置错误 / LLM 失败（不可恢复）。主循环停消费
+/// # 消费许可状态机（唯一权威定义，主循环是无策略驱动器）
+///
+/// - `Completed`（双队列跑空、AI 给最终回复）：[`may_consume`](Self::may_consume) 为真，
+///   主循环继续 consume（本就空）或落 select! 等待
+/// - 非 `Completed`（命令停 / 中断 / 失败）：`may_consume` 为假 → 主循环跳过 consume，
+///   guide/pending 剩余**原样保留**（引擎不清队列），落 select! 等待
+/// - **恢复迁移**：idle select! 的 inbound 分支收到新用户消息时调
+///   [`resume_on_new_intent`](Self::resume_on_new_intent) 重置为 `Completed`——新消息 =
+///   新意图，回顶部 consume 把「旧剩余 + 新消息」一起跑（忠实消费）
+/// - **空闲解禁**：task 空闲（无活跃 turn）时 pending 的「等链结束」解禁条件已满足，
+///   主循环顶部先倒 pending 再消费（否则只发 pending 会死信）——这是主循环侧的固定
+///   动作，不属于本类型，但依赖 `may_consume` 为真才执行
+///
+/// 状态机的全部许可判定与迁移都经本类型的方法发生；修改消费语义只需动这里。
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum TurnOutcome {
     /// 正常完成：双队列跑空，AI 给了最终回复
     Completed,
@@ -98,6 +110,24 @@ pub(crate) enum TurnOutcome {
     Interrupted,
     /// 配置错误 / LLM 失败（不可恢复）
     Failed,
+}
+
+impl TurnOutcome {
+    /// 消费许可：仅 `Completed` 允许主循环消费 guide/pending
+    ///
+    /// 非 `Completed` 的退出（命令停 / 中断 / 失败）都意味着「队列剩余不该继续跑」，
+    /// 返回假让主循环跳过 consume、保留剩余等待恢复。
+    pub(crate) fn may_consume(&self) -> bool {
+        matches!(self, Self::Completed)
+    }
+
+    /// 新用户消息入队：恢复消费许可
+    ///
+    /// 新消息 = 新意图，重置为 `Completed`，主循环回顶部把「旧剩余 + 新消息」
+    /// 一起消费（忠实消费，引擎不清队列）。由 idle select! 的 inbound 分支调用。
+    pub(crate) fn resume_on_new_intent(&mut self) {
+        *self = Self::Completed;
+    }
 }
 
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环经 inject_messages 注入 DB）
@@ -135,7 +165,7 @@ pub(crate) async fn run_turn(
                 cause = %msg,
                 "模型解析失败（model_id 无效或为空）"
             );
-            emit_config_error(ctx, &msg).await;
+            emit_unrecoverable_error(ctx, &msg).await;
             return TurnOutcome::Failed;
         }
     };
@@ -152,7 +182,7 @@ pub(crate) async fn run_turn(
                 cause = %msg,
                 "Provider 实例未找到"
             );
-            emit_config_error(ctx, &msg).await;
+            emit_unrecoverable_error(ctx, &msg).await;
             return TurnOutcome::Failed;
         }
     };
@@ -217,14 +247,12 @@ pub(crate) async fn run_turn(
                     return TurnOutcome::Interrupted;
                 }
                 result = &mut retry_fut => result,
-                // 中断通道独立：此处只会收到 Interrupt
-                interrupt_msg = rx_interrupt.recv() => {
-                    if let Some(interrupt_msg) = interrupt_msg {
-                        handle_stream_interrupt(ctx, &state, &interrupt_msg.payload).await;
-                        return TurnOutcome::Interrupted;
-                    }
-                    // 中断通道关闭：忽略，继续等流式
-                    continue;
+                // 中断通道独立：此处只会收到 Interrupt。
+                // Some 模式：通道关闭（所有 tx drop）时本分支禁用，select 继续等流式 / shutdown
+                // ——关闭不是事件、不参与调度，也消除「关闭后 recv 立即就绪 + continue」的忙循环
+                Some(interrupt_msg) = rx_interrupt.recv() => {
+                    handle_stream_interrupt(ctx, &state, &interrupt_msg.payload).await;
+                    return TurnOutcome::Interrupted;
                 }
             }
         };
@@ -238,7 +266,9 @@ pub(crate) async fn run_turn(
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
                     // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
-                    let halted = handle_tool_calls(ctx, rx_interrupt, &result, &model_config).await;
+                    let halted =
+                        handle_tool_calls(ctx, rx_interrupt, &result, &model_config, keep_tokens)
+                            .await;
                     if halted {
                         return TurnOutcome::Interrupted;
                     }
@@ -252,25 +282,19 @@ pub(crate) async fn run_turn(
                     cause = %e,
                     "LLM 调用失败，本轮未产出 Assistant 消息"
                 );
-                let error_event = OutputEvent::Error(fuyao_api::message::output::ErrorMessage {
-                    base: EventBase::default(),
-                    payload: fuyao_api::message::output::ErrorPayload {
-                        message: format!("LLM 调用失败: {e}"),
-                        recoverable: false,
-                    },
-                });
-                crate::dispatch::dispatch(&ctx.emitter, &ctx.hooks, error_event).await;
+                emit_unrecoverable_error(ctx, &format!("LLM 调用失败: {e}")).await;
                 return TurnOutcome::Failed;
             }
         }
     }
 }
 
-/// 发"配置类错误"事件（永久不可恢复）
+/// 发「不可恢复错误」事件（`recoverable: false`）
 ///
-/// 统一处理 model_id 解析失败 / Provider 实例未注册等配置错误：发 `OutputEvent::Error`，
-/// `recoverable: false`（与 LLM 调用失败共用 Error 通道，但 message 精准指向配置问题）。
-async fn emit_config_error(ctx: &SessionCtx, message: &str) {
+/// 统一构造本文件三类失败的通知事件：model_id 解析失败 / Provider 实例未注册（配置错误）
+/// 与 LLM 调用失败（retry 已判定不可重试或耗尽）——三者共用 Error 通道，
+/// `message` 由各调用点精准指向错误源；`tracing::warn` 留在调用点（各处语义不同）。
+async fn emit_unrecoverable_error(ctx: &SessionCtx, message: &str) {
     let error_event = OutputEvent::Error(fuyao_api::message::output::ErrorMessage {
         base: EventBase::default(),
         payload: fuyao_api::message::output::ErrorPayload {
@@ -309,118 +333,6 @@ async fn handle_final_reply(ctx: &SessionCtx, result: &StreamResult, model_confi
     }
 }
 
-/// 首轮用户消息后触发标题自动生成（fire-and-forget）
-///
-/// 在 `inject_messages` 落库首条 user 消息后调用（早于 `run_turn`，不等 AI 回复），
-/// 解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤与长回复拖累问题。
-///
-/// 触发条件（同时满足）：
-/// - `[session.title] enabled = true`
-/// - 非子 session 或 `[session.title] skip_child = false`：子任务 session 用
-///   `parent_session_id` 表达归属，重命名反而扰乱父/子分组与前端过滤
-/// - DB 可见消息中 `role=user` 的消息数严格等于 1（首轮判定：计数法比
-///   `title=="新会话"` 更稳——用户可能改过 title）
-/// - 能取到首条 user content 与当前引擎模型 ID
-///
-/// 执行模型：`tokio::spawn` 独立 task，不阻塞主 ReAct 循环。
-/// spawn 的 future 是 `'static` 的，**不借用 `&mut Session`**——标题直接走
-/// `SessionStore::update_title` 单字段 SQL 落库，内存态不更新（下次 resume 时
-/// 从 DB 自然读回）。
-///
-/// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
-/// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
-pub(super) async fn maybe_spawn_title_generation(ctx: &SessionCtx, is_child: bool) {
-    let title_cfg = &fuyao_api::get_config().session.title;
-    if !title_cfg.enabled {
-        return;
-    }
-
-    // 子 session 跳过（可配置）：parent_session_id 已是归属标记，
-    // 默认 skip_child=true 避免重命名扰乱父/子分组
-    if is_child && title_cfg.skip_child {
-        return;
-    }
-
-    // 标题生成在首轮 user 消息落库后触发（仅 1 条消息，不可能压缩过），走从未压缩分支拿到全部消息，
-    // keep_tokens 不参与
-    let visible = match ctx
-        .store
-        .load_visible_messages(ctx.emitter.session_id(), 0)
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                session_id = ctx.emitter.session_id(),
-                cause = %e,
-                "标题生成前加载可见消息失败，跳过"
-            );
-            return;
-        }
-    };
-
-    // 计数法判定首轮：user 消息数严格等于 1（后续轮次 user_count 必然 >1，自然跳过）
-    let user_count = visible
-        .iter()
-        .filter(|m| matches!(m.role, MessageRole::User))
-        .count();
-    if user_count != 1 {
-        return;
-    }
-
-    // 取首条 user content（标题仅基于用户首句意图）
-    let user_content = visible
-        .iter()
-        .find(|m| matches!(m.role, MessageRole::User))
-        .and_then(|m| m.content.clone())
-        .unwrap_or_default();
-
-    // 标题生成回退用的主模型 ID：从 session_params 现读模型配置（ReAct 主循环同款快照）。
-    // 读不到则空串，maybe_generate_title 内部会因 model_id 无法解析返回 None。
-    let main_model_id = {
-        let params = ctx.session_params.lock().await;
-        params.model_config.model_id.clone()
-    };
-
-    // clone 'static 依赖进 spawn（所有字段都是 Send + 'static）
-    let store = Arc::clone(&ctx.store);
-    let providers = Arc::clone(&ctx.providers);
-    let emitter = ctx.emitter.clone();
-    let hooks = ctx.hooks.clone();
-    let agent_paths = ctx.agent_paths.clone();
-    let session_id = ctx.emitter.session_id().to_string();
-
-    tokio::spawn(async move {
-        match fuyao_session::maybe_generate_title(
-            &user_content,
-            &main_model_id,
-            &providers,
-            &agent_paths,
-        )
-        .await
-        {
-            Some(title) => {
-                // 单字段落库（失败仅 warn，不影响主流程）
-                if let Err(e) = store.update_title(&session_id, &title).await {
-                    tracing::warn!(session_id = %session_id, cause = %e, "标题落库失败");
-                    return;
-                }
-                // 发 Title 事件：经 dispatch 管道（拦截 → 发送 → 观察）
-                crate::dispatch::dispatch(
-                    &emitter,
-                    &hooks,
-                    OutputEvent::Title(TitleMessage {
-                        base: EventBase::default(),
-                        payload: TitlePayload { title },
-                    }),
-                )
-                .await;
-            }
-            None => tracing::debug!(session_id = %session_id, "标题生成跳过（无可用标题）"),
-        }
-    });
-}
-
 /// 处理工具调用：逐个拦截工具调用 → 计费入口同步 AssistantMessage → 执行整批工具 → 消费时机①
 ///
 /// 返回 `true` 表示执行期间被 shutdown / interrupt 打断（已 emit 事件 + 落库），调用方应据此
@@ -440,6 +352,7 @@ async fn handle_tool_calls(
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
+    keep_tokens: usize,
 ) -> bool {
     // 步骤1：逐个拦截 ToolCall 事件，构造 effective_tool_calls
     // 整批 tool_calls 拆成单个 ToolCall 事件各自拦截；Block 的跳过。
@@ -527,26 +440,31 @@ async fn handle_tool_calls(
                     push_tool_result_to_history(ctx, r).await;
                 }
                 emit_interrupt_and_complete_tool_results(
-                    ctx, &effective_result.tool_calls,
+                    ctx,
+                    &effective_result.tool_calls,
+                    keep_tokens,
                     &shutdown_interrupt_payload(),
-                ).await;
+                )
+                .await;
                 return true;
             }
-            cmd = rx_interrupt.recv() => {
+            Some(interrupt_msg) = rx_interrupt.recv() => {
                 // interrupt 命中：显式 cancel 工具批 child_token（shutdown 靠 parent 传播，无需此处 cancel）
-                // 让监听 token 的长任务 handler 后台优雅收尾；无宽限期，立即清空 + 补发
+                // 让监听 token 的长任务 handler 后台优雅收尾；无宽限期，立即清空 + 补发。
+                // Some 模式：通道关闭时本分支禁用，工具批正常跑完——关闭不模拟用户中断
                 cancel.cancel();
-                // 收到 Interrupt 或通道关闭（None）：清空 channel 把已完成的落库
+                // 清空 channel 把已完成的落库（不丢已完成结果）
                 // 用 try_recv 非阻塞清空（exec_fut 可能还在跑，recv 会阻塞）
                 while let Ok(r) = result_rx.try_recv() {
                     push_tool_result_to_history(ctx, r).await;
                 }
-                if let Some(ref interrupt_msg) = cmd {
-                    emit_interrupt_and_complete_tool_results(
-                        ctx, &effective_result.tool_calls,
-                        &interrupt_msg.payload,
-                    ).await;
-                }
+                emit_interrupt_and_complete_tool_results(
+                    ctx,
+                    &effective_result.tool_calls,
+                    keep_tokens,
+                    &interrupt_msg.payload,
+                )
+                .await;
                 return true;
             }
             Some(r) = result_rx.recv() => {
@@ -596,26 +514,17 @@ async fn push_tool_result_to_history(ctx: &SessionCtx, result: tool_exec::ToolEx
 ///
 /// 未完成判定：从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存），
 /// effective 中不在 answered 集合的 tool_call 视为未完成，逐个补发中断式 ToolResult。
+///
+/// `keep_tokens` 由调用方（run_turn 顶部）传入——与主对话可见窗口同一份预算
+/// （`effective_keep_tokens` 按 `resolved.context_length` 算），本函数不重算口径。
 async fn emit_interrupt_and_complete_tool_results(
     ctx: &SessionCtx,
     effective_tool_calls: &[fuyao_provider::ToolCallData],
+    keep_tokens: usize,
     payload: &OutputInterruptPayload,
 ) {
     emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 
-    // 从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存）
-    // keep_tokens 与主对话同口径（effective_keep_tokens 按 context_length 算）。
-    // 本路径在 run_turn 之外、无 resolved 在手：复用 resolve_context_length 纯函数，
-    // 传入 session 的 model_id（创建会话时已给定的非空值）；模型未注册时为 None，
-    // 保留预算按 0（与主对话同语义）。
-    let context_length = {
-        let p = ctx.session_params.lock().await;
-        let model_id = p.model_config.model_id.as_str();
-        resolve_context_length(model_id, &ctx.agent_paths)
-    };
-    let keep_tokens = ctx
-        .compression_config
-        .effective_keep_tokens(context_length.unwrap_or(0));
     let answered: std::collections::HashSet<String> = match ctx
         .store
         .load_visible_messages(ctx.emitter.session_id(), keep_tokens)

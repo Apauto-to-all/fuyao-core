@@ -1,0 +1,125 @@
+//! 会话标题自动生成（fire-and-forget 旁路功能）
+//!
+//! 首轮 user 消息落库后触发，不等 AI 回复。判定成本：每 session 仅一次——
+//! [`SessionCtx::title_gate`](super::SessionCtx::title_gate) 保证首个批次判定过后
+//! 原子跳过后续所有轮次，判定本身只发一条 COUNT 查询（不加载消息体），
+//! 标题内容直接取自刚注入的批（不回读 DB）。
+
+use super::SessionCtx;
+use fuyao_api::message::EventBase;
+use fuyao_api::message::OutputEvent;
+use fuyao_api::message::output::{TitleMessage, TitlePayload};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+/// 首轮用户消息注入后触发标题自动生成（每 session 至多判定一次）
+///
+/// 在 `inject_user_messages` 落库后由主循环调用（早于 `run_turn`，不等 AI 回复），
+/// 解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤与长回复拖累问题。
+///
+/// 触发条件（按序短路，全部满足才生成）：
+/// - 本 session 首次经过本函数：[`SessionCtx::title_gate`] 原子换防，之后所有轮次
+///   零成本返回（含配置关闭 / 子会话豁免 / 非首轮的情形——标题配置为进程级静态，
+///   首次判定即终局，无需每轮重评）
+/// - `[session.title] enabled = true`
+/// - 非子 session 或 `[session.title] skip_child = false`：子任务 session 用
+///   `parent_session_id` 表达归属，重命名反而扰乱父/子分组与前端过滤
+/// - DB 中 `role=user` 的普通消息数严格等于 1（首轮判定：计数法比
+///   `title=="新会话"` 更稳——用户可能改过 title；COUNT 查询不加载消息体）
+/// - 能取到首条 user content（调用方从刚注入的批传入，不回读 DB）
+///
+/// 执行模型：`tokio::spawn` 独立 task，不阻塞主 ReAct 循环。
+/// spawn 的 future 是 `'static` 的——标题直接走 `SessionStore::update_title`
+/// 单字段 SQL 落库，内存态不更新（下次 resume 时从 DB 自然读回）。
+///
+/// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
+/// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
+pub(super) async fn maybe_spawn_title(ctx: &SessionCtx, first_user_content: Option<&str>) {
+    // 每 session 一次：首个批次原子换防，后续轮次零成本返回
+    if ctx.title_gate.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let title_cfg = &fuyao_api::get_config().session.title;
+    if !title_cfg.enabled {
+        return;
+    }
+
+    // 子 session 跳过（可配置）：parent_session_id 已是归属标记，
+    // 默认 skip_child=true 避免重命名扰乱父/子分组
+    if ctx.is_child && title_cfg.skip_child {
+        return;
+    }
+
+    // 计数法判定首轮：注入后 user 消息数严格等于 1（COUNT 查询，不加载消息体）。
+    // 等价于「全新会话且本批恰 1 条」——恢复的带历史会话计数 >1，自然跳过
+    let user_count = match ctx
+        .store
+        .count_user_messages(ctx.emitter.session_id())
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %e,
+                "标题生成前统计 user 消息失败，跳过"
+            );
+            return;
+        }
+    };
+    if user_count != 1 {
+        return;
+    }
+
+    // 首条 user content 取自调用方传入的本批首条（不回读 DB）；
+    // to_string 拿所有权——spawn 的 future 是 'static，不能借用本函数参数
+    let Some(user_content) = first_user_content.map(str::to_string) else {
+        return;
+    };
+
+    // 标题生成回退用的主模型 ID：从 session_params 现读模型配置（ReAct 主循环同款快照）。
+    // 读不到则空串，maybe_generate_title 内部会因 model_id 无法解析返回 None。
+    let main_model_id = {
+        let params = ctx.session_params.lock().await;
+        params.model_config.model_id.clone()
+    };
+
+    // clone 'static 依赖进 spawn（所有字段都是 Send + 'static）
+    let store = Arc::clone(&ctx.store);
+    let providers = Arc::clone(&ctx.providers);
+    let emitter = ctx.emitter.clone();
+    let hooks = ctx.hooks.clone();
+    let agent_paths = ctx.agent_paths.clone();
+    let session_id = ctx.emitter.session_id().to_string();
+
+    tokio::spawn(async move {
+        match fuyao_session::maybe_generate_title(
+            &user_content,
+            &main_model_id,
+            &providers,
+            &agent_paths,
+        )
+        .await
+        {
+            Some(title) => {
+                // 单字段落库（失败仅 warn，不影响主流程）
+                if let Err(e) = store.update_title(&session_id, &title).await {
+                    tracing::warn!(session_id = %session_id, cause = %e, "标题落库失败");
+                    return;
+                }
+                // 发 Title 事件：经 dispatch 管道（拦截 → 发送 → 观察）
+                crate::dispatch::dispatch(
+                    &emitter,
+                    &hooks,
+                    OutputEvent::Title(TitleMessage {
+                        base: EventBase::default(),
+                        payload: TitlePayload { title },
+                    }),
+                )
+                .await;
+            }
+            None => tracing::debug!(session_id = %session_id, "标题生成跳过（无可用标题）"),
+        }
+    });
+}

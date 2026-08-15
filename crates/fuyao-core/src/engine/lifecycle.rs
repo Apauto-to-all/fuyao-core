@@ -412,26 +412,25 @@ impl Engine {
             self.assemble_session_hooks(&session_id, tx_inbound.clone(), tx_interrupt.clone());
 
         // 装配 SessionCtx（会话级共享依赖的 owned 视图）+ SessionRx（入站通道集合）。
-        // 此前 run_session 接 18 个位置参数、入口内部再打包成 SessionCtx——调用方拆包、
-        // 入口打包的两份参数表需手动同步（签名顺序与字面量顺序还不一致）。现收敛为调用方
-        // 一次性构造 ctx + rx，入口降到两参数，消除双份参数表的漂移风险。
-        let ctx = react::SessionCtx {
-            is_child,
-            store: Arc::clone(&self.store),
-            providers: Arc::clone(&self.providers),
-            tools: Arc::clone(&self.tools),
+        // SessionCtx 统一经 builder 构造（与测试共用唯一构造点）：必填字段位置参数钉死，
+        // 可选字段生产侧全部显式覆盖——不用默认值，漏配即显式可见（fail-loud）。
+        let ctx = react::SessionCtx::builder(
+            Arc::clone(&self.store),
+            Arc::clone(&self.providers),
+            Arc::clone(&self.tools),
             hooks,
-            agent_paths: self.params.agent_paths.clone(),
+            self.params.agent_paths.clone(),
             definition,
-            session_params: Arc::clone(&session_params),
-            emitter: Emitter::new(tx_event, session_id.clone()),
-            guide: Arc::clone(&guide),
-            pending: Arc::clone(&pending),
-            last_usage: Arc::new(Mutex::new(None)),
-            compression_config: fuyao_api::get_config().session.compression.clone(),
-            shutdown_token: shutdown_token.clone(),
-            subagent_ops: Some(self.subagent_ops_weak()),
-        };
+            Arc::clone(&session_params),
+            Emitter::new(tx_event, session_id.clone()),
+            is_child,
+        )
+        .guide(Arc::clone(&guide))
+        .pending(Arc::clone(&pending))
+        .compression_config(fuyao_api::get_config().session.compression.clone())
+        .shutdown_token(shutdown_token.clone())
+        .subagent_ops(Some(self.subagent_ops_weak()))
+        .build();
         let rx = react::SessionRx {
             inbound: rx_inbound,
             interrupt: rx_interrupt,

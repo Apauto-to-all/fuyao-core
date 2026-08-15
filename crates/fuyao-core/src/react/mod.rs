@@ -27,6 +27,7 @@ pub(crate) mod retry;
 mod rollback;
 #[cfg(test)]
 mod tests;
+mod title;
 pub(crate) mod turn;
 
 use crate::emit::Emitter;
@@ -106,6 +107,138 @@ pub(crate) struct SessionCtx {
     /// 取代旧的"内存 `session.parent_session_id` 现读"——DB 唯一数据源后，
     /// session 不再常驻内存，此标记提升为 ctx 的不可变字段。
     pub is_child: bool,
+    /// 标题生成判定门（每 session 至多开一次）
+    ///
+    /// 首批 user 消息注入时由 title 模块原子消耗（`swap` 换防），此后所有轮次
+    /// 零成本跳过标题判定——含配置关闭 / 子会话豁免 / 非首轮的情形
+    /// （标题配置为进程级静态，首次判定即终局）。恒 false 起步，builder 不暴露 setter。
+    pub title_gate: std::sync::atomic::AtomicBool,
+}
+
+/// SessionCtx 的可选字段覆盖链（由 [`SessionCtx::builder`] 进入，[`SessionCtxBuilder::build`] 收口）
+///
+/// 生产装配与测试共用：必填字段在 builder 入口以位置参数钉死（编译期强制，
+/// 漏一个即编译失败），可选字段链式覆盖、`build` 兜底默认值。SessionCtx 增删
+/// 字段时只需动 builder 与 build 两处，全部构造点自动跟随。
+pub(crate) struct SessionCtxBuilder {
+    // 必填字段（builder 入口已定，不可再改）
+    store: Arc<fuyao_session::SessionStore>,
+    providers: Arc<ProviderRegistry>,
+    tools: Arc<ToolRegistry>,
+    hooks: SharedHooks,
+    agent_paths: fuyao_api::AgentPaths,
+    definition: AgentDefinition,
+    session_params: Arc<Mutex<SessionParams>>,
+    emitter: Emitter,
+    is_child: bool,
+    // 可选字段（None = build 时取默认）
+    guide: Option<SharedQueue>,
+    pending: Option<SharedQueue>,
+    compression_config: Option<CompressionConfig>,
+    shutdown_token: Option<CancellationToken>,
+    subagent_ops: Option<Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>>,
+}
+
+impl SessionCtxBuilder {
+    /// 覆盖引导队列（默认空队列）
+    pub(crate) fn guide(mut self, guide: SharedQueue) -> Self {
+        self.guide = Some(guide);
+        self
+    }
+
+    /// 覆盖排队队列（默认空队列）
+    pub(crate) fn pending(mut self, pending: SharedQueue) -> Self {
+        self.pending = Some(pending);
+        self
+    }
+
+    /// 覆盖压缩配置（默认 `CompressionConfig::default()`；生产从全局配置显式传入）
+    pub(crate) fn compression_config(mut self, config: CompressionConfig) -> Self {
+        self.compression_config = Some(config);
+        self
+    }
+
+    /// 覆盖关闭信号（默认新建 token；生产传引擎级 shutdown 的 child_token）
+    pub(crate) fn shutdown_token(mut self, token: CancellationToken) -> Self {
+        self.shutdown_token = Some(token);
+        self
+    }
+
+    /// 覆盖子 session 派生能力弱引用（默认 None；生产传引擎的 Weak）
+    pub(crate) fn subagent_ops(
+        mut self,
+        ops: Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>,
+    ) -> Self {
+        self.subagent_ops = Some(ops);
+        self
+    }
+
+    /// 收口构造：可选字段取默认（空队列 / 默认压缩配置 / 新 token / None 弱引用），
+    /// `last_usage` 恒 None 起步、`title_gate` 恒未消耗——两者无 setter
+    pub(crate) fn build(self) -> SessionCtx {
+        SessionCtx {
+            store: self.store,
+            providers: self.providers,
+            tools: self.tools,
+            hooks: self.hooks,
+            agent_paths: self.agent_paths,
+            definition: self.definition,
+            session_params: self.session_params,
+            emitter: self.emitter,
+            guide: self.guide.unwrap_or_else(|| {
+                Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+            }),
+            pending: self.pending.unwrap_or_else(|| {
+                Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
+            }),
+            last_usage: Arc::new(Mutex::new(None)),
+            compression_config: self.compression_config.unwrap_or_default(),
+            shutdown_token: self.shutdown_token.unwrap_or_default(),
+            subagent_ops: self.subagent_ops.flatten(),
+            is_child: self.is_child,
+            title_gate: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl SessionCtx {
+    /// SessionCtx 的唯一构造入口（生产 assemble_session 与测试共用）
+    ///
+    /// 九个必填字段作位置参数——编译期强制，漏一个即编译失败（fail-loud，无运行时
+    /// 默认兜底）。可选字段（双队列 / 压缩配置 / 关闭信号 / 子代理弱引用）经
+    /// [`SessionCtxBuilder`] 链式覆盖，见各 setter 的默认值说明。
+    ///
+    /// 参数超限是刻意选择：换成「必填字段聚合结构体」会退化成 SessionCtx 的字段
+    /// 镜像（又一处需手动同步的字面量），位置参数才能让漏传直接编译失败。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn builder(
+        store: Arc<fuyao_session::SessionStore>,
+        providers: Arc<ProviderRegistry>,
+        tools: Arc<ToolRegistry>,
+        hooks: SharedHooks,
+        agent_paths: fuyao_api::AgentPaths,
+        definition: AgentDefinition,
+        session_params: Arc<Mutex<SessionParams>>,
+        emitter: Emitter,
+        is_child: bool,
+    ) -> SessionCtxBuilder {
+        SessionCtxBuilder {
+            store,
+            providers,
+            tools,
+            hooks,
+            agent_paths,
+            definition,
+            session_params,
+            emitter,
+            is_child,
+            guide: None,
+            pending: None,
+            compression_config: None,
+            shutdown_token: None,
+            subagent_ops: None,
+        }
+    }
 }
 
 /// session 执行流的入站通道集合
@@ -158,12 +291,9 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
 
     // 主循环：从 guide 全取消息 → 注入 → 跑 ReAct（自包含循环）。
     //
-    // 消费许可由 `outcome` 表达：只有上次 turn `Completed`（双队列跑空）才允许 consume guide。
-    // 任何非 Completed 退出（命令停 / 中断 / 失败）→ outcome 保持非 Completed → 下次 loop 顶部
-    // 跳过 consume，guide/pending 剩余原样保留，落 select! 等待。
-    //
-    // 恢复消费：select! 的 inbound 分支收到新用户消息时把 outcome 重置为 Completed——
-    // 新消息入队 = 新意图，回顶部 consume 把「旧剩余 + 新消息」一起跑（忠实消费，引擎不清队列）。
+    // 消费许可状态机由 `TurnOutcome` 自带（may_consume / resume_on_new_intent，
+    // 唯一权威定义见 turn.rs 的类型文档）；本循环只做无策略驱动：
+    // 顶部按许可消费、idle 收到新用户消息时恢复许可。
     let mut outcome = turn::TurnOutcome::Completed;
     loop {
         // === 控制通道消费（turn 边界）===
@@ -176,7 +306,7 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
         }
         // 消费许可：上次 turn 非 Completed（被命令停 / 中断 / 失败）→ 跳过 consume，
         // guide/pending 剩余原样保留，直接落 select! 等待用户新消息恢复
-        if matches!(outcome, turn::TurnOutcome::Completed) {
+        if outcome.may_consume() {
             // task 空闲时（无活跃 turn）= 无进行中的 ReAct 链，pending 的"等链结束"解禁条件已满足
             // → 此时 pending 与 guide 语义等价，立即解禁进 guide 触发新 turn
             // （否则只发 pending 时 pending 会死信，永远进不了 turn）
@@ -208,12 +338,14 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                     let p = ctx.session_params.lock().await;
                     p.model_config.clone()
                 };
+                // 首条内容先留一份（inject 调用会拿走 msgs 所有权），供标题旁路直取
+                let title_seed = msgs.first().map(|m| m.payload.content.clone());
                 // 一次性全部注入：每条经统一历史入口（拦截 → 投影落 DB → 发送 → 观察）
                 crate::history::inject_user_messages(&ctx, msgs).await;
                 // 首轮 user 消息落库后立即触发标题生成（fire-and-forget，不等 AI 回复）：
                 // 在 run_turn 之前判定，解决旧逻辑「等 AI 整轮回复完成才生成」的延迟硬伤。
-                // 内部按 user_count==1 判首轮，仅首轮通过，后续轮次天然跳过。
-                turn::maybe_spawn_title_generation(&ctx, ctx.is_child).await;
+                // 判定门每 session 只开一次，内容取自本批首条（不回读 DB）
+                title::maybe_spawn_title(&ctx, title_seed.as_deref()).await;
                 // run_turn 自包含跑完整个队列直到空、或被控制命令/中断打断 → return TurnOutcome。
                 // outcome 决定下一轮 loop 顶部的消费许可：非 Completed 则跳过 consume 等恢复。
                 outcome =
@@ -225,7 +357,7 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
         // ① guide 空（Completed 且无消息）② run_turn 非 Completed return（队列剩余被保留）
         // ③ 消费被跳过（outcome 非 Completed）。
         // 停止消费：非 Completed 时 guide 剩余不跑，落这里等。
-        // 恢复消费：inbound 收到新用户消息 → 重置 outcome=Completed → 回顶部 consume，
+        // 恢复消费：inbound 收到新用户消息 → 恢复许可 → 回顶部 consume，
         // 旧剩余 + 新消息一起跑（忠实消费，不清队列）。
         tokio::select! {
             biased;
@@ -239,8 +371,8 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
             }
             Some(inbound) = rx_inbound.recv() => {
                 // 入站 User 消息过完整管道：拦截 → 处理(入队) → 发送(回显) → 观察。
-                // 重置消费许可：新消息 = 新意图，回顶部 consume（旧剩余 + 新消息一起跑）
-                outcome = turn::TurnOutcome::Completed;
+                // 恢复消费许可：新消息 = 新意图，回顶部 consume（旧剩余 + 新消息一起跑）
+                outcome.resume_on_new_intent();
                 handle_inbound_user(&ctx, inbound).await;
             }
             Some(interrupt_msg) = rx_interrupt.recv() => {
