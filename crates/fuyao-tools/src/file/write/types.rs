@@ -1,6 +1,15 @@
 //! 文件写入工具类型定义
 //!
-//! 定义文件写入工具的结果类型。
+//! 定义文件写入工具的参数与结果类型。
+
+/// write 工具参数（类型化解析）
+#[derive(Debug, serde::Deserialize)]
+pub struct WriteArgs {
+    /// 文件路径（不存在则创建，存在则覆盖）
+    pub path: String,
+    /// 要写入的完整内容
+    pub content: String,
+}
 
 /// 文件写入结果
 #[derive(Debug, Clone, serde::Serialize)]

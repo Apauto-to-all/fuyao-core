@@ -28,7 +28,7 @@ mod parallel;
 
 use crate::emit::Emitter;
 use crate::tool_registry::ToolRegistry;
-use fuyao_api::{CancellationToken, ToolCallContext, ToolCapabilities};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolCapabilities, ToolOutput};
 use fuyao_provider::ToolCallData;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -210,11 +210,11 @@ async fn execute_single(tc: &ToolCallData, ctx: &ToolExecCtx) -> ToolExecResult 
     let tool_call_id = tc.id.clone();
 
     let Some(entry) = ctx.tools.get(&tool_name) else {
-        // 未知工具：容错降级，返回明确提示而非报错
+        // 未知工具：容错降级，返回明确提示而非报错（错误信封形态与工具错误一致）
         tracing::warn!(tool_name = %tool_name, "未知工具");
         return ToolExecResult {
             tool_call_id,
-            content: format!("未知工具: {tool_name}"),
+            content: ToolOutput::error(format!("未知工具: {tool_name}")).to_wire(),
             tool_name,
         };
     };
@@ -234,15 +234,15 @@ async fn execute_single(tc: &ToolCallData, ctx: &ToolExecCtx) -> ToolExecResult 
     };
 
     let started = std::time::Instant::now();
-    let content = (entry.handler)(args, tool_ctx, ctx.cancel.clone()).await;
+    let output = (entry.handler)(args, tool_ctx, ctx.cancel.clone()).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
-    tracing::info!(tool_name = %tool_name, elapsed_ms, "工具执行完成");
+    tracing::info!(tool_name = %tool_name, ok = !output.is_error(), elapsed_ms, "工具执行完成");
 
     ToolExecResult {
         tool_call_id,
         tool_name,
-        content,
+        content: output.to_wire(),
     }
 }
 

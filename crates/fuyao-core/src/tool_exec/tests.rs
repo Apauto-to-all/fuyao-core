@@ -39,7 +39,7 @@ fn fixed_result_tool(name: &str, result: &str) -> ToolEntry {
     let result = result.to_string();
     let handler: ToolFn = Arc::new(move |_args, _ctx, _cancel| {
         let result = result.clone();
-        Box::pin(async move { result })
+        Box::pin(async move { fuyao_api::ToolOutput::text(result) })
     });
     ToolEntry {
         definition: ToolDefinition::new(name, "测试工具"),
@@ -56,7 +56,7 @@ fn echo_name_tool(name: &str) -> ToolEntry {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        Box::pin(async move { format!("result_{n}") })
+        Box::pin(async move { fuyao_api::ToolOutput::text(format!("result_{n}")) })
     });
     ToolEntry {
         definition: ToolDefinition::new(name, "测试工具"),

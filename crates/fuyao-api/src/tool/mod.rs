@@ -2,9 +2,9 @@
 //!
 //! 定义工具系统相关的类型，遵循 OpenAI Function Calling 规范。
 //! - `definition`: 工具定义（ToolDefinition、ToolSchema、ToolParameters、ToolParameterProperty）
-//! - `entry`: 工具条目（ToolEntry = schema + handler + 可见性元数据）
-//! - `result`: 工具执行结果（ToolResult）
-//! - `func`: 工具执行器函数类型（ToolFn）
+//! - `entry`: 工具条目（ToolEntry = schema + handler + 可见性元数据 + insert_tool 注册）
+//! - `output`: 工具执行结果信封（ToolOutput / ToolError，"error" 键约定类型化）
+//! - `func`: 工具执行器函数类型（ToolFn）与 handler 侧辅助（tool_handler / parse_args）
 //! - `context`: 工具调用上下文（ToolCallContext）
 //! - `ops`: 运行期能力注入接口（SubagentOps + ChildSessionSource + TodoStoreOps）
 
@@ -13,16 +13,16 @@ pub mod definition;
 pub mod entry;
 pub mod func;
 pub mod ops;
-pub mod result;
+pub mod output;
 
 pub use context::{ToolCallContext, ToolCapabilities};
 pub use definition::{
     ToolDefinition, ToolDefinitionBuilder, ToolParameterProperty, ToolParameters, ToolSchema,
 };
-pub use entry::ToolEntry;
-pub use func::ToolFn;
+pub use entry::{ToolEntry, insert_tool};
+pub use func::{ToolFn, parse_args, tool_handler};
 pub use ops::{ChildSessionSource, SubagentOps, TodoStoreOps};
-pub use result::ToolResult;
+pub use output::{ToolError, ToolOutput};
 
 // 取消令牌：工具 handler 据此响应中断 / shutdown，优雅收尾长任务
 pub use tokio_util::sync::CancellationToken;

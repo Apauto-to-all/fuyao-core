@@ -14,8 +14,7 @@ use fuyao_mcp::MCPManager;
 /// 收集 MCP 工具
 ///
 /// 从 `[mcp_servers]` 配置创建 MCPManager，启动所有 server 连接，
-/// 把发现的工具（name / schema / handler 三元组）反序列化 schema 成 `ToolDefinition`
-/// 后包成 `ToolEntry` 收集。
+/// 收集已发现工具的注册条目（强类型 schema + bridge 生成的 handler）。
 ///
 /// - 无配置 server → 返回 `None`（不启动子进程）。
 /// - 部分启动失败 → 仅记录 WARN，继续收集已成功的工具。
@@ -39,23 +38,7 @@ pub async fn collect_mcp_tools() -> Option<(Arc<MCPManager>, Vec<ToolEntry>)> {
         );
     }
 
-    // MCPManager 已用强类型 ToolDefinition 持有 schema，get_tool_entries 序列化为 Value 返回；
-    // 此处反序列化回 ToolDefinition 再包成 ToolEntry（handler 直接复用 MCP 生成的 ToolFn）
-    let mut entries = Vec::new();
-    for (name, schema_value, handler) in manager.get_tool_entries().await {
-        let definition = match serde_json::from_value::<fuyao_api::ToolDefinition>(schema_value) {
-            Ok(def) => def,
-            Err(e) => {
-                tracing::warn!(tool_name = %name, cause = %e, "MCP 工具 schema 反序列化失败，跳过");
-                continue;
-            }
-        };
-        entries.push(ToolEntry {
-            definition,
-            handler,
-            child_invisible: false,
-        });
-    }
+    let entries = manager.get_tool_entries().await;
 
     tracing::info!(tools = entries.len(), "MCP 工具收集完成");
     Some((manager, entries))

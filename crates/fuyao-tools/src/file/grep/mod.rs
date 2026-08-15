@@ -14,41 +14,35 @@
 mod handler;
 pub mod types;
 
-use fuyao_api::ToolEntry;
-use fuyao_api::{ToolDefinition, ToolFn};
+use fuyao_api::{ToolDefinition, ToolEntry, insert_tool, tool_handler};
 use handler::grep_impl;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashMap;
+use types::{DEFAULT_LIMIT, DEFAULT_PATH};
 
 /// 注册 grep 工具
-pub fn register(map: &mut HashMap<&'static str, ToolEntry>) {
-    let handler: ToolFn = std::sync::Arc::new(|args: Value, ctx, _cancel| {
-        Box::pin(async move { grep_impl(args, &ctx).await })
-    });
-
-    let definition = ToolDefinition::builder(
-        "grep",
-        "使用正则表达式搜索文件内容。\n支持正则表达式语法（如 log.*Error、function\\s+\\w+）。\n可使用 include 参数过滤文件类型（如 *.py）。\n自动遵守 .gitignore 规则。",
-    )
-    .string("pattern", "正则表达式（如 log.*Error、def\\s+\\w+）")
-    .required()
-    .string("path", "搜索路径（默认当前目录）")
-    .default(json!("."))
-    .string("include", "文件过滤模式（如 *.py、*.{ts,tsx}）")
-    .integer("limit", "最大结果数（默认 50）")
-    .default(json!(50))
-    .integer("offset", "跳过前 N 个结果（分页用）")
-    .default(json!(0))
-    .integer("context", "显示匹配行的上下文行数")
-    .default(json!(0))
-    .build();
-
-    map.insert(
-        "grep",
-        ToolEntry {
-            definition,
-            handler,
-            child_invisible: false,
-        },
+pub fn register(map: &mut HashMap<String, ToolEntry>) {
+    insert_tool(
+        map,
+        ToolEntry::new(
+            ToolDefinition::builder(
+                "grep",
+                "使用正则表达式搜索文件内容。\n支持正则表达式语法（如 log.*Error、function\\s+\\w+）。\n可使用 include 参数过滤文件类型（如 *.py）。\n自动遵守 .gitignore 规则。",
+            )
+            .string("pattern", "正则表达式（如 log.*Error、def\\s+\\w+）")
+            .required()
+            .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))
+            .default(json!(DEFAULT_PATH))
+            .string("include", "文件过滤模式（如 *.py、*.{ts,tsx}）")
+            .integer("limit", format!("最大结果数（默认 {DEFAULT_LIMIT}）"))
+            .default(json!(DEFAULT_LIMIT))
+            .integer("offset", "跳过前 N 个结果（分页用）")
+            .default(json!(0))
+            .integer("context", "显示匹配行的上下文行数")
+            .default(json!(0))
+            .build(),
+            tool_handler(grep_impl),
+            false,
+        ),
     );
 }

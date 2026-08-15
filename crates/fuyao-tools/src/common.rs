@@ -61,21 +61,6 @@ fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// 返回 JSON 格式的错误信息
-pub fn tool_error(message: &str) -> String {
-    serde_json::json!({ "error": message }).to_string()
-}
-
-/// 返回 JSON 格式的错误信息（带额外字段）
-pub fn tool_error_with(extra: serde_json::Value) -> String {
-    extra.to_string()
-}
-
-/// 返回 JSON 格式的结果
-pub fn tool_result(data: serde_json::Value) -> String {
-    data.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

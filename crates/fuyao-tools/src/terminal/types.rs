@@ -1,6 +1,19 @@
 //! 终端工具类型定义
 //!
-//! 定义 bash 工具返回给 AI 的结果结构体。
+//! 定义 bash 工具的参数与结果类型。
+
+/// bash 工具参数（类型化解析）
+///
+/// timeout 缺省由 handler 从全局配置取默认值并按上限收敛。
+#[derive(Debug, serde::Deserialize)]
+pub struct BashArgs {
+    /// 要执行的 shell 命令
+    pub command: String,
+    /// 超时时间（秒）
+    pub timeout: Option<u64>,
+    /// 工作目录。不传则默认使用 Agent workspace
+    pub workdir: Option<String>,
+}
 
 /// bash 工具返回结果
 #[derive(Debug, Clone, serde::Serialize)]

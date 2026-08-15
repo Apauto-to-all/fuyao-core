@@ -7,7 +7,7 @@ use super::output::{decode_output, strip_ansi, truncate_output};
 use super::safety::build_safe_env;
 use super::shell::ShellInfo;
 use super::types::BashToolResult;
-use fuyao_api::CancellationToken;
+use fuyao_api::{CancellationToken, ToolOutput};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -238,8 +238,11 @@ pub async fn execute_command(
 
 // =========== 结果格式化 ===========
 
-/// 格式化 TerminalResult 为 JSON 字符串
-pub fn format_result(result: TerminalResult) -> String {
+/// 格式化 TerminalResult 为结果信封
+///
+/// 执行结果（含失败/超时/取消）都走 Value 变体——
+/// LLM 需要 exit_code / output 等字段自行判断，不整体折成错误信封。
+pub fn format_result(result: TerminalResult) -> ToolOutput {
     // 无输出时填充提示，避免 AI 误判为异常
     let output = if result.output.trim().is_empty() && result.success {
         "（无输出）".to_string()
@@ -261,7 +264,7 @@ pub fn format_result(result: TerminalResult) -> String {
         exit_code_meaning: result.exit_code_meaning,
         shell_type: result.shell_type.to_string(),
     };
-    serde_json::to_string(&output).unwrap_or_else(|_| "{}".to_string())
+    ToolOutput::ok(serde_json::to_value(&output).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -282,7 +285,7 @@ mod tests {
             exit_code_meaning: None,
             shell_type: "bash",
         };
-        let json = format_result(result);
+        let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["output"], "hello");
@@ -304,7 +307,7 @@ mod tests {
             exit_code_meaning: None,
             shell_type: "bash",
         };
-        let json = format_result(result);
+        let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["timed_out"], true);
         assert_eq!(parsed["exit_code"], 124);
@@ -325,7 +328,7 @@ mod tests {
             exit_code_meaning: None,
             shell_type: "bash",
         };
-        let json = format_result(result);
+        let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["output"], "（无输出）");
     }
@@ -345,7 +348,7 @@ mod tests {
             exit_code_meaning: None,
             shell_type: "bash",
         };
-        let json = format_result(result);
+        let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["output"], "");
     }

@@ -5,14 +5,13 @@
 //! - 传 name → 加载 Skill 内容
 //! - 传 name + file_path → 加载关联文件
 
-use super::types::{SkillFileResult, SkillListResult, SkillMetaItem, SkillViewResult};
-use crate::common;
-use fuyao_api::{AgentPaths, ToolCallContext};
+use super::types::{SkillArgs, SkillFileResult, SkillListResult, SkillMetaItem, SkillViewResult};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
 use fuyao_skills::{find_all_skills, load_skill, load_skill_file};
 use serde_json::Value;
 
 /// 格式化 Skill 未找到错误
-fn format_skill_not_found(name: &str, agent_paths: &AgentPaths) -> String {
+fn format_skill_not_found(name: &str, agent_paths: &fuyao_api::AgentPaths) -> String {
     let available = find_all_skills(agent_paths).unwrap_or_default();
     if available.is_empty() {
         format!("未找到 Skill '{}'。当前没有可用的 Skills", name)
@@ -31,7 +30,11 @@ fn format_skill_not_found(name: &str, agent_paths: &AgentPaths) -> String {
 }
 
 /// 格式化文件未找到错误
-fn format_file_not_found(name: &str, file_path: &str, agent_paths: &AgentPaths) -> String {
+fn format_file_not_found(
+    name: &str,
+    file_path: &str,
+    agent_paths: &fuyao_api::AgentPaths,
+) -> String {
     let hint = match load_skill(name, agent_paths) {
         Ok(skill) => {
             if skill.linked_files.is_empty() {
@@ -47,15 +50,15 @@ fn format_file_not_found(name: &str, file_path: &str, agent_paths: &AgentPaths) 
 }
 
 /// 列出所有可用 Skills
-fn skill_list_handler(ctx: &ToolCallContext) -> String {
+fn skill_list_handler(ctx: &ToolCallContext) -> ToolOutput {
     let agent_paths = match &ctx.agent_paths {
         Some(paths) => paths,
-        None => return common::tool_error("无法获取 Agent 路径上下文"),
+        None => return ToolOutput::error("无法获取 Agent 路径上下文"),
     };
 
     let all_skills = match find_all_skills(agent_paths) {
         Ok(skills) => skills,
-        Err(e) => return common::tool_error(&format!("加载 Skills 失败: {e}")),
+        Err(e) => return ToolOutput::error(format!("加载 Skills 失败: {e}")),
     };
 
     if all_skills.is_empty() {
@@ -65,7 +68,7 @@ fn skill_list_handler(ctx: &ToolCallContext) -> String {
             message: Some("未找到 Skills".to_string()),
             hint: None,
         };
-        return serde_json::to_string(&result).unwrap_or_else(|_| common::tool_error("序列化失败"));
+        return ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default());
     }
 
     let skills: Vec<SkillMetaItem> = all_skills.iter().map(SkillMetaItem::from).collect();
@@ -78,14 +81,14 @@ fn skill_list_handler(ctx: &ToolCallContext) -> String {
         hint: Some("使用 skill(name) 查看完整内容".to_string()),
     };
 
-    serde_json::to_string(&result).unwrap_or_else(|_| common::tool_error("序列化失败"))
+    ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
 }
 
 /// 加载 Skill 完整内容或关联文件
-fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext) -> String {
+fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext) -> ToolOutput {
     let agent_paths = match &ctx.agent_paths {
         Some(paths) => paths,
-        None => return common::tool_error("无法获取 Agent 路径上下文"),
+        None => return ToolOutput::error("无法获取 Agent 路径上下文"),
     };
 
     // 如果指定了 file_path，加载关联文件
@@ -93,9 +96,9 @@ fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext
         match load_skill_file(name, file_path, agent_paths) {
             Ok(content) => {
                 let result = SkillFileResult { content };
-                serde_json::to_string(&result).unwrap_or_else(|_| common::tool_error("序列化失败"))
+                ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
             }
-            Err(_) => common::tool_error(&format_file_not_found(name, file_path, agent_paths)),
+            Err(_) => ToolOutput::error(format_file_not_found(name, file_path, agent_paths)),
         }
     } else {
         // 加载 Skill 完整内容
@@ -133,9 +136,9 @@ fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext
                     usage_hint,
                     skill_dir: skill.skill_dir,
                 };
-                serde_json::to_string(&result).unwrap_or_else(|_| common::tool_error("序列化失败"))
+                ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
             }
-            Err(_) => common::tool_error(&format_skill_not_found(name, agent_paths)),
+            Err(_) => ToolOutput::error(format_skill_not_found(name, agent_paths)),
         }
     }
 }
@@ -145,21 +148,25 @@ fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext
 /// 不传参数 → 列出所有 Skills
 /// 传 name → 加载 Skill 内容
 /// 传 name + file_path → 加载关联文件
-pub fn skill_handler(args: Value, ctx: &ToolCallContext) -> String {
-    let name = args.get("name").and_then(|v| v.as_str());
-    let file_path = args
-        .get("file_path")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty());
+pub async fn skill_handler(
+    args: Value,
+    ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
+    let SkillArgs { name, file_path } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
+    };
+    let file_path = file_path.filter(|s| !s.trim().is_empty());
 
     // file_path 存在但 name 缺失，报错
-    if file_path.is_some() && (name.is_none() || name.unwrap().trim().is_empty()) {
-        return common::tool_error("缺少必需参数 'name'");
+    if file_path.is_some() && name.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return ToolOutput::error("缺少必需参数 'name'");
     }
 
-    match name {
-        None | Some("") => skill_list_handler(ctx),
-        Some(name) => skill_view_handler(name.trim(), file_path, ctx),
+    match name.as_deref().map(str::trim) {
+        None | Some("") => skill_list_handler(&ctx),
+        Some(name) => skill_view_handler(name, file_path.as_deref(), &ctx),
     }
 }
 
@@ -177,47 +184,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn skill_handler_empty_name_lists_skills() {
+    #[tokio::test]
+    async fn skill_handler_empty_name_lists_skills() {
         let args = serde_json::json!({});
         let ctx = create_test_ctx();
-        let result = skill_handler(args, &ctx);
+        let result = skill_handler(args, ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("count"));
     }
 
-    #[test]
-    fn skill_handler_nonexistent_skill_returns_error() {
+    #[tokio::test]
+    async fn skill_handler_nonexistent_skill_returns_error() {
         let args = serde_json::json!({ "name": "nonexistent_skill_12345" });
         let ctx = create_test_ctx();
-        let result = skill_handler(args, &ctx);
+        let result = skill_handler(args, ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("error"));
         assert!(result.contains("未找到 Skill"));
     }
 
-    #[test]
-    fn skill_handler_empty_name_param_lists_skills() {
+    #[tokio::test]
+    async fn skill_handler_empty_name_param_lists_skills() {
         let args = serde_json::json!({ "name": "" });
         let ctx = create_test_ctx();
-        let result = skill_handler(args, &ctx);
+        let result = skill_handler(args, ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("count"));
     }
 
-    #[test]
-    fn skill_handler_nonexistent_file_returns_error() {
+    #[tokio::test]
+    async fn skill_handler_nonexistent_file_returns_error() {
         let args = serde_json::json!({
             "name": "nonexistent_skill_12345",
             "file_path": "nonexistent/file.txt"
         });
         let ctx = create_test_ctx();
-        let result = skill_handler(args, &ctx);
+        let result = skill_handler(args, ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("error"));
     }
 
-    #[test]
-    fn skill_handler_no_agent_paths_returns_error() {
+    #[tokio::test]
+    async fn skill_handler_no_agent_paths_returns_error() {
         let args = serde_json::json!({});
         let ctx = ToolCallContext::default();
-        let result = skill_handler(args, &ctx);
+        let result = skill_handler(args, ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("error"));
         assert!(result.contains("无法获取 Agent 路径上下文"));
     }

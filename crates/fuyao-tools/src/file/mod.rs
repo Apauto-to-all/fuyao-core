@@ -28,7 +28,7 @@ mod safety;
 mod tracker;
 mod write;
 
-pub fn register(map: &mut std::collections::HashMap<&'static str, fuyao_api::ToolEntry>) {
+pub fn register(map: &mut std::collections::HashMap<String, fuyao_api::ToolEntry>) {
     read::register(map);
     write::register(map);
     glob::register(map);

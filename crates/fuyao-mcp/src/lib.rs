@@ -13,7 +13,7 @@ mod security;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fuyao_api::MCPServerConfig;
+use fuyao_api::{MCPServerConfig, ToolOutput};
 use tokio::sync::Mutex;
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -200,11 +200,12 @@ impl MCPManager {
         reg.values().map(|t| t.schema.clone()).collect()
     }
 
-    /// 获取所有工具的注册条目（name, schema, handler）
+    /// 获取所有工具的注册条目
     ///
-    /// 返回可直接注册到 EngineHandle 的三元组。
+    /// 返回可直接注入引擎工具注册表的 [`ToolEntry`] 列表——
+    /// schema 是强类型 [`fuyao_api::ToolDefinition`]（name 即 prefixed_name），
     /// handler 通过 make_tool_call_handler 生成，绑定了 MCPConnection 引用。
-    pub async fn get_tool_entries(&self) -> Vec<(String, serde_json::Value, fuyao_api::ToolFn)> {
+    pub async fn get_tool_entries(&self) -> Vec<fuyao_api::ToolEntry> {
         let reg = self.registered_tools.lock().await;
         let connections = self.connections.lock().await;
 
@@ -229,18 +230,11 @@ impl MCPManager {
                 timeout,
             );
 
-            let schema = serde_json::to_value(&tool.schema).unwrap_or_else(|_| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.prefixed_name,
-                        "description": "",
-                        "parameters": { "type": "object", "properties": {} }
-                    }
-                })
-            });
-
-            entries.push((tool.prefixed_name.clone(), schema, handler));
+            entries.push(fuyao_api::ToolEntry::new(
+                tool.schema.clone(),
+                handler,
+                false,
+            ));
         }
 
         entries
@@ -253,7 +247,7 @@ impl MCPManager {
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String, MCPManagerError> {
+    ) -> Result<ToolOutput, MCPManagerError> {
         // 查找工具注册信息
         let (server_name, original_name) = {
             let reg = self.registered_tools.lock().await;
@@ -308,7 +302,7 @@ impl MCPManager {
             )));
         }
 
-        Ok(bridge::extract_call_output(&result))
+        Ok(ToolOutput::ok(bridge::extract_call_output(&result)))
     }
 
     /// 刷新工具列表

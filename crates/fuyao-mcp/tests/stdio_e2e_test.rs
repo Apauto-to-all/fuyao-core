@@ -43,7 +43,7 @@ async fn stdio_context7_call_tool_returns_result() {
     // 找 resolve-library-id 工具（连字符被 sanitize 成下划线）
     let target = entries
         .iter()
-        .find(|(name, _, _)| name.contains("resolve_library_id"))
+        .find(|e| e.name().contains("resolve_library_id"))
         .expect("应找到 resolve-library-id 工具");
 
     // 3. 调用 handler（与引擎 execute_single 走完全相同的路径）
@@ -56,17 +56,15 @@ async fn stdio_context7_call_tool_returns_result() {
 
     let call_result = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        (target.2)(args, ctx, cancel),
+        (target.handler)(args, ctx, cancel),
     )
     .await;
 
     match call_result {
-        Ok(result_str) => {
+        Ok(output) => {
+            let result_str = output.to_wire();
             println!("[e2e] ✅ 调用成功返回，结果长度 {} 字符", result_str.len());
-            assert!(
-                !result_str.contains("\"error\""),
-                "不应返回 error，实际：{result_str}"
-            );
+            assert!(!output.is_error(), "不应返回 error，实际：{result_str}");
         }
         Err(_) => panic!("[e2e] ❌ 调用超时（60 秒无响应），调用链卡死"),
     }

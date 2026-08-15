@@ -8,9 +8,8 @@
 //! 存储能力经 ctx.capabilities.todo_store 注入（SessionStore 实现的 TodoStoreOps），
 //! 不再自建连接池。
 
-use super::types::{TodoSummary, TodoWriteResult};
-use crate::common;
-use fuyao_api::{TodoItem, ToolCallContext};
+use super::types::{TodoSummary, TodoWriteArgs, TodoWriteResult};
+use fuyao_api::{CancellationToken, TodoItem, ToolCallContext, ToolError, ToolOutput, parse_args};
 use serde_json::Value;
 
 /// 合法的 status 值
@@ -46,64 +45,48 @@ fn build_summary(items: &[TodoItem]) -> TodoSummary {
 ///
 /// 不传 todos → 读取当前列表
 /// 传 todos → 整体覆盖写入
-pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
+///
+/// 畸形项（id/content 缺失或为空）fail-loud 报错而非静默跳过——
+/// 跳过会让 LLM 误以为全部写入成功，造成任务静默丢失。
+/// status 容错保留：非法值回退 pending。
+pub async fn todo_handler(
+    args: Value,
+    ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
+    let TodoWriteArgs { todos } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
+    };
+
     let session_id = match &ctx.session_id {
         Some(id) => id,
         None => {
-            return common::tool_error("缺少 session_id，请检查 Agent 是否正确初始化了 session");
+            return ToolOutput::error("缺少 session_id，请检查 Agent 是否正确初始化了 session");
         }
     };
 
-    let todos_data = args.get("todos");
-
-    // 参数校验优先于存储取用：todos 给了但非数组是输入错误，应在任何 I/O 前报
-    if todos_data.is_some_and(|t| t.as_array().is_none()) {
-        return common::tool_error("todos 必须是数组");
-    }
-
-    let store = match &ctx.capabilities.todo_store {
-        Some(s) => s.clone(),
-        None => {
-            return common::tool_error(
-                "任务列表存储未注入（TodoStoreOps 不可用），请检查工具调用上下文配置",
-            );
-        }
-    };
-
-    let result_items = if let Some(todos) = todos_data {
-        // 整体覆盖写入（数组校验已在上方完成）
-        let arr = todos.as_array().unwrap();
-
-        let mut items: Vec<TodoItem> = Vec::new();
-        for raw in arr {
-            let obj = match raw.as_object() {
-                Some(obj) => obj,
-                None => continue,
-            };
-
-            let item_id = match obj.get("id").and_then(|v| v.as_str()) {
-                Some(id) => id.trim().to_string(),
-                None => continue,
-            };
-            let content = match obj.get("content").and_then(|v| v.as_str()) {
-                Some(c) => c.trim().to_string(),
-                None => continue,
-            };
+    // 参数校验优先于存储取用：先把输入整体转换成 TodoItem（畸形项 fail-loud），
+    // 校验失败即刻短路返回，再取 store——输入错误不应触碰任何 I/O
+    let write_items = match todos.map(|inputs| {
+        let mut items: Vec<TodoItem> = Vec::with_capacity(inputs.len());
+        for raw in inputs {
+            let item_id = raw.id.trim().to_string();
+            let content = raw.content.trim().to_string();
             if item_id.is_empty() || content.is_empty() {
-                continue;
+                return Err(
+                    ToolError::new("todo 项的 id 与 content 均为必填且不能为空白").with(
+                        "suggestion",
+                        "请为每个任务提供非空的 id 与 content 后整体重发",
+                    ),
+                );
             }
 
-            let status = obj
-                .get("status")
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    if VALID_STATUSES.contains(&s) {
-                        s.to_string()
-                    } else {
-                        "pending".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "pending".to_string());
+            let status = if VALID_STATUSES.contains(&raw.status.as_str()) {
+                raw.status
+            } else {
+                "pending".to_string()
+            };
 
             items.push(TodoItem {
                 id: item_id,
@@ -111,17 +94,33 @@ pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
                 status,
             });
         }
+        Ok(items)
+    }) {
+        Some(Ok(items)) => Some(items),
+        Some(Err(e)) => return ToolOutput::Err(e),
+        None => None,
+    };
 
-        match store.write_todos(session_id, items).await {
-            Ok(result) => result,
-            Err(e) => return common::tool_error(&format!("写入 todo 失败: {e}")),
+    let store = match &ctx.capabilities.todo_store {
+        Some(s) => s.clone(),
+        None => {
+            return ToolOutput::error(
+                "任务列表存储未注入（TodoStoreOps 不可用），请检查工具调用上下文配置",
+            );
         }
-    } else {
+    };
+
+    let result_items = match write_items {
+        // 整体覆盖写入
+        Some(items) => match store.write_todos(session_id, items).await {
+            Ok(result) => result,
+            Err(e) => return ToolOutput::error(format!("写入 todo 失败: {e}")),
+        },
         // 读取
-        match store.read_todos(session_id).await {
+        None => match store.read_todos(session_id).await {
             Ok(result) => result,
-            Err(e) => return common::tool_error(&format!("读取 todo 失败: {e}")),
-        }
+            Err(e) => return ToolOutput::error(format!("读取 todo 失败: {e}")),
+        },
     };
 
     let todos: Vec<serde_json::Value> = result_items
@@ -142,7 +141,7 @@ pub async fn todo_handler(args: Value, ctx: &ToolCallContext) -> String {
         error: None,
     };
 
-    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -203,7 +202,9 @@ mod tests {
     #[tokio::test]
     async fn todo_handler_returns_error_without_session_id() {
         let ctx = ToolCallContext::default();
-        let result = todo_handler(serde_json::json!({}), &ctx).await;
+        let result = todo_handler(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("缺少 session_id"));
     }
 
@@ -213,7 +214,9 @@ mod tests {
             session_id: Some("test".to_string()),
             ..ToolCallContext::default()
         };
-        let result = todo_handler(serde_json::json!({}), &ctx).await;
+        let result = todo_handler(serde_json::json!({}), ctx, CancellationToken::new())
+            .await
+            .to_wire();
         assert!(result.contains("TodoStoreOps 不可用"));
     }
 
@@ -223,7 +226,33 @@ mod tests {
             session_id: Some("test".to_string()),
             ..ToolCallContext::default()
         };
-        let result = todo_handler(serde_json::json!({ "todos": "not_array" }), &ctx).await;
-        assert!(result.contains("todos 必须是数组"));
+        let result = todo_handler(
+            serde_json::json!({ "todos": "not_array" }),
+            ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        // 类型化解析：todos 非数组在反序列化时即报错
+        assert!(result.contains("参数类型不正确"), "实际：{result}");
+        assert!(result.contains("error"), "实际：{result}");
+    }
+
+    /// 畸形项（content 为空白）fail-loud：不再静默跳过，防止任务静默丢失
+    #[tokio::test]
+    async fn todo_handler_fails_loud_on_blank_item_field() {
+        let ctx = ToolCallContext {
+            session_id: Some("test".to_string()),
+            ..ToolCallContext::default()
+        };
+        let result = todo_handler(
+            serde_json::json!({ "todos": [{ "id": "1", "content": "  " }] }),
+            ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        assert!(result.contains("id 与 content 均为必填"));
+        assert!(result.contains("suggestion"));
     }
 }

@@ -15,7 +15,7 @@
 //! 经父 session 的 per-session 出站通道进 fan_out（事件 session_id 标的是 child，
 //! 前端按 child_id 过滤渲染到子代理区域）。事件已落 DB，转发失败仅 WARN 不阻断。
 
-use super::types::validate_subagent_type;
+use super::types::{SubagentArgs, validate_subagent_type};
 use std::time::Duration;
 
 use fuyao_api::message::OutputEvent;
@@ -24,7 +24,9 @@ use fuyao_api::message::output::{
     ChildSessionMessage, ChildSessionOrigin, ChildSessionPayload, ChildSessionState,
 };
 use fuyao_api::message::{EventBase, InputEvent};
-use fuyao_api::{AgentConfig, CancellationToken, ChildSessionSource, ToolCallContext};
+use fuyao_api::{
+    AgentConfig, CancellationToken, ChildSessionSource, ToolCallContext, ToolOutput, parse_args,
+};
 
 /// 子代理执行超时兜底
 ///
@@ -39,22 +41,25 @@ const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(600);
 /// `subagent_type` 透传为子 session 的 `AgentConfig.definition`（引擎按名加载 `agents/{type}.md`）。
 pub async fn subagent_handler(
     args: serde_json::Value,
-    ctx: &ToolCallContext,
+    ctx: ToolCallContext,
     cancel: CancellationToken,
-) -> String {
-    // 1. 解析参数
-    let subagent_type = match args.get("subagent_type").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return "❌ 子代理工具缺少 subagent_type 参数或为空".to_string(),
+) -> ToolOutput {
+    // 1. 解析参数（类型化：subagent_type / prompt 必填，description 可缺省）
+    let SubagentArgs {
+        subagent_type,
+        description,
+        prompt,
+    } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
     };
-    let description = args
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(无描述)");
-    let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
-        Some(p) if !p.is_empty() => p.to_string(),
-        _ => return "❌ 子代理工具缺少 prompt 参数或为空".to_string(),
-    };
+    if subagent_type.trim().is_empty() {
+        return ToolOutput::error("子代理工具的 subagent_type 不能为空");
+    }
+    if prompt.trim().is_empty() {
+        return ToolOutput::error("子代理工具的 prompt 不能为空");
+    }
+    let description = description.as_deref().unwrap_or("(无描述)");
 
     // 2. 校验 subagent_type：实时查可用列表，不在则返错误 + 列表供 LLM 修正。
     //    生产环境 agent_paths 总是注入；缺失（仅测试场景）时跳过校验不阻断。
@@ -62,7 +67,7 @@ pub async fn subagent_handler(
     //    置于 SubagentOps upgrade 之前：输入校验优先，失败快返不触碰引擎。
     if let Some(agent_paths) = &ctx.agent_paths {
         if let Err(msg) = validate_subagent_type(&subagent_type, agent_paths) {
-            return format!("❌ {msg}");
+            return ToolOutput::error(msg);
         }
     } else {
         tracing::warn!("agent_paths 未注入，跳过 subagent_type 校验");
@@ -70,10 +75,10 @@ pub async fn subagent_handler(
 
     // 3. upgrade SubagentOps（引擎弱引用 → 强引用）
     let Some(ops_weak) = &ctx.capabilities.subagent_ops else {
-        return "❌ 子代理工具未注入引擎能力（SubagentOps 不可用）".to_string();
+        return ToolOutput::error("子代理工具未注入引擎能力（SubagentOps 不可用）");
     };
     let Some(ops) = ops_weak.upgrade() else {
-        return "❌ 引擎已关闭，无法派生子代理".to_string();
+        return ToolOutput::error("引擎已关闭，无法派生子代理");
     };
 
     // 4. 派生子 session（Fresh 模式：空上下文，子代理不继承父会话历史）
@@ -90,7 +95,7 @@ pub async fn subagent_handler(
         Ok(x) => x,
         Err(e) => {
             tracing::warn!(parent_id, cause = %e, "子代理 session 创建失败");
-            return format!("❌ 子代理派生失败：{e}");
+            return ToolOutput::error(format!("子代理派生失败：{e}"));
         }
     };
     tracing::info!(
@@ -102,7 +107,7 @@ pub async fn subagent_handler(
     );
 
     // 5. 发 ChildSession(Started)——前端据此开辟子代理渲染区，后续 child session_id 的事件归此区
-    emit_child_session_event(ctx, &child_id, ChildSessionState::Started, description);
+    emit_child_session_event(&ctx, &child_id, ChildSessionState::Started, description);
 
     // 6. send 任务指令（Guide 模式：立即触发新 turn）
     let msg = InputEvent::User(UserMessage {
@@ -117,8 +122,8 @@ pub async fn subagent_handler(
     if let Err(e) = ops.send(&child_id, msg).await {
         tracing::warn!(child_id = %child_id, cause = %e, "子代理任务发送失败");
         let _ = ops.end_session(&child_id, "send 失败").await;
-        emit_child_session_event(ctx, &child_id, ChildSessionState::Ended, description);
-        return format!("❌ 子代理任务发送失败：{e}");
+        emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
+        return ToolOutput::error(format!("子代理任务发送失败：{e}"));
     }
 
     // 7. 消费子事件流：取 finish_reason=stop 的最终回复；中间事件经 event_forwarder 转发
@@ -133,8 +138,8 @@ pub async fn subagent_handler(
             _ = cancel.cancelled() => {
                 tracing::info!(child_id = %child_id, "子代理被父取消");
                 let _ = ops.end_session(&child_id, "被父取消").await;
-                emit_child_session_event(ctx, &child_id, ChildSessionState::Ended, description);
-                return "⚠️ 子代理被父取消".to_string();
+                emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
+                return ToolOutput::text("⚠️ 子代理被父取消");
             }
 
             _ = tokio::time::sleep_until(deadline) => {
@@ -144,8 +149,11 @@ pub async fn subagent_handler(
                     "子代理执行超时"
                 );
                 let _ = ops.end_session(&child_id, "超时").await;
-                emit_child_session_event(ctx, &child_id, ChildSessionState::Ended, description);
-                return format!("❌ 子代理执行超时（{}s）", SUBAGENT_TIMEOUT.as_secs());
+                emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
+                return ToolOutput::error(format!(
+                    "子代理执行超时（{}s）",
+                    SUBAGENT_TIMEOUT.as_secs()
+                ));
             }
 
             ev = child_rx.recv() => {
@@ -181,16 +189,16 @@ pub async fn subagent_handler(
 
     // 8. end_session（一次性子 session）
     let _ = ops.end_session(&child_id, "子代理完成").await;
-    emit_child_session_event(ctx, &child_id, ChildSessionState::Ended, description);
+    emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
     tracing::info!(child_id = %child_id, got_final, "子代理结束");
 
-    // 9. 返回最终回复
+    // 9. 返回最终回复（纯文本回喂，不裹 JSON）
     if !got_final {
-        "（子代理 session 退出，未产出最终回复）".to_string()
+        ToolOutput::text("（子代理 session 退出，未产出最终回复）")
     } else if final_content.is_empty() {
-        "（子代理最终回复为空）".to_string()
+        ToolOutput::text("（子代理最终回复为空）")
     } else {
-        final_content
+        ToolOutput::text(final_content)
     }
 }
 
@@ -241,11 +249,12 @@ mod tests {
         let ctx = ToolCallContext::default();
         let result = subagent_handler(
             serde_json::json!({"description": "测试", "prompt": "做某事"}),
-            &ctx,
+            ctx,
             CancellationToken::new(),
         )
-        .await;
-        assert!(result.contains("缺少 subagent_type"), "实际：{result}");
+        .await
+        .to_wire();
+        assert!(result.contains("subagent_type"), "实际：{result}");
     }
 
     #[tokio::test]
@@ -253,11 +262,12 @@ mod tests {
         let ctx = ToolCallContext::default();
         let result = subagent_handler(
             serde_json::json!({"subagent_type": "explore", "description": "测试"}),
-            &ctx,
+            ctx,
             CancellationToken::new(),
         )
-        .await;
-        assert!(result.contains("缺少 prompt"), "实际：{result}");
+        .await
+        .to_wire();
+        assert!(result.contains("prompt"), "实际：{result}");
     }
 
     #[tokio::test]
@@ -269,10 +279,11 @@ mod tests {
                 "description": "测试",
                 "prompt": "做某事"
             }),
-            &ctx,
+            ctx,
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .to_wire();
         assert!(
             result.contains("SubagentOps 不可用"),
             "应有 SubagentOps 缺失错误，实际：{result}"
@@ -293,10 +304,11 @@ mod tests {
                 "description": "测试",
                 "prompt": "做某事"
             }),
-            &ctx,
+            ctx,
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .to_wire();
         assert!(
             result.contains("未找到子代理类型"),
             "应拒绝未知 subagent_type，实际：{result}"

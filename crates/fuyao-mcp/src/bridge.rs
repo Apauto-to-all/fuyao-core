@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fuyao_api::{CancellationToken, ToolCallContext, ToolFn};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolFn, ToolOutput};
 use rmcp::model::CallToolResult;
 use serde_json::Value;
 
@@ -49,11 +49,11 @@ pub(crate) fn extract_error_text(result: &CallToolResult) -> String {
         .join("")
 }
 
-/// 从 CallToolResult 提取文本与结构化内容，组装为统一的 JSON 输出
+/// 从 CallToolResult 提取文本与结构化内容，组装为统一的结果对象
 ///
 /// 规则：有 structuredContent 时并入 result；否则仅返回 result 文本。
 /// 统一 call_tool（管理器直调）与 do_call（handler 路径）的结果形态。
-pub(crate) fn extract_call_output(result: &CallToolResult) -> String {
+pub(crate) fn extract_call_output(result: &CallToolResult) -> Value {
     let parts: Vec<String> = result
         .content
         .iter()
@@ -70,7 +70,6 @@ pub(crate) fn extract_call_output(result: &CallToolResult) -> String {
     } else {
         serde_json::json!({"result": text_result})
     }
-    .to_string()
 }
 
 /// 构建带 MCPConnection 引用的工具 handler
@@ -111,7 +110,7 @@ pub fn make_tool_call_handler(
                         reason = %msg,
                         "MCP 工具调用被熔断器拦截"
                     );
-                    return serde_json::json!({"error": msg}).to_string();
+                    return ToolOutput::error(msg);
                 }
 
                 // 执行 MCP 调用
@@ -122,16 +121,14 @@ pub fn make_tool_call_handler(
                 )
                 .await;
 
-                let result = match call_result {
-                    Ok(Ok(result)) => {
-                        if let Ok(parsed) = serde_json::from_str::<Value>(&result) {
-                            if parsed.get("error").is_some() {
-                                breaker.bump_error(&server_name);
-                            } else {
-                                breaker.reset_error(&server_name);
-                            }
+                let output = match call_result {
+                    Ok(Ok(output)) => {
+                        if output.is_error() {
+                            breaker.bump_error(&server_name);
+                        } else {
+                            breaker.reset_error(&server_name);
                         }
-                        result
+                        output
                     }
                     Ok(Err(err_msg)) => {
                         // 检测可恢复错误（Auth/Session）并尝试重连重试
@@ -149,10 +146,9 @@ pub fn make_tool_call_handler(
                             return recovered;
                         }
                         breaker.bump_error(&server_name);
-                        serde_json::json!({
-                            "error": sanitize_error(&format!("MCP 调用失败: {err_msg}"))
-                        })
-                        .to_string()
+                        ToolOutput::Err(ToolError::new(sanitize_error(&format!(
+                            "MCP 调用失败: {err_msg}"
+                        ))))
                     }
                     Err(_) => {
                         // 超时是可恢复故障，按日志规范记 WARN（突出故障态，与下方通用完成 INFO 互补）
@@ -164,32 +160,31 @@ pub fn make_tool_call_handler(
                             "MCP 工具调用超时"
                         );
                         breaker.bump_error(&server_name);
-                        serde_json::json!({
-                            "error": format!("MCP tool '{tool_name}' timed out after {timeout_secs}s")
-                        })
-                        .to_string()
+                        ToolOutput::error(format!(
+                            "MCP tool '{tool_name}' timed out after {timeout_secs}s"
+                        ))
                     }
                 };
 
                 tracing::info!(
                     name = %server_name,
                     tool = %tool_name,
-                    ok = !result.contains("\"error\""),
+                    ok = !output.is_error(),
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "MCP 工具调用完成"
                 );
-                result
+                output
             })
         },
     )
 }
 
-/// 执行单次 MCP 工具调用，返回格式化的 JSON 字符串
+/// 执行单次 MCP 工具调用，返回结果信封
 async fn do_call(
     conn: &Arc<tokio::sync::Mutex<Option<MCPConnection>>>,
     tool_name: &str,
     args: Value,
-) -> Result<String, String> {
+) -> Result<ToolOutput, String> {
     let guard = conn.lock().await;
     let conn = guard
         .as_ref()
@@ -200,16 +195,16 @@ async fn do_call(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 处理 MCP 调用结果：is_error 时以 {"error": ...} 返回（handler 侧据此计入熔断）
+    // 处理 MCP 调用结果：is_error 时以错误信封返回（handler 侧据此计入熔断）
     if result.is_error.unwrap_or(false) {
         let error_text = extract_error_text(&result);
-        return Ok(serde_json::json!({"error": sanitize_error(&error_text)}).to_string());
+        return Ok(ToolOutput::Err(ToolError::new(sanitize_error(&error_text))));
     }
 
-    Ok(extract_call_output(&result))
+    Ok(ToolOutput::ok(extract_call_output(&result)))
 }
 
-/// 对可恢复错误（Auth/Session）触发重连并重试，成功返回 Some(result)
+/// 对可恢复错误（Auth/Session）触发重连并重试，成功返回 Some(结果信封)
 ///
 /// 两条恢复路径（鉴权失败、会话过期）结构相同，仅错误分类器不同，
 /// 此处合并为一条：归类 → 留痕 → 通知重连 → 等待恢复后重试。
@@ -221,7 +216,7 @@ async fn try_recover_and_retry(
     err_msg: &str,
     args: &Value,
     started: std::time::Instant,
-) -> Option<String> {
+) -> Option<ToolOutput> {
     // 归类可恢复错误：auth 或 session，其余不处理
     let kind = if crate::recovery::is_auth_error_str(err_msg) {
         "auth"
@@ -246,7 +241,7 @@ async fn try_recover_and_retry(
     tracing::info!(
         name = %server_name,
         tool = %tool_name,
-        ok = !retry_result.contains("\"error\""),
+        ok = !retry_result.is_error(),
         recovered = true,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "MCP 工具调用完成"
@@ -269,7 +264,7 @@ async fn wait_and_retry(
     server_name: &str,
     tool_name: &str,
     args: &Value,
-) -> Option<String> {
+) -> Option<ToolOutput> {
     // 等待 session 恢复（时长从全局配置 get_config().mcp 读取）
     let deadline = tokio::time::Instant::now()
         + Duration::from_secs(fuyao_api::get_config().mcp.session_recovery_wait_secs);
@@ -282,10 +277,9 @@ async fn wait_and_retry(
 
     // 重试调用（attempt=2 表示这是第二次尝试）
     match do_call(conn, tool_name, args.clone()).await {
-        Ok(result) => {
-            let parsed: serde_json::Value = serde_json::from_str(&result).unwrap_or_default();
-            if parsed.get("error").is_none() {
-                Some(result)
+        Ok(output) => {
+            if !output.is_error() {
+                Some(output)
             } else {
                 None
             }

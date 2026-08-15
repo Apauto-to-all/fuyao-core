@@ -7,13 +7,14 @@
 //!
 //! 使用 `LazyLock<HashMap>` 实现编译时注册，零运行时开销。
 //! Agent 通过 `get_tool()` 获取工具条目，通过 `all_tools()` 获取全部工具定义。
+//! key 为 schema 定义里的工具名（`definition.function.name`，单一来源）。
 
 use fuyao_api::ToolEntry;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 /// 通用工具注册表
-static TOOL_REGISTRY: LazyLock<HashMap<&'static str, ToolEntry>> = LazyLock::new(|| {
+static TOOL_REGISTRY: LazyLock<HashMap<String, ToolEntry>> = LazyLock::new(|| {
     let mut map = HashMap::new();
     super::file::register(&mut map);
     super::skill::register(&mut map);
@@ -25,13 +26,13 @@ static TOOL_REGISTRY: LazyLock<HashMap<&'static str, ToolEntry>> = LazyLock::new
 });
 
 /// 获取所有已注册的通用工具
-pub fn all_tools() -> &'static HashMap<&'static str, ToolEntry> {
+pub fn all_tools() -> &'static HashMap<String, ToolEntry> {
     &TOOL_REGISTRY
 }
 
 /// 获取所有工具名称
-pub fn all_tool_names() -> Vec<&'static str> {
-    TOOL_REGISTRY.keys().copied().collect()
+pub fn all_tool_names() -> Vec<String> {
+    TOOL_REGISTRY.keys().cloned().collect()
 }
 
 /// 获取指定工具
@@ -80,7 +81,7 @@ mod tests {
         for name in names {
             assert!(!name.is_empty());
             // 每个注册的工具都应该能通过 get_tool 获取
-            assert!(get_tool(name).is_some());
+            assert!(get_tool(name.as_str()).is_some());
         }
     }
 
@@ -88,11 +89,11 @@ mod tests {
     fn registered_tools_include_expected_tools() {
         let names = all_tool_names();
         // 应该包含这些核心工具
-        assert!(names.contains(&"read"));
-        assert!(names.contains(&"write"));
-        assert!(names.contains(&"glob"));
-        assert!(names.contains(&"grep"));
-        assert!(names.contains(&"edit"));
-        assert!(names.contains(&"skill"));
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&"write".to_string()));
+        assert!(names.contains(&"glob".to_string()));
+        assert!(names.contains(&"grep".to_string()));
+        assert!(names.contains(&"edit".to_string()));
+        assert!(names.contains(&"skill".to_string()));
     }
 }

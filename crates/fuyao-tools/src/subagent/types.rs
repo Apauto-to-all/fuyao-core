@@ -1,11 +1,22 @@
 //! 子代理工具类型定义
 //!
-//! 定义子代理校验与错误格式化的辅助类型。
+//! 定义子代理工具的参数、校验与错误格式化的辅助类型。
 //!
 //! 子代理工具与 skill 工具同源：调用时实时查询可用列表（无缓存），
-//! `subagent_type` 校验失败时返回带可用列表的错误字符串，供 LLM 据此修正。
+//! `subagent_type` 校验失败时返回带可用列表的错误信封，供 LLM 据此修正。
 
 use fuyao_api::AgentPaths;
+
+/// subagent 工具参数（类型化解析）
+#[derive(Debug, serde::Deserialize)]
+pub struct SubagentArgs {
+    /// 子代理定义名（系统提示词中「子代理」索引列出的 name，如 explore / executor）
+    pub subagent_type: String,
+    /// 3-5 词任务描述（简明扼要，供追踪显示）
+    pub description: Option<String>,
+    /// 给子代理的完整任务指令（应包含所有必要上下文，子代理不继承父会话历史）
+    pub prompt: String,
+}
 
 /// 子代理元数据（用于校验失败时的可用列表显示）
 #[derive(Debug, Clone)]

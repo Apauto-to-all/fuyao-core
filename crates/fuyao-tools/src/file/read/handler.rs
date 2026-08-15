@@ -19,19 +19,17 @@
 //! 列出目录下的文件和子目录，按修改时间排序（目录优先）。
 //! 自动跳过排除目录（.venv、node_modules、__pycache__ 等）。
 
-use crate::common::{self, resolve_path};
+use crate::common::resolve_path;
 use crate::config::{LARGE_FILE_HINT_BYTES, MAX_READ_CHARS, SEARCH_EXCLUDE_DIRS};
 use crate::file::helpers::suggest_similar_files;
-use crate::file::read::types::{DirectoryEntry, DirectoryResult, ReadResult};
+use crate::file::read::types::{DirectoryEntry, DirectoryResult, MAX_LIMIT, ReadArgs, ReadResult};
 use crate::file::safety::{has_binary_extension, is_blocked_device, is_internal_path};
 use crate::file::tracker::{check_dedup, record_read};
 use crate::redact::redact_sensitive_text;
+use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput, parse_args};
 use serde_json::Value;
 use std::io::BufRead;
 use std::path::Path;
-
-const DEFAULT_LIMIT: i64 = 500;
-const MAX_LIMIT: i64 = 2000;
 
 /// 列出目录内容
 ///
@@ -48,16 +46,16 @@ const MAX_LIMIT: i64 = 2000;
 /// # 返回
 ///
 /// JSON 字符串，包含 entries 数组、total_count、truncated 等字段。
-fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: usize) -> String {
+fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: usize) -> ToolOutput {
     let mut entries: Vec<DirectoryEntry> = Vec::new();
 
     let read_dir = match std::fs::read_dir(dir_path) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return common::tool_error(&format!("无权限访问目录: {original_path}"));
+            return ToolOutput::error(format!("无权限访问目录: {original_path}"));
         }
         Err(e) => {
-            return common::tool_error(&format!(
+            return ToolOutput::error(format!(
                 "读取目录失败: {}: {e}",
                 std::any::type_name_of_val(&e)
                     .split("::")
@@ -127,7 +125,7 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
         },
     };
 
-    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
 /// 读取文件内容的核心实现
@@ -141,38 +139,41 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
 /// 3. 文件存在性检查（不存在则建议相似文件名）
 /// 4. 二进制文件检查
 /// 5. 内容大小检查（> MAX_READ_CHARS 则拒绝）
-pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let offset = args
-        .get("offset")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(1)
-        .max(1) as usize;
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(DEFAULT_LIMIT)
-        .clamp(1, MAX_LIMIT) as usize;
+pub async fn read_file_impl(
+    args: Value,
+    ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
+    let ReadArgs {
+        path,
+        offset,
+        limit,
+    } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
+    };
+    let offset = offset.max(1) as usize;
+    let limit = limit.clamp(1, MAX_LIMIT) as usize;
     let task_id = ctx.task_id().to_string();
     let workspace = ctx.workspace().map(Path::to_path_buf);
 
-    let resolved_path_obj = resolve_path(path, workspace.as_deref());
+    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
     let resolved_path = resolved_path_obj.to_string_lossy().to_string();
 
-    if is_blocked_device(path) {
-        return common::tool_error(&format!(
+    if is_blocked_device(&path) {
+        return ToolOutput::error(format!(
             "无法读取设备文件: {path}。该文件会产生无限输出或阻塞输入。"
         ));
     }
 
-    if is_internal_path(path) {
-        return common::tool_error(&format!(
+    if is_internal_path(&path) {
+        return ToolOutput::error(format!(
             "拒绝读取框架内部路径: {path}。此路径包含框架内部数据，不允许直接访问。"
         ));
     }
 
     if !resolved_path_obj.exists() {
-        let suggestions = suggest_similar_files(path, 5);
+        let suggestions = suggest_similar_files(&path, 5);
         let mut error_msg = format!("文件不存在: {path}");
         if !suggestions.is_empty() {
             error_msg.push_str("\n\n您是否想要以下文件之一？\n");
@@ -180,19 +181,19 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
                 error_msg.push_str(&format!("  • {s}\n"));
             }
         }
-        let mut err = serde_json::json!({"error": error_msg, "path": path});
+        let mut err = ToolError::new(error_msg).with("path", path.as_str());
         if !suggestions.is_empty() {
-            err["suggestions"] = serde_json::json!(suggestions);
+            err = err.with("suggestions", serde_json::json!(suggestions));
         }
-        return common::tool_error_with(err);
+        return ToolOutput::Err(err);
     }
 
     if resolved_path_obj.is_dir() {
-        return list_directory(&resolved_path_obj, path, offset, limit);
+        return list_directory(&resolved_path_obj, &path, offset, limit);
     }
 
     if !resolved_path_obj.is_file() {
-        return common::tool_error(&format!("路径不是文件或目录: {path}"));
+        return ToolOutput::error(format!("路径不是文件或目录: {path}"));
     }
 
     if has_binary_extension(&resolved_path) {
@@ -200,11 +201,11 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
             .extension()
             .unwrap_or_default()
             .to_string_lossy();
-        return common::tool_error(&format!("无法读取二进制文件: {path} ({ext})"));
+        return ToolOutput::error(format!("无法读取二进制文件: {path} ({ext})"));
     }
 
     if let Some(dedup) = check_dedup(&resolved_path, offset, limit, &task_id) {
-        return common::tool_result(dedup);
+        return ToolOutput::ok(dedup);
     }
 
     record_read(&resolved_path, offset, limit, &task_id);
@@ -212,7 +213,7 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
     let file_size = match resolved_path_obj.metadata() {
         Ok(m) => m.len(),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return common::tool_error(&format!("无权限读取文件: {path}"));
+            return ToolOutput::error(format!("无权限读取文件: {path}"));
         }
         Err(_) => 0,
     };
@@ -223,10 +224,10 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
     let file = match std::fs::File::open(&resolved_path_obj) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return common::tool_error(&format!("无权限读取文件: {path}"));
+            return ToolOutput::error(format!("无权限读取文件: {path}"));
         }
         Err(e) => {
-            return common::tool_error(&format!("读取文件失败: {e}"));
+            return ToolOutput::error(format!("读取文件失败: {e}"));
         }
     };
     let mut reader = std::io::BufReader::new(file);
@@ -240,7 +241,7 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
             Ok(0) => break, // EOF
             Ok(_) => {}
             Err(e) => {
-                return common::tool_error(&format!("读取文件失败: {e}"));
+                return ToolOutput::error(format!("读取文件失败: {e}"));
             }
         }
         line_no += 1;
@@ -250,7 +251,7 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
                 Ok(s) => s.trim_end_matches(['\n', '\r']),
                 // 区分 UTF-8 编码错误（InvalidData）和其他 IO 错误：编码错误给用户明确的修复提示
                 Err(_) => {
-                    return common::tool_error(&format!(
+                    return ToolOutput::error(format!(
                         "文件编码无法解析: {path}。文件可能包含非 UTF-8 字节，请用二进制编辑器查看。"
                     ));
                 }
@@ -265,7 +266,7 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
     let output = content_lines.join("\n");
 
     if output.len() > MAX_READ_CHARS {
-        return common::tool_error(&format!(
+        return ToolOutput::error(format!(
             "读取内容超过安全限制 ({} > {} 字符)。请使用 offset 和 limit 参数读取更小的范围。文件共 {} 行。",
             output.len(),
             MAX_READ_CHARS,
@@ -302,15 +303,15 @@ pub fn read_file_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
         },
     };
 
-    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn read_existing_file() {
+    #[tokio::test]
+    async fn read_existing_file() {
         let dir = std::env::temp_dir().join("fuyao_test_read_full");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -319,7 +320,13 @@ mod tests {
         let args = serde_json::json!({
             "path": file_path.to_string_lossy().to_string()
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("line1"));
         assert!(result.contains("line2"));
         assert!(result.contains("line3"));
@@ -328,8 +335,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn read_with_offset_and_limit() {
+    #[tokio::test]
+    async fn read_with_offset_and_limit() {
         let dir = std::env::temp_dir().join("fuyao_test_read_offset_full");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -340,7 +347,13 @@ mod tests {
             "offset": 2,
             "limit": 2
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("line2"));
         assert!(result.contains("line3"));
         assert!(!result.contains("line1"));
@@ -350,8 +363,8 @@ mod tests {
     }
 
     /// 末行无换行符：仍是完整一行，计入 total_lines
-    #[test]
-    fn read_file_without_trailing_newline() {
+    #[tokio::test]
+    async fn read_file_without_trailing_newline() {
         let dir = std::env::temp_dir().join("fuyao_test_read_no_trailing_nl");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -360,7 +373,13 @@ mod tests {
         let args = serde_json::json!({
             "path": file_path.to_string_lossy().to_string()
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("line1"));
         assert!(result.contains("line2"));
         assert!(result.contains("\"total_lines\":2"));
@@ -369,8 +388,8 @@ mod tests {
     }
 
     /// CRLF 行尾：\r\n 不带入行内容
-    #[test]
-    fn read_file_crlf_lines() {
+    #[tokio::test]
+    async fn read_file_crlf_lines() {
         let dir = std::env::temp_dir().join("fuyao_test_read_crlf");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -380,7 +399,13 @@ mod tests {
             "path": file_path.to_string_lossy().to_string(),
             "limit": 1
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("line1"));
         assert!(!result.contains("line2"));
         assert!(result.contains("\"total_lines\":2"));
@@ -389,8 +414,8 @@ mod tests {
     }
 
     /// offset 超出文件末尾：空结果、无截断提示
-    #[test]
-    fn read_offset_beyond_eof() {
+    #[tokio::test]
+    async fn read_offset_beyond_eof() {
         let dir = std::env::temp_dir().join("fuyao_test_read_offset_eof");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -401,7 +426,13 @@ mod tests {
             "offset": 10,
             "limit": 5
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("\"total_lines\":2"));
         assert!(!result.contains("truncated"));
 
@@ -409,8 +440,8 @@ mod tests {
     }
 
     /// 大文件小窗口：行号正确，窗口外不进入结果
-    #[test]
-    fn read_large_file_small_window() {
+    #[tokio::test]
+    async fn read_large_file_small_window() {
         let dir = std::env::temp_dir().join("fuyao_test_read_large_window");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("big.txt");
@@ -422,7 +453,13 @@ mod tests {
             "offset": 9990,
             "limit": 3
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("row-9990"));
         assert!(result.contains("row-9992"));
         assert!(!result.contains("row-9989"));
@@ -433,8 +470,8 @@ mod tests {
     }
 
     /// 非 UTF-8 字节位于窗口外的行：只读取窗口时不受影响（流式只解码窗口内行）
-    #[test]
-    fn read_tolerates_bad_utf8_outside_window() {
+    #[tokio::test]
+    async fn read_tolerates_bad_utf8_outside_window() {
         let dir = std::env::temp_dir().join("fuyao_test_read_bad_utf8_outside");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -448,7 +485,13 @@ mod tests {
             "offset": 1,
             "limit": 1
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("good line"));
         assert!(!result.contains("编码无法解析"));
 
@@ -456,8 +499,8 @@ mod tests {
     }
 
     /// 非 UTF-8 字节位于窗口内的行：明确报编码错误
-    #[test]
-    fn read_rejects_bad_utf8_inside_window() {
+    #[tokio::test]
+    async fn read_rejects_bad_utf8_inside_window() {
         let dir = std::env::temp_dir().join("fuyao_test_read_bad_utf8_inside");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.txt");
@@ -468,21 +511,33 @@ mod tests {
             "offset": 1,
             "limit": 1
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("编码无法解析"));
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    #[test]
-    fn read_nonexistent_file() {
+    #[tokio::test]
+    async fn read_nonexistent_file() {
         let args = serde_json::json!({ "path": "/nonexistent/file.txt" });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("文件不存在"));
     }
 
-    #[test]
-    fn read_binary_file_rejected() {
+    #[tokio::test]
+    async fn read_binary_file_rejected() {
         let dir = std::env::temp_dir().join("fuyao_test_read_binary_full");
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("test.png");
@@ -491,7 +546,13 @@ mod tests {
         let args = serde_json::json!({
             "path": file_path.to_string_lossy().to_string()
         });
-        let result = read_file_impl(args, &fuyao_api::ToolCallContext::default());
+        let result = read_file_impl(
+            args,
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("二进制文件"));
 
         std::fs::remove_dir_all(&dir).ok();
@@ -504,7 +565,7 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "a").unwrap();
         std::fs::create_dir_all(dir.join("subdir")).unwrap();
 
-        let result = list_directory(&dir, &dir.to_string_lossy(), 1, 100);
+        let result = list_directory(&dir, &dir.to_string_lossy(), 1, 100).to_wire();
         assert!(result.contains("a.txt"));
         assert!(result.contains("subdir"));
 

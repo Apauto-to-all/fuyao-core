@@ -1,6 +1,36 @@
 //! 文件读取工具类型定义
 //!
-//! 定义文件读取工具的结果类型。
+//! 定义文件读取工具的参数与结果类型。参数默认值常量在此声明，
+//! schema 构建器（mod.rs）与参数结构体 serde 默认函数共享同一份，
+//! 两处不再各写一个数字。
+
+/// 默认起始位置（从 1 开始）
+pub const DEFAULT_OFFSET: i64 = 1;
+/// 默认读取数量
+pub const DEFAULT_LIMIT: i64 = 500;
+/// 读取数量上限
+pub const MAX_LIMIT: i64 = 2000;
+
+/// read 工具参数（类型化解析）
+#[derive(Debug, serde::Deserialize)]
+pub struct ReadArgs {
+    /// 文件或目录路径（支持绝对路径、相对路径、~/路径）
+    pub path: String,
+    /// 起始位置（从 1 开始）。文件：行号；目录：条目索引
+    #[serde(default = "default_offset")]
+    pub offset: i64,
+    /// 最大读取数量。文件：行数；目录：条目数
+    #[serde(default = "default_limit")]
+    pub limit: i64,
+}
+
+fn default_offset() -> i64 {
+    DEFAULT_OFFSET
+}
+
+fn default_limit() -> i64 {
+    DEFAULT_LIMIT
+}
 
 /// 文件读取结果
 #[derive(Debug, Clone, serde::Serialize)]

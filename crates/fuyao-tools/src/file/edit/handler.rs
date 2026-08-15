@@ -8,56 +8,48 @@
 //! - 编辑前检测外部编辑并发出警告
 //! - 编辑后更新追踪器时间戳
 
-use crate::common::{self, resolve_path};
+use crate::common::resolve_path;
 use crate::file::edit::backend::apply_replace;
+use crate::file::edit::types::EditArgs;
+use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput, parse_args};
 use serde_json::Value;
 use std::path::Path;
 
-/// 查找替换处理器
+/// edit 工具入口，执行查找替换
 ///
 /// 处理查找替换请求，调用 `apply_replace` 执行模糊匹配替换。
 /// 失败时在错误信息后附加提示（建议使用 read 验证或 grep 定位）。
-fn replace_handler(args: &Value, ctx: &fuyao_api::ToolCallContext) -> String {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let old_string = args
-        .get("old_string")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let new_string = args
-        .get("new_string")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let replace_all = args
-        .get("replace_all")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+pub async fn edit_impl(
+    args: Value,
+    ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
+    let EditArgs {
+        path,
+        old_string,
+        new_string,
+        replace_all,
+    } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
+    };
     let task_id = ctx.task_id().to_string();
     let workspace = ctx.workspace().map(Path::to_path_buf);
 
     if path.is_empty() {
-        let err = serde_json::json!({
-            "error": "path 参数必填",
-            "suggestion": "请提供要修改的文件路径"
-        });
-        return common::tool_error_with(err);
+        return ToolOutput::Err(
+            ToolError::new("path 参数必填").with("suggestion", "请提供要修改的文件路径"),
+        );
     }
 
-    if args.get("old_string").is_none() || args.get("new_string").is_none() {
-        let err = serde_json::json!({
-            "error": "old_string 和 new_string 参数必填",
-            "suggestion": "请提供要查找和替换的文本内容"
-        });
-        return common::tool_error_with(err);
-    }
-
-    let file_path = resolve_path(path, workspace.as_deref());
+    let file_path = resolve_path(&path, workspace.as_deref());
 
     let result = apply_replace(
         &file_path,
-        old_string,
-        new_string,
+        &old_string,
+        &new_string,
         replace_all,
-        path,
+        &path,
         &task_id,
     );
 
@@ -69,24 +61,20 @@ fn replace_handler(args: &Value, ctx: &fuyao_api::ToolCallContext) -> String {
             hint = "\n\n[提示: old_string 未找到。使用 read 验证当前内容，或使用 grep 定位文本。]"
                 .to_string();
         }
-        let mut err = serde_json::json!({
-            "error": format!("{}{hint}", result.error.unwrap_or_default()),
-            "path": path,
-            "suggestion": "请提供更多上下文使匹配唯一，或使用 replace_all=true 替换所有匹配"
-        });
+        let mut err = ToolError::new(format!("{}{hint}", result.error.unwrap_or_default()))
+            .with("path", path.as_str())
+            .with(
+                "suggestion",
+                "请提供更多上下文使匹配唯一，或使用 replace_all=true 替换所有匹配",
+            );
         if let Some(w) = result.warning {
-            err["warning"] = serde_json::json!(w);
+            err = err.with("warning", serde_json::json!(w));
         }
-        return common::tool_error_with(err);
+        return ToolOutput::Err(err);
     }
 
     // 成功路径：result.error 必为 None，由 skip_serializing_if 自动省略
-    common::tool_result(serde_json::to_value(&result).unwrap_or_default())
-}
-
-/// edit 工具入口，执行查找替换
-pub fn edit_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
-    replace_handler(&args, ctx)
+    ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
 }
 
 #[cfg(test)]

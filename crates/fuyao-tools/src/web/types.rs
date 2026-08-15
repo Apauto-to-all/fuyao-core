@@ -1,6 +1,23 @@
 //! Web 工具类型定义
 //!
-//! 定义 URL 安全检查、抓取结果、重定向提示等数据模型。
+//! 定义 webfetch 工具的参数、URL 安全检查、抓取结果、重定向提示等数据模型。
+
+/// webfetch 工具参数（类型化解析）
+///
+/// timeout / offset / limit 缺省由 handler 从全局配置取默认值并收敛。
+#[derive(Debug, serde::Deserialize)]
+pub struct WebFetchArgs {
+    /// 要抓取的 URL（必须以 http:// 或 https:// 开头）
+    pub url: String,
+    /// 输出格式：markdown（默认）、html
+    pub output_format: Option<String>,
+    /// 超时时间（秒）
+    pub timeout: Option<u64>,
+    /// 跳过前面的字符数
+    pub offset: Option<u64>,
+    /// 限制返回的字符数
+    pub limit: Option<u64>,
+}
 
 /// URL 安全检查结果
 #[derive(Debug, Clone, serde::Serialize)]

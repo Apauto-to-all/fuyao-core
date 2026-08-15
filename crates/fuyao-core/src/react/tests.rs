@@ -238,7 +238,7 @@ async fn temp_store() -> Arc<fuyao_session::SessionStore> {
 fn echo_registry() -> Arc<ToolRegistry> {
     let handler: fuyao_api::ToolFn = Arc::new(|args, _ctx, _cancel| {
         let s = args.to_string();
-        Box::pin(async move { format!("echo:{s}") })
+        Box::pin(async move { fuyao_api::ToolOutput::text(format!("echo:{s}")) })
     });
     let entry = fuyao_api::ToolEntry {
         definition: fuyao_api::ToolDefinition::new("echo", "回显参数"),
@@ -1219,7 +1219,7 @@ async fn interrupt_during_tool_execution() {
         Box::pin(async {
             // 永不完成：sleep 30 秒，足够测试发中断
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            "unreachable".to_string()
+            fuyao_api::ToolOutput::text("unreachable")
         })
     });
     let tools = ToolRegistry::builder()
@@ -1316,12 +1316,12 @@ async fn interrupt_during_tool_execution_only_completes_unfinished() {
     ]]));
 
     let fast_handler: fuyao_api::ToolFn =
-        Arc::new(|_args, _ctx, _cancel| Box::pin(async { "fast ok".to_string() }));
+        Arc::new(|_args, _ctx, _cancel| Box::pin(async { fuyao_api::ToolOutput::text("fast ok") }));
     let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx, _cancel| {
         Box::pin(async {
             // 永不完成：sleep 30 秒，足够测试发中断
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            "unreachable".to_string()
+            fuyao_api::ToolOutput::text("unreachable")
         })
     });
     let tools = ToolRegistry::builder()
@@ -1506,7 +1506,7 @@ async fn shutdown_during_tool_execution() {
         Box::pin(async {
             // 永不完成：sleep 30 秒，足够测试发 shutdown 信号
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            "unreachable".to_string()
+            fuyao_api::ToolOutput::text("unreachable")
         })
     });
     let tools = ToolRegistry::builder()

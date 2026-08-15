@@ -14,9 +14,9 @@ use super::converter::convert_content;
 use super::pagination::{apply_pagination, validate_pagination};
 use super::redirect::{get_redirect_url, is_same_domain_redirect};
 use super::safety::check_url_safety;
-use super::types::{WebFetchRedirect, WebFetchResult};
-use crate::common;
+use super::types::{WebFetchArgs, WebFetchRedirect, WebFetchResult};
 use crate::config::WEBFETCH_USER_AGENT;
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
 use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -43,44 +43,45 @@ fn validate_timeout(timeout: Option<u64>) -> u64 {
 }
 
 /// WebFetch 工具处理函数
-pub async fn webfetch_handler(args: Value) -> String {
+pub async fn webfetch_handler(
+    args: Value,
+    _ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
     // 下载大小上限从全局配置读取
     let max_download_bytes = fuyao_api::get_config()
         .tools
         .limits
         .webfetch_max_download_bytes;
-    let url = match args.get("url").and_then(|v| v.as_str()) {
-        Some(u) => u.trim().to_string(),
-        None => return common::tool_error("URL 不能为空"),
+    let WebFetchArgs {
+        url,
+        output_format,
+        timeout,
+        offset,
+        limit,
+    } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
     };
-    let output_format = args
-        .get("output_format")
-        .and_then(|v| v.as_str())
-        .unwrap_or("markdown")
-        .to_string();
-    let timeout = validate_timeout(args.get("timeout").and_then(|v| v.as_u64()));
-    let (offset, limit) = validate_pagination(
-        args.get("offset")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize),
-        args.get("limit")
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize),
-    );
+    let url = url.trim().to_string();
+    let output_format = output_format.unwrap_or_else(|| "markdown".to_string());
+    let timeout = validate_timeout(timeout);
+    let (offset, limit) =
+        validate_pagination(offset.map(|n| n as usize), limit.map(|n| n as usize));
 
     // 1. URL 验证
     if url.is_empty() {
-        return common::tool_error("URL 不能为空");
+        return ToolOutput::error("URL 不能为空");
     }
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return common::tool_error("URL 必须以 http:// 或 https:// 开头");
+        return ToolOutput::error("URL 必须以 http:// 或 https:// 开头");
     }
 
     // 2. 安全检查
     let safety_result = check_url_safety(&url).await;
     if !safety_result.safe {
         tracing::warn!(url = %url, "阻断 SSRF 危险 URL");
-        return common::tool_error(
+        return ToolOutput::error(
             safety_result
                 .message
                 .as_deref()
@@ -108,7 +109,7 @@ pub async fn webfetch_handler(args: Value) -> String {
             redirect_url: None,
         };
 
-        return common::tool_result(serde_json::to_value(result).unwrap_or_default());
+        return ToolOutput::ok(serde_json::to_value(result).unwrap_or_default());
     }
 
     // 4. HTTP 抓取（缓存未命中），共享客户端 + 请求粒度超时
@@ -125,12 +126,12 @@ pub async fn webfetch_handler(args: Value) -> String {
         Ok(r) => r,
         Err(e) => {
             if e.is_timeout() {
-                return common::tool_error(&format!("请求超时（{timeout}秒）"));
+                return ToolOutput::error(format!("请求超时（{timeout}秒）"));
             }
             if e.is_connect() {
-                return common::tool_error(&format!("网络错误: {e}"));
+                return ToolOutput::error(format!("网络错误: {e}"));
             }
-            return common::tool_error(&format!("请求失败: {e}"));
+            return ToolOutput::error(format!("请求失败: {e}"));
         }
     };
 
@@ -139,7 +140,7 @@ pub async fn webfetch_handler(args: Value) -> String {
     if matches!(status, 301 | 302 | 307 | 308) {
         let redirect_url = match get_redirect_url(&response) {
             Some(u) => u,
-            None => return common::tool_error("重定向响应缺少 Location 头"),
+            None => return ToolOutput::error("重定向响应缺少 Location 头"),
         };
 
         if !is_same_domain_redirect(&current_url, &redirect_url) {
@@ -157,14 +158,11 @@ pub async fn webfetch_handler(args: Value) -> String {
                 status,
                 message: format!(
                     "检测到跨域名重定向:\n原始 URL: {}\n目标 URL: {}\n状态: {status} {status_text}\n\n请使用新 URL 再次调用 webfetch",
-                    args.get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(&current_url),
-                    redirect_url,
+                    &url, redirect_url,
                 ),
             };
 
-            return common::tool_result(serde_json::to_value(result).unwrap_or_default());
+            return ToolOutput::ok(serde_json::to_value(result).unwrap_or_default());
         }
 
         // 同域名重定向：继续抓取
@@ -178,9 +176,9 @@ pub async fn webfetch_handler(args: Value) -> String {
             Ok(r) => r,
             Err(e) => {
                 if e.is_timeout() {
-                    return common::tool_error(&format!("重定向请求超时（{timeout}秒）"));
+                    return ToolOutput::error(format!("重定向请求超时（{timeout}秒）"));
                 }
-                return common::tool_error(&format!("重定向请求失败: {e}"));
+                return ToolOutput::error(format!("重定向请求失败: {e}"));
             }
         };
         current_url = redirect_url;
@@ -189,7 +187,7 @@ pub async fn webfetch_handler(args: Value) -> String {
     // 6. 检查响应大小（content-length 头；无头或不可解析按 0 放行，正文长度兜底）
     let body_bytes = response.content_length().unwrap_or(0) as usize;
     if body_bytes > max_download_bytes {
-        return common::tool_error(&format!(
+        return ToolOutput::error(format!(
             "响应过大（超过 {}MB 限制）",
             max_download_bytes / 1024 / 1024
         ));
@@ -206,11 +204,11 @@ pub async fn webfetch_handler(args: Value) -> String {
 
     let raw_content = match response.text().await {
         Ok(t) => t,
-        Err(e) => return common::tool_error(&format!("读取响应内容失败: {e}")),
+        Err(e) => return ToolOutput::error(format!("读取响应内容失败: {e}")),
     };
 
     if raw_content.len() > max_download_bytes {
-        return common::tool_error(&format!(
+        return ToolOutput::error(format!(
             "响应过大（超过 {}MB 限制）",
             max_download_bytes / 1024 / 1024
         ));
@@ -251,7 +249,7 @@ pub async fn webfetch_handler(args: Value) -> String {
         redirect_url: None,
     };
 
-    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
 /// 构建请求头
@@ -310,13 +308,25 @@ mod tests {
 
     #[tokio::test]
     async fn webfetch_handler_empty_url() {
-        let result = webfetch_handler(serde_json::json!({ "url": "" })).await;
+        let result = webfetch_handler(
+            serde_json::json!({ "url": "" }),
+            ToolCallContext::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("URL 不能为空"));
     }
 
     #[tokio::test]
     async fn webfetch_handler_invalid_scheme() {
-        let result = webfetch_handler(serde_json::json!({ "url": "ftp://example.com" })).await;
+        let result = webfetch_handler(
+            serde_json::json!({ "url": "ftp://example.com" }),
+            ToolCallContext::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .to_wire();
         assert!(result.contains("http://") || result.contains("https://"));
     }
 }

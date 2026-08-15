@@ -11,9 +11,10 @@
 //! 支持 context 参数显示匹配行的上下文。
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
-use crate::common::{self, resolve_path};
-use crate::file::grep::types::{GrepMatch, GrepResult};
+use crate::common::resolve_path;
+use crate::file::grep::types::{GrepArgs, GrepMatch, GrepResult, MAX_LIMIT};
 use crate::redact::redact_sensitive_text;
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::sinks::UTF8;
@@ -194,32 +195,32 @@ fn match_glob_pattern(name: &str, pattern: &str) -> bool {
 /// grep 工具的异步入口
 ///
 /// 解析参数后，在 `spawn_blocking` 中执行搜索（避免阻塞异步运行时）。
-pub async fn grep_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
-    let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let include = args.get("include").and_then(|v| v.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(50)
-        .clamp(1, 100) as usize;
-    let offset = args
-        .get("offset")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0) as usize;
-    let context_lines = args
-        .get("context")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0) as usize;
+pub async fn grep_impl(
+    args: Value,
+    ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
+    let GrepArgs {
+        pattern,
+        path,
+        include,
+        limit,
+        offset,
+        context,
+    } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
+    };
+    let limit = limit.clamp(1, MAX_LIMIT) as usize;
+    let offset = offset.max(0) as usize;
+    let context_lines = context.max(0) as usize;
 
     if pattern.is_empty() {
-        return common::tool_error("搜索模式不能为空");
+        return ToolOutput::error("搜索模式不能为空");
     }
 
     let workspace = ctx.workspace().map(std::path::Path::to_path_buf);
-    let resolved_path_obj = resolve_path(path, workspace.as_deref());
+    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
     let resolved_path = resolved_path_obj.to_string_lossy().to_string();
 
     let timeout_secs = fuyao_api::get_config().tools.limits.search_timeout_secs;
@@ -227,9 +228,8 @@ pub async fn grep_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_clone = cancel.clone();
     let join = tokio::task::spawn_blocking({
-        let pattern = pattern.to_string();
+        let pattern = pattern.clone();
         let resolved_path = resolved_path.clone();
-        let include = include.map(|s| s.to_string());
         move || {
             search_content(
                 &pattern,
@@ -271,7 +271,7 @@ pub async fn grep_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
     };
 
     if let Some(err) = &result.error {
-        return common::tool_error(err);
+        return ToolOutput::error(err);
     }
 
     let mut result = result;
@@ -284,7 +284,7 @@ pub async fn grep_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
         ));
     }
 
-    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
 #[cfg(test)]

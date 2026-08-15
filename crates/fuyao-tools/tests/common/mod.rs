@@ -68,12 +68,16 @@ pub async fn make_ctx_with_store(workspace: PathBuf) -> ToolCallContext {
 }
 
 /// 调用工具 handler，返回解析后的 JSON
+///
+/// Value/Err 变体的 wire 均为 JSON 可直接解析；纯文本结果（Text 变体）
+/// 包成 `{"raw": 原文}` 供断言使用。
 pub async fn call_tool(handler: &ToolFn, args: Value, ctx: &ToolCallContext) -> Value {
-    let result = handler(args, ctx.clone(), CancellationToken::new()).await;
-    serde_json::from_str(&result).unwrap_or_else(|_| {
+    let output = handler(args, ctx.clone(), CancellationToken::new()).await;
+    let wire = output.to_wire();
+    serde_json::from_str(&wire).unwrap_or_else(|_| {
         Value::Object(serde_json::Map::from_iter([(
             "raw".to_string(),
-            Value::String(result),
+            Value::String(wire),
         )]))
     })
 }

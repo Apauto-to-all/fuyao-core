@@ -1,8 +1,17 @@
 //! Skills 工具类型定义
 //!
-//! 定义 Skills 加载工具的结果类型。
+//! 定义 Skills 加载工具的参数与结果类型。
 
 use std::collections::HashMap;
+
+/// skill 工具参数（类型化解析）
+#[derive(Debug, serde::Deserialize)]
+pub struct SkillArgs {
+    /// Skill 名称（可选，不传则列出所有）
+    pub name: Option<String>,
+    /// 关联文件路径，如 'references/api.md'（可选）
+    pub file_path: Option<String>,
+}
 
 /// Skill 元数据（用于列表显示）
 #[derive(Debug, Clone, serde::Serialize)]

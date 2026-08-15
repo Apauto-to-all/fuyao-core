@@ -110,7 +110,7 @@ mod tests {
     use std::sync::Arc;
 
     fn dummy_handler() -> ToolFn {
-        Arc::new(|_args, _ctx, _cancel| Box::pin(async { "ok".to_string() }))
+        Arc::new(|_args, _ctx, _cancel| Box::pin(async { fuyao_api::ToolOutput::text("ok") }))
     }
 
     fn make_entry(name: &str) -> ToolEntry {

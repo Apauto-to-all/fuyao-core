@@ -9,8 +9,9 @@
 //! 自动跳过隐藏文件和 .gitignore 排除的文件。
 //! 搜索结果按修改时间排序（最新优先），支持 offset/limit 分页。
 
-use crate::common::{self, resolve_path};
-use crate::file::glob::types::{GlobMatch, GlobResult};
+use crate::common::resolve_path;
+use crate::file::glob::types::{GlobArgs, GlobMatch, GlobResult, MAX_LIMIT};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
 use glob::Pattern;
 use ignore::WalkBuilder;
 use serde_json::Value;
@@ -140,26 +141,29 @@ fn search_files(
 /// glob 工具的异步入口
 ///
 /// 解析参数后，在 `spawn_blocking` 中执行目录遍历（避免阻塞异步运行时）。
-pub async fn glob_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String {
-    let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(100)
-        .clamp(1, 100) as usize;
-    let offset = args
-        .get("offset")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(0) as usize;
+pub async fn glob_impl(
+    args: Value,
+    ctx: ToolCallContext,
+    _cancel: CancellationToken,
+) -> ToolOutput {
+    let GlobArgs {
+        pattern,
+        path,
+        limit,
+        offset,
+    } = match parse_args(args) {
+        Ok(a) => a,
+        Err(e) => return ToolOutput::Err(e),
+    };
+    let limit = limit.clamp(1, MAX_LIMIT) as usize;
+    let offset = offset.max(0) as usize;
 
     if pattern.is_empty() {
-        return common::tool_error("搜索模式不能为空");
+        return ToolOutput::error("搜索模式不能为空");
     }
 
     let workspace = ctx.workspace().map(Path::to_path_buf);
-    let resolved_path_obj = resolve_path(path, workspace.as_deref());
+    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
     let resolved_path = resolved_path_obj.to_string_lossy().to_string();
 
     let pattern_owned = pattern.to_string();
@@ -207,7 +211,7 @@ pub async fn glob_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
     };
 
     if let Some(err) = &result.error {
-        return common::tool_error(err);
+        return ToolOutput::error(err);
     }
 
     let mut result = result;
@@ -218,7 +222,7 @@ pub async fn glob_impl(args: Value, ctx: &fuyao_api::ToolCallContext) -> String 
         ));
     }
 
-    common::tool_result(serde_json::to_value(result).unwrap_or_default())
+    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
 }
 
 #[cfg(test)]
