@@ -1199,6 +1199,75 @@ async fn interrupt_during_streaming() {
     assert_eq!(interrupted_row.cost, 0.0);
 }
 
+/// 中断-流式期间（纯思考）：模型仅产出思考增量、正文未开始时中断 →
+/// 落库的 assistant 行 content 补空串（content 与 tool_calls 双空违反
+/// OpenAI 协议，会让下轮请求 400），reasoning 原样保留
+#[tokio::test]
+async fn interrupt_during_streaming_reasoning_only() {
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
+
+    // 准备 1 轮事件流（中断发生在首轮流式期间）
+    let (provider, txs) = ControllableProvider::with_batches(1);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "test").await;
+
+    let tx_interrupt = h.tx_interrupt.clone();
+
+    // 只喂思考增量（正文一个字未吐），流随后挂起在第二个事件上
+    txs[0]
+        .send(Ok(StreamEvent::ReasoningDelta {
+            content: "先想一想".to_string(),
+        }))
+        .unwrap();
+
+    let turn_fut = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    );
+    tokio::pin!(turn_fut);
+    let interrupter = async {
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tx_interrupt
+            .send(InterruptMessage::new("用户取消", InterruptSource::User))
+            .await
+            .unwrap();
+    };
+    tokio::select! {
+        _ = &mut turn_fut => {}
+        _ = interrupter => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在中断后结束");
+        }
+    }
+
+    // 落库行：content 为空串（双空被历史入口兜底）、reasoning 携带已累积思考
+    let visible: Vec<_> = h
+        .ctx
+        .store
+        .load_visible_messages(&h.session_id, usize::MAX)
+        .await
+        .unwrap();
+    let interrupted_row = visible
+        .iter()
+        .find(|m| m.finish_reason.as_deref() == Some("interrupted"))
+        .expect("中断补发的 assistant 消息应落 DB");
+    assert_eq!(
+        interrupted_row.content.as_deref(),
+        Some(""),
+        "纯思考中断的落库行 content 应为空串，而非 None"
+    );
+    assert_eq!(interrupted_row.reasoning.as_deref(), Some("先想一想"));
+    assert!(interrupted_row.tool_calls.is_none());
+}
+
 /// 中断-工具执行期间：工具 handler 阻塞时发 Interrupt → 产出 Interrupt + 中断式 ToolResult
 ///
 /// 时序：MockProvider 吐工具调用 → run_turn 进入工具执行 select!（turn.rs:172），

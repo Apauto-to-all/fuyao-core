@@ -164,6 +164,15 @@ fn event_to_message(
                 msg.model_id = Some(model_id.to_string());
                 fuyao_session::fill_message_cost(&mut msg, model_id, agent_paths);
             }
+            // 不变量：assistant 消息 content 与 tool_calls 不得同时为空——
+            // OpenAI 协议要求二者至少其一存在，双空消息进入历史会让下轮请求
+            // 直接 400。双空只出现在「模型仅产出思考内容即被中断」的场景
+            // （reasoning 非空、正文未开始），落库前补空串 content 使历史数据
+            // 始终协议合法；content=None 且携带 tool_calls 的纯工具调用消息
+            // 是合法形态，不干预。
+            if msg.tool_calls.is_none() && msg.content.as_deref().is_none_or(str::is_empty) {
+                msg.content = Some(String::new());
+            }
             Some(msg)
         }
         OutputEvent::ToolResult(m) => Some(Message::tool_result(
@@ -418,6 +427,39 @@ mod tests {
         assert_eq!(msg.finish_reason.as_deref(), Some("interrupted"));
         assert_eq!(msg.model_id, None);
         assert_eq!(msg.cost, 0.0);
+    }
+
+    #[test]
+    fn assistant_both_content_and_tool_calls_empty_fills_empty_string() {
+        // 模型仅产出思考内容即被中断：content 与 tool_calls 双空。
+        // OpenAI 协议要求 assistant 消息二者至少其一存在，落库前补空串
+        // content 保证历史数据协议合法；reasoning 原样保留
+        let ev = make_assistant_event(&|p| {
+            p.reasoning = Some("思考到一半".into());
+            p.finish_reason = Some("interrupted".into());
+        });
+        let paths = AgentPaths::default();
+        let msg = event_to_message(&ev, None, &paths).expect("应投影成功");
+        assert_eq!(msg.content.as_deref(), Some(""));
+        assert!(msg.tool_calls.is_none());
+        assert_eq!(msg.reasoning.as_deref(), Some("思考到一半"));
+    }
+
+    #[test]
+    fn assistant_content_none_with_tool_calls_untouched() {
+        // 纯工具调用消息：content=None + tool_calls 非空是合法形态，不干预
+        let ev = make_assistant_event(&|p| {
+            p.finish_reason = Some("tool_calls".into());
+            p.tool_calls = Some(vec![ToolCallPayload {
+                tool_call_id: "call_1".into(),
+                tool_name: "search".into(),
+                tool_args: serde_json::json!({"q": "rust"}),
+            }]);
+        });
+        let paths = AgentPaths::default();
+        let msg = event_to_message(&ev, None, &paths).expect("应投影成功");
+        assert_eq!(msg.content, None);
+        assert!(msg.tool_calls.is_some());
     }
 
     #[test]
