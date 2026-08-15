@@ -86,7 +86,7 @@ impl Engine {
                 InputEvent::Interrupt(interrupt_msg) => {
                     // 入口转化：input 侧 InterruptMessage → output 侧 InterruptMessage。
                     // input 侧消息的唯一职责就是在此被转化，之后内核链路（通道、select!、
-                    // emit_interrupt_event）全程只认 output 侧类型。
+                    // 中断通知与收尾入口）全程只认 output 侧类型。
                     let outbound = OutputInterruptMessage::new(
                         interrupt_msg.payload.reason,
                         interrupt_msg.payload.source,

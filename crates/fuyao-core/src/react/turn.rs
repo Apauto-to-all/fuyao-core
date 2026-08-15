@@ -12,14 +12,14 @@
 //! 中断：两段 select!——流式期间、工具执行期间。idle 段在 run_session 外层。
 //! 中断分支用 `Some(...)` 模式：中断通道关闭（所有 tx drop）时分支禁用而非当作事件，
 //! 调用方无需为保证通道打开而持有 tx。
-//! 中断时保存部分结果（发增量事件），经统一历史入口（`crate::history`）即时落库
-//! 每条消息，结束本轮。
+//! 中断收尾协议（通知 + 部分结果 / 未完成 tool_call 的差集补发落库）归 interrupt
+//! 模块，本文件的 select! 臂只负责判定命中哪种信号并触发对应入口，结束本轮。
 //!
 //! shutdown：两段 select! 各有 `biased` 优先的 shutdown 分支（优先于 interrupt），
-//! 命中后与 interrupt 共用同一条三步链（`handle_stream_interrupt`：
-//! emit_interrupt_event → classify → handle_interrupt），把已累积的部分结果经
-//! 统一历史入口落库后立即 return。retry.rs 的退避 sleep 也监听 shutdown_token，
-//! 收到信号立即冒泡 Cancelled 让本层 shutdown 分支接管。这样 shutdown 不再依赖 10s abort 兜底。
+//! 命中后与 interrupt 共用同一条收尾协议（`interrupt::shutdown_payload` 提供
+//! source=Shutdown 的载荷），把已累积的部分结果落库后立即 return。retry.rs 的
+//! 退避 sleep 也监听 shutdown_token，收到信号立即冒泡 Cancelled 让本层 shutdown
+//! 分支接管。这样 shutdown 不再依赖 10s abort 兜底。
 
 use super::SessionCtx;
 use super::builders::{
@@ -27,59 +27,19 @@ use super::builders::{
     tool_call_event_to_data,
 };
 use super::handle_control;
-use crate::interrupt::{
-    SharedTurnState, TurnState, classify, emit_interrupt_event, handle_interrupt,
-};
+use crate::interrupt::{self, SharedTurnState, TurnState};
 use crate::react::queue;
 use crate::stream::StreamResult;
 use crate::tool_exec;
-use fuyao_api::InterruptSource;
+use fuyao_api::ModelConfig;
 use fuyao_api::TurnDirective;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::output::{
-    AssistantMessage, InterruptMessage as OutputInterruptMessage,
-    InterruptPayload as OutputInterruptPayload,
-};
-use fuyao_api::{MessageRole, ModelConfig};
+use fuyao_api::message::output::{AssistantMessage, InterruptMessage as OutputInterruptMessage};
 use fuyao_provider::Provider;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
-
-/// 构造 shutdown 中断 payload（供两段 select! 的 shutdown 分支复用）
-///
-/// shutdown 中断语义：source=Shutdown / reason="引擎关闭"。
-/// 作为 `handle_stream_interrupt` 的入参，与 interrupt 共用同一条三步链，
-/// 让 UI 收到标准 Interrupt 事件，DB 记录能区分「引擎关闭中断」vs「用户主动中断」。
-///
-/// 内核内部产生的中断载荷本就是 output 侧类型，直接构造。
-fn shutdown_interrupt_payload() -> OutputInterruptPayload {
-    OutputInterruptPayload::new("引擎关闭", InterruptSource::Shutdown)
-}
-
-/// 流式期间中断处理：发通知 + 补增量结果落库（shutdown 与 interrupt 共用同一条三步链）
-///
-/// 三步链：emit_interrupt_event → classify → handle_interrupt。
-/// 调用方负责判定命中哪种信号（shutdown token / interrupt 通道），并把对应的
-/// payload 传入——本函数不关心信号来源，只忠实执行"通知 + 补增量"。
-///
-/// 与工具执行期间的中断处理 `emit_interrupt_and_complete_tool_results` 对仗：
-/// 两者覆盖两段 select! 的中断语义，形成"流式 vs 工具执行"一对中断处理器。
-///
-/// 锁安全沿用 interrupt 模块约定：先 lock 取 TurnState 做 classify，block scope
-/// 结束自动释放（不跨 await 持锁）；handle_interrupt 内部再独立 lock + clone。
-async fn handle_stream_interrupt(
-    ctx: &SessionCtx,
-    state: &SharedTurnState,
-    payload: &OutputInterruptPayload,
-) {
-    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
-    let kind = {
-        let s = state.lock().unwrap_or_else(|e| e.into_inner());
-        classify(&s)
-    };
-    handle_interrupt(state, kind, payload, ctx).await;
-}
 
 /// run_turn 退出原因——自带主循环的消费许可状态机
 ///
@@ -241,9 +201,9 @@ pub(crate) async fn run_turn(
             tokio::pin!(retry_fut);
             tokio::select! {
                 biased;
-                // shutdown 优先（高于 interrupt）：立即落库退出，不等流式结束
+                // shutdown 优先（高于 interrupt）：收尾（通知 + 部分结果落库）后立即退出
                 _ = ctx.shutdown_token.cancelled() => {
-                    handle_stream_interrupt(ctx, &state, &shutdown_interrupt_payload()).await;
+                    interrupt::finish_streaming(ctx, &state, &interrupt::shutdown_payload()).await;
                     return TurnOutcome::Interrupted;
                 }
                 result = &mut retry_fut => result,
@@ -251,7 +211,7 @@ pub(crate) async fn run_turn(
                 // Some 模式：通道关闭（所有 tx drop）时本分支禁用，select 继续等流式 / shutdown
                 // ——关闭不是事件、不参与调度，也消除「关闭后 recv 立即就绪 + continue」的忙循环
                 Some(interrupt_msg) = rx_interrupt.recv() => {
-                    handle_stream_interrupt(ctx, &state, &interrupt_msg.payload).await;
+                    interrupt::finish_streaming(ctx, &state, &interrupt_msg.payload).await;
                     return TurnOutcome::Interrupted;
                 }
             }
@@ -266,9 +226,7 @@ pub(crate) async fn run_turn(
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
                     // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
-                    let halted =
-                        handle_tool_calls(ctx, rx_interrupt, &result, &model_config, keep_tokens)
-                            .await;
+                    let halted = handle_tool_calls(ctx, rx_interrupt, &result, &model_config).await;
                     if halted {
                         return TurnOutcome::Interrupted;
                     }
@@ -352,7 +310,6 @@ async fn handle_tool_calls(
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
-    keep_tokens: usize,
 ) -> bool {
     // 步骤1：逐个拦截 ToolCall 事件，构造 effective_tool_calls
     // 整批 tool_calls 拆成单个 ToolCall 事件各自拦截；Block 的跳过。
@@ -399,10 +356,14 @@ async fn handle_tool_calls(
 
     // 步骤3：中断点②——工具执行期间（含 shutdown）
     // execute_tools 通过 result_tx 通知完成（一个一个通知）；本循环边收边走统一历史入口
-    // 中断/shutdown 时 channel 里已完成的也落库（不丢），未完成的补发中断式 ToolResult。
+    // （拦截 → 落 DB → 发送事件）并记入已答集。中断/shutdown 时通道里已缓冲的已完成
+    // 结果也落库（不丢），未完成的经 interrupt 模块按差集补发中断式 ToolResult——
+    // 通知 + 补发的收尾协议归 interrupt 模块，本循环只负责触发。
     //
-    // shutdown 与 interrupt 的落库逻辑完全相同（发 Interrupt 通知 → 补未完成 tool_result），
-    // 抽 `emit_interrupt_and_complete_tool_results` 复用，唯一差异是 payload 的 source/reason。
+    // 已答集（answered）是未完成判定的内存真相源：逐条观测结果通道即精确，不查 DB、
+    // 不依赖可见窗口（窗口截断会把已完成误判成未完成而重复补发，同一 tool_call_id
+    // 出现两条结果会让下轮 LLM 调用协议报错）。已答 = 已经过历史入口处理——含插件
+    // Block（插件的责任，引擎不补偿）与落库失败（沿用「落库失败已丢弃」降级）。
     let tool_calls_for_exec = effective_result.tool_calls.clone();
     let (result_tx, mut result_rx) =
         tokio::sync::mpsc::channel::<tool_exec::ToolExecResult>(tool_calls_for_exec.len());
@@ -429,53 +390,47 @@ async fn handle_tool_calls(
     let exec_fut = tool_exec::execute_tools(&tool_calls_for_exec, &result_tx, &exec_ctx);
     tokio::pin!(exec_fut);
 
+    // 本批已答集：已观测到结果并经历史入口处理的 tool_call_id
+    let mut answered: HashSet<String> = HashSet::new();
+
     loop {
         tokio::select! {
             biased; // shutdown / 中断优先，保证及时响应
-            // shutdown 优先（高于 interrupt）：立即清空已完成工具结果 + 落库退出
+            // shutdown 优先（高于 interrupt）：先清空已完成结果（不丢），再走收尾协议退出
             // 工具执行 fut 被 drop → JoinSet drop → tokio 自动 abort 所有未完成工具 task
             _ = ctx.shutdown_token.cancelled() => {
-                // 清空 channel 把已完成的落库（不丢已完成结果）
-                while let Ok(r) = result_rx.try_recv() {
-                    push_tool_result_to_history(ctx, r).await;
-                }
-                emit_interrupt_and_complete_tool_results(
+                drain_finished_results(ctx, &mut result_rx, &mut answered).await;
+                interrupt::finish_tool_batch(
                     ctx,
                     &effective_result.tool_calls,
-                    keep_tokens,
-                    &shutdown_interrupt_payload(),
+                    &answered,
+                    &interrupt::shutdown_payload(),
                 )
                 .await;
                 return true;
             }
             Some(interrupt_msg) = rx_interrupt.recv() => {
                 // interrupt 命中：显式 cancel 工具批 child_token（shutdown 靠 parent 传播，无需此处 cancel）
-                // 让监听 token 的长任务 handler 后台优雅收尾；无宽限期，立即清空 + 补发。
+                // 让监听 token 的长任务 handler 后台优雅收尾；无宽限期，立即清空 + 收尾。
                 // Some 模式：通道关闭时本分支禁用，工具批正常跑完——关闭不模拟用户中断
                 cancel.cancel();
-                // 清空 channel 把已完成的落库（不丢已完成结果）
-                // 用 try_recv 非阻塞清空（exec_fut 可能还在跑，recv 会阻塞）
-                while let Ok(r) = result_rx.try_recv() {
-                    push_tool_result_to_history(ctx, r).await;
-                }
-                emit_interrupt_and_complete_tool_results(
+                drain_finished_results(ctx, &mut result_rx, &mut answered).await;
+                interrupt::finish_tool_batch(
                     ctx,
                     &effective_result.tool_calls,
-                    keep_tokens,
+                    &answered,
                     &interrupt_msg.payload,
                 )
                 .await;
                 return true;
             }
             Some(r) = result_rx.recv() => {
-                // 完成一个：立即走统一历史入口（拦截 → 落 DB → 发送事件）
-                push_tool_result_to_history(ctx, r).await;
+                // 完成一个：立即走统一历史入口（拦截 → 落 DB → 发送事件）并记入已答集
+                record_tool_result(ctx, &mut answered, r).await;
             }
             _ = &mut exec_fut => {
                 // execute_tools 完成：清空 channel 里剩余的（防丢，理论已空）
-                while let Ok(r) = result_rx.try_recv() {
-                    push_tool_result_to_history(ctx, r).await;
-                }
+                drain_finished_results(ctx, &mut result_rx, &mut answered).await;
                 break;
             }
         }
@@ -490,11 +445,18 @@ async fn handle_tool_calls(
     false
 }
 
-/// 把工具执行结果经统一入口单条落 DB
+/// 记录一条已完成的工具结果：经统一入口落 DB 并记入已答集
 ///
-/// 工具完成时立即调用：拦截 → 投影 Message（含 tool_name）→ 落 DB → 发送事件 → 观察。
-/// 保证「拦截→存储→发送」三者一致；中断时已完成的也不丢。
-async fn push_tool_result_to_history(ctx: &SessionCtx, result: tool_exec::ToolExecResult) {
+/// 工具完成时立即调用：拦截 → 投影 Message（含 tool_name）→ 落 DB → 发送事件 → 观察，
+/// 保证「拦截→存储→发送」三者一致；id 同步记入已答集，供中断收尾做未完成判定。
+/// id 先于落库 await 记入（中断信号不会打断本函数——select! 臂的处理函数跑完才重新调度），
+/// 且 Block / 落库失败同样记入：插件决策不补偿，落库失败沿用「已丢弃」降级。
+async fn record_tool_result(
+    ctx: &SessionCtx,
+    answered: &mut HashSet<String>,
+    result: tool_exec::ToolExecResult,
+) {
+    answered.insert(result.tool_call_id.clone());
     let event = OutputEvent::ToolResult(fuyao_api::message::output::ToolResultMessage {
         base: EventBase::default(),
         payload: fuyao_api::message::output::ToolResultPayload {
@@ -506,55 +468,16 @@ async fn push_tool_result_to_history(ctx: &SessionCtx, result: tool_exec::ToolEx
     let _ = crate::history::emit_to_history(ctx, event).await;
 }
 
-/// 发 Interrupt 通知 + 为未完成 tool_call 补发中断式 ToolResult（落 DB）
+/// 非阻塞清空结果通道：已完成结果逐条落库并记入已答集
 ///
-/// 工具执行期间收到 interrupt 或 shutdown 信号时复用本函数（payload 由调用方决定）。
-/// 调用方应在调用本函数前**先用 `try_recv` 清空 channel** 把已完成的工具结果 push 进 history，
-/// 本函数只负责「通知 + 补未完成」两步。
-///
-/// 未完成判定：从 DB 查询已落库的 answered tool_call_id（事件级落库模式下消息不在内存），
-/// effective 中不在 answered 集合的 tool_call 视为未完成，逐个补发中断式 ToolResult。
-///
-/// `keep_tokens` 由调用方（run_turn 顶部）传入——与主对话可见窗口同一份预算
-/// （`effective_keep_tokens` 按 `resolved.context_length` 算），本函数不重算口径。
-async fn emit_interrupt_and_complete_tool_results(
+/// 中断 / shutdown / 正常完成三路共用——结果通道里已缓冲的结果都不丢。
+/// 用 try_recv 非阻塞清空（exec_fut 可能还在跑，recv 会阻塞）。
+async fn drain_finished_results(
     ctx: &SessionCtx,
-    effective_tool_calls: &[fuyao_provider::ToolCallData],
-    keep_tokens: usize,
-    payload: &OutputInterruptPayload,
+    result_rx: &mut Receiver<tool_exec::ToolExecResult>,
+    answered: &mut HashSet<String>,
 ) {
-    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
-
-    let answered: std::collections::HashSet<String> = match ctx
-        .store
-        .load_visible_messages(ctx.emitter.session_id(), keep_tokens)
-        .await
-    {
-        Ok(msgs) => msgs
-            .iter()
-            .filter(|m| matches!(m.role, MessageRole::Tool))
-            .filter_map(|m| m.tool_call_id.clone())
-            .collect(),
-        Err(e) => {
-            tracing::warn!(
-                session_id = ctx.emitter.session_id(),
-                cause = %e,
-                "中断补发前加载可见消息失败，按全部未完成处理"
-            );
-            std::collections::HashSet::new()
-        }
-    };
-
-    // 为 effective 中未完成的 tool_call 补发中断式 ToolResult（也走统一落库入口）
-    for tc in effective_tool_calls {
-        if !answered.contains(&tc.id) {
-            let ev = crate::interrupt::make_interrupt_tool_result(
-                tc.id.clone(),
-                tc.name.clone(),
-                &payload.source,
-                &payload.reason,
-            );
-            let _ = crate::history::emit_to_history(ctx, ev).await;
-        }
+    while let Ok(r) = result_rx.try_recv() {
+        record_tool_result(ctx, answered, r).await;
     }
 }

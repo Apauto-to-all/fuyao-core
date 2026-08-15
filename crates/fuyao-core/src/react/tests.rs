@@ -1286,6 +1286,128 @@ async fn interrupt_during_tool_execution() {
     );
 }
 
+/// 中断-工具执行期间（差集补发）：快工具已完成、阻塞工具未完成 → 只为未完成的中断补发
+///
+/// 未完成判定用本批内存观测的已答集：已完成工具不得重复补发中断式 ToolResult——
+/// 否则同一 tool_call_id 出现两条结果，下轮 LLM 调用协议报错。
+#[tokio::test]
+async fn interrupt_during_tool_execution_only_completes_unfinished() {
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
+
+    // 一批两个工具调用：fast 立即完成（结果先被记录进已答集），slow 阻塞等中断
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(StreamEvent::ToolCallChunk {
+            index: 0,
+            id: Some("tc_fast".to_string()),
+            name: Some("fast_tool".to_string()),
+            args_delta: Some("{}".to_string()),
+        }),
+        Ok(StreamEvent::ToolCallChunk {
+            index: 1,
+            id: Some("tc_slow".to_string()),
+            name: Some("blocking_tool".to_string()),
+            args_delta: Some("{}".to_string()),
+        }),
+        Ok(StreamEvent::Done {
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::ToolCalls,
+        }),
+    ]]));
+
+    let fast_handler: fuyao_api::ToolFn =
+        Arc::new(|_args, _ctx, _cancel| Box::pin(async { "fast ok".to_string() }));
+    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx, _cancel| {
+        Box::pin(async {
+            // 永不完成：sleep 30 秒，足够测试发中断
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            "unreachable".to_string()
+        })
+    });
+    let tools = ToolRegistry::builder()
+        .register(fuyao_api::ToolEntry {
+            definition: fuyao_api::ToolDefinition::new("fast_tool", "立即完成的工具"),
+            handler: fast_handler,
+            child_invisible: false,
+        })
+        .register(fuyao_api::ToolEntry {
+            definition: fuyao_api::ToolDefinition::new("blocking_tool", "阻塞测试工具"),
+            handler: blocking_handler,
+            child_invisible: false,
+        })
+        .build();
+
+    let mut h = make_harness(provider, Arc::new(tools)).await;
+    preload_user(&h, "调工具").await;
+
+    let tx_interrupt = h.tx_interrupt.clone();
+
+    let turn_fut = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    );
+    tokio::pin!(turn_fut);
+    let interrupter = async {
+        // 等 run_turn 进入工具执行段且 fast_tool 的结果已被记录进已答集
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tx_interrupt
+            .send(InterruptMessage::new("用户取消", InterruptSource::User))
+            .await
+            .unwrap();
+    };
+    tokio::select! {
+        _ = &mut turn_fut => {}
+        _ = interrupter => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在工具中断后结束");
+        }
+    }
+
+    let events = collect_events(&mut h.rx_event).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, OutputEvent::Interrupt(_))),
+        "应有 Interrupt 事件"
+    );
+
+    // fast：恰一条真实结果，无中断式补发（已答不重复补发）
+    let fast_results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            OutputEvent::ToolResult(m) if m.payload.tool_call_id == "tc_fast" => Some(&m.payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fast_results.len(), 1, "fast_tool 应恰一条 ToolResult");
+    assert_eq!(fast_results[0].content, "fast ok");
+
+    // slow：恰一条中断式 ToolResult（content 格式 [{source:?}][{reason}]）
+    let slow_results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            OutputEvent::ToolResult(m) if m.payload.tool_call_id == "tc_slow" => Some(&m.payload),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        slow_results.len(),
+        1,
+        "blocking_tool 应恰一条中断式 ToolResult"
+    );
+    assert!(
+        slow_results[0].content.contains("用户取消"),
+        "中断式 ToolResult content 应含中断原因: {}",
+        slow_results[0].content
+    );
+}
+
 /// shutdown-流式期间：ControllableProvider 吐 TextDelta 后挂起 → cancel shutdown_token
 ///
 /// 验证 turn.rs 流式 select! 的 shutdown 分支（biased 优先）：

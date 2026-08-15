@@ -32,7 +32,7 @@ pub(crate) mod turn;
 
 use crate::emit::Emitter;
 use crate::engine::types::SharedQueue;
-use crate::interrupt::emit_interrupt_event;
+use crate::interrupt::notify_idle;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
@@ -376,9 +376,8 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                 handle_inbound_user(&ctx, inbound).await;
             }
             Some(interrupt_msg) = rx_interrupt.recv() => {
-                // idle 中断：无活跃 turn，只发通知事件
-                emit_interrupt_event(&interrupt_msg.payload, &ctx.emitter, &ctx.hooks).await;
-                tracing::debug!(session_id = ctx.emitter.session_id(), "idle 时收到中断信号");
+                // idle 中断：无活跃 turn，只发通知事件（收尾协议归 interrupt 模块）
+                notify_idle(&ctx, &interrupt_msg.payload).await;
             }
             Some(cmd) = rx_control.recv() => {
                 // idle 时控制命令到达：执行（同 task 串行消费，天然互斥）。
