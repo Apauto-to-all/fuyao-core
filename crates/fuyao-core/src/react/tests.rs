@@ -1,7 +1,9 @@
 //! ReAct 循环单元测试
 //!
 //! 测试组织：MockProvider 驱动 + TestHarness 聚合共享依赖 + 临时 DB 隔离。
-//! 覆盖 run_turn（7 个）与 run_session（1 个，pending 空闲解禁回归）。
+//! 覆盖面：run_turn 基本 ReAct 行为 / 双队列三消费时机（含 turn 内入站通道入队路径、
+//! 最终回复后触发下一轮）/ 中断与 shutdown 收尾 / TurnOutcome 消费许可状态机 /
+//! run_session 主循环（pending 空闲解禁、停止后重启、连发消息同 turn 批量消费）。
 
 use super::*;
 use async_trait::async_trait;
@@ -319,6 +321,10 @@ struct TestHarness {
     ctx: SessionCtx,
     /// 本 harness 关联的 session_id（DB 唯一数据源，内核不再常驻内存 Session）
     session_id: String,
+    /// 入站通道接收端：run_turn 流式 / 工具执行两段 select! 消费它
+    rx_inbound: mpsc::Receiver<OutputUserMessage>,
+    /// 入站通道发送端：测试向 turn 运行期间注入用户消息用（与生产 Engine::send 同路径）
+    tx_inbound: mpsc::Sender<OutputUserMessage>,
     rx_interrupt: Receiver<OutputInterruptMessage>,
     tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
     /// 控制通道接收端：run_turn 间隙检查点消费它
@@ -387,6 +393,8 @@ async fn make_harness_full(
     store.create(&session).await.unwrap();
     drop(session);
     let (tx_event, rx_event) = mpsc::unbounded_channel();
+    // 入站通道：与生产同容量（16），测试经 tx_inbound 模拟 Engine::send 的投递路径
+    let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
     // 控制通道：tx 保留供测试注入命令，rx 供 run_turn 间隙检查点 try_recv
     let (tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
@@ -407,6 +415,8 @@ async fn make_harness_full(
     TestHarness {
         ctx,
         session_id: TEST_SESSION_ID.to_string(),
+        rx_inbound,
+        tx_inbound,
         rx_interrupt,
         tx_interrupt,
         rx_control,
@@ -473,6 +483,7 @@ async fn single_turn_no_tools() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -506,6 +517,7 @@ async fn react_loop_with_tool() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -535,6 +547,7 @@ async fn tool_result_in_messages() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -561,6 +574,7 @@ async fn llm_error_emits_error_event() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -594,6 +608,7 @@ async fn guide_all_consumed_on_tool_complete() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -621,9 +636,13 @@ async fn guide_all_consumed_on_tool_complete() {
 }
 
 /// 最终回复后：pending 先倒 guide，再 guide 全消费（pending 优先于 guide）
+///
+/// 第一轮直接最终回复（无工具），触发消费时机②：pending + guide 都被消费注入，
+/// **并触发下一轮 ReAct 循环**（第二轮 LLM 调用消费 mock 的「回复2」）——
+/// 修复前注入后 run_turn 直接 return Completed，消息进 DB 但 AI 永不回应。
 #[tokio::test]
 async fn pending_before_guide_on_final_reply() {
-    // 第一轮直接最终回复（无工具），触发消费时机②
+    // 第一轮直接最终回复（无工具），触发消费时机②；注入后再调一轮（「回复2」）
     let provider = Arc::new(MockProvider::new(vec![
         MockProvider::text_response("回复1"),
         // 注入 pending+guide 消息后再调一轮，最终回复
@@ -643,32 +662,42 @@ async fn pending_before_guide_on_final_reply() {
         .unwrap()
         .push_back(make_inbound_with_mode("引导消息", UserMessageMode::Guide));
 
-    turn::run_turn(
+    let outcome = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
     )
     .await;
 
-    // 两条都应进 DB
-    let user_msgs: Vec<_> = visible_messages(&h)
-        .await
-        .iter()
-        .filter(|m| matches!(m.role, MessageRole::User))
-        .map(|m| m.content.clone().unwrap_or_default())
-        .collect();
-    assert!(
-        user_msgs.contains(&"排队消息".to_string()),
-        "pending 应被消费"
-    );
-    assert!(
-        user_msgs.contains(&"引导消息".to_string()),
-        "guide 应被消费"
-    );
+    // 两条都应进 DB（pos 闭包在消息缺失时直接 panic）
+    let msgs = visible_messages(&h).await;
+    let pos = |needle: &str| {
+        msgs.iter()
+            .position(|m| m.content.as_deref() == Some(needle))
+            .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+    };
+    pos("排队消息");
+    pos("引导消息");
     // 两个队列都空
     assert!(h.ctx.pending.lock().unwrap().is_empty());
     assert!(h.ctx.guide.lock().unwrap().is_empty());
+
+    // 顺序语义：pending 追加在 guide 现有内容之后（引导消息在前、排队消息在后）
+    assert!(pos("引导消息") < pos("排队消息"));
+
+    // 消费注入后触发下一轮 ReAct：两条 user 消息都排在「回复1」之后、
+    // 且 AI 对它们给出了「回复2」（同 turn 内被回应）
+    assert!(pos("排队消息") > pos("回复1"));
+    assert!(pos("引导消息") > pos("回复1"));
+    assert!(pos("排队消息") < pos("回复2"));
+    assert!(pos("引导消息") < pos("回复2"));
+    // turn 正常结束（双队列跑空后 Completed）
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "双队列跑空后应返回 Completed"
+    );
 }
 
 /// guide + pending 都空，最终回复后 turn 结束（不追加额外消息）
@@ -680,6 +709,7 @@ async fn both_empty_turn_ends() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -689,6 +719,376 @@ async fn both_empty_turn_ends() {
     // user + assistant，没有多余消息
     let msgs = visible_messages(&h).await;
     assert_eq!(msgs.len(), 2);
+}
+
+/// 工具执行期间经入站通道到达的 guide 消息，在消费时机①（整批工具完成后）被消费
+///
+/// 走生产同款投递路径（tx_inbound 通道，Engine::send 同路）：消息由工具执行段
+/// select! 的 inbound 分支即时入队。修复前 turn 运行期间通道无人消费，消息滞留到
+/// turn 结束后才入队——消费时机①在生产链路上永远消费到空队列。
+///
+/// 时序：阻塞工具 sleep 200ms 制造 exec_fut 的 Pending 窗口，测试在窗口内（约 50ms）
+/// 投递消息——inbound 分支在工具批完成前即时入队，消费时机①必然看到它。
+#[tokio::test]
+async fn guide_via_channel_consumed_after_tool_batch() {
+    // 阻塞工具：sleep 200ms 后完成（Pending 窗口，等测试在窗口内投递消息）
+    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx, _cancel| {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            fuyao_api::ToolOutput::text("done")
+        })
+    });
+    let tools = ToolRegistry::builder()
+        .register(fuyao_api::ToolEntry {
+            definition: fuyao_api::ToolDefinition::new("blocking_tool", "阻塞窗口工具"),
+            handler: blocking_handler,
+            child_invisible: false,
+        })
+        .build();
+
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response("tc_1", "blocking_tool", r#"{}"#),
+        MockProvider::text_response("最终回复"),
+    ]));
+    let mut h = make_harness(provider, Arc::new(tools)).await;
+    preload_user(&h, "原始问题").await;
+
+    let tx_inbound = h.tx_inbound.clone();
+    let turn_fut = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    );
+    tokio::pin!(turn_fut);
+    let driver = async {
+        // 等 run_turn 跑完流式（工具调用）并进入工具执行的 Pending 窗口
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // 工具执行期间投 guide 消息（inbound 分支即时入队，不打断工具批）
+        tx_inbound.send(make_inbound("工具期间补充")).await.unwrap();
+    };
+    let outcome = tokio::select! {
+        _ = &mut turn_fut => panic!("工具阻塞 200ms，turn 不可能先于投递完成"),
+        _ = driver => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在工具完成后结束")
+        }
+    };
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "双队列跑空后应返回 Completed，实际: {outcome:?}"
+    );
+
+    // DB 顺序：user → assistant(tool_calls) → tool → user(补充) → assistant(最终)
+    // 直取 ctx.store（字段级借用）——turn_fut 的 PinMut 仍持有 h.rx_inbound 等可变借用
+    let msgs = h
+        .ctx
+        .store
+        .load_visible_messages(&h.session_id, usize::MAX)
+        .await
+        .expect("加载可见消息失败");
+    let pos = |needle: &str| {
+        msgs.iter()
+            .position(|m| m.content.as_deref() == Some(needle))
+            .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+    };
+    let tool_pos = msgs
+        .iter()
+        .position(|m| matches!(m.role, MessageRole::Tool))
+        .expect("应有 tool 消息");
+    assert!(
+        tool_pos < pos("工具期间补充"),
+        "补充消息应在工具结果之后注入（消费时机①），实际位置：tool={tool_pos}, 补充={}",
+        pos("工具期间补充")
+    );
+    assert!(
+        pos("工具期间补充") < pos("最终回复"),
+        "补充消息应在最终回复之前（同 turn 内被 AI 看到）"
+    );
+    assert!(h.ctx.guide.lock().unwrap().is_empty(), "guide 应被消费空");
+}
+
+/// turn 启动前连投两条 guide 消息进通道：流式段 inbound 分支先于流结果轮询（biased），
+/// 两条都赶在消费时机①入队，同一 turn 内一次性批量消费——而非各开独立 turn。
+/// 修复前通道消息滞留，run_turn 全程消费不到，两条都不进 DB。
+#[tokio::test]
+async fn guide_via_channel_batched_in_one_turn() {
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response("c1", "echo", r#"{}"#),
+        MockProvider::text_response("最终回复"),
+    ]));
+    let mut h = make_harness(provider, echo_registry()).await;
+    preload_user(&h, "原始问题").await;
+    // 连投两条（模拟用户快速连发）
+    h.tx_inbound.send(make_inbound("补充1")).await.unwrap();
+    h.tx_inbound.send(make_inbound("补充2")).await.unwrap();
+
+    turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    )
+    .await;
+
+    // 恰 6 条：user / assistant(tool_calls) / tool / 补充1 / 补充2 / assistant(最终)
+    let msgs = visible_messages(&h).await;
+    assert_eq!(
+        msgs.len(),
+        6,
+        "两条补充都应在本 turn 消费时机①注入，实际消息数: {msgs:?}"
+    );
+    let pos = |needle: &str| {
+        msgs.iter()
+            .position(|m| m.content.as_deref() == Some(needle))
+            .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+    };
+    // 批量顺序保持 FIFO：补充1 在补充2 前，且都在工具结果后、最终回复前
+    let tool_pos = msgs
+        .iter()
+        .position(|m| matches!(m.role, MessageRole::Tool))
+        .expect("应有 tool 消息");
+    assert!(tool_pos < pos("补充1"));
+    assert!(pos("补充1") < pos("补充2"));
+    assert!(pos("补充2") < pos("最终回复"));
+    assert!(h.ctx.guide.lock().unwrap().is_empty());
+}
+
+/// 流式期间到达的 guide 消息：inbound 分支即时入队（不打断流式），最终回复后在
+/// 消费时机②被消费，并触发下一轮 ReAct 循环（AI 对补充消息给出「第二轮回复」）
+#[tokio::test]
+async fn inbound_during_streaming_consumed_at_final_reply() {
+    // 批 0：吐一个 TextDelta 后挂起（等测试投补充消息再喂 Done）；
+    // 批 1：补充消息触发的下一轮，预喂完整最终回复后 drop 发送端（流读到关闭即结束）
+    let (provider, mut txs) = ControllableProvider::with_batches(2);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "原始问题").await;
+
+    txs[0]
+        .send(Ok(StreamEvent::TextDelta {
+            content: "第一轮回复".to_string(),
+        }))
+        .unwrap();
+    {
+        let tx1 = txs.pop().unwrap();
+        tx1.send(Ok(StreamEvent::TextDelta {
+            content: "第二轮回复".to_string(),
+        }))
+        .unwrap();
+        tx1.send(Ok(StreamEvent::Done {
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::Stop,
+        }))
+        .unwrap();
+    }
+
+    let tx_inbound = h.tx_inbound.clone();
+    // 独占批 0 的发送端（pop 取走所有权）：喂完 Done 后 drop 关闭通道，
+    // 流读到关闭即结束——clone 会留下第二个发送端，通道不关流不结束
+    let tx0 = txs.pop().unwrap();
+    let turn_fut = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    );
+    tokio::pin!(turn_fut);
+    let driver = async {
+        // 等 run_turn 消费掉 TextDelta 并挂起在流的第二个事件上
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // 流式挂起期间投 guide 消息（inbound 分支即时入队，不打断流式）
+        tx_inbound.send(make_inbound("流式期间补充")).await.unwrap();
+        // 补充消息入队后喂 Done 并 drop 发送端，流结束 → 最终回复 → 消费时机②
+        tx0.send(Ok(StreamEvent::Done {
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::Stop,
+        }))
+        .unwrap();
+        drop(tx0);
+    };
+    let outcome = tokio::select! {
+        _ = &mut turn_fut => unreachable!("流挂起时 turn 不可能先完成"),
+        _ = driver => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在两轮 ReAct 后结束")
+        }
+    };
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "双队列跑空后应返回 Completed"
+    );
+
+    // DB 顺序：user → assistant(第一轮) → user(补充) → assistant(第二轮)
+    // 直取 ctx.store（字段级借用）——turn_fut 的 PinMut 仍持有 h.rx_inbound 等可变借用
+    let msgs = h
+        .ctx
+        .store
+        .load_visible_messages(&h.session_id, usize::MAX)
+        .await
+        .expect("加载可见消息失败");
+    let pos = |needle: &str| {
+        msgs.iter()
+            .position(|m| m.content.as_deref() == Some(needle))
+            .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+    };
+    assert!(pos("原始问题") < pos("第一轮回复"));
+    assert!(
+        pos("第一轮回复") < pos("流式期间补充"),
+        "补充消息应在第一轮最终回复之后注入（消费时机②）"
+    );
+    assert!(
+        pos("流式期间补充") < pos("第二轮回复"),
+        "补充消息应触发下一轮 ReAct 并被 AI 回应"
+    );
+}
+
+/// 中断语义（turn 内入队路径）：流式期间入队的 guide 消息，中断后不被消费、
+/// 不被清除，原样保留在队列——直到下一条用户消息恢复消费（TurnOutcome 状态机）
+#[tokio::test]
+async fn interrupt_after_inbound_preserves_guide_queue() {
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
+
+    let (provider, txs) = ControllableProvider::with_batches(1);
+    let provider: Arc<dyn Provider> = Arc::new(provider);
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "原始问题").await;
+
+    // 吐一个 TextDelta 后挂起（流等第二个事件）
+    txs[0]
+        .send(Ok(StreamEvent::TextDelta {
+            content: "部分回复".to_string(),
+        }))
+        .unwrap();
+
+    let tx_inbound = h.tx_inbound.clone();
+    let tx_interrupt = h.tx_interrupt.clone();
+    let turn_fut = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    );
+    tokio::pin!(turn_fut);
+    let driver = async {
+        for _ in 0..6 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // 流式挂起期间投 guide 消息（inbound 分支即时入队）
+        tx_inbound.send(make_inbound("中断前补充")).await.unwrap();
+        // 留时间让入队发生（select! 下一轮轮询即入队），再发中断
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tx_interrupt
+            .send(InterruptMessage::new("用户取消", InterruptSource::User))
+            .await
+            .unwrap();
+    };
+    let outcome = tokio::select! {
+        _ = &mut turn_fut => unreachable!("流挂起 + 无 Done 时 turn 不可能先完成"),
+        _ = driver => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在中断后结束")
+        }
+    };
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Interrupted),
+        "流式期间中断应返回 Interrupted"
+    );
+
+    // 队列保留：guide 恰含这条消息，未被消费、未被清除
+    let guide_contents: Vec<String> = h
+        .ctx
+        .guide
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.payload.content.clone())
+        .collect();
+    assert_eq!(
+        guide_contents,
+        vec!["中断前补充".to_string()],
+        "中断后 guide 剩余应原样保留（不消费、不清除）"
+    );
+    // 未消费 = 未过历史入口落库（直取 ctx.store——turn_fut 仍持有字段级可变借用）
+    let msgs = h
+        .ctx
+        .store
+        .load_visible_messages(&h.session_id, usize::MAX)
+        .await
+        .expect("加载可见消息失败");
+    let users: Vec<String> = msgs
+        .iter()
+        .filter(|m| matches!(m.role, MessageRole::User))
+        .map(|m| m.content.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        !users.contains(&"中断前补充".to_string()),
+        "中断后未消费的消息不应落 DB"
+    );
+}
+
+/// turn 运行期间经入站通道到达的 pending 消息：消费时机①不消费（pending 不动），
+/// 最终回复后在消费时机②被消费并触发下一轮 ReAct——「等链结束」语义在
+/// turn 内入队路径下依然成立
+#[tokio::test]
+async fn pending_via_channel_consumed_at_final_reply_not_tool_batch() {
+    // 三轮 LLM：工具调用 → 第一轮最终回复（时机①不动 pending）→
+    // 时机②消费 pending 触发的下一轮 → 第二轮最终回复
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response("tc_1", "echo", r#"{}"#),
+        MockProvider::text_response("第一轮回复"),
+        MockProvider::text_response("第二轮回复"),
+    ]));
+    let mut h = make_harness(provider, echo_registry()).await;
+    preload_user(&h, "原始问题").await;
+    // turn 启动前投一条 pending 消息（流式段 inbound 分支入队，走生产同款通道路径）
+    h.tx_inbound
+        .send(make_inbound_with_mode("排队补充", UserMessageMode::Pending))
+        .await
+        .unwrap();
+
+    turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        test_params(),
+    )
+    .await;
+
+    let msgs = visible_messages(&h).await;
+    let pos = |needle: &str| {
+        msgs.iter()
+            .position(|m| m.content.as_deref() == Some(needle))
+            .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+    };
+    // 排队补充不在消费时机①注入（否则会排在「第一轮回复」之前），
+    // 而是在时机②注入（第一轮回复之后）并被下一轮回应（第二轮回复之前）
+    assert!(
+        pos("第一轮回复") < pos("排队补充"),
+        "pending 不应在工具批完成时消费（时机①不动 pending）"
+    );
+    assert!(
+        pos("排队补充") < pos("第二轮回复"),
+        "pending 应在时机②消费并触发下一轮 ReAct 被回应"
+    );
+    assert!(h.ctx.pending.lock().unwrap().is_empty());
+    assert!(h.ctx.guide.lock().unwrap().is_empty());
 }
 
 /// TurnOutcome 消费许可状态机：四态许可判定 + 任意非 Completed 态经新用户消息恢复
@@ -751,6 +1151,7 @@ async fn closed_interrupt_channel_does_not_disturb_turn() {
 
     let outcome = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -952,6 +1353,94 @@ async fn turn_restart_on_new_inbound_after_drained() {
     );
 }
 
+/// 快速连发两条消息：第二条在第一条 turn 的流式期间经 inbound 分支入队，
+/// 最终回复后在消费时机②被消费——同一个 turn 内被 AI 回应（回复1 → 回复2），
+/// 而非各开独立 turn。修复前第二条滞留通道，第一条 turn 结束后才各开新 turn。
+#[tokio::test]
+async fn rapid_fire_messages_answered_in_single_turn() {
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::text_response("回复1"),
+        MockProvider::text_response("回复2"),
+    ]));
+
+    let store = temp_store().await;
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
+    session.id = "test_session".to_string();
+    store.create(&session).await.unwrap();
+
+    let guide = empty_queue();
+    let pending = empty_queue();
+    let (tx_inbound, rx_inbound) = mpsc::channel::<OutputUserMessage>(16);
+    let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+    let (_tx_control, rx_control) = mpsc::channel::<ControlCommand>(8);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
+
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test", provider,
+    ));
+    let ctx = test_ctx_builder(
+        Arc::clone(&store),
+        providers,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, "test_session".to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .guide(Arc::clone(&guide))
+    .pending(Arc::clone(&pending))
+    .shutdown_token(tokio_util::sync::CancellationToken::new())
+    .build();
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+            control: rx_control,
+        },
+    ));
+
+    // 连投两条（都进通道后 task 才开始消费——第二条必然在第一条 turn 期间被
+    // 流式段的 inbound 分支入队，赶上前面的消费点）
+    tx_inbound.send(make_inbound("问题1")).await.unwrap();
+    tx_inbound.send(make_inbound("问题2")).await.unwrap();
+    let got_second = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = rx_event.recv().await {
+            if matches!(ev, OutputEvent::Assistant(m) if m.payload.content.as_deref() == Some("回复2"))
+            {
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+
+    task.abort();
+
+    assert!(
+        got_second.unwrap_or(false),
+        "连发的两条消息都应在同一 turn 内被回应（回复1 → 回复2）"
+    );
+
+    // DB 顺序：user(问题1) → assistant(回复1) → user(问题2) → assistant(回复2)
+    let msgs = store
+        .load_visible_messages("test_session", usize::MAX)
+        .await
+        .unwrap();
+    let pos = |needle: &str| {
+        msgs.iter()
+            .position(|m| m.content.as_deref() == Some(needle))
+            .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+    };
+    assert!(pos("问题1") < pos("回复1"));
+    assert!(
+        pos("回复1") < pos("问题2"),
+        "问题2 应在第一轮最终回复后注入（消费时机②），而非抢先落库"
+    );
+    assert!(pos("问题2") < pos("回复2"));
+    assert!(guide.lock().unwrap().is_empty());
+    assert!(pending.lock().unwrap().is_empty());
+}
+
 /// 中断退出保留 guide 剩余；新用户消息恢复消费，旧剩余 + 新消息一起跑
 ///
 /// 验证 TurnOutcome 消费许可状态机最贵的迁移链：
@@ -1133,6 +1622,7 @@ async fn interrupt_during_streaming() {
     // yield_now 让出调度让 run_turn 进入挂起态，再发中断。
     let turn_fut = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1224,6 +1714,7 @@ async fn interrupt_during_streaming_reasoning_only() {
 
     let turn_fut = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1306,6 +1797,7 @@ async fn interrupt_during_tool_execution() {
 
     let turn_fut = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1413,6 +1905,7 @@ async fn interrupt_during_tool_execution_only_completes_unfinished() {
 
     let turn_fut = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1503,6 +1996,7 @@ async fn shutdown_during_streaming() {
 
     let turn_fut = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1593,6 +2087,7 @@ async fn shutdown_during_tool_execution() {
 
     let turn_fut = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1661,6 +2156,7 @@ async fn messages_persisted_to_db() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1736,6 +2232,7 @@ async fn usage_flows_to_final_assistant_message() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -1830,7 +2327,14 @@ async fn cost_accumulated_per_assistant_message() {
     let mut params = test_params();
     params.model_id = "test/cost-model".to_string();
 
-    turn::run_turn(&h.ctx, &mut h.rx_interrupt, &mut h.rx_control, params).await;
+    turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        &mut h.rx_control,
+        params,
+    )
+    .await;
 
     // 清理全局缓存（避免污染后续测试）
     fuyao_provider::clear_cache(&agent_paths);
@@ -1961,6 +2465,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2019,6 +2524,7 @@ async fn intercept_block_skips_final_assistant_in_history() {
 
     turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2500,6 +3006,7 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
     // run_turn 进 loop 顶部间隙检查点：捕获 Rollback → 执行 → return HaltedByCommand
     let outcome = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2584,6 +3091,7 @@ async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
 
     let outcome = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2626,6 +3134,7 @@ async fn run_turn_returns_completed_on_final_reply() {
 
     let outcome = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),
@@ -2652,6 +3161,7 @@ async fn run_turn_returns_failed_on_llm_error() {
 
     let outcome = turn::run_turn(
         &h.ctx,
+        &mut h.rx_inbound,
         &mut h.rx_interrupt,
         &mut h.rx_control,
         test_params(),

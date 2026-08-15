@@ -13,7 +13,13 @@
 //!
 //! 两个消费时机（详见 [`turn::run_turn`]）：
 //! - 一批工具全部执行完成后、发回 AI 前：只看 guide（还在调工具，pending 不动）
-//! - AI 不调用工具（最终回复，一轮 ReAct 结束）：先 pending 全倒 guide，再 guide 全消费
+//! - AI 不调用工具（最终回复，一轮 ReAct 结束）：先 pending 全倒 guide，再 guide 全消费；
+//!   消费到消息则回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环），双队列都空才结束 turn
+//!
+//! 入队时机（三处，全走 `handle_inbound_user` 纯入队）：task idle 时主循环 select! 的
+//! inbound 分支 + turn 内两段 select!（流式期间 / 工具执行期间）——turn 运行期间到达的
+//! 消息即时入队，保证上面的两个消费时机在真实链路上能看到它们，而不是滞留通道
+//! 推迟到 turn 结束后才各开独立 turn。
 //!
 //! 中断通道与队列分离：Interrupt 走独立 `rx_interrupt`（mpsc），
 //! select! 中断点只监听它——不会误取 User。
@@ -347,9 +353,16 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                 // 判定门每 session 只开一次，内容取自本批首条（不回读 DB）
                 title::maybe_spawn_title(&ctx, title_seed.as_deref()).await;
                 // run_turn 自包含跑完整个队列直到空、或被控制命令/中断打断 → return TurnOutcome。
-                // outcome 决定下一轮 loop 顶部的消费许可：非 Completed 则跳过 consume 等恢复。
-                outcome =
-                    turn::run_turn(&ctx, &mut rx_interrupt, &mut rx_control, model_config).await;
+                // turn 运行期间到达的入站消息由 run_turn 内两段 select! 即时入队（见 turn.rs），
+                // 不滞留通道；outcome 决定下一轮 loop 顶部的消费许可：非 Completed 则跳过 consume 等恢复。
+                outcome = turn::run_turn(
+                    &ctx,
+                    &mut rx_inbound,
+                    &mut rx_interrupt,
+                    &mut rx_control,
+                    model_config,
+                )
+                .await;
             }
         }
         // === 等待（无条件）===
@@ -396,6 +409,11 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
 ///
 /// 这样保证 user 消息的拦截/落库/发送三个时机**对齐**（都在消费时刻），
 /// 修复"以输入消息为核心组织"导致的三时机错位（拦截提前、发送提前、落库延迟）。
+///
+/// 三处调用（同一 task 串行消费，天然互斥）：
+/// - 主循环 idle select! 的 inbound 分支（task 空闲时入队，附带恢复消费许可）
+/// - turn.rs 流式期间 / 工具执行期间两段 select! 的 inbound 分支（turn 运行期间即时入队，
+///   不打断 turn，由 turn 内消费时机接管）
 async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
     let mode = inbound.payload.mode;
     match mode {
