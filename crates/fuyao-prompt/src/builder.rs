@@ -28,9 +28,6 @@
 //! ## 全局层
 //! [全局 AGENTS.md 内容]
 //!
-//! # 工具使用指南
-//! [硬编码工具使用原则]
-//!
 //! # 技能 skills
 //! [可用 skills 索引]
 //!
@@ -51,7 +48,7 @@
 use crate::sections::{
     build_agent_identity_section, build_datetime_section, build_environment_section,
     build_instructions_section, build_project_context_section, build_skills_section,
-    build_subagent_index_section, build_tool_guidance_section,
+    build_subagent_index_section,
 };
 use fuyao_api::{AgentDefinition, AgentPaths};
 
@@ -96,22 +93,13 @@ pub fn build_all_sections(
         sections.push(("项目上下文".to_string(), content));
     }
 
-    // Layer 3: 工具使用引导
-    let content = build_tool_guidance_section();
-    if !content.is_empty() {
-        sections.push(("工具使用指南".to_string(), content));
-    }
-
-    // Layer 4: Memory 快照（未来功能）
-    // build_memory_section 当前返回空字符串，不加入 sections
-
-    // Layer 5: Skills 索引
+    // Layer 3: Skills 索引
     let content = build_skills_section(agent_paths);
     if !content.is_empty() {
         sections.push(("技能 skills".to_string(), content));
     }
 
-    // Layer 5.5: 子代理索引（仅主 Agent 注入：子代理不可再派生，无需此清单）
+    // Layer 4: 子代理索引（仅主 Agent 注入：子代理不可再派生，无需此清单）
     if usage == PromptUsage::Primary {
         let content = build_subagent_index_section(agent_paths);
         if !content.is_empty() {
@@ -119,13 +107,13 @@ pub fn build_all_sections(
         }
     }
 
-    // Layer 5.6: 补充指令（instructions/ 文件夹全量拼接）
+    // Layer 5: 补充指令（instructions/ 文件夹全量拼接）
     let content = build_instructions_section(agent_paths);
     if !content.is_empty() {
         sections.push(("补充指令".to_string(), content));
     }
 
-    // Layer 6+7: 环境（时间 + 运行环境合为一节）
+    // Layer 6: 环境（时间 + 运行环境合为一节）
     let datetime_str = build_datetime_section();
     let env_str = build_environment_section();
     let env_content = format!("{datetime_str}\n{env_str}");
@@ -217,18 +205,17 @@ mod tests {
         let ctx = AgentPaths::default();
         let sections = build_all_sections(&ctx, &default_definition(&ctx), PRIMARY);
         let titles: Vec<&str> = sections.iter().map(|(t, _)| t.as_str()).collect();
-        // 期望顺序：Agent 定义 → 项目上下文 → 工具使用指南 → 技能 skills → 子代理 → 环境
+        // 期望顺序：Agent 定义 → (项目上下文) → (技能 skills) → 子代理 → (补充指令) → 环境
         let agent_idx = titles.iter().position(|t| *t == "Agent 定义").unwrap();
         let env_idx = titles.iter().position(|t| *t == "环境").unwrap();
         assert!(agent_idx < env_idx);
-        // 工具指南在 skills 前
-        if let (Some(tool_idx), Some(skills_idx)) = (
-            titles.iter().position(|t| *t == "工具使用指南"),
-            titles.iter().position(|t| *t == "技能 skills"),
-        ) {
-            assert!(tool_idx < skills_idx);
-            assert!(skills_idx < env_idx);
-        }
+        // 内置子代理定义恒存在，子代理索引应在 Agent 定义之后、环境之前
+        let subagent_idx = titles
+            .iter()
+            .position(|t| *t == "子代理")
+            .expect("默认内置子代理定义存在，子代理 section 应存在");
+        assert!(agent_idx < subagent_idx);
+        assert!(subagent_idx < env_idx);
     }
 
     #[test]

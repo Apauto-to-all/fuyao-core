@@ -131,7 +131,7 @@ fn build_system_prompt_includes_instructions_from_extra_dirs() {
 
 #[test]
 fn build_system_prompt_section_order_agent_before_env() {
-    // 固定顺序契约：Agent 定义 → (项目上下文) → (工具指南) → (技能) → (补充指令) → 环境
+    // 固定顺序契约：Agent 定义 → (项目上下文) → (技能) → (子代理) → (补充指令) → 环境
     let home = temp_home();
     let paths = make_agent_paths(home.path().to_path_buf(), None, Vec::new());
 

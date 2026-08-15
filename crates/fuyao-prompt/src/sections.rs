@@ -2,16 +2,15 @@
 //!
 //! 各层 section 的构建逻辑，按顺序拼接成最终系统提示词。
 //!
-//! 分层结构（7层）：
+//! 分层结构（6层，与 builder 的拼装顺序一致）：
 //! | Layer | 内容 | 当前状态 |
 //! |-------|------|----------|
 //! | 1 | Agent 身份 | ✅ 已实现 |
 //! | 2 | 项目上下文 | ✅ 已实现 |
-//! | 3 | 工具使用引导 | ✅ 已实现 |
-//! | 4 | Memory 快照 | ⏳ Stub（未来功能） |
-//! | 5 | Skills 索引 | ✅ 已实现 |
-//! | 6 | 日期时间 | ✅ 已实现 |
-//! | 7 | 运行环境 | ✅ 已实现 |
+//! | 3 | Skills 索引 | ✅ 已实现 |
+//! | 4 | 子代理索引（仅主 Agent 注入） | ✅ 已实现 |
+//! | 5 | 补充指令 | ✅ 已实现 |
+//! | 6 | 环境（日期时间 + 运行环境合为一节） | ✅ 已实现 |
 
 use crate::error::PromptError;
 use crate::loader::{
@@ -136,7 +135,7 @@ pub fn build_project_context_section(agent_paths: &AgentPaths) -> String {
     parts.join("\n\n")
 }
 
-/// 构建补充指令 section
+/// 构建补充指令 section（Layer 5）
 ///
 /// 扫描 `instructions/` 文件夹（四层优先级：workspace → agent → global → extra），
 /// 每个目录下所有 `*.md` 全量拼接，每个文件用 `## {完整路径}` 作标题区分。
@@ -190,58 +189,7 @@ pub fn build_instructions_section(agent_paths: &AgentPaths) -> String {
     parts.join("\n\n")
 }
 
-/// 构建工具使用引导 section（Layer 3）
-///
-/// 提供工具使用的最佳实践和策略指导。
-/// 工具的具体参数和功能由 API schema 提供，此处只讲使用原则。
-pub fn build_tool_guidance_section() -> String {
-    let mut guides: Vec<(&str, String)> = Vec::new();
-
-    let file_guidance = "\
-- 修改文件必须先 read 确认现有内容，不要凭记忆修改
-- 大文件用 offset 和 limit 分段读取，不要一次全读浪费上下文
-- 局部修改用 edit（查找替换），整体重写用 write
-- edit 的 old_string 要包含足够上下文确保唯一匹配
-- search 先定位目标位置，read 再确认上下文，edit 最后修改"
-        .to_string();
-    guides.push(("文件操作", file_guidance));
-
-    let command_guidance = "\
-- bash 用于构建、安装、git 操作、运行脚本等需要 shell 的场景
-- 文件操作优先使用专用工具（read/write/edit/search），不要用 bash 的 cat/echo/grep
-- 长时间命令设置合理的 timeout（默认 120 秒，长任务设 300）"
-        .to_string();
-    guides.push(("命令执行", command_guidance));
-
-    let efficiency_guidance = "\
-- 多个独立的读取操作可以并行调用
-- 复杂多步骤任务用 todowrite 拆解并跟踪进度
-- 不确定有哪些 Skills 时，用 skill() 浏览可用的技能"
-        .to_string();
-    guides.push(("效率原则", efficiency_guidance));
-
-    if guides.is_empty() {
-        return String::new();
-    }
-
-    let parts: Vec<String> = guides
-        .iter()
-        .map(|(category, content)| format!("## {category}\n\n{content}"))
-        .collect();
-
-    parts.join("\n\n")
-}
-
-/// 构建 Memory 快照 section（Layer 4）
-///
-/// 从 Memory store 获取快照。
-// TODO: 当前为 stub，Memory 系统实现后启用
-#[allow(dead_code)]
-pub fn build_memory_section() -> String {
-    String::new()
-}
-
-/// 构建 Skills 索引 section（Layer 5）
+/// 构建 Skills 索引 section（Layer 3）
 ///
 /// 列出可用的 Skills 名称和摘要，供 Agent 快速了解可用技能。
 pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
@@ -380,7 +328,7 @@ pub fn list_subagent_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOpti
         .collect()
 }
 
-/// 构建子代理索引 section（Layer 5.5）
+/// 构建子代理索引 section（Layer 4）
 ///
 /// 列出可用的子代理定义（name + description），供主 Agent 通过 `subagent` 工具的
 /// `subagent_type` 参数选择。仅注入主 Agent session（子代理不可再派生）。
@@ -405,7 +353,7 @@ pub fn build_subagent_index_section(agent_paths: &AgentPaths) -> String {
     lines.join("\n")
 }
 
-/// 构建日期时间 section（Layer 6）
+/// 构建日期时间 section（Layer 6 环境层，与运行环境合为一节）
 ///
 /// 提供当前日期时间信息。
 pub fn build_datetime_section() -> String {
@@ -413,7 +361,7 @@ pub fn build_datetime_section() -> String {
     format!("当前时间：{}", now.format("%Y-%m-%d %H:%M"))
 }
 
-/// 构建运行环境 section（Layer 7）
+/// 构建运行环境 section（Layer 6 环境层，与日期时间合为一节）
 ///
 /// 显示操作系统信息，帮助 Agent 了解运行环境。
 pub fn build_environment_section() -> String {
@@ -424,21 +372,6 @@ pub fn build_environment_section() -> String {
 mod tests {
     use super::*;
     use fuyao_api::AgentMode;
-
-    #[test]
-    fn build_tool_guidance_section_works() {
-        let section = build_tool_guidance_section();
-        assert!(!section.is_empty());
-        assert!(section.contains("文件操作"));
-        assert!(section.contains("命令执行"));
-        assert!(section.contains("效率原则"));
-    }
-
-    #[test]
-    fn build_memory_section_returns_empty() {
-        let section = build_memory_section();
-        assert!(section.is_empty());
-    }
 
     #[test]
     fn build_datetime_section_works() {
