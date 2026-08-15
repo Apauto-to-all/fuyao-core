@@ -1,7 +1,7 @@
 //! 文件读取处理逻辑
 //!
 //! 提供文件读取功能，支持分页、行号显示、设备文件保护、相似文件名建议、
-//! 文件去重、外部编辑检测、循环检测、敏感信息脱敏。
+//! 外部编辑检测、循环检测、敏感信息脱敏。
 //!
 //! ## 文件读取
 //!
@@ -10,7 +10,6 @@
 //! - 框架内部路径（.fuyao/.env）→ 拒绝
 //! - 二进制文件（.exe、.png 等）→ 拒绝
 //! - 文件不存在 → 建议相似文件名
-//! - 重复读取未修改文件 → 返回去重提示
 //! - 内容超限（> MAX_READ_CHARS 字符）→ 拒绝并提示分页
 //! - 读取结果自动脱敏 API Key 等敏感信息
 //!
@@ -24,7 +23,7 @@ use crate::config::{LARGE_FILE_HINT_BYTES, MAX_READ_CHARS, SEARCH_EXCLUDE_DIRS};
 use crate::file::helpers::suggest_similar_files;
 use crate::file::read::types::{DirectoryEntry, DirectoryResult, MAX_LIMIT, ReadArgs, ReadResult};
 use crate::file::safety::{has_binary_extension, is_blocked_device, is_internal_path};
-use crate::file::tracker::{check_dedup, record_read};
+use crate::file::tracker::record_read;
 use crate::redact::redact_sensitive_text;
 use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput, parse_args};
 use serde_json::Value;
@@ -130,7 +129,7 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
 
 /// 读取文件内容的核心实现
 ///
-/// 处理完整的读取流程：路径解析 → 安全检查 → 去重检查 → 读取 → 行号格式化 → 脱敏 → 返回。
+/// 处理完整的读取流程：路径解析 → 安全检查 → 读取 → 行号格式化 → 脱敏 → 返回。
 ///
 /// # 安全检查顺序
 ///
@@ -204,11 +203,7 @@ pub async fn read_file_impl(
         return ToolOutput::error(format!("无法读取二进制文件: {path} ({ext})"));
     }
 
-    if let Some(dedup) = check_dedup(&resolved_path, offset, limit, &task_id) {
-        return ToolOutput::ok(dedup);
-    }
-
-    record_read(&resolved_path, offset, limit, &task_id);
+    record_read(&resolved_path, &task_id);
 
     let file_size = match resolved_path_obj.metadata() {
         Ok(m) => m.len(),

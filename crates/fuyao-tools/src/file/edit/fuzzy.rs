@@ -20,22 +20,10 @@
 //! 1. **exact**: 精确匹配
 //! 2. **newline_normalized**: 换行符归一化（\r\n → \n）
 //! 3. **line_trimmed**: 行首尾空白去除后匹配
-//! 4. **whitespace_normalized**: 连续空白归一化为单空格
-//! 5. **indentation_flexible**: 忽略前导缩进差异
-//! 6. **escape_normalized**: 转义字符归一化（\\n → \n）
-//! 7. **trimmed_boundary**: 首尾行空白处理后匹配
-//! 8. **unicode_normalized**: Unicode 标准化（智能引号、全角字符）
-//! 9. **block_anchor**: 首尾行锚定 + 中间内容相似度匹配
+//! 4. **indentation_flexible**: 忽略前导缩进差异
+//! 5. **block_anchor**: 首尾行锚定 + 中间内容相似度匹配
 
-use regex::Regex;
 use similar::TextDiff;
-use std::sync::LazyLock;
-use unicode_normalization::UnicodeNormalization;
-
-/// 策略 4 用的连续空白归一化正则
-///
-/// 模式为编译期常量，提升为进程级静态量只编译一次，避免每次模糊匹配重复编译。
-static WS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[ \t]+").expect("无效的空白正则"));
 
 /// 一次匹配：原始 content 中的字节偏移与匹配段的字节长度
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,11 +86,7 @@ pub fn fuzzy_find_and_replace(
         ("exact", strategy_exact),
         ("newline_normalized", strategy_newline_normalized),
         ("line_trimmed", strategy_line_trimmed),
-        ("whitespace_normalized", strategy_whitespace_normalized),
         ("indentation_flexible", strategy_indentation_flexible),
-        ("escape_normalized", strategy_escape_normalized),
-        ("trimmed_boundary", strategy_trimmed_boundary),
-        ("unicode_normalized", strategy_unicode_normalized),
         ("block_anchor", strategy_block_anchor),
     ];
 
@@ -349,31 +333,7 @@ fn strategy_line_trimmed(content: &str, pattern: &str) -> Vec<Match> {
     )
 }
 
-/// 策略 4: 连续空白归一化为单空格
-///
-/// 将多个空格/制表符合并为单个空格，适用于格式化差异。
-fn strategy_whitespace_normalized(content: &str, pattern: &str) -> Vec<Match> {
-    let normalize = |s: &str| WS_RE.replace_all(s, " ").to_string();
-
-    let content_normalized = normalize(content);
-    let pattern_normalized = normalize(pattern);
-
-    if content_normalized == content && pattern_normalized == pattern {
-        return Vec::new();
-    }
-
-    // 归一化后按行比较，用行号锚定回原串计算字节区间
-    let content_lines: Vec<&str> = content.split('\n').collect();
-    let content_norm_lines: Vec<String> = content_lines.iter().map(|l| normalize(l)).collect();
-    find_normalized_matches(
-        content,
-        &content_lines,
-        &content_norm_lines,
-        &pattern_normalized,
-    )
-}
-
-/// 策略 5: 忽略前导缩进差异
+/// 策略 4: 忽略前导缩进差异
 ///
 /// 只去除行首空白（保留行内空白），适用于缩进级别不同的代码块。
 fn strategy_indentation_flexible(content: &str, pattern: &str) -> Vec<Match> {
@@ -395,142 +355,7 @@ fn strategy_indentation_flexible(content: &str, pattern: &str) -> Vec<Match> {
     )
 }
 
-/// 策略 6: 转义字符归一化
-///
-/// 处理转义字符差异，如 `\\n` → `\n`, `\\t` → `\t`。
-///
-/// 转义归一化会破坏行结构（一行里的 `\\n` 反转义成真实换行后跨行），
-/// 因此不能按行块比较，改用全文归一化后子串查找 + 字符级偏移映射回原串。
-fn strategy_escape_normalized(content: &str, pattern: &str) -> Vec<Match> {
-    let normalize_escapes = |s: &str| -> String {
-        s.replace("\\n", "\n")
-            .replace("\\t", "\t")
-            .replace("\\r", "\r")
-            .replace("\\\"", "\"")
-            .replace("\\'", "'")
-            .replace("\\\\", "\\")
-    };
-
-    let pattern_normalized = normalize_escapes(pattern);
-
-    find_normalized_substring_matches(content, normalize_escapes, &pattern_normalized)
-}
-
-/// 策略 7: 首尾行空白处理后匹配
-///
-/// 去除首尾行的空白后进行锚定匹配，中间行也去除空白后比较。
-fn strategy_trimmed_boundary(content: &str, pattern: &str) -> Vec<Match> {
-    let pattern_lines: Vec<&str> = pattern.split('\n').collect();
-    let content_lines: Vec<&str> = content.split('\n').collect();
-
-    if pattern_lines.is_empty() {
-        return Vec::new();
-    }
-
-    let pattern_first = pattern_lines[0].trim();
-    let pattern_last = pattern_lines.last().unwrap().trim();
-
-    let mut matches = Vec::new();
-    let pattern_len = pattern_lines.len();
-
-    for i in 0..=content_lines.len().saturating_sub(pattern_len) {
-        let content_first = content_lines[i].trim();
-        let content_last = content_lines[i + pattern_len - 1].trim();
-
-        if content_first == pattern_first && content_last == pattern_last {
-            if pattern_len <= 2 {
-                matches.push(lines_to_match(content, &content_lines, i, pattern_len));
-            } else {
-                let content_middle: String = content_lines[i + 1..i + pattern_len - 1]
-                    .iter()
-                    .map(|l| l.trim())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let pattern_middle: String = pattern_lines[1..pattern_len - 1]
-                    .iter()
-                    .map(|l| l.trim())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                if content_middle == pattern_middle {
-                    matches.push(lines_to_match(content, &content_lines, i, pattern_len));
-                }
-            }
-        }
-    }
-
-    matches
-}
-
-/// 策略 8: Unicode 标准化
-///
-/// 处理智能引号（' → '）、全角字符（Ａ → A）、不间断空格等 Unicode 差异。
-///
-/// 分两路查找：
-/// - **整行块匹配**：pattern 对齐若干完整行时，按行号锚定回原串（行首是字符边界，安全）；
-/// - **行内子串匹配**：pattern 是某行内的一段时（如全角字符夹在中文中间），
-///   全文归一化后子串查找 + 字符级偏移映射回原串（全角→半角在 char 级是 1:1，映射安全）。
-fn strategy_unicode_normalized(content: &str, pattern: &str) -> Vec<Match> {
-    let normalize_unicode = |s: &str| -> String {
-        let mut result: String = s.nfc().collect();
-
-        let replacements = [
-            ('\u{2018}', '\''),
-            ('\u{2019}', '\''),
-            ('\u{201c}', '"'),
-            ('\u{201d}', '"'),
-            ('\u{2013}', '-'),
-            ('\u{2014}', '-'),
-            ('\u{2026}', '.'),
-            ('\u{00a0}', ' '),
-            ('\u{3000}', ' '),
-        ];
-
-        for (old, new) in replacements {
-            result = result.replace(old, &new.to_string());
-        }
-
-        // Fullwidth → ASCII
-        result
-            .chars()
-            .map(|c| {
-                let code = c as u32;
-                if (0xFF01..=0xFF5E).contains(&code) {
-                    char::from_u32(code - 0xFEE0).unwrap_or(c)
-                } else {
-                    c
-                }
-            })
-            .collect()
-    };
-
-    let content_normalized = normalize_unicode(content);
-    let pattern_normalized = normalize_unicode(pattern);
-
-    if content_normalized == content && pattern_normalized == pattern {
-        return Vec::new();
-    }
-
-    // 第一路：整行块匹配（pattern 对齐完整行时命中）
-    let content_lines: Vec<&str> = content.split('\n').collect();
-    let content_norm_lines: Vec<String> =
-        content_lines.iter().map(|l| normalize_unicode(l)).collect();
-    let block_matches = find_normalized_matches(
-        content,
-        &content_lines,
-        &content_norm_lines,
-        &pattern_normalized,
-    );
-
-    if !block_matches.is_empty() {
-        return block_matches;
-    }
-
-    // 第二路：行内子串匹配（pattern 是某行内的一段）
-    find_normalized_substring_matches(content, normalize_unicode, &pattern_normalized)
-}
-
-/// 策略 9: 首尾行锚定 + 中间内容相似度匹配
+/// 策略 5: 首尾行锚定 + 中间内容相似度匹配
 ///
 /// 用首尾行定位候选位置，中间内容用 TextDiff 计算相似度（阈值 0.50/0.70）。
 /// 唯一匹配时阈值较低（0.50），多个候选时阈值较高（0.70）。
@@ -615,138 +440,6 @@ fn find_normalized_matches(
     }
 
     matches
-}
-
-/// 在归一化全文中查找子串匹配，命中后用【字符级对齐】把归一化偏移映射回原串字节区间
-///
-/// 用于归一化会改变字符序列长度（全角→半角、`\\n`→`\n`）的策略。
-///
-/// 对齐原理：归一化是对 original 逐字符应用变换得到 normalized，因此每个归一化字符
-/// 都源自 original 的某个（或某些）字符。这里用 `similar` 计算 original→normalized 的
-/// 字符级 diff，从 diff 操作流中精确重建「归一化字符索引 → 原始字符索引」映射，
-/// 全程基于字符而非字节，多字节字符永远不会被切到字符内部。
-///
-/// 这是把 Python（codepoint 级天然安全）算法适配到 Rust（UTF-8 字节存储）的正确做法。
-fn find_normalized_substring_matches(
-    original: &str,
-    normalize: impl Fn(&str) -> String,
-    pattern_normalized: &str,
-) -> Vec<Match> {
-    let normalized = normalize(original);
-    if normalized == original {
-        return Vec::new();
-    }
-
-    let orig_chars: Vec<char> = original.chars().collect();
-    let norm_chars: Vec<char> = normalized.chars().collect();
-
-    // 字符级 diff：orig_chars → norm_chars，得到精确的字符对齐关系
-    // 用 capture_diff_slices 对 Vec<char> 做非字符串 diff
-    use similar::{Algorithm, DiffOp, capture_diff_slices};
-    let ops = capture_diff_slices(Algorithm::Myers, &orig_chars, &norm_chars);
-
-    // norm_to_orig[ni] = 归一化第 ni 个字符源自原始第几个字符
-    let mut norm_to_orig: Vec<usize> = vec![usize::MAX; norm_chars.len() + 1];
-    {
-        let mut oi = 0usize; // 原始字符游标
-        let mut ni = 0usize; // 归一化字符游标
-        for op in ops.iter() {
-            match op {
-                DiffOp::Equal { len, .. } => {
-                    for _ in 0..*len {
-                        if norm_to_orig[ni] == usize::MAX {
-                            norm_to_orig[ni] = oi;
-                        }
-                        oi += 1;
-                        ni += 1;
-                    }
-                }
-                DiffOp::Delete { old_len, .. } => {
-                    // 原始字符被归一化删除（如 `\\n` 的 `\` 被删，保留 `n`→`\n`）
-                    oi += old_len;
-                }
-                DiffOp::Insert { new_len, .. } => {
-                    // 归一化新增字符，映射到当前原始位置
-                    for _ in 0..*new_len {
-                        if norm_to_orig[ni] == usize::MAX {
-                            norm_to_orig[ni] = oi;
-                        }
-                        ni += 1;
-                    }
-                }
-                DiffOp::Replace {
-                    old_len, new_len, ..
-                } => {
-                    // 原始 old_len 个字符被替换为归一化 new_len 个字符（如全角→半角 1:1）
-                    for _ in 0..*new_len {
-                        if norm_to_orig[ni] == usize::MAX {
-                            norm_to_orig[ni] = oi;
-                        }
-                        ni += 1;
-                    }
-                    oi += old_len;
-                }
-            }
-        }
-        // 末尾哨兵
-        norm_to_orig[norm_chars.len()] = oi.min(orig_chars.len());
-    }
-
-    let orig_byte_offsets = char_byte_offsets(original);
-    let norm_byte_offsets = char_byte_offsets(&normalized);
-
-    // 在归一化全文中查找所有 pattern_normalized 出现位置
-    let mut matches = Vec::new();
-    let mut search_start = 0;
-    while let Some(rel) = normalized[search_start..].find(pattern_normalized) {
-        let ns = search_start + rel;
-        let ne = ns + pattern_normalized.len();
-
-        // 归一化字节偏移 → 归一化字符索引 → 原始字符索引 → 原始字节偏移
-        let ns_char = byte_to_char_idx(&norm_byte_offsets, ns);
-        let ne_char = byte_to_char_idx(&norm_byte_offsets, ne);
-
-        let orig_start_char = norm_to_orig.get(ns_char).copied().unwrap_or(usize::MAX);
-        let orig_end_char = norm_to_orig.get(ne_char).copied().unwrap_or(usize::MAX);
-        if orig_start_char != usize::MAX && orig_end_char != usize::MAX {
-            let os_byte = orig_byte_offsets
-                .get(orig_start_char)
-                .copied()
-                .unwrap_or(original.len());
-            let oe_byte = orig_byte_offsets
-                .get(orig_end_char)
-                .copied()
-                .unwrap_or(original.len());
-            if os_byte < oe_byte {
-                matches.push(Match(os_byte, oe_byte - os_byte));
-            }
-        }
-
-        // 推进避免死循环
-        search_start = ne.max(ns + 1);
-    }
-
-    matches
-}
-
-/// 构建字符索引 → 字节偏移表
-///
-/// `offsets[i]` 是第 i 个字符在字符串中的起始字节偏移，
-/// 末尾追加字符串长度作为哨兵，供 `byte_to_char_idx` 越界回退。
-fn char_byte_offsets(s: &str) -> Vec<usize> {
-    let mut offsets: Vec<usize> = s.char_indices().map(|(b, _)| b).collect();
-    offsets.push(s.len());
-    offsets
-}
-
-/// 字节偏移 → 字符索引（二分查找）
-///
-/// 匹配位置天然是字符边界，二分必然命中；非边界索引回退到最近的左侧字符索引。
-fn byte_to_char_idx(byte_offsets: &[usize], byte_idx: usize) -> usize {
-    match byte_offsets.binary_search(&byte_idx) {
-        Ok(ci) => ci,
-        Err(ci) => ci,
-    }
 }
 
 #[cfg(test)]
@@ -925,26 +618,9 @@ mod tests {
 
     // ========================================================================
     // 归一化 + 多字节字符回归测试 —— 验证架构性修复
-    // 全角/智能引号/换行收缩/空白折叠使归一化后字节流错位，
+    // 换行收缩（\r\n → \n）使归一化后字节流错位，
     // 旧实现的逐字节对齐会 panic；新架构按行计算字节区间，天然安全。
     // ========================================================================
-
-    #[test]
-    fn unicode_normalized_fullwidth_multibyte_no_panic() {
-        // 复现 panic 的同类场景：content 用全角、old_string 用半角，
-        // exact 不匹配 → 走 unicode_normalized（全角→半角归一化后匹配）→ 按行计算字节区间
-        let content = "测试ＡＢＣ内容\n第二行\n";
-        let FuzzyOutcome {
-            content: new_content,
-            replacements: count,
-            strategy,
-            error: err,
-        } = fuzzy_find_and_replace(content, "ABC", "XYZ", false);
-        assert!(err.is_none(), "全角→半角归一化不应报错：{err:?}");
-        assert_eq!(count, 1);
-        assert_eq!(strategy.as_deref(), Some("unicode_normalized"));
-        assert_eq!(new_content, "测试XYZ内容\n第二行\n");
-    }
 
     #[test]
     fn newline_normalized_multibyte_no_panic() {
@@ -960,51 +636,6 @@ mod tests {
         assert_eq!(count, 1);
         assert!(new_content.contains("HI"));
         assert!(new_content.contains("WORLD"));
-    }
-
-    #[test]
-    fn whitespace_normalized_multibyte_no_panic() {
-        // 空白折叠（多空格 → 单空格）+ 多字节中文：验证不 panic
-        let content = "你好     世界\n第二行\n";
-        let FuzzyOutcome {
-            content: new_content,
-            replacements: count,
-            error: err,
-            ..
-        } = fuzzy_find_and_replace(content, "你好 世界", "HI WORLD", false);
-        assert!(err.is_none(), "空白归一化不应报错：{err:?}");
-        assert_eq!(count, 1);
-        assert!(new_content.contains("HI WORLD"));
-    }
-
-    #[test]
-    fn escape_normalized_multibyte_no_panic() {
-        // 转义归一化（\\n → \n）+ 多字节中文：验证不 panic
-        let content = "你好\\n世界\n第二行\n";
-        let FuzzyOutcome {
-            content: new_content,
-            replacements: count,
-            error: err,
-            ..
-        } = fuzzy_find_and_replace(content, "你好\n世界", "HI\nWORLD", false);
-        assert!(err.is_none(), "转义归一化不应报错：{err:?}");
-        assert_eq!(count, 1);
-        assert!(new_content.contains("HI"));
-        assert!(new_content.contains("WORLD"));
-    }
-
-    #[test]
-    fn map_positions_fullwidth_replacement_correctness() {
-        // 直接验证归一化映射结果正确（不仅不 panic）：
-        // 全角「ＡＢ」→ 半角「AB」，中间夹中文，替换为 ASCII
-        let content = "前面ＡＢ中间文字";
-        let FuzzyOutcome {
-            content: new_content,
-            error: err,
-            ..
-        } = fuzzy_find_and_replace(content, "AB", "XY", false);
-        assert!(err.is_none());
-        assert_eq!(new_content, "前面XY中间文字");
     }
 
     #[test]
