@@ -355,8 +355,8 @@ mod tests {
         ]);
         let def = ToolDefinition::builder("multi", "多模式工具")
             .string("mode", "模式")
-            .enum_values(["replace", "patch"])
-            .default(json!("replace"))
+            .enum_values(["fast", "deep"])
+            .default(json!("fast"))
             .array("list", "列表")
             .items(items)
             .build();
@@ -369,9 +369,9 @@ mod tests {
             .expect("mode 参数应存在");
         assert_eq!(
             mode.enum_values.as_deref(),
-            Some(&["replace".to_string(), "patch".to_string()][..])
+            Some(&["fast".to_string(), "deep".to_string()][..])
         );
-        assert_eq!(mode.default, Some(json!("replace")));
+        assert_eq!(mode.default, Some(json!("fast")));
         let list = def
             .function
             .parameters
