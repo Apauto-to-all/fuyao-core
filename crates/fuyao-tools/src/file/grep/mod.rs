@@ -27,9 +27,9 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "grep",
-                "使用正则表达式搜索文件内容。\n支持正则表达式语法（如 log.*Error、function\\s+\\w+）。\n可使用 include 参数过滤文件类型（如 *.py）。\n自动遵守 .gitignore 规则。",
+                "按正则表达式搜索文件内容（大小写不敏感），遵守 .gitignore 规则",
             )
-            .string("pattern", "正则表达式（如 log.*Error、def\\s+\\w+）")
+            .string("pattern", "正则表达式（大小写不敏感）")
             .required()
             .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))
             .default(json!(DEFAULT_PATH))

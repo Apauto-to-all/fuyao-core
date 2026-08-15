@@ -27,7 +27,7 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "edit",
-                "文件编辑工具：查找并替换文本，使用模糊匹配处理空白差异，自动检测外部编辑并发出警告。",
+                "查找替换式文件编辑。old_string 必须与文件内容精确匹配，并包含足够上下文以唯一定位；多处匹配时指定 replace_all 或补充更多上下文。编辑前先 read 确认现有内容，不要凭记忆修改。",
             )
             .string("path", "文件路径")
             .required()

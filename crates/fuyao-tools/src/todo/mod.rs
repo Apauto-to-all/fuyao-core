@@ -53,9 +53,9 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "todowrite",
-                "管理任务列表。不传 todos 读取当前列表，传了则整体覆盖写入。\n字段：id（必填）、content（必填）、status(pending|in_progress|completed|cancelled)\n规则：顺序=优先级，同时只有一个 in_progress，完成即 completed",
+                "管理任务列表，不传 todos 读取当前列表，传了则整体覆盖写入",
             )
-            .array("todos", "任务数组。不传则读取。")
+            .array("todos", "任务数组")
             .items(HashMap::from([
                 ("type".to_string(), json!("object")),
                 ("properties".to_string(), json!(todo_item_properties)),

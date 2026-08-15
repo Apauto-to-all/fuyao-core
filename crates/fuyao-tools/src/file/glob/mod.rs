@@ -23,17 +23,17 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
     insert_tool(
         map,
         ToolEntry::new(
-            ToolDefinition::builder(
-                "glob",
-                "使用标准 glob 语法搜索文件名。\n支持递归匹配（**/*.py）、通配符（*、?、[]）等标准 glob 模式。\n自动遵守 .gitignore 规则，跳过隐藏文件。",
-            )
-            .string("pattern", "标准 glob 模式")
-            .required()
-            .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))
-            .default(json!(DEFAULT_PATH))
-            .integer("limit", format!("最大结果数（默认 {DEFAULT_LIMIT}，有硬上限，超出自动截断）"))
-            .default(json!(DEFAULT_LIMIT))
-            .build(),
+            ToolDefinition::builder("glob", "按 glob 模式递归搜索文件名，遵守 .gitignore 规则")
+                .string("pattern", "标准 glob 模式")
+                .required()
+                .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))
+                .default(json!(DEFAULT_PATH))
+                .integer(
+                    "limit",
+                    format!("最大结果数（默认 {DEFAULT_LIMIT}，有硬上限，超出自动截断）"),
+                )
+                .default(json!(DEFAULT_LIMIT))
+                .build(),
             tool_handler(glob_impl),
             false,
         ),

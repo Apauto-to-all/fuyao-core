@@ -32,7 +32,7 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "webfetch",
-                "从 URL 抓取内容并转换为指定格式。\n支持 markdown（默认）、html（原始）两种输出格式。\n自动处理同域名重定向，跨域名重定向会提示新 URL。\n安全限制：阻止私有网络地址和云元数据端点。\n分页支持：使用 offset/limit 参数获取部分内容。",
+                "抓取 URL 内容并转为 markdown。仅支持公开可访问的 http/https 地址，私有网络地址会被阻止。",
             )
             .string("url", "要抓取的 URL（必须以 http:// 或 https:// 开头）")
             .required()

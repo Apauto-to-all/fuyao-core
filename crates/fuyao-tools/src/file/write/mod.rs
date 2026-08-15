@@ -16,7 +16,7 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "write",
-                "写入内容到文件，完全覆盖现有内容。如果文件不存在则创建，父目录不存在则自动创建。如需部分编辑，请使用 edit 工具。注意：敏感路径（如 SSH 密钥、系统配置）将被拒绝写入。自动检测外部编辑并发出警告。",
+                "写入内容到文件，完全覆盖现有内容。文件不存在则创建（含父目录）。如需部分编辑请用 edit 工具。敏感路径（SSH 密钥、系统配置等）拒绝写入。",
             )
             .string("path", "文件路径（不存在则创建，存在则覆盖）")
             .required()

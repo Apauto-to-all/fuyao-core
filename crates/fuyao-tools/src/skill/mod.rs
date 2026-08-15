@@ -19,9 +19,9 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "skill",
-                "加载 Skill。不传参数：列出所有可用 Skills。传 name：加载指定 Skill 的完整内容。传 name + file_path：加载 Skill 的关联文件。",
+                "Skill 加载：不传参数列出全部；传 name 加载内容；再传 file_path 加载其关联文件。",
             )
-            .string("name", "Skill 名称（可选，不传则列出所有）")
+            .string("name", "Skill 名称")
             .string("file_path", "关联文件路径，如 'references/api.md'（可选）")
             .build(),
             tool_handler(skill_handler),
