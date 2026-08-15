@@ -9,7 +9,7 @@
 ```text
 MCPManager（lib.rs）       ← 编排器：管理多 Server 生命周期、工具发现 / 注册 / 调用
   │
-  ├── bridge.rs            ← 适配层：MCP 工具 → ToolFn（OpenAI Function Calling 格式）
+  ├── bridge.rs            ← 适配层：MCP 工具 → ToolEntry（中立工具定义 + handler）
   │     └── 四层防护：超时 + 熔断 + Auth 恢复 + Session 恢复
   │
   ├── connection.rs        ← 传输层：MCPConnection 封装单 Server 连接（stdio / HTTP）
@@ -74,7 +74,8 @@ RegisteredTool {
     prefixed_name: String    // 对外唯一标识（LLM 看到的名字）
     original_name: String    // 调用 MCP Server 时用的名字
     server_name: String      // 反查连接的 key
-    schema: ToolDefinition   // OpenAI Function Calling 格式（已标准化）
+    description: String      // 工具描述
+    schema: ToolDefinition   // 工具定义（中立三要素，供应商适配层再编码为 wire 形态）
 }
 ```
 
@@ -141,7 +142,7 @@ handler(args, ctx, cancel)
 | env 白名单 | `build_safe_env` 只传白名单 + 用户显式配置 | API Key 泄露给子进程 |
 | 错误脱敏 | `sanitize_error` 正则替换凭证为 `[REDACTED]` | 凭证进入 LLM 上下文 |
 | schema 标准化 | `normalize_mcp_input_schema` 四步处理 | 格式不兼容导致 LLM 拒收 |
-| 名称清洗 | `sanitize_mcp_name_component` | OpenAI function name 规范违反 |
+| 名称清洗 | `sanitize_mcp_name_component` | 工具名含非标识符字符（连字符 / 点号等） |
 
 schema 标准化四步：`definitions` → `$defs` / 折叠 nullable union / 补 object 形状 / 裁剪悬空 required。
 

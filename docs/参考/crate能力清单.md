@@ -35,7 +35,7 @@ L0  fuyao-api（零内部依赖）
   - **Provider 类型**：`Provider` trait / `Model` / `ModelCost` / `ModelLimit` / `ThinkingType` 等
   - **会话类型**：`Session` / `Message`（含多模态图片附件 `images`）/ `MessageKind` / `ImageContent`（`{mime_type, data}`，data 为裸 base64，`from_data_url` 做入站归一）/ `TodoItem`
   - **子代理能力**：`SubagentOps` trait（`create_child_session` / `send` / `end_session`，工具 handler 经 `ToolCallContext` 持弱引用调用）/ `ChildSessionSource`（`Fresh` / `Fork(String)`）
-  - **工具类型**：`ToolDefinition`（配 `ToolDefinitionBuilder` 链式构造）/ `ToolSchema` / `ToolParameters` / `ToolParameterProperty` / `ToolFn`（返回统一结果信封）/ `ToolOutput`（结果信封：`Value` JSON 对象 / `Text` 纯文本 / `Err` 错误）/ `ToolError`（错误主信息 + 附加字段，wire 恒有 `"error"` 键）/ `ToolCallContext`
+  - **工具类型**：`ToolDefinition`（中立三要素 `name` / `description` / `parameters` 平铺，配 `ToolDefinitionBuilder` 链式构造）/ `ToolParameters` / `ToolParameterProperty` / `ToolCallData`（一次工具调用的中立表示：`id` / `name` / `arguments`，arguments 为 JSON 字符串）/ `ToolFn`（返回统一结果信封）/ `ToolOutput`（结果信封：`Value` JSON 对象 / `Text` 纯文本 / `Err` 错误）/ `ToolError`（错误主信息 + 附加字段，wire 恒有 `"error"` 键）/ `ToolCallContext`
   - **工具条目**：`ToolEntry`（`new` 组装 schema + handler + 可见性 / `name` 取 schema 名——工具名单一来源）+ `insert_tool`（以 schema 名为 key 注册进 map，重名 panic）
   - **handler 侧辅助**：`tool_handler`（规范签名异步函数一步包装成 `ToolFn`，吸收 `Arc` / `Box::pin` 闭包体操）/ `parse_args`（JSON 参数类型化解析为结构体，常见 serde 错误中文化）
   - **其他**：`AgentDefinition` / `AgentMode` / `SkillDefinition` / `SkillMeta` / `MCPServerConfig` / `ApiError` / `ConfigError`
@@ -48,7 +48,7 @@ L0  fuyao-api（零内部依赖）
 - **公开 API**：
   - **trait**：`Provider`（`stream_chat` / `chat`）
   - **OpenAI 兼容实现**：`OpenAIProvider`
-  - **请求响应类型**：`ChatRequest` / `ChatResponse` / `ChatMessage` / `StreamEvent` / `StreamOptions` / `StreamUsage` / `ToolCallData` / `FinishReason` / `BoxStream`
+  - **请求响应类型**：`ChatRequest` / `ChatResponse` / `ChatMessage`（`tool_calls` 持 fuyao-api 的 `Vec<ToolCallData>`）/ `StreamEvent` / `StreamOptions`（`tools` 为 typed `Vec<ToolDefinition>`）/ `StreamUsage` / `FinishReason` / `BoxStream`
   - **错误**：`StreamError`（含 `Cancelled` 变体，shutdown 触发的非错误取消）/ `ProviderError` / `ClientError`
   - **工厂**：`create_provider` / `parse_model_id`
   - **注册表**：`register_provider` / `register_model` / `get_provider` / `get_model` / `list_providers` / `list_models` / `clear_cache` / `agent_paths_cache_key`
