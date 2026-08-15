@@ -51,7 +51,7 @@ pub struct GrepResult {
     pub error: Option<String>,
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub _hint: Option<String>,
+    pub hint: Option<String>,
 }
 
 /// 内容匹配项
@@ -61,9 +61,9 @@ pub struct GrepMatch {
     pub file: String,
     /// 行号
     pub line: u64,
-    /// 匹配内容
+    /// 匹配内容（超长行按字符截断，尾部以省略标记 `…` 示意）
     pub content: String,
-    /// 上下文
+    /// 上下文（超长行按字符截断，尾部以省略标记 `…` 示意）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
 }

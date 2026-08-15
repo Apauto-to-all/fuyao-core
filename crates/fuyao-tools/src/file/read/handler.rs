@@ -19,7 +19,7 @@
 //! 自动跳过排除目录（.venv、node_modules、__pycache__ 等）。
 
 use crate::common::resolve_path;
-use crate::config::{LARGE_FILE_HINT_BYTES, MAX_READ_CHARS, SEARCH_EXCLUDE_DIRS};
+use crate::config::{MAX_READ_CHARS, SEARCH_EXCLUDE_DIRS};
 use crate::file::helpers::suggest_similar_files;
 use crate::file::read::types::{DirectoryEntry, DirectoryResult, MAX_LIMIT, ReadArgs, ReadResult};
 use crate::file::safety::{has_binary_extension, is_blocked_device, is_internal_path};
@@ -116,8 +116,7 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
         truncated: if truncated { Some(true) } else { None },
         hint: if truncated {
             Some(format!(
-                "使用 offset={} 继续读取（显示第 {offset}-{end_idx} 个条目，共 {total_count} 个）",
-                end_idx + 1
+                "结果已截断（共 {total_count} 个条目）。建议使用 glob 按模式缩小范围"
             ))
         } else {
             None
@@ -284,14 +283,6 @@ pub async fn read_file_impl(
             Some(format!(
                 "使用 offset={} 继续读取（显示第 {offset}-{end_idx} 行，共 {total_lines} 行）",
                 end_idx + 1
-            ))
-        } else {
-            None
-        },
-        _hint: if file_size > LARGE_FILE_HINT_BYTES && limit > 200 && truncated {
-            Some(format!(
-                "此文件较大 ({} 字节)。建议使用 offset 和 limit 只读取需要的部分，以节省上下文。",
-                file_size
             ))
         } else {
             None

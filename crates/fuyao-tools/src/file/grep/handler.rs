@@ -12,6 +12,7 @@
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
 use crate::common::resolve_path;
+use crate::config::GREP_MAX_LINE_CHARS;
 use crate::file::grep::types::{GrepArgs, GrepMatch, GrepResult};
 use crate::redact::redact_sensitive_text;
 use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
@@ -34,6 +35,20 @@ fn redact_content_in_result(matches: &mut [GrepMatch]) {
             *context = redact_sensitive_text(context);
         }
     }
+}
+
+/// 截断超长行并追加省略标记
+///
+/// limit 只限匹配条数，单行巨物（压缩 JS、单行 JSON 等）一条即可灌爆上下文，
+/// 故对每条返回行再限字符数。按字符而非字节计数截断——多字节字符（如中文）
+/// 从字节中间切断会产生乱码；未超上限的行原样返回，不加标记。
+fn truncate_line(line: &str) -> String {
+    if line.chars().count() <= GREP_MAX_LINE_CHARS {
+        return line.to_string();
+    }
+    let mut truncated: String = line.chars().take(GREP_MAX_LINE_CHARS).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// 内容搜索的核心实现
@@ -70,7 +85,7 @@ fn search_content(
                 pattern: pattern.to_string(),
                 path: path.to_string(),
                 error: Some(format!("正则表达式无效: {e}")),
-                _hint: None,
+                hint: None,
             };
         }
     };
@@ -84,7 +99,7 @@ fn search_content(
             pattern: pattern.to_string(),
             path: path.to_string(),
             error: Some(format!("路径不存在: {path}")),
-            _hint: None,
+            hint: None,
         };
     }
 
@@ -141,9 +156,10 @@ fn search_content(
                     matches.push(GrepMatch {
                         file: file_path_str.clone(),
                         line: line_num,
-                        content: line.trim_end().to_string(),
+                        // 超长行截断：content 与 context 共用同一条截断逻辑
+                        content: truncate_line(line.trim_end()),
                         context: if context > 0 {
-                            Some(line.trim_end().to_string())
+                            Some(truncate_line(line.trim_end()))
                         } else {
                             None
                         },
@@ -170,7 +186,7 @@ fn search_content(
         pattern: pattern.to_string(),
         path: path.to_string(),
         error: None,
-        _hint: None,
+        hint: None,
     }
 }
 
@@ -257,7 +273,7 @@ pub async fn grep_impl(
             pattern: pattern.to_string(),
             path: resolved_path.clone(),
             error: Some(format!("搜索任务失败: {e}")),
-            _hint: None,
+            hint: None,
         },
         Err(_elapsed) => {
             // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
@@ -271,7 +287,7 @@ pub async fn grep_impl(
                 error: Some(format!(
                     "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围、使用更具体的 pattern，或通过 include 参数限定文件类型"
                 )),
-                _hint: None,
+                hint: None,
             }
         }
     };
@@ -284,7 +300,7 @@ pub async fn grep_impl(
     redact_content_in_result(&mut result.matches);
 
     if result.truncated {
-        result._hint =
+        result.hint =
             Some("结果已截断。请使用更具体的 pattern 或 include 参数缩小搜索范围。".to_string());
     }
 
@@ -304,7 +320,7 @@ mod tests {
             pattern: "test".to_string(),
             path: ".".to_string(),
             error: None,
-            _hint: None,
+            hint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("error").is_none());
@@ -319,7 +335,7 @@ mod tests {
             pattern: "test".to_string(),
             path: ".".to_string(),
             error: Some("正则表达式无效".to_string()),
-            _hint: None,
+            hint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["error"], "正则表达式无效");
@@ -392,6 +408,60 @@ mod tests {
         assert_eq!(json["matches"].as_array().map(Vec::len), Some(max));
         assert_eq!(json["truncated"], serde_json::json!(true));
         assert_eq!(json["total_count"], serde_json::json!(max + 1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncate_line_keeps_short_line_intact() {
+        assert_eq!(truncate_line("fn main() {}"), "fn main() {}");
+        assert_eq!(truncate_line("中文短行"), "中文短行");
+    }
+
+    #[test]
+    fn truncate_line_truncates_by_chars_not_bytes() {
+        // 1000 字符长行，混入中文验证按字符（而非字节）截断——按字节切会切断
+        // 多字节字符产生乱码
+        let long_line = "中文内容x".repeat(200);
+        assert_eq!(long_line.chars().count(), 1000);
+
+        let truncated = truncate_line(&long_line);
+        assert_eq!(truncated.chars().count(), GREP_MAX_LINE_CHARS + 1);
+        assert!(truncated.ends_with('…'));
+        // 截断后仍是合法 UTF-8（字符边界安全，无 panic）
+        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    /// 超长匹配行经完整搜索链路后被截断：content 与 context 均截到上限 + 省略标记
+    #[tokio::test]
+    async fn grep_truncates_overlong_match_line_end_to_end() {
+        let dir = std::env::temp_dir().join("fuyao_test_grep_line_truncate");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 1007 字符长行（含中文），单条即可灌爆上下文，验证逐行截断生效
+        let long_line = format!("needle {}", "中文内容x".repeat(200));
+        assert!(long_line.chars().count() > GREP_MAX_LINE_CHARS);
+        let file_path = dir.join("long.txt");
+        std::fs::write(&file_path, format!("{long_line}\n")).unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": file_path.to_string_lossy().to_string(),
+            "limit": 10,
+            "context": 1
+        });
+        let output = grep_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        let content = json["matches"][0]["content"].as_str().unwrap();
+        assert!(content.ends_with('…'), "实际：{content:?}");
+        assert_eq!(content.chars().count(), GREP_MAX_LINE_CHARS + 1);
+
+        let context_line = json["matches"][0]["context"].as_str().unwrap();
+        assert!(context_line.ends_with('…'), "实际：{context_line:?}");
+        assert_eq!(context_line.chars().count(), GREP_MAX_LINE_CHARS + 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

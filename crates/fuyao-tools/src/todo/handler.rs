@@ -9,6 +9,7 @@
 //! 不再自建连接池。
 
 use super::types::{TodoSummary, TodoWriteArgs, TodoWriteResult};
+use crate::config::TODO_MAX_ITEMS;
 use fuyao_api::{CancellationToken, TodoItem, ToolCallContext, ToolError, ToolOutput, parse_args};
 use serde_json::Value;
 
@@ -49,6 +50,7 @@ fn build_summary(items: &[TodoItem]) -> TodoSummary {
 /// 畸形项（id/content 缺失或为空）fail-loud 报错而非静默跳过——
 /// 跳过会让 LLM 误以为全部写入成功，造成任务静默丢失。
 /// status 容错保留：非法值回退 pending。
+/// 数量上限兜底：单次超过 `TODO_MAX_ITEMS` 项即报错拒绝整批。
 pub async fn todo_handler(
     args: Value,
     ctx: ToolCallContext,
@@ -69,6 +71,19 @@ pub async fn todo_handler(
     // 参数校验优先于存储取用：先把输入整体转换成 TodoItem（畸形项 fail-loud），
     // 校验失败即刻短路返回，再取 store——输入错误不应触碰任何 I/O
     let write_items = match todos.map(|inputs| {
+        // 数量上限兜底：失控或注入式巨量提交时拒绝整批，防任务列表无界膨胀
+        if inputs.len() > TODO_MAX_ITEMS {
+            return Err(ToolError::new(format!(
+                "todos 数量 {} 超过单次提交上限 {}，已拒绝整批写入",
+                inputs.len(),
+                TODO_MAX_ITEMS
+            ))
+            .with(
+                "suggestion",
+                "请精简任务列表：合并同类项或拆分为多次提交，每次不超过上限",
+            ));
+        }
+
         let mut items: Vec<TodoItem> = Vec::with_capacity(inputs.len());
         for raw in inputs {
             let item_id = raw.id.trim().to_string();
@@ -254,5 +269,48 @@ mod tests {
         .to_wire();
         assert!(result.contains("id 与 content 均为必填"));
         assert!(result.contains("suggestion"));
+    }
+
+    /// 数量超上限（201 项）整批拒绝，错误信息含实际上限值与精简建议
+    #[tokio::test]
+    async fn todo_handler_rejects_more_than_max_items() {
+        let ctx = ToolCallContext {
+            session_id: Some("test".to_string()),
+            ..ToolCallContext::default()
+        };
+        let items: Vec<_> = (0..=TODO_MAX_ITEMS)
+            .map(|i| serde_json::json!({ "id": format!("{i}"), "content": format!("任务{i}") }))
+            .collect();
+        assert_eq!(items.len(), TODO_MAX_ITEMS + 1);
+        let result = todo_handler(
+            serde_json::json!({ "todos": items }),
+            ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        assert!(result.contains("超过单次提交上限"), "实际：{result}");
+        assert!(result.contains("精简"), "实际：{result}");
+    }
+
+    /// 恰好 200 项不触发数量上限：校验通过后走到存储层（未注入 store 报存储错误）
+    #[tokio::test]
+    async fn todo_handler_accepts_exactly_max_items() {
+        let ctx = ToolCallContext {
+            session_id: Some("test".to_string()),
+            ..ToolCallContext::default()
+        };
+        let items: Vec<_> = (0..TODO_MAX_ITEMS)
+            .map(|i| serde_json::json!({ "id": format!("{i}"), "content": format!("任务{i}") }))
+            .collect();
+        assert_eq!(items.len(), TODO_MAX_ITEMS);
+        let result = todo_handler(
+            serde_json::json!({ "todos": items }),
+            ctx,
+            CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        assert!(result.contains("TodoStoreOps 不可用"), "实际：{result}");
     }
 }

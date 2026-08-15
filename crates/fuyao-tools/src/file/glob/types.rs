@@ -46,7 +46,7 @@ pub struct GlobResult {
     pub error: Option<String>,
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub _hint: Option<String>,
+    pub hint: Option<String>,
 }
 
 /// 文件名匹配项

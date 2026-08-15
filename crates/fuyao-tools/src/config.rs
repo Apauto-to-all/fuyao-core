@@ -6,9 +6,6 @@
 /// 最大读取字符数
 pub const MAX_READ_CHARS: usize = 100_000;
 
-/// 大文件提示字节数
-pub const LARGE_FILE_HINT_BYTES: u64 = 512_000;
-
 /// 读取时间戳缓存大小
 pub const READ_TIMESTAMPS_CAP: usize = 1000;
 
@@ -43,3 +40,14 @@ pub const WEBFETCH_CACHE_MAX_SIZE: usize = 100;
 
 /// 缓存 TTL（秒），默认 15分钟
 pub const WEBFETCH_CACHE_TTL: u64 = 900;
+
+/// grep 匹配行 / 上下文行最大字符数，超出截断加省略标记
+///
+/// 防单行巨物（压缩 JS、单行 JSON 等）绕过条数上限灌爆上下文：
+/// limit 限条数，本常量限每条的字符数
+pub const GREP_MAX_LINE_CHARS: usize = 300;
+
+/// todowrite 单次提交的任务项数上限
+///
+/// 宽松兜底：正常规划永远到不了此量级，超限即报错拒绝整批提交
+pub const TODO_MAX_ITEMS: usize = 200;

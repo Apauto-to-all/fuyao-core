@@ -41,7 +41,7 @@ fn search_files(pattern: &str, path: &str, limit: usize, cancel: &AtomicBool) ->
             pattern: pattern.to_string(),
             path: path.to_string(),
             error: Some(format!("路径不存在: {path}")),
-            _hint: None,
+            hint: None,
         };
     }
 
@@ -55,7 +55,7 @@ fn search_files(pattern: &str, path: &str, limit: usize, cancel: &AtomicBool) ->
                 pattern: pattern.to_string(),
                 path: path.to_string(),
                 error: Some(format!("glob 模式无效: {e}")),
-                _hint: None,
+                hint: None,
             };
         }
     };
@@ -127,7 +127,7 @@ fn search_files(pattern: &str, path: &str, limit: usize, cancel: &AtomicBool) ->
         pattern: pattern.to_string(),
         path: path.to_string(),
         error: None,
-        _hint: None,
+        hint: None,
     }
 }
 
@@ -186,7 +186,7 @@ pub async fn glob_impl(
             pattern: pattern.to_string(),
             path: resolved_path.clone(),
             error: Some(format!("搜索任务失败: {e}")),
-            _hint: None,
+            hint: None,
         },
         Err(_elapsed) => {
             // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
@@ -200,7 +200,7 @@ pub async fn glob_impl(
                 error: Some(format!(
                     "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围或使用更具体的 pattern"
                 )),
-                _hint: None,
+                hint: None,
             }
         }
     };
@@ -211,7 +211,7 @@ pub async fn glob_impl(
 
     let mut result = result;
     if result.truncated {
-        result._hint = Some("结果已截断。请使用更具体的 pattern 缩小搜索范围。".to_string());
+        result.hint = Some("结果已截断。请使用更具体的 pattern 缩小搜索范围。".to_string());
     }
 
     ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
@@ -230,7 +230,7 @@ mod tests {
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
             error: None,
-            _hint: None,
+            hint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("error").is_none());
@@ -245,7 +245,7 @@ mod tests {
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
             error: Some("路径不存在".to_string()),
-            _hint: None,
+            hint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["error"], "路径不存在");
@@ -260,10 +260,10 @@ mod tests {
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
             error: None,
-            _hint: None,
+            hint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert!(json.get("_hint").is_none());
+        assert!(json.get("hint").is_none());
     }
 
     #[test]
@@ -275,10 +275,10 @@ mod tests {
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
             error: None,
-            _hint: Some("结果已截断".to_string()),
+            hint: Some("结果已截断".to_string()),
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["_hint"], "结果已截断");
+        assert_eq!(json["hint"], "结果已截断");
     }
 
     #[test]
@@ -303,7 +303,7 @@ mod tests {
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
             error: None,
-            _hint: None,
+            hint: None,
         };
         assert!(!result.truncated);
     }
@@ -317,7 +317,7 @@ mod tests {
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
             error: None,
-            _hint: None,
+            hint: None,
         };
         assert!(result.truncated);
     }

@@ -53,9 +53,6 @@ pub struct ReadResult {
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
-    /// 大文件提示
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub _hint: Option<String>,
 }
 
 /// 目录列表结果
