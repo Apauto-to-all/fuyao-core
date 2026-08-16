@@ -29,4 +29,4 @@ pub use global::{get_fuyao_agents_dir, get_fuyao_home};
 pub use workspace::{get_agent_root, get_workspace_agents_dir, get_workspace_root};
 
 // 工作目录路径归一化
-pub use normalize::normalize_workspace;
+pub use normalize::{normalize_workspace, normalize_workspace_str};
