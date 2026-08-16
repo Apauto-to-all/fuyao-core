@@ -75,6 +75,24 @@ impl SessionManager {
         })
     }
 
+    /// 获取单个会话的最新元数据（纯元数据，不含消息）
+    ///
+    /// 单行主键直读，返回 DB 当前值——token 累计四项与 `total_cost`（落库 assistant
+    /// 消息时由 `insert_message` 事务内原子累加）、`last_active_at`（消息落库时同
+    /// 事务刷新）均为 DB 派生字段。落库先于事件发送，消费方在收到事件的时点经此
+    /// 拉取即可拿到含该事件效果的最新读数——以 DB 为唯一真相源对齐内存快照，无需
+    /// 在应用侧复刻累计规则。
+    ///
+    /// # 返回
+    /// - `Ok(Some(session))`：命中
+    /// - `Ok(None)`：session_id 在数据库中不存在
+    pub async fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<fuyao_api::Session>, fuyao_session::SessionError> {
+        self.store.get(session_id).await
+    }
+
     // ── 会话元数据编辑（面向二次开发应用）──────────────────────
 
     /// 更新会话标题
@@ -294,6 +312,36 @@ mod tests {
         let p1_ids: Vec<&str> = p1.items.iter().map(|s| s.id.as_str()).collect();
         let p2_ids: Vec<&str> = p2.items.iter().map(|s| s.id.as_str()).collect();
         assert!(p1_ids.iter().all(|id| !p2_ids.contains(id)));
+    }
+
+    // ===== get_session：单会话主键直读 =====
+
+    #[tokio::test]
+    async fn get_session_returns_session_by_id() {
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, Some("/proj-a")).await;
+
+        let loaded = manager.get_session(&sid).await.unwrap().expect("应命中");
+        assert_eq!(loaded.id, sid);
+        assert_eq!(loaded.workspace.as_deref(), Some("/proj-a"));
+    }
+
+    #[tokio::test]
+    async fn get_session_unknown_id_returns_none() {
+        let manager = temp_manager().await;
+        assert!(manager.get_session("no-such-id").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_session_reflects_db_derived_counters() {
+        // 落一条消息后 message_count 应为 1——证明返回的是 DB 最新读数（计数由
+        // insert_message 事务内累加），而非创建时的快照
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        seed_user_message(&manager, &sid, "你好").await;
+
+        let loaded = manager.get_session(&sid).await.unwrap().expect("应命中");
+        assert_eq!(loaded.message_count, 1);
     }
 
     // ===== MessagePage：游标分页 + has_more / next_cursor =====
