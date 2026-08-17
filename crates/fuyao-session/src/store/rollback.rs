@@ -93,13 +93,13 @@ pub struct RollbackResult {
 impl super::SessionStore {
     /// 把会话回退到目标消息（删目标 seq 之后的所有消息 + 重算 count 类与压缩元数据）
     ///
-    /// 单事务原子操作，五步：
+    /// 单事务原子操作，四步：
     /// 1. 校验目标消息存在 + role/kind 合法（只能是 user 或 compaction）
-    /// 2. 统计待删范围（`seq > target`）的分类计数，供返回值反馈
-    /// 3. 删除目标 seq 之后的所有消息
-    /// 4. 重算 count 类字段（message_count / tool_call_count）与压缩元数据
-    ///    （last_compacted_seq / compression_count）
-    /// 5. 局部 UPDATE sessions 写回 4 个重算字段——token/cost 原值不动
+    /// 2. 删除目标 seq 之后的所有消息——`RETURNING` 带回被删行的 (role, kind)，
+    ///    Rust 侧聚合成 `deleted_count` / `deleted_total` 供返回值反馈
+    /// 3. 重算 count 类字段（message_count / tool_call_count）与压缩元数据
+    ///    （last_compacted_seq / compression_count）——四个标量聚合进单条查询
+    /// 4. 局部 UPDATE sessions 写回 4 个重算字段——token/cost 原值不动
     ///
     /// # 参数
     /// - `session_id`:被回退的会话
@@ -164,66 +164,47 @@ impl super::SessionStore {
             None
         };
 
-        // 3. 统计待删范围（seq > target）的分类计数
+        // 3. 删除目标 seq 之后的所有消息，RETURNING 带回被删行的 (role, kind)——
+        //    删除与删除计数一次往返完成。计数口径：
         //    deleted_count = user 消息数 + compaction 消息数（界面通知口径，不含 assistant/tool）
-        //    deleted_total = 全部待删消息数（含 assistant/tool，审计用）
-        let deleted_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages
-             WHERE session_id = ?1 AND seq > ?2 AND (role = 'user' OR kind = 'compaction')",
+        //    deleted_total = 全部被删消息数（含 assistant/tool，审计用）
+        let deleted_rows: Vec<(String, String)> = sqlx::query_as(
+            "DELETE FROM messages WHERE session_id = ?1 AND seq > ?2 RETURNING role, kind",
         )
         .bind(session_id)
         .bind(target_seq)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
+        let deleted_total = deleted_rows.len() as i64;
+        let deleted_count = deleted_rows
+            .iter()
+            // user 靠 role 判定，compaction 靠 kind 判定（compaction 行的 role 是 assistant）
+            .filter(|(role, kind)| role == "user" || kind == MessageKind::Compaction.as_str())
+            .count() as i64;
 
-        let deleted_total: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND seq > ?2")
-                .bind(session_id)
-                .bind(target_seq)
-                .fetch_one(&mut *tx)
-                .await?;
-
-        // 4. 删除目标 seq 之后的所有消息
-        sqlx::query("DELETE FROM messages WHERE session_id = ?1 AND seq > ?2")
-            .bind(session_id)
-            .bind(target_seq)
-            .execute(&mut *tx)
-            .await?;
-
-        // 5. 重算 count 类字段与压缩元数据（基于删除后的剩余消息）
+        // 4. 重算 count 类字段与压缩元数据（基于删除后的剩余消息），四个标量聚合成单条查询
         //    message_count：只数普通消息（kind='message'），与 count_messages 口径一致
-        let message_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = 'message'",
-        )
-        .bind(session_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
         //    tool_call_count：数 tool 结果消息数（一次调用对应一条 tool 结果）
-        let tool_call_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND role = 'tool'",
-        )
-        .bind(session_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        //    last_compacted_seq：剩余消息里最新一条 compaction 的 seq，无则置空
-        let last_compacted_seq: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(seq) FROM messages WHERE session_id = ?1 AND kind = 'compaction'",
-        )
-        .bind(session_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
+        //    last_compacted_seq：剩余消息里最新一条 compaction 的 seq，无则置空（MAX 空集为 NULL）
         //    compression_count：剩余消息里 compaction 的条数
-        let compression_count: i32 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = 'compaction'",
+        let (message_count, tool_call_count, last_compacted_seq, compression_count): (
+            i64,
+            i64,
+            Option<i64>,
+            i32,
+        ) = sqlx::query_as(
+            "SELECT
+                COUNT(*) FILTER (WHERE kind = 'message'),
+                COUNT(*) FILTER (WHERE role = 'tool'),
+                MAX(seq) FILTER (WHERE kind = 'compaction'),
+                COUNT(*) FILTER (WHERE kind = 'compaction')
+             FROM messages WHERE session_id = ?1",
         )
         .bind(session_id)
         .fetch_one(&mut *tx)
         .await?;
 
-        // 6. 局部 UPDATE sessions：只写回 4 个重算字段，token/cost 原值不动
+        // 5. 局部 UPDATE sessions：只写回 4 个重算字段，token/cost 原值不动
         //    （局部 UPDATE 是 session 表的唯一写范式——DB 单一数据源，无全量写）
         sqlx::query(
             "UPDATE sessions SET

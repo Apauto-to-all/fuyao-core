@@ -21,7 +21,7 @@
 use super::row::MessageRow;
 use super::window::select_recent;
 use crate::error::SessionError;
-use fuyao_api::Message;
+use fuyao_api::{Message, MessageKind};
 
 impl super::SessionStore {
     /// 加载模型可见窗口消息(动态拼接,压缩感知)
@@ -63,9 +63,9 @@ impl super::SessionStore {
     ///
     /// # 性能
     ///
-    /// 几次索引查询(走 `idx_messages_session_kind_seq` /
-    /// `UNIQUE(session_id, seq)` 约束自带的隐式索引)
-    /// + 内存拼接,复杂度低;仅在构造 LLM 请求时调一次,不在流式热路径。
+    /// 单条 SQL(CTE 定位最近两条摘要边界,走 `idx_messages_session_kind_seq` /
+    /// `UNIQUE(session_id, seq)` 约束自带的隐式索引;从未压缩是同一条语句的自然特例)
+    /// + 内存切分拼接,复杂度低;仅在构造 LLM 请求时调一次,不在流式热路径。
     pub async fn load_visible_messages(
         &self,
         session_id: &str,
@@ -75,84 +75,53 @@ impl super::SessionStore {
         let keep_tokens =
             keep_tokens.min(fuyao_api::get_config().session.compression.keep_tokens_max);
 
-        // 1. 取全部 compaction 消息的 seq(升序),用于定位最新摘要 M 与上一条摘要 M2
-        let compaction_seqs: Vec<i64> = sqlx::query_scalar(
-            "SELECT seq FROM messages WHERE session_id = ?1 AND kind = 'compaction' ORDER BY seq",
+        // 单条 SQL 取回拼接所需的全部候选行:seq > 上一条摘要 M2(无上一条摘要则 > 0,
+        // 即全量)。CTE latest 定位最新摘要 M(kind='compaction' 的最大 seq),prev 定位
+        // M 之前最近一条摘要 M2;未压缩(M 不存在 → M2 为 NULL)由 COALESCE 退化成
+        // 全量,与已压缩路径共用同一条语句,不再有独立分支。
+        // 摘要行本身、摘要前的区间候选、摘要后的新消息,三段恰好等于 seq > M2 的
+        // 行集,故一次往返即可取齐,切分留在 Rust 侧。
+        let rows: Vec<MessageRow> = sqlx::query_as::<_, MessageRow>(
+            "WITH latest AS (
+                    SELECT MAX(seq) AS m FROM messages WHERE session_id = ?1 AND kind = 'compaction'
+                ),
+                prev AS (
+                    SELECT MAX(seq) AS m2 FROM messages, latest
+                    WHERE session_id = ?1 AND kind = 'compaction' AND seq < latest.m
+                )
+                SELECT id, session_id, model_id, role, content, images, tool_call_id,
+                        tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                        reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
+                FROM messages, prev
+                WHERE session_id = ?1 AND seq > COALESCE(prev.m2, 0)
+                ORDER BY seq",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
 
-        // 从未压缩过:keep_tokens 不参与(没压缩就没有「压缩前的消息」需要控制量),
-        // 直接返回全部消息
-        if compaction_seqs.is_empty() {
-            return self.load_full_history(session_id).await;
-        }
+        let mut candidates: Vec<Message> = rows.into_iter().map(Message::from).collect();
 
-        // 最新摘要 M = compaction_seqs 最后一个;上一条摘要 M2 = 倒数第二个(无则视为 0)
-        let latest_seq = *compaction_seqs.last().expect("非空");
-        let prev_seq = if compaction_seqs.len() >= 2 {
-            compaction_seqs[compaction_seqs.len() - 2]
-        } else {
-            0
+        // 按 seq 升序在结果集内定位最新摘要行(结果集内 kind='compaction' 至多一行:
+        // M 是 compaction 的最大 seq,(M2, M) 开区间内无其他 compaction 行,M 之后也没有)
+        let Some(boundary) = candidates
+            .iter()
+            .position(|m| m.kind == MessageKind::Compaction)
+        else {
+            // 从未压缩过:keep_tokens 不参与(没压缩就没有「压缩前的消息」需要控制量),
+            // 直接返回全部消息
+            return Ok(candidates);
         };
 
-        // 2. 取最新摘要消息本身
-        let latest_summary: Vec<Message> = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages
-             WHERE session_id = ?1 AND seq = ?2",
-        )
-        .bind(session_id)
-        .bind(latest_seq)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(Message::from)
-        .collect();
-
-        // 3. 取 (M2, M) 区间的消息作 keep_recent 候选,按 seq 升序
-        let keep_candidates: Vec<Message> = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages
-             WHERE session_id = ?1 AND seq > ?2 AND seq < ?3
-             ORDER BY seq",
-        )
-        .bind(session_id)
-        .bind(prev_seq)
-        .bind(latest_seq)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(Message::from)
-        .collect();
+        // 三段切分:摘要行之前 = keep_recent 候选(seq ∈ (M2, M)),之后 = 新消息(seq > M)
+        let newer = candidates.split_off(boundary + 1);
+        let latest_summary = candidates.split_off(boundary);
 
         // 向前切 keep_recent(基于 token 预算),用原始记录不复制
-        let window = select_recent(&keep_candidates, keep_tokens);
+        let window = select_recent(&candidates, keep_tokens);
 
-        // 4. 取最新摘要之后的新消息(seq > M),按 seq 升序
-        let newer: Vec<Message> = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages
-             WHERE session_id = ?1 AND seq > ?2
-             ORDER BY seq",
-        )
-        .bind(session_id)
-        .bind(latest_seq)
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .map(Message::from)
-        .collect();
-
-        // 5. 显式拼接:摘要(最前)+ keep_recent + 新消息
-        //    摘要 seq 最大但逻辑排最前,不能靠单一 ORDER BY seq
+        // 显式拼接:摘要(最前)+ keep_recent + 新消息
+        // 摘要 seq 最大但逻辑排最前,不能靠单一 ORDER BY seq
         let mut result =
             Vec::with_capacity(latest_summary.len() + window.keep_recent.len() + newer.len());
         result.extend(latest_summary);

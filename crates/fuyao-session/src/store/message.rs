@@ -17,9 +17,11 @@
 //! (不随历史增长),多 session 并发无内存压力。需要历史消息时(构造 ChatRequest /
 //! 压缩 / 标题生成 / 中断补发等)通过本模块的方法按需查询。
 //!
-//! seq 生成规则:插入时事务内 `SELECT COALESCE(MAX(seq), 0) + 1 FROM messages
-//! WHERE session_id = ?`,事务保证并发安全。普通消息与 compaction 边界消息共享同一 seq 序列。
-//! 批量路径(`insert_messages_batch`)事务内取一次起点后连续递增分配,规则相同。
+//! seq 生成规则:插入时事务内以 `COALESCE(MAX(seq), 0) + 1` 分配新 seq,
+//! 事务保证并发安全。普通消息与 compaction 边界消息共享同一 seq 序列。
+//! 单条路径(`insert_message`)把该标量子查询折叠进 INSERT 的 VALUES 槽位,
+//! `RETURNING seq` 取回分配值;批量路径(`insert_messages_batch`)事务内取一次
+//! 起点后连续递增分配,分配规则相同。
 
 use super::row::MessageRow;
 use crate::error::SessionError;
@@ -33,10 +35,11 @@ impl super::SessionStore {
     /// 这是消息进 DB 的唯一入口(事件级落库),所有产出消息(user / assistant /
     /// tool_result / 中断补发 / 工具执行结果)必经此入口。
     ///
-    /// 事务内原子完成三件事(单一数据源,杜绝内存镜像覆盖):
-    /// 1. `SELECT COALESCE(MAX(seq), 0) + 1` 分配新 seq(并发安全)
-    /// 2. INSERT 消息行,回填 `msg.seq`
-    /// 3. UPDATE sessions 累加计数与费用(条件化,见下)
+    /// 事务内原子完成两件事(单一数据源,杜绝内存镜像覆盖):
+    /// 1. INSERT 消息行——seq 分配折叠进 VALUES 的标量子查询(`COALESCE(MAX(seq), 0) + 1`,
+    ///    并发安全),`RETURNING seq` 取回分配值;commit 成功后才回填 `msg.seq`
+    ///    (失败路径不动调用方数据)
+    /// 2. UPDATE sessions 累加计数与费用(条件化,见下)
     ///
     /// # sessions 表原子累加规则
     ///
@@ -60,14 +63,7 @@ impl super::SessionStore {
     ) -> Result<i64, SessionError> {
         let mut tx = self.pool.begin().await?;
 
-        let next_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
-        )
-        .bind(session_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-        Self::insert_message_row(&mut tx, session_id, msg, next_seq).await?;
+        let next_seq = Self::insert_message_row_allocating_seq(&mut tx, session_id, msg).await?;
 
         // 普通消息(kind=Message):事务内原子累加 sessions 表统计字段。
         // compaction 边界消息由 mark_compaction 独立路径处理,不走本分支,不误增计数。
@@ -201,10 +197,63 @@ impl super::SessionStore {
         Ok(())
     }
 
-    /// 在事务内以指定 seq 插入一条消息行(单条与批量两条落库路径共用的 INSERT)
+    /// 在事务内插入一条消息行并内联分配 seq(单条落库路径专用)
     ///
-    /// seq 由调用方分配(单条路径逐条取 MAX+1,批量路径取一次起点后连续递增),
-    /// 本函数只负责写行,不触碰 sessions 统计——统计累加条件在两条路径各自维护。
+    /// seq 分配折叠进 INSERT 本身:VALUES 的 seq 槽位是标量子查询
+    /// `COALESCE(MAX(seq), 0) + 1`(事务保证并发安全),`RETURNING seq`
+    /// 把实际分配值带回,省掉一次独立的 MAX(seq) 预查询往返。
+    /// 批量路径不适用此形态(一次取起点后连续递增),走显式 seq 的
+    /// [`Self::insert_message_row`]。本函数只负责写行并返回分配的 seq,
+    /// 不触碰 sessions 统计——统计累加条件由调用方维护。
+    async fn insert_message_row_allocating_seq(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        msg: &Message,
+    ) -> Result<i64, SessionError> {
+        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
+        let tool_calls_json = msg
+            .tool_calls
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        // 图片列表存 JSON 数组(`[{mime_type, data}]`),空列表存 NULL
+        let images_json = (!msg.images.is_empty())
+            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
+
+        let (next_seq,): (i64,) = sqlx::query_as(
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), ?17)
+             RETURNING seq",
+        )
+        .bind(session_id)
+        .bind(msg.model_id.as_deref())
+        .bind(msg.role.as_str())
+        .bind(msg.content.as_deref())
+        .bind(images_json.as_deref())
+        .bind(msg.tool_call_id.as_deref())
+        .bind(tool_calls_json.as_deref())
+        .bind(msg.tool_name.as_deref())
+        .bind(msg.timestamp)
+        .bind(msg.prompt_tokens)
+        .bind(msg.completion_tokens)
+        .bind(msg.reasoning_tokens)
+        .bind(msg.cached_tokens)
+        .bind(msg.cost)
+        .bind(msg.finish_reason.as_deref())
+        .bind(msg.reasoning.as_deref())
+        .bind(msg.kind.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        Ok(next_seq)
+    }
+
+    /// 在事务内以指定 seq 插入一条消息行(批量落库路径的 INSERT)
+    ///
+    /// seq 由调用方分配(事务内取一次起点后连续递增),本函数只负责写行,
+    /// 不触碰 sessions 统计——统计累加条件由调用方维护。
     async fn insert_message_row(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,

@@ -52,7 +52,8 @@ impl super::SessionStore {
     /// 标记一次压缩完成
     ///
     /// 事务内做三件事:
-    /// 1. 给 messages 表插入一条 `kind='compaction'` 的边界消息(content=summary)
+    /// 1. 给 messages 表插入一条 `kind='compaction'` 的边界消息(content=summary,
+    ///    seq 分配内联在 INSERT 的标量子查询中)
     /// 2. 更新 sessions.`last_compacted_seq` = 新 compaction 消息的 seq
     /// 3. sessions.`compression_count` += 1
     ///
@@ -79,33 +80,29 @@ impl super::SessionStore {
         // 验证 session 存在(避免给不存在的 session 插孤儿消息)
         super::session::require_session(&mut tx, session_id).await?;
 
-        // 生成新 seq(事务内 COALESCE 保证并发安全)
-        let next_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
-        )
-        .bind(session_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
 
         // 插入 compaction 边界消息(role='assistant':摘要是助手产出的对话总结,
-        // 以 assistant 身份参与对话流;kind='compaction' 才是真正的类型标记)
-        sqlx::query(
+        // 以 assistant 身份参与对话流;kind='compaction' 才是真正的类型标记)。
+        // seq 分配折叠进 INSERT 的 VALUES 槽位(标量子查询 COALESCE(MAX(seq), 0) + 1,
+        // 事务内保证并发安全),RETURNING 取回实际分配值,省掉一次独立的 MAX(seq)
+        // 预查询往返。
+        let (next_seq,): (i64,) = sqlx::query_as(
             "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
                 tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                 reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, NULL, 'assistant', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL, ?5, 'compaction')",
+             VALUES (?1, NULL, 'assistant', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL,
+                (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), 'compaction')
+             RETURNING seq",
         )
         .bind(session_id)
         .bind(&summary)
         .bind(reason.as_str())
         .bind(now)
-        .bind(next_seq)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
 
         // 更新 sessions 压缩元数据
