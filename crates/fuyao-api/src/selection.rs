@@ -55,15 +55,17 @@ pub struct DefinitionOption {
 
 /// 可选 model
 ///
-/// `id` 为纯模型名（不带 `provider/` 前缀），供应商由 `provider` 独立承载；
-/// 调用方按需拼成 `provider/id` 设给 `ModelConfig.model_id`。
+/// `id` 为纯模型名（不带 `provider/` 前缀），供应商由 `provider_id` 独立承载；
+/// 调用方按需拼成 `provider_id/id` 设给 `ModelConfig.model_id`。
 /// 无来源字段：model 配置在 fuyao.toml 多层合并，无单一层来源。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelOption {
     /// 纯模型名，如 "deepseek-v4-flash"
     pub id: String,
-    /// 供应商 id，如 "deepseek"
-    pub provider: String,
+    /// 供应商 id，如 "deepseek"（身份，用于拼 model_id 路由）
+    pub provider_id: String,
+    /// 供应商显示名，如 "商汤 SenseNova"（来自 Provider 注册配置，仅展示用途）
+    pub provider_name: String,
     /// 完整模型元信息（复用领域类型）
     pub model: Model,
 }
@@ -125,7 +127,8 @@ mod tests {
         // ModelOption：内嵌 Model（连带 ModelCost / ModelLimit / PriceTier），验证整链可序列化
         let model = ModelOption {
             id: "deepseek-v4-flash".to_string(),
-            provider: "deepseek".to_string(),
+            provider_id: "deepseek".to_string(),
+            provider_name: "深度求索 DeepSeek".to_string(),
             model: crate::Model {
                 name: "DeepSeek V4 Flash".to_string(),
                 cost: crate::ModelCost::default(),
@@ -140,8 +143,12 @@ mod tests {
             "id 应进 JSON：{json}"
         );
         assert!(
-            json.contains("\"provider\":\"deepseek\""),
-            "provider 应进 JSON：{json}"
+            json.contains("\"provider_id\":\"deepseek\""),
+            "provider_id 应进 JSON：{json}"
+        );
+        assert!(
+            json.contains("\"provider_name\":\"深度求索 DeepSeek\""),
+            "provider_name 应进 JSON：{json}"
         );
         assert!(
             json.contains("\"name\":\"DeepSeek V4 Flash\""),
