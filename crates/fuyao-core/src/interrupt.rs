@@ -137,7 +137,7 @@ pub(crate) async fn finish_streaming(
                 base: EventBase::default(),
                 payload: interrupted_assistant_payload(&text, &reasoning, Some(&valid)),
             });
-            let _ = crate::history::emit_to_history(ctx, event).await;
+            crate::history::emit_to_history(ctx, event).await;
 
             // 2. 为每个有效 tool_call 补发中断式 ToolResult → 落 DB
             for tc in valid {
@@ -147,7 +147,7 @@ pub(crate) async fn finish_streaming(
                     &payload.source,
                     &payload.reason,
                 );
-                let _ = crate::history::emit_to_history(ctx, event).await;
+                crate::history::emit_to_history(ctx, event).await;
             }
         }
         InterruptKind::Streaming => {
@@ -157,7 +157,7 @@ pub(crate) async fn finish_streaming(
                     base: EventBase::default(),
                     payload: interrupted_assistant_payload(&text, &reasoning, None),
                 });
-                let _ = crate::history::emit_to_history(ctx, event).await;
+                crate::history::emit_to_history(ctx, event).await;
             }
         }
     }
@@ -185,7 +185,7 @@ pub(crate) async fn finish_tool_batch(
             &payload.source,
             &payload.reason,
         );
-        let _ = crate::history::emit_to_history(ctx, event).await;
+        crate::history::emit_to_history(ctx, event).await;
     }
 }
 

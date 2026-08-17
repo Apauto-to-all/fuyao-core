@@ -7,6 +7,7 @@
 //! - end_session 后该 session 从调度表移除（后续 send 返 SessionNotFound）
 //! - end_session 落库 ended_at / end_reason
 //! - end_session 只销毁指定 session，不波及其他 session
+//! - end_session 触发该 session 插件实例的逆序 dispose（生命周期闭环）
 //! - 子 session 的 per-session 通道独立于父 session（事件不串扰）
 //! - 子 session task 退出后其 rx 自然返 None
 
@@ -413,4 +414,79 @@ async fn child_session_rx_returns_none_after_session_exits() {
     }
 
     engine.shutdown().await;
+}
+
+// ============================================================================
+// 插件实例 dispose 闭环：end_session 逆序销毁实例，工厂销毁留给 shutdown
+// ============================================================================
+
+/// end_session 触发该 session 插件实例的**逆序** dispose（后注册的先销毁）；
+/// 工厂 dispose 不在 end_session 发生（引擎仍存活，工厂还可服务其他 session），
+/// shutdown 时工厂才逆序销毁——完整闭环：实例（session 级）先于工厂（引擎级）
+#[tokio::test]
+async fn end_session_disposes_plugin_instances_in_reverse_order() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
+
+    // 两个记录型插件：alpha 先注册、beta 后注册（dispose 期望 beta 在前）
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut host = PluginHost::new();
+    host.add(Box::new(common::DisposeRecordingPlugin {
+        name: "alpha",
+        log: std::sync::Arc::clone(&log),
+    }));
+    host.add(Box::new(common::DisposeRecordingPlugin {
+        name: "beta",
+        log: std::sync::Arc::clone(&log),
+    }));
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        host,
+        store,
+    )
+    .await;
+
+    let (session_id, _rx_event) = engine
+        .create_session(test_session_params())
+        .await
+        .expect("创建 session 失败");
+
+    // 装配期只创建实例（create_instance），不触发 dispose
+    assert!(log.lock().unwrap().is_empty(), "装配期不应有 dispose 调用");
+
+    // end_session：task 退出后逆序 dispose 实例
+    let done = timeout(
+        Duration::from_secs(3),
+        engine.end_session(&session_id, "session_ended"),
+    )
+    .await;
+    assert!(done.is_ok(), "end_session 应在 3 秒内完成");
+    done.expect("end_session 未在 3s 内完成")
+        .expect("end_session 返回错误");
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["instance:beta".to_string(), "instance:alpha".to_string()],
+        "end_session 应逆序 dispose 插件实例（后注册的 beta 先销毁），且不动工厂"
+    );
+
+    // shutdown 后工厂才销毁（同样逆序），流水呈现「实例 → 工厂」的完整闭环
+    engine.shutdown().await;
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec![
+            "instance:beta".to_string(),
+            "instance:alpha".to_string(),
+            "factory:beta".to_string(),
+            "factory:alpha".to_string(),
+        ],
+        "shutdown 应逆序 dispose 工厂，且在实例销毁之后"
+    );
 }

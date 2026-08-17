@@ -27,7 +27,7 @@ use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_api::{
     ChildSessionSource, EngineParams, InputEvent, OutputEvent, Session, SessionParams,
 };
-use fuyao_hooks::{HooksRegistry, PluginHost, SessionSender, SharedHooks};
+use fuyao_hooks::{HooksRegistry, NamedPluginInstance, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_provider::ProviderRegistry;
 use fuyao_session::SessionStore;

@@ -4,14 +4,20 @@
 //! - PluginHost（create_instances / dispose_all / validate_unique_names / list / panic 防护）
 //! - PluginInstance trait register 行为（含 sender 接收）
 //! - SessionSender 两通道分流 + 身份绑定
+//! - simple_plugin 快捷构造（钩子真实生效 / name / 每 session 独立调用闭包）
 
 use super::factory::Plugin;
 use super::host::{PluginHost, PluginInstallError};
 use super::instance::PluginInstance;
 use super::sender::SessionSender;
+use super::simple::simple_plugin;
 use crate::HooksRegistry;
 use fuyao_api::InterruptSource;
 use fuyao_api::UserMessageMode;
+use fuyao_api::message::EventBase;
+use fuyao_api::message::OutputEvent;
+use fuyao_api::message::output::ChunkMessage;
+use fuyao_api::message::output::ChunkPayload;
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use std::sync::Arc;
@@ -436,4 +442,127 @@ fn sender_is_cloneable() {
     let (sender, _rx_user, _rx_int) = make_sender();
     let cloned = sender.clone();
     assert_eq!(cloned.name(), "test_plugin");
+}
+
+// ---------------------------------------------------------------------------
+// simple_plugin：无状态插件快捷构造
+// ---------------------------------------------------------------------------
+
+/// 构造测试用 Chunk 事件
+fn make_chunk() -> OutputEvent {
+    OutputEvent::Chunk(ChunkMessage {
+        base: EventBase::default(),
+        payload: ChunkPayload {
+            content: None,
+            reasoning: None,
+        },
+    })
+}
+
+/// 构造测试用 SessionSender（绑定指定插件名 + 两条丢弃接收端）
+fn make_sender_named(name: &str) -> SessionSender {
+    let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
+    let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
+    SessionSender::new(name, tx_user, tx_interrupt)
+}
+
+/// simple_plugin：name 正确，注册的观察钩子真实生效
+#[tokio::test]
+async fn simple_plugin_registers_effective_observe_hook() {
+    let observed = Arc::new(AtomicUsize::new(0));
+
+    let plugin = {
+        let observed = observed.clone();
+        simple_plugin("simple_observer", move |hooks, _sender| {
+            let observed = observed.clone();
+            hooks.register_output_observe(
+                0,
+                Arc::new(move |_msg| {
+                    let observed = observed.clone();
+                    Box::pin(async move {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    })
+                }),
+            );
+        })
+    };
+
+    assert_eq!(plugin.name(), "simple_observer");
+
+    let instance = plugin.create_instance();
+    let mut hooks = HooksRegistry::new();
+    instance.register(&mut hooks, &make_sender_named("simple_observer"));
+    hooks.finalize();
+
+    hooks.hook_output_observe(Arc::new(make_chunk())).await;
+    assert_eq!(
+        observed.load(Ordering::SeqCst),
+        1,
+        "观察钩子应被真实注册并执行"
+    );
+}
+
+/// simple_plugin：注册的拦截钩子真实生效（原地修改事件）
+#[test]
+fn simple_plugin_registers_effective_intercept_hook() {
+    let plugin = simple_plugin("simple_intercept", |hooks, _sender| {
+        hooks.register_output_intercept(
+            0,
+            Arc::new(|ev| {
+                if let OutputEvent::Chunk(msg) = ev {
+                    msg.payload.content = Some("simple 拦截改写".into());
+                }
+                None
+            }),
+        );
+    });
+
+    let instance = plugin.create_instance();
+    let mut hooks = HooksRegistry::new();
+    instance.register(&mut hooks, &make_sender_named("simple_intercept"));
+    hooks.finalize();
+
+    let mut ev = make_chunk();
+    assert!(hooks.hook_output_intercept(&mut ev).is_none());
+    let content = match ev {
+        OutputEvent::Chunk(msg) => msg.payload.content,
+        _ => None,
+    };
+    assert_eq!(content.as_deref(), Some("simple 拦截改写"));
+}
+
+/// create_instance 每 session 独立调用闭包：两个 session 各装配一次、各生效一份钩子
+#[tokio::test]
+async fn simple_plugin_create_instance_per_session() {
+    // 高 2 位记注册调用次数（每 session 1 次），低 2 位记钩子执行次数（每 session 10 次）
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let plugin = {
+        let counter = counter.clone();
+        simple_plugin("multi_session", move |hooks, _sender| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let counter = counter.clone();
+            hooks.register_output_observe(
+                0,
+                Arc::new(move |_msg| {
+                    let counter = counter.clone();
+                    Box::pin(async move {
+                        counter.fetch_add(10, Ordering::SeqCst);
+                    })
+                }),
+            );
+        })
+    };
+
+    // 模拟两个 session 各自装配
+    for _ in 0..2 {
+        let instance = plugin.create_instance();
+        let mut hooks = HooksRegistry::new();
+        instance.register(&mut hooks, &make_sender_named("multi_session"));
+        hooks.finalize();
+        hooks.hook_output_observe(Arc::new(make_chunk())).await;
+    }
+
+    // 2 次注册调用（各 +1）+ 2 次钩子执行（各 +10）
+    assert_eq!(counter.load(Ordering::SeqCst), 22);
 }

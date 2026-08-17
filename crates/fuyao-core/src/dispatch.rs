@@ -5,9 +5,11 @@
 //! 并路由消息到对应 session 的管道。多 session 各自一条独立管道，互不干扰。
 //!
 //! 三段职责（串行执行）：
-//! 1. **拦截（intercept）**：插件可修改或阻断事件（`InterceptResult::Block` 短路丢弃）
+//! 1. **拦截（intercept）**：插件经 `&mut` 原地修改事件或返回原因阻止
+//!    （阻止即整条丢弃）
 //! 2. **发送（deliver）**：经 `Emitter::emit` 推到出口通道（全引擎唯一发送出口）
-//! 3. **观察（observe）**：插件只读副作用（持久化/日志/统计）
+//! 3. **观察（observe）**：插件只读副作用（持久化/日志/统计），
+//!    多钩子经 `Arc` 共享同一份事件本体，不随钩子数量复制
 //!
 //! 本模块只提供管道原语，不感知「进历史」语义：
 //! - 不进历史的纯事件（Chunk/Error/Compression/Interrupt 通知等）用 [`dispatch`]
@@ -17,24 +19,26 @@
 
 use crate::emit::Emitter;
 use fuyao_api::message::OutputEvent;
-use fuyao_hooks::{InterceptResult, SharedHooks};
+use fuyao_hooks::SharedHooks;
+use std::sync::Arc;
 
 // ===== 管道各段：intercept / deliver =====
 
 /// 执行拦截钩子
 ///
-/// 返回 `Some(event)` 表示 Pass（事件可能被插件修改）；
-/// 返回 `None` 表示 Block，调用方应丢弃该事件。
+/// 拿 owned 事件原地过拦截链：钩子经 `&mut` 直接改写事件（原地修改零分配）。
+/// 返回 `Some(event)` 表示通过（事件可能已被插件修改）；返回 `None` 表示
+/// 某钩子阻止（携带原因，已记 WARN 日志），调用方应丢弃该事件。
 ///
-/// registry 装配后只读（无锁共享），拦截是同步调用。
-pub(crate) async fn intercept(
-    _emitter: &Emitter,
-    hooks: &SharedHooks,
-    event: OutputEvent,
-) -> Option<OutputEvent> {
-    match hooks.hook_output_intercept(&event) {
-        InterceptResult::Pass(modified) => Some(modified),
-        InterceptResult::Block(reason) => {
+/// registry 装配后只读（无锁共享），拦截是同步调用——本函数因而不是 async，
+/// 调用方无需 await（热路径省一次状态机开销）。
+pub(crate) fn intercept(hooks: &SharedHooks, event: OutputEvent) -> Option<OutputEvent> {
+    let mut ev = event;
+    match hooks.hook_output_intercept(&mut ev) {
+        // None=全部通过：原地修改后的事件还给调用方继续走管道
+        None => Some(ev),
+        // Some(reason)=阻止：丢弃整条
+        Some(reason) => {
             tracing::warn!(
                 hook = "output_intercept",
                 block = true,
@@ -49,32 +53,27 @@ pub(crate) async fn intercept(
 /// 发送事件到出口通道 + 触发观察钩子
 ///
 /// 顺序：先 `Emitter::emit`（盖 session_id + tx.send），后 `hook_output_observe`。
-/// registry 装配后只读（无锁共享），观察钩子自行内部同步。
 ///
-/// observe 钩子按注册顺序串行执行，单个 panic 或超时不阻塞后续（见 HooksRegistry）。
+/// 事件物化成本恒定为一次 clone：本处为 emit clone 一份（emit 按值消费并盖
+/// session_id 标签），原事件本体包进 `Arc` 给观察侧——任意多个观察钩子共享
+/// 同一份 Arc（引用计数拷贝），成本不随钩子数量增长。
 ///
-/// 暴露为 `pub(crate)` 供工具调用等分离式场景在拦截 + 处理后单独调用。
+/// observe 钩子按优先级序（同优先级按注册序）串行执行，单个 panic 或超时
+/// 不阻塞后续（见 HooksRegistry）。观察侧看到的是 emit 盖标签前的事件本体，
+/// 插件随 session 装配运行，session 身份由插件自持。
 ///
-/// 返回原 event（move 进来再还回去）——`emit` 按值消费 event，本函数在 emit 前
-/// 先 clone 一份给 observe 用，emit 完成后把这份 clone 还给调用方，让调用方
-/// （如 `emit_to_history`）不必再为返回值单独 clone 一次。
-pub(crate) async fn deliver(
-    emitter: &Emitter,
-    hooks: &SharedHooks,
-    event: OutputEvent,
-) -> OutputEvent {
-    // observe 需要拿到与发送一致的事件，先 clone 一份留给 observe；
-    // 这份 clone 同时也是返回值——emit 之后 event 已 move，observe_event 是唯一剩余副本
-    let observe_event = event.clone();
+/// 暴露为 `pub(crate)` 供工具调用等分离式场景在拦截 + 处理后单独调用；
+/// 事件按值消费，调用方还需要事件本体时须在调用前自行留存。
+pub(crate) async fn deliver(emitter: &Emitter, hooks: &SharedHooks, event: OutputEvent) {
+    // 观察侧共享本体：原事件包 Arc（零拷贝），所有观察钩子共享这一份
+    let observe_event = Arc::new(event);
 
     // 先发送（Emitter 负责：盖 session_id 标签 + 推到出口通道）
-    // 出站通道无界，emit 同步返回——但本函数仍保留 async 因 observe hook 可能跨 await
-    emitter.emit(event);
+    // 出站通道无界，emit 同步返回——但本函数保留 async 因 observe hook 跨 await
+    emitter.emit(observe_event.as_ref().clone());
 
     // 再观察
-    hooks.hook_output_observe(observe_event.clone()).await;
-
-    observe_event
+    hooks.hook_output_observe(observe_event).await;
 }
 
 // ===== 完整管道入口 =====
@@ -86,9 +85,9 @@ pub(crate) async fn deliver(
 /// 注意：本函数**不落 DB**——只走管道。如需把拦截后的消息落到历史
 /// （进 DB + 下轮 LLM 输入），用 [`crate::history::emit_to_history`]。
 pub(crate) async fn dispatch(emitter: &Emitter, hooks: &SharedHooks, event: OutputEvent) {
-    // 1. 拦截
-    let Some(intercepted) = intercept(emitter, hooks, event).await else {
-        return; // Block：丢弃
+    // 1. 拦截（同步原地修改）
+    let Some(intercepted) = intercept(hooks, event) else {
+        return; // Block：丢弃（不发送、不观察）
     };
 
     // 2. 发送 + 3. 观察
@@ -99,8 +98,7 @@ pub(crate) async fn dispatch(emitter: &Emitter, hooks: &SharedHooks, event: Outp
 mod tests {
     use super::*;
     use fuyao_api::message::output::{AssistantMessage, AssistantPayload};
-    use fuyao_hooks::{HooksRegistry, InterceptResult};
-    use std::sync::Arc;
+    use fuyao_hooks::HooksRegistry;
     use tokio::sync::mpsc;
 
     /// 构造测试用 Emitter + 出站接收端
@@ -152,47 +150,42 @@ mod tests {
 
     #[tokio::test]
     async fn intercept_returns_modified_event() {
-        // 拦截器修改 content：intercept 返回修改后的事件
-        let (emitter, _rx) = make_emitter();
+        // 拦截器原地修改 content：intercept 返回修改后的事件
         let mut reg = HooksRegistry::default();
         reg.register_output_intercept(
             0,
-            Arc::new(|ev: &OutputEvent| {
-                if let OutputEvent::Assistant(m) = ev {
-                    let mut modified = m.clone();
-                    if let Some(c) = &mut modified.payload.content {
-                        *c = c.to_uppercase();
-                    }
-                    InterceptResult::Pass(OutputEvent::Assistant(modified))
-                } else {
-                    InterceptResult::Pass(ev.clone())
+            Arc::new(|ev: &mut OutputEvent| {
+                if let OutputEvent::Assistant(m) = ev
+                    && let Some(c) = &mut m.payload.content
+                {
+                    *c = c.to_uppercase();
                 }
+                None
             }),
         );
         let hooks = freeze_hooks(reg);
 
-        let result = intercept(&emitter, &hooks, make_assistant_event("hi")).await;
+        let result = intercept(&hooks, make_assistant_event("hi"));
         match result {
             Some(OutputEvent::Assistant(m)) => {
                 assert_eq!(m.payload.content.as_deref(), Some("HI"));
             }
-            _ => panic!("拦截 Pass 应返回修改后的事件"),
+            _ => panic!("拦截通过应返回修改后的事件"),
         }
     }
 
     #[tokio::test]
     async fn intercept_returns_none_on_block() {
-        // 拦截器 Block：返回 None，事件被丢弃
-        let (emitter, _rx) = make_emitter();
+        // 拦截器返回阻止原因：返回 None，事件被丢弃
         let mut reg = HooksRegistry::default();
         reg.register_output_intercept(
             0,
-            Arc::new(|_: &OutputEvent| InterceptResult::Block("插件拦截".to_string())),
+            Arc::new(|_: &mut OutputEvent| Some("插件拦截".to_string())),
         );
         let hooks = freeze_hooks(reg);
 
-        let result = intercept(&emitter, &hooks, make_assistant_event("hi")).await;
-        assert!(result.is_none(), "Block 应返回 None");
+        let result = intercept(&hooks, make_assistant_event("hi"));
+        assert!(result.is_none(), "阻止应返回 None");
     }
 
     #[tokio::test]
@@ -202,7 +195,7 @@ mod tests {
         let mut reg = HooksRegistry::default();
         reg.register_output_intercept(
             0,
-            Arc::new(|_: &OutputEvent| InterceptResult::Block("拦截丢弃".to_string())),
+            Arc::new(|_: &mut OutputEvent| Some("拦截丢弃".to_string())),
         );
         let hooks = freeze_hooks(reg);
         dispatch(&emitter, &hooks, make_assistant_event("dropped")).await;
@@ -218,14 +211,17 @@ mod tests {
         let mut reg = HooksRegistry::default();
         {
             let observed = observed.clone();
-            reg.register_output_observe(Arc::new(move |_ev| {
-                Box::pin({
-                    let observed = observed.clone();
-                    async move {
-                        *observed.lock().unwrap() = true;
-                    }
-                })
-            }));
+            reg.register_output_observe(
+                0,
+                Arc::new(move |_ev: Arc<OutputEvent>| {
+                    Box::pin({
+                        let observed = observed.clone();
+                        async move {
+                            *observed.lock().unwrap() = true;
+                        }
+                    })
+                }),
+            );
         }
         let hooks = freeze_hooks(reg);
 

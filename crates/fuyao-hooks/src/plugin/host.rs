@@ -1,8 +1,7 @@
 //! 插件装配宿主
 //!
 //! [`PluginHost`] 收集所有插件工厂（[`Plugin`](crate::Plugin)），提供：
-//! - 重名校验（[`validate_unique_names`](PluginHost::validate_unique_names)）
-//! - 批量生成实例（[`create_instances`](PluginHost::create_instances)）
+//! - 批量生成实例（[`create_instances`](PluginHost::create_instances)，生成前内置重名校验）
 //! - 批量销毁工厂（[`dispose_all`](PluginHost::dispose_all)）
 //!
 //! 关键约束：
@@ -80,11 +79,12 @@ impl PluginHost {
         self.plugins.iter().map(|p| p.name()).collect()
     }
 
-    /// 校验插件名称唯一性
+    /// 校验插件名称唯一性（crate 内部辅助方法）
     ///
     /// core 不接受任何重名情况——检测到重名立即返回 `Err`。
-    /// 建议在 [`create_instances`](Self::create_instances) 之前调用，避免半途中断。
-    pub fn validate_unique_names(&self) -> Result<(), PluginInstallError> {
+    /// 由 [`create_instances`](Self::create_instances) 在生成实例前内部调用，
+    /// 避免半途中断残留状态。
+    pub(crate) fn validate_unique_names(&self) -> Result<(), PluginInstallError> {
         let mut seen = std::collections::HashSet::new();
         for plugin in &self.plugins {
             let name = plugin.name().to_string();

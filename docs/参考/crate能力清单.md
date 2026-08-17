@@ -71,12 +71,13 @@ L0  fuyao-api（零内部依赖）
 
 ## fuyao-hooks（L1 能力）
 
-- **职责**：钩子（拦截 + 观察）+ Plugin 两层模型（工厂 + session 实例）
+- **职责**：钩子（拦截 + 观察）+ Plugin 两层模型（工厂 + session 实例）+ 无状态插件快捷构造
 - **内部依赖**：api
 - **公开 API**：
-  - **Plugin 两层模型**：`Plugin` trait（工厂模板，`name` / `create_instance`（每 session 生成独立实例）/ `dispose`（默认空））；`PluginInstance` trait（session 级，`register(&mut HooksRegistry, &SessionSender)` 注册 hook 并接收绑定插件名的发送器 / `dispose`（默认空））；`PluginHost`（引擎级工厂集合，`add` / `create_instances` 返回 `Vec<(插件名, 实例)>` 配对 / `list` / `validate_unique_names` / `dispose_all`）；`PluginInstallError`
+  - **Plugin 两层模型**：`Plugin` trait（工厂模板，`name` / `create_instance`（每 session 生成独立实例）/ `dispose`（默认空，引擎 shutdown 最后逆序调用））；`PluginInstance` trait（session 级，`register(&mut HooksRegistry, &SessionSender)` 注册 hook 并接收绑定插件名的发送器 / `dispose`（默认空，session 结束时逆序调用））；`PluginHost`（引擎级工厂集合，`add` / `create_instances` 返回 `Vec<(插件名, 实例)>` 配对（生成前内置重名校验）/ `list` / `dispose_all`）；`PluginInstallError`
+  - **无状态快捷路径**：`simple_plugin(name, register)` → `SimplePlugin`——一个注册闭包即插件（每 session 装配时调用一次注册各自的钩子）；无 per-session 状态的插件免写两层样板，与完整两层模型共存
   - **发消息能力**：`SessionSender`（绑定插件名 + 该 session 的入站 / 中断两条通道，方法 `send_user` / `send_user_with_mode` / `send_interrupt`，全部 try_send 非阻塞、source 自动按插件名追溯）
-  - **钩子类型**：`HooksRegistry`（`new` / `register_output_intercept` / `register_output_observe` / `finalize`（装配期排序冻结））；`InterceptResult`（`Pass` / `Block`）；钩子签名 `OutputInterceptFn` / `OutputObserveFn`
+  - **钩子类型**：`HooksRegistry`（`new` / `register_output_intercept(priority, handler)` / `register_output_observe(priority, handler)`——两类钩子统一 priority 降序、同优先级按注册序 / `finalize`（装配期排序冻结））；钩子签名 `OutputInterceptFn`（`&mut OutputEvent` 原地修改，返回 `Option<String>`：`None` = 通过 / `Some(原因)` = 阻止）/ `OutputObserveFn`（`Arc<OutputEvent>` 共享只读，异步）
   - **`SharedHooks`**：`Arc<HooksRegistry>`（注册只发生在 session 装配期，finalize 后只读共享，运行期无锁）
   - **辅助**：`panic_payload_to_string`
 

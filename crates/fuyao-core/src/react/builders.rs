@@ -275,7 +275,7 @@ pub(crate) fn assistant_payload(result: &StreamResult) -> AssistantPayload {
 
 // ===== 工具调用拦截回灌用的转换函数 =====
 //
-// 工具调用逐个经 dispatch_intercept 拦截后，需要从拦截后的 OutputEvent::ToolCall
+// 工具调用逐个经 dispatch 模块的拦截管道拦截后，需要从拦截后的 OutputEvent::ToolCall
 // 提取出执行用的 ToolCallData（参数可能被插件修改），保证「执行 / 存储 / 发送」
 // 三者数据一致（都以拦截后的 payload 为准）。
 //

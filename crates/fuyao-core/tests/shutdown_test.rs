@@ -9,6 +9,8 @@
 //! - shutdown 中断活跃 task + 落库验证
 //! - shutdown 打断 retry 退避中的 task
 //! - 多 session 并发 shutdown 是并发退出而非串行
+//! - shutdown 的插件清理闭环：实例先销毁（session 级）→ 工厂后销毁（引擎级），
+//!   无活跃 session 时工厂清理也执行
 
 mod common;
 
@@ -390,4 +392,86 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
         let session = store.get(id).await.expect("DB 查询失败");
         assert!(session.is_some(), "session {id} 应在 DB 中存在");
     }
+}
+
+// ============================================================================
+// 插件清理闭环：shutdown 收尾所有 session 后 dispose 插件工厂
+// ============================================================================
+
+/// shutdown 收尾所有 session 后执行工厂级 dispose：
+/// 实例销毁（session 级，各 session 收尾内完成）先于工厂销毁（引擎级）
+#[tokio::test]
+async fn shutdown_disposes_plugin_instances_then_factories() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
+
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut host = PluginHost::new();
+    host.add(Box::new(common::DisposeRecordingPlugin {
+        name: "solo",
+        log: std::sync::Arc::clone(&log),
+    }));
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        host,
+        store,
+    )
+    .await;
+
+    let (_session_id, _rx_event) = engine
+        .create_session(test_session_params())
+        .await
+        .expect("创建 session 失败");
+
+    let shutdown_done = timeout(Duration::from_secs(3), engine.shutdown()).await;
+    assert!(shutdown_done.is_ok(), "shutdown 应在 3 秒内完成");
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["instance:solo".to_string(), "factory:solo".to_string()],
+        "shutdown 应先 dispose 实例（session 收尾内）再 dispose 工厂"
+    );
+}
+
+/// 无活跃 session 时 shutdown 也执行工厂级清理（工厂资源不依赖 session 存在过）
+#[tokio::test]
+async fn shutdown_disposes_factories_even_without_sessions() {
+    let (agent_paths, _home) = temp_agent_paths();
+    let store = make_store(&agent_paths).await;
+
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut host = PluginHost::new();
+    host.add(Box::new(common::DisposeRecordingPlugin {
+        name: "lonely",
+        log: std::sync::Arc::clone(&log),
+    }));
+
+    let engine = Engine::new(
+        EngineParams {
+            agent_paths: agent_paths.clone(),
+        },
+        as_providers(MockProvider {
+            events: text_events("ok"),
+        }),
+        fuyao_core::ToolRegistry::builder().build(),
+        host,
+        store,
+    )
+    .await;
+
+    // 不创建任何 session，直接 shutdown
+    engine.shutdown().await;
+
+    assert_eq!(
+        log.lock().unwrap().clone(),
+        vec!["factory:lonely".to_string()],
+        "无活跃 session 的 shutdown 也应 dispose 插件工厂"
+    );
 }

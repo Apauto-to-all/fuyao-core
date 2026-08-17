@@ -93,8 +93,8 @@ pub type ExecLog = Arc<Mutex<Vec<String>>>;
 /// 钩子动作：描述 FakeInstance 在 register 阶段注册哪种钩子、钩子做什么
 #[derive(Clone)]
 pub enum HookAction {
-    /// 注册 observe 钩子，执行时记录日志（log_tag）
-    Observe { log_tag: String },
+    /// 注册 observe 钩子（priority，执行时记录 log_tag）
+    Observe { priority: i32, log_tag: String },
     /// 注册 intercept 钩子（priority，执行时记录 log_tag 并放行）
     Intercept { priority: i32, log_tag: String },
     /// register 时记录日志（log_tag）并立即用 sender 发一条 User 消息（content）
@@ -126,25 +126,29 @@ impl PluginInstance for FakeInstance {
         }
         for action in &self.cfg.actions {
             match action {
-                HookAction::Observe { log_tag } => {
+                HookAction::Observe { priority, log_tag } => {
                     let log = self.log.clone();
                     let tag = log_tag.clone();
-                    hooks.register_output_observe(Arc::new(move |_msg| {
-                        let log = log.clone();
-                        let tag = tag.clone();
-                        Box::pin(async move {
-                            log.lock().unwrap().push(tag);
-                        })
-                    }));
+                    hooks.register_output_observe(
+                        *priority,
+                        Arc::new(move |_msg| {
+                            let log = log.clone();
+                            let tag = tag.clone();
+                            Box::pin(async move {
+                                log.lock().unwrap().push(tag);
+                            })
+                        }),
+                    );
                 }
                 HookAction::Intercept { priority, log_tag } => {
                     let log = self.log.clone();
                     let tag = log_tag.clone();
+                    // 原地协议：钩子只记录日志不修改事件，返回 None 放行
                     hooks.register_output_intercept(
                         *priority,
-                        Arc::new(move |msg| {
+                        Arc::new(move |_msg| {
                             log.lock().unwrap().push(tag.clone());
-                            fuyao_hooks::InterceptResult::Pass(msg.clone())
+                            None
                         }),
                     );
                 }

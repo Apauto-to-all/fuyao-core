@@ -1,7 +1,9 @@
 //! Hooks 注册表与执行引擎
 //!
-//! 拦截钩子（同步串行，可取消带原因，panic 防护）+ 观察钩子（异步串行）。
-//! 按优先级排序执行（[`HooksRegistry::finalize`] 装配期一次排定）。
+//! 拦截钩子（同步串行原地修改，可阻止带原因，panic 防护）+
+//! 观察钩子（异步串行，Arc 共享只读，panic 防护 + 超时防护）。
+//! 两类钩子统一按优先级排序执行（priority 降序、同优先级按注册序，
+//! [`HooksRegistry::finalize`] 装配期一次排定）。
 //!
 //! 生命周期约定：注册只发生在 session 装配期（`register_*` 需 `&mut self`），
 //! 装配方在注册完成后调一次 [`HooksRegistry::finalize`] 排序冻结，之后注册表
@@ -14,6 +16,7 @@ use futures_util::future::FutureExt;
 use fuyao_api::message::OutputEvent;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 带优先级的钩子条目
@@ -56,20 +59,22 @@ impl HooksRegistry {
             .push(Prioritized { priority, handler });
     }
 
-    /// 注册输出观察钩子（观察无优先级语义，按注册顺序串行）
-    pub fn register_output_observe(&mut self, handler: OutputObserveFn) {
-        self.output_observe.push(Prioritized {
-            priority: 0,
-            handler,
-        });
+    /// 注册输出观察钩子
+    ///
+    /// `priority` 高者先执行；同优先级按注册顺序（finalize 用稳定排序）。
+    /// 与拦截钩子对称的优先级语义。
+    pub fn register_output_observe(&mut self, priority: i32, handler: OutputObserveFn) {
+        self.output_observe.push(Prioritized { priority, handler });
     }
 
-    /// 冻结注册表：按 priority 降序排定拦截钩子（高优先级先执行）
+    /// 冻结注册表：按 priority 降序排定拦截与观察两类钩子（高优先级先执行）
     ///
     /// 装配方在所有 register 完成后调用一次；之后注册表包进 `Arc`
     /// 进入运行期只读状态。稳定排序保证同优先级保持注册顺序。
     pub fn finalize(&mut self) {
         self.output_intercept
+            .sort_by_key(|b| std::cmp::Reverse(b.priority));
+        self.output_observe
             .sort_by_key(|b| std::cmp::Reverse(b.priority));
     }
 
@@ -87,13 +92,18 @@ impl HooksRegistry {
         }
     }
 
-    /// 执行输出拦截钩子：串行，panic 防护，任一返回 Block 则立即返回
-    pub fn hook_output_intercept(&self, msg: &OutputEvent) -> InterceptResult<OutputEvent> {
-        let mut current = msg.clone();
+    /// 执行输出拦截钩子：串行原地修改，panic 防护，任一阻止则立即短路
+    ///
+    /// 每个钩子拿到 `&mut` 事件原地修改——借用检查天然保证链式串行，
+    /// 前一个钩子的修改对后续钩子可见。返回 `Some(reason)` 表示某钩子
+    /// 阻止了该事件（携带原因），调用方据此丢弃事件；`None` 表示全部通过。
+    pub fn hook_output_intercept(&self, msg: &mut OutputEvent) -> Option<String> {
         for entry in &self.output_intercept {
-            match std::panic::catch_unwind(AssertUnwindSafe(|| (entry.handler)(&current))) {
-                Ok(InterceptResult::Pass(modified)) => current = modified,
-                Ok(InterceptResult::Block(reason)) => return InterceptResult::Block(reason),
+            // &mut 借用穿过 catch_unwind 边界需 AssertUnwindSafe：钩子 panic 后
+            // 事件仍是合法内存值，继续用当前值走下一个钩子
+            match std::panic::catch_unwind(AssertUnwindSafe(|| (entry.handler)(msg))) {
+                Ok(None) => {}
+                Ok(Some(reason)) => return Some(reason),
                 Err(payload) => {
                     tracing::warn!(
                         hook = "output_intercept",
@@ -104,15 +114,17 @@ impl HooksRegistry {
                 }
             }
         }
-        InterceptResult::Pass(current)
+        None
     }
 
-    /// 执行输出观察钩子：串行，panic 防护
+    /// 执行输出观察钩子：串行，panic 防护，超时防护
     ///
-    /// 按注册顺序逐个执行，单个钩子 panic 不阻塞后续钩子。
-    pub async fn hook_output_observe(&self, msg: OutputEvent) {
+    /// 按 priority 降序（同优先级注册序）逐个执行，单个钩子 panic 或超时
+    /// 不阻塞后续钩子。每个钩子拿到事件的 Arc 引用计数拷贝（事件本体共享只读）。
+    pub async fn hook_output_observe(&self, msg: Arc<OutputEvent>) {
         for entry in &self.output_observe {
-            let handler_fut = AssertUnwindSafe((entry.handler)(msg.clone())).catch_unwind();
+            // Arc::clone 只做引用计数拷贝（廉价），事件本体不复制
+            let handler_fut = AssertUnwindSafe((entry.handler)(Arc::clone(&msg))).catch_unwind();
             match self.run_hook_with_timeout(handler_fut).await {
                 Some(Ok(())) => {}
                 Some(Err(payload)) => tracing::warn!(
@@ -149,7 +161,7 @@ mod tests {
         })
     }
 
-    /// 观察钩子按注册顺序串行执行
+    /// 同优先级观察钩子按注册顺序串行执行
     #[tokio::test]
     async fn hook_output_observe_executes_in_registration_order() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -157,18 +169,49 @@ mod tests {
         let mut reg = HooksRegistry::new();
         for i in 0..3 {
             let log = log.clone();
-            reg.register_output_observe(std::sync::Arc::new(move |_msg| {
-                let log = log.clone();
-                Box::pin(async move {
-                    log.lock().unwrap().push(i);
-                })
-            }));
+            reg.register_output_observe(
+                0,
+                std::sync::Arc::new(move |_msg| {
+                    let log = log.clone();
+                    Box::pin(async move {
+                        log.lock().unwrap().push(i);
+                    })
+                }),
+            );
         }
+        reg.finalize();
 
-        reg.hook_output_observe(make_chunk()).await;
+        reg.hook_output_observe(Arc::new(make_chunk())).await;
 
         let log = log.lock().unwrap();
-        assert_eq!(*log, vec![0, 1, 2], "观察钩子应按注册顺序串行执行");
+        assert_eq!(*log, vec![0, 1, 2], "同优先级观察钩子应按注册顺序串行执行");
+    }
+
+    /// 观察钩子按 priority 降序执行（finalize 排定），同优先级保持注册顺序
+    #[tokio::test]
+    async fn observe_executes_in_priority_order_after_finalize() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut reg = HooksRegistry::new();
+        // 低优先级先注册、高优先级后注册：finalize 后高者仍先执行
+        for (priority, tag) in [(0, "low"), (10, "high")] {
+            let log = log.clone();
+            reg.register_output_observe(
+                priority,
+                std::sync::Arc::new(move |_msg| {
+                    let log = log.clone();
+                    Box::pin(async move {
+                        log.lock().unwrap().push(tag);
+                    })
+                }),
+            );
+        }
+        reg.finalize();
+
+        reg.hook_output_observe(Arc::new(make_chunk())).await;
+
+        let log = log.lock().unwrap();
+        assert_eq!(*log, vec!["high", "low"], "高优先级观察钩子应先执行");
     }
 
     /// 观察钩子 panic 防护：单个钩子崩溃不阻塞后续钩子
@@ -180,30 +223,40 @@ mod tests {
 
         // hook A: 正常
         let counter_a = executed.clone();
-        reg.register_output_observe(std::sync::Arc::new(move |_msg| {
-            let c = counter_a.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            })
-        }));
+        reg.register_output_observe(
+            0,
+            std::sync::Arc::new(move |_msg| {
+                let c = counter_a.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
 
         // hook B: panic
-        reg.register_output_observe(std::sync::Arc::new(|_msg| {
-            Box::pin(async {
-                panic!("观察钩子崩溃");
-            })
-        }));
+        reg.register_output_observe(
+            0,
+            std::sync::Arc::new(|_msg| {
+                Box::pin(async {
+                    panic!("观察钩子崩溃");
+                })
+            }),
+        );
 
         // hook C: 正常
         let counter_c = executed.clone();
-        reg.register_output_observe(std::sync::Arc::new(move |_msg| {
-            let c = counter_c.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            })
-        }));
+        reg.register_output_observe(
+            0,
+            std::sync::Arc::new(move |_msg| {
+                let c = counter_c.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
+        reg.finalize();
 
-        reg.hook_output_observe(make_chunk()).await;
+        reg.hook_output_observe(Arc::new(make_chunk())).await;
 
         // panic 防护：A 和 C 都执行了（B panic 不阻塞）
         assert_eq!(executed.load(Ordering::SeqCst), 2);
@@ -217,25 +270,31 @@ mod tests {
         reg.hook_timeout = Duration::from_millis(50);
 
         // 慢 hook：sleep 10s
-        reg.register_output_observe(std::sync::Arc::new(|_msg| {
-            Box::pin(async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-            })
-        }));
+        reg.register_output_observe(
+            0,
+            std::sync::Arc::new(|_msg| {
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                })
+            }),
+        );
 
         // 正常 hook
         let called = std::sync::Arc::new(AtomicUsize::new(0));
         let called_clone = called.clone();
-        reg.register_output_observe(std::sync::Arc::new(move |_msg| {
-            let c = called_clone.clone();
-            Box::pin(async move {
-                c.fetch_add(1, Ordering::SeqCst);
-            })
-        }));
+        reg.register_output_observe(
+            0,
+            std::sync::Arc::new(move |_msg| {
+                let c = called_clone.clone();
+                Box::pin(async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                })
+            }),
+        );
 
         // 应在 ~50ms 内返回（不是 10s）
         let start = std::time::Instant::now();
-        reg.hook_output_observe(make_chunk()).await;
+        reg.hook_output_observe(Arc::new(make_chunk())).await;
         let elapsed = start.elapsed();
 
         // 慢 hook 超时被跳过，正常 hook 仍执行
@@ -260,15 +319,118 @@ mod tests {
                 priority,
                 std::sync::Arc::new(move |_ev| {
                     log.lock().unwrap().push(tag);
-                    InterceptResult::Pass(_ev.clone())
+                    None
                 }),
             );
         }
         reg.finalize();
 
-        let _ = reg.hook_output_intercept(&make_chunk());
+        let mut ev = make_chunk();
+        let result = reg.hook_output_intercept(&mut ev);
 
+        assert!(result.is_none(), "未阻止时应返回 None");
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["high", "low"], "高优先级拦截钩子应先执行");
+    }
+
+    /// 拦截钩子原地修改链式生效：前一个钩子的修改对后续钩子可见
+    #[test]
+    fn intercept_mutations_chain_in_place() {
+        let mut reg = HooksRegistry::new();
+        // 高优先级钩子先写入一层内容
+        reg.register_output_intercept(
+            10,
+            std::sync::Arc::new(|ev| {
+                if let OutputEvent::Chunk(msg) = ev {
+                    msg.payload.content = Some("第一层".into());
+                }
+                None
+            }),
+        );
+        // 低优先级钩子应看到高优先级钩子已写入的内容，并在其上追加
+        reg.register_output_intercept(
+            0,
+            std::sync::Arc::new(|ev| {
+                if let OutputEvent::Chunk(msg) = ev {
+                    let prev = msg.payload.content.clone().unwrap_or_default();
+                    msg.payload.content = Some(format!("{prev}+第二层"));
+                }
+                None
+            }),
+        );
+        reg.finalize();
+
+        let mut ev = make_chunk();
+        assert!(reg.hook_output_intercept(&mut ev).is_none());
+        let content = match ev {
+            OutputEvent::Chunk(msg) => msg.payload.content,
+            _ => None,
+        };
+        assert_eq!(content.as_deref(), Some("第一层+第二层"));
+    }
+
+    /// 拦截钩子阻止语义：返回 Some(reason) 立即短路，后续钩子不再执行
+    #[test]
+    fn intercept_block_short_circuits_remaining_hooks() {
+        let executed = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let mut reg = HooksRegistry::new();
+        // 高优先级钩子阻止事件
+        reg.register_output_intercept(
+            10,
+            std::sync::Arc::new(|_ev| Some("被高优先级钩子阻止".into())),
+        );
+        // 低优先级钩子不应被执行
+        let executed_low = executed.clone();
+        reg.register_output_intercept(
+            0,
+            std::sync::Arc::new(move |_ev| {
+                executed_low.fetch_add(1, Ordering::SeqCst);
+                None
+            }),
+        );
+        reg.finalize();
+
+        let mut ev = make_chunk();
+        let result = reg.hook_output_intercept(&mut ev);
+
+        assert_eq!(result, Some("被高优先级钩子阻止".to_string()));
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            0,
+            "阻止后低优先级钩子不应执行"
+        );
+    }
+
+    /// 拦截钩子 panic 防护：单个钩子崩溃不阻塞后续钩子，事件继续传递
+    #[test]
+    fn intercept_panic_protection() {
+        let mut reg = HooksRegistry::new();
+        // 高优先级钩子 panic
+        reg.register_output_intercept(
+            10,
+            std::sync::Arc::new(|_ev| {
+                panic!("拦截钩子崩溃");
+            }),
+        );
+        // 低优先级钩子仍应收到事件并正常修改
+        reg.register_output_intercept(
+            0,
+            std::sync::Arc::new(|ev| {
+                if let OutputEvent::Chunk(msg) = ev {
+                    msg.payload.content = Some("panic 后仍被低优先级钩子修改".into());
+                }
+                None
+            }),
+        );
+        reg.finalize();
+
+        let mut ev = make_chunk();
+        assert!(reg.hook_output_intercept(&mut ev).is_none());
+        let content = match ev {
+            OutputEvent::Chunk(msg) => msg.payload.content,
+            _ => None,
+        };
+        assert_eq!(content.as_deref(), Some("panic 后仍被低优先级钩子修改"));
     }
 }

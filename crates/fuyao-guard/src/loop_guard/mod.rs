@@ -96,7 +96,10 @@ impl PluginInstance for LoopGuardInstance {
         let observe = make_output_observe(self.state.clone());
         let intercept = make_output_intercept(self.state.clone());
 
-        hooks.register_output_observe(observe);
+        // 观察钩子：优先级 0（默认档）——LoopGuard 只读累积检测，
+        // 无跨钩子顺序依赖；高优先级先执行、同优先级按注册序
+        hooks.register_output_observe(0, observe);
+        // 拦截钩子：优先级 10——先于默认档的其他拦截器完成警告注入/内容替换
         hooks.register_output_intercept(10, intercept);
     }
 }

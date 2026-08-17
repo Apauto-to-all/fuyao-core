@@ -13,7 +13,7 @@ use std::sync::Arc;
 use fuyao_api::UserMessageSource;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{ChunkMessage, ToolCallMessage, ToolResultMessage};
-use fuyao_hooks::{InterceptResult, SessionSender};
+use fuyao_hooks::SessionSender;
 use std::sync::Mutex;
 
 use super::text_guard::TextLoopGuard;
@@ -203,12 +203,13 @@ impl LoopGuardState {
 ///
 /// 工具调用优先于文本内容处理。
 pub fn make_output_observe(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::OutputObserveFn {
-    Arc::new(move |msg: OutputEvent| {
+    Arc::new(move |msg: Arc<OutputEvent>| {
         let state = state.clone();
         Box::pin(async move {
             // 同步锁：handler 体内无 await，锁不跨 await 点
             let mut guard = state.lock().unwrap_or_else(|e| e.into_inner());
-            match &msg {
+            // Arc 共享只读事件：解引用借用读字段即可，累积检测无需 owned 数据
+            match &*msg {
                 OutputEvent::User(um) => match &um.payload.source {
                     UserMessageSource::User => guard.reset_turn(),
                     UserMessageSource::Plugin(_) | UserMessageSource::System(_) => {
@@ -225,30 +226,33 @@ pub fn make_output_observe(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::Ou
 
 /// 构建输出拦截钩子
 ///
-/// 只负责修改或阻止事件：
-/// - 工具结果 + Warn/Inject 级别：注入警告或替换内容后放行
+/// 原地修改协议：钩子拿到 `&mut` 事件直接改写，无需 clone 往返；
+/// 返回 `None`=放行（保留已做的原地修改），`Some(reason)`=阻止。
+/// LoopGuard 只修改不阻止，恒返回 `None`：
+/// - 工具结果 + Warn/Inject 级别：原地注入警告或替换内容后放行
+/// - Chunk：清理 pending_severity 后放行
 /// - Interrupt/Abort 级别的中断已由 observe 钩子通过 sender 发送，intercept 不再处理
+///
+/// try_lock 失败（锁竞争）时事件原样放行，不做修改。
 pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::OutputInterceptFn {
-    Arc::new(move |msg: &OutputEvent| match msg {
-        OutputEvent::ToolResult(_) => match state.try_lock() {
-            Ok(mut guard) => {
-                let mut modified = msg.clone();
-                if let OutputEvent::ToolResult(ref mut tr) = modified {
-                    guard.intercept_tool_result(tr);
-                }
+    Arc::new(move |msg: &mut OutputEvent| match msg {
+        // 工具结果：锁可用时原地注入警告/替换内容并清理 severity
+        OutputEvent::ToolResult(tr) => {
+            if let Ok(mut guard) = state.try_lock() {
+                guard.intercept_tool_result(tr);
                 guard.pending_severity = None;
-                InterceptResult::Pass(modified)
             }
-            Err(_) => InterceptResult::Pass(msg.clone()),
-        },
-        OutputEvent::Chunk(_) => match state.try_lock() {
-            Ok(mut guard) => {
+            None
+        }
+        // 文本块：仅清理 pending_severity
+        OutputEvent::Chunk(_) => {
+            if let Ok(mut guard) = state.try_lock() {
                 guard.pending_severity = None;
-                InterceptResult::Pass(msg.clone())
             }
-            Err(_) => InterceptResult::Pass(msg.clone()),
-        },
-        _ => InterceptResult::Pass(msg.clone()),
+            None
+        }
+        // 其余事件：不修改不阻止
+        _ => None,
     })
 }
 
@@ -404,7 +408,7 @@ mod tests {
         })));
         let observe = make_output_observe(state.clone());
         let chunk = OutputEvent::Chunk(make_chunk(Some("hello"), None));
-        observe(chunk).await;
+        observe(Arc::new(chunk)).await;
         let guard = lock(&state);
         assert_eq!(guard.text_guard.accumulated_text, "hello");
     }
@@ -414,7 +418,7 @@ mod tests {
         let state = Arc::new(Mutex::new(LoopGuardState::new(LoopGuardConfig::default())));
         let observe = make_output_observe(state.clone());
         let tc = OutputEvent::ToolCall(make_tool_call("bash", r#"{"command":"ls"}"#));
-        observe(tc).await;
+        observe(Arc::new(tc)).await;
         let guard = lock(&state);
         assert_eq!(guard.tool_guard.tool_history.len(), 1);
     }
@@ -423,9 +427,11 @@ mod tests {
     fn make_intercept_passes_through_non_tool_result() {
         let state = Arc::new(Mutex::new(LoopGuardState::new(LoopGuardConfig::default())));
         let intercept = make_output_intercept(state);
-        let chunk = OutputEvent::Chunk(make_chunk(Some("hello"), None));
-        let result = intercept(&chunk);
-        assert!(matches!(result, InterceptResult::Pass(_)));
+        let mut chunk = OutputEvent::Chunk(make_chunk(Some("hello"), None));
+        let blocked = intercept(&mut chunk);
+        // None=放行；非 ToolResult 不做任何修改
+        assert!(blocked.is_none());
+        assert!(matches!(chunk, OutputEvent::Chunk(_)));
     }
 
     #[test]
@@ -437,17 +443,15 @@ mod tests {
             guard.pending_severity = Some(LoopSeverity::Warn);
         }
         let intercept = make_output_intercept(state);
-        let tr = OutputEvent::ToolResult(make_tool_result("bash", "原始结果"));
-        let result = intercept(&tr);
-        match result {
-            InterceptResult::Pass(event) => {
-                if let OutputEvent::ToolResult(tr) = event {
-                    assert!(tr.payload.content.starts_with("[循环检测警告]"));
-                } else {
-                    panic!("应为 ToolResult");
-                }
+        let mut event = OutputEvent::ToolResult(make_tool_result("bash", "原始结果"));
+        let blocked = intercept(&mut event);
+        assert!(blocked.is_none(), "Warn 级别应放行");
+        // 原地修改协议：传入事件本身已被注入警告
+        match event {
+            OutputEvent::ToolResult(tr) => {
+                assert!(tr.payload.content.starts_with("[循环检测警告]"));
             }
-            _ => panic!("应为 Pass"),
+            _ => panic!("应为 ToolResult"),
         }
     }
 
@@ -460,10 +464,10 @@ mod tests {
             guard.pending_inject = "循环中断".to_string();
         }
         let intercept = make_output_intercept(state);
-        let tr = OutputEvent::ToolResult(make_tool_result("bash", "原始结果"));
-        let result = intercept(&tr);
-        // Interrupt 不再通过 intercept 返回，intercept 只做注入/修改
-        assert!(matches!(result, InterceptResult::Pass(_)));
+        let mut event = OutputEvent::ToolResult(make_tool_result("bash", "原始结果"));
+        let blocked = intercept(&mut event);
+        // Interrupt 不通过 intercept 阻止（中断已由 observe 经 sender 发送），intercept 只做注入/修改
+        assert!(blocked.is_none());
     }
 
     #[test]
@@ -475,10 +479,10 @@ mod tests {
             guard.pending_inject = "循环终止".to_string();
         }
         let intercept = make_output_intercept(state);
-        let tr = OutputEvent::ToolResult(make_tool_result("bash", "原始结果"));
-        let result = intercept(&tr);
-        // Abort 不再通过 intercept 返回，intercept 只做注入/修改
-        assert!(matches!(result, InterceptResult::Pass(_)));
+        let mut event = OutputEvent::ToolResult(make_tool_result("bash", "原始结果"));
+        let blocked = intercept(&mut event);
+        // Abort 不通过 intercept 阻止（中断已由 observe 经 sender 发送），intercept 只做注入/修改
+        assert!(blocked.is_none());
     }
 
     #[tokio::test]
@@ -575,10 +579,10 @@ mod tests {
         // 填充 tool_history（3 次调用）
         let observe = make_output_observe(state.clone());
         for _ in 0..3 {
-            observe(OutputEvent::ToolCall(make_tool_call(
+            observe(Arc::new(OutputEvent::ToolCall(make_tool_call(
                 "bash",
                 r#"{"command":"ls"}"#,
-            )))
+            ))))
             .await;
         }
 
@@ -590,7 +594,7 @@ mod tests {
         }
 
         // 模拟插件注入消息（loop_guard 注入引导消息）
-        observe(OutputEvent::User(OutputUserMessage {
+        observe(Arc::new(OutputEvent::User(OutputUserMessage {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "[循环检测] 请调整策略".into(),
@@ -600,7 +604,7 @@ mod tests {
                     name: "loop_guard".into(),
                 }),
             },
-        }))
+        })))
         .await;
 
         // 验证：tool_history 保留，interrupt_count 保留，pending 已清理
@@ -633,18 +637,18 @@ mod tests {
 
         // 填充 3 次重复调用（刚好到 threshold）
         for _ in 0..3 {
-            observe(OutputEvent::ToolCall(make_tool_call(
+            observe(Arc::new(OutputEvent::ToolCall(make_tool_call(
                 "bash",
                 r#"{"command":"ls"}"#,
-            )))
+            ))))
             .await;
         }
 
         // 第 4 次调用触发 Warn
-        observe(OutputEvent::ToolCall(make_tool_call(
+        observe(Arc::new(OutputEvent::ToolCall(make_tool_call(
             "bash",
             r#"{"command":"ls"}"#,
-        )))
+        ))))
         .await;
         {
             let guard = lock(&state);
@@ -652,7 +656,7 @@ mod tests {
         }
 
         // 模拟插件注入消息
-        observe(OutputEvent::User(OutputUserMessage {
+        observe(Arc::new(OutputEvent::User(OutputUserMessage {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "[循环检测] 请调整策略".into(),
@@ -662,14 +666,14 @@ mod tests {
                     name: "loop_guard".into(),
                 }),
             },
-        }))
+        })))
         .await;
 
         // AI 继续重复相同工具：只需 1 次就应立即触发检测（tool_history 保留）
-        observe(OutputEvent::ToolCall(make_tool_call(
+        observe(Arc::new(OutputEvent::ToolCall(make_tool_call(
             "bash",
             r#"{"command":"ls"}"#,
-        )))
+        ))))
         .await;
         let guard = lock(&state);
         // tool_history 保留，count 仍然 >= threshold，所以立即检测
@@ -699,7 +703,7 @@ mod tests {
         }
 
         // 用户主动发消息
-        observe(OutputEvent::User(OutputUserMessage {
+        observe(Arc::new(OutputEvent::User(OutputUserMessage {
             base: EventBase::default(),
             payload: OutputUserPayload {
                 content: "新任务".into(),
@@ -707,7 +711,7 @@ mod tests {
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
             },
-        }))
+        })))
         .await;
 
         // 验证：完全重置

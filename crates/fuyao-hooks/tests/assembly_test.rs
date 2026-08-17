@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use common::{FakePlugin, FakePluginConfig, HookAction, assemble, make_channels, make_chunk};
 use fuyao_api::message::OutputEvent;
-use fuyao_hooks::{InterceptResult, Plugin, PluginHost};
+use fuyao_hooks::{Plugin, PluginHost};
 
 /// 用日志驱动的 helper：构造单插件 + 装配，返回 hooks 与日志
 fn single_plugin_assemble(cfg: FakePluginConfig) -> (fuyao_hooks::SharedHooks, common::ExecLog) {
@@ -44,6 +44,7 @@ async fn full_assembly_registers_and_invokes_observe() {
     let cfg = FakePluginConfig {
         name: "observer".into(),
         actions: vec![HookAction::Observe {
+            priority: 0,
             log_tag: "obs_fired".into(),
         }],
         create_instance_panic: false,
@@ -52,12 +53,12 @@ async fn full_assembly_registers_and_invokes_observe() {
     let (hooks, _log) = single_plugin_assemble(cfg);
 
     hooks
-        .hook_output_observe(OutputEvent::Chunk(make_chunk("hello")))
+        .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk("hello"))))
         .await;
 
     // 仅注册了 observe，intercept 为空应原样放行
-    let result = hooks.hook_output_intercept(&OutputEvent::Chunk(make_chunk("hello")));
-    assert!(matches!(result, InterceptResult::Pass(_)));
+    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("hello")));
+    assert!(result.is_none());
 }
 
 #[tokio::test]
@@ -67,10 +68,10 @@ async fn empty_registry_handles_events_without_panic() {
     let hooks = assemble(vec![], tx_user, tx_interrupt);
 
     hooks
-        .hook_output_observe(OutputEvent::Chunk(make_chunk("x")))
+        .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk("x"))))
         .await;
-    let result = hooks.hook_output_intercept(&OutputEvent::Chunk(make_chunk("x")));
-    assert!(matches!(result, InterceptResult::Pass(_)));
+    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("x")));
+    assert!(result.is_none());
 }
 
 // ============================================================================
@@ -80,13 +81,14 @@ async fn empty_registry_handles_events_without_panic() {
 #[tokio::test]
 async fn multiple_plugins_register_and_observe_in_registration_order() {
     // 两个插件按 PluginHost 注册顺序 create_instance + register，
-    // observe 钩子按注册顺序触发（observe 无优先级语义，不参与排序）
+    // 同优先级（priority=0）的 observe 钩子按注册顺序触发（finalize 稳定排序）
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let mut host = PluginHost::new();
     host.add(Box::new(FakePlugin::new(
         FakePluginConfig {
             name: "p1".into(),
             actions: vec![HookAction::Observe {
+                priority: 0,
                 log_tag: "p1_obs".into(),
             }],
             create_instance_panic: false,
@@ -98,6 +100,7 @@ async fn multiple_plugins_register_and_observe_in_registration_order() {
         FakePluginConfig {
             name: "p2".into(),
             actions: vec![HookAction::Observe {
+                priority: 0,
                 log_tag: "p2_obs".into(),
             }],
             create_instance_panic: false,
@@ -113,7 +116,7 @@ async fn multiple_plugins_register_and_observe_in_registration_order() {
     let hooks = assemble(instances, tx_user, tx_interrupt);
 
     hooks
-        .hook_output_observe(OutputEvent::Chunk(make_chunk("e")))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
         .await;
 
     let recorded = log.lock().unwrap().clone();
@@ -139,6 +142,7 @@ async fn create_instance_panic_skipped_others_proceed() {
         FakePluginConfig {
             name: "healthy".into(),
             actions: vec![HookAction::Observe {
+                priority: 0,
                 log_tag: "healthy_obs".into(),
             }],
             create_instance_panic: false,
@@ -159,6 +163,7 @@ async fn create_instance_panic_skipped_others_proceed() {
         FakePluginConfig {
             name: "trailing".into(),
             actions: vec![HookAction::Observe {
+                priority: 0,
                 log_tag: "trailing_obs".into(),
             }],
             create_instance_panic: false,
@@ -174,7 +179,7 @@ async fn create_instance_panic_skipped_others_proceed() {
     let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
     let hooks = assemble(instances, tx_user, tx_interrupt);
     hooks
-        .hook_output_observe(OutputEvent::Chunk(make_chunk("e")))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
         .await;
 
     let recorded = log.lock().unwrap().clone();
@@ -201,6 +206,7 @@ async fn register_panic_isolated_others_proceed() {
         FakePluginConfig {
             name: "ok".into(),
             actions: vec![HookAction::Observe {
+                priority: 0,
                 log_tag: "ok_obs".into(),
             }],
             create_instance_panic: false,
@@ -222,7 +228,7 @@ async fn register_panic_isolated_others_proceed() {
     let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
     let hooks = assemble(instances, tx_user, tx_interrupt);
     hooks
-        .hook_output_observe(OutputEvent::Chunk(make_chunk("e")))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
         .await;
 
     let recorded = log.lock().unwrap().clone();
@@ -290,6 +296,7 @@ async fn observe_intercept_and_sender_coexist_on_single_plugin() {
             name: "combo".into(),
             actions: vec![
                 HookAction::Observe {
+                    priority: 0,
                     log_tag: "observe_fired".into(),
                 },
                 HookAction::Intercept {
@@ -319,9 +326,9 @@ async fn observe_intercept_and_sender_coexist_on_single_plugin() {
 
     // 喂一个事件：observe + intercept 都应记录
     let event = OutputEvent::Chunk(make_chunk("payload"));
-    hooks.hook_output_observe(event).await;
-    let result = hooks.hook_output_intercept(&OutputEvent::Chunk(make_chunk("payload")));
-    assert!(matches!(result, InterceptResult::Pass(_)));
+    hooks.hook_output_observe(Arc::new(event)).await;
+    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("payload")));
+    assert!(result.is_none());
 
     let recorded = log.lock().unwrap().clone();
     assert!(recorded.contains(&"register_send_fired".to_string()));

@@ -12,11 +12,16 @@
 //! - [`instance`](crate::plugin::instance): PluginInstance trait（session 级实例）
 //! - [`sender`](crate::plugin::sender): SessionSender（封装两通道分流）
 //! - [`host`](crate::plugin::host): PluginHost + PluginInstallError + panic 辅助
+//! - [`simple`](crate::plugin::simple): simple_plugin 快捷构造 + SimplePlugin（无状态插件）
+//!
+//! 无状态插件可走 [`simple_plugin`](crate::plugin::simple::simple_plugin) 快捷路径
+//! （一个闭包即插件）；有状态插件走完整两层模型，两条路径共存。
 
 mod factory;
 mod host;
 mod instance;
 mod sender;
+mod simple;
 #[cfg(test)]
 mod tests;
 
@@ -24,3 +29,4 @@ pub use factory::Plugin;
 pub use host::{NamedPluginInstance, PluginHost, PluginInstallError, panic_payload_to_string};
 pub use instance::PluginInstance;
 pub use sender::SessionSender;
+pub use simple::{SimplePlugin, simple_plugin};

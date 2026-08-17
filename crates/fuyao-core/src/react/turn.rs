@@ -317,8 +317,7 @@ async fn handle_final_reply(
         base: EventBase::default(),
         payload: assistant_payload(result),
     });
-    let _ =
-        crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
+    crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
     // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
     // 消费时机②：① pending 全倒 guide ② guide 全取注入
@@ -362,13 +361,13 @@ async fn handle_tool_calls(
         Vec::with_capacity(result.tool_calls.len());
     for tc in &result.tool_calls {
         let event = tool_call_data_to_event(tc);
-        if let Some(intercepted) = crate::dispatch::intercept(&ctx.emitter, &ctx.hooks, event).await
-        {
-            // 拦截 Pass：发送（含观察），并从拦截后的 payload 提取工具调用数据回灌
-            crate::dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted.clone()).await;
+        if let Some(intercepted) = crate::dispatch::intercept(&ctx.hooks, event) {
+            // 拦截通过：先从拦截后的 payload 提取工具调用数据回灌，再发送（含观察）——
+            // deliver 按值消费事件，提取必须在发送前完成
             if let Some(data) = tool_call_event_to_data(&intercepted) {
                 effective_tool_calls.push(data);
             }
+            crate::dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted).await;
         }
         // Block：跳过该工具（不发送、不执行、不存储）
     }
@@ -386,8 +385,7 @@ async fn handle_tool_calls(
         base: EventBase::default(),
         payload: assistant_payload(&effective_result),
     });
-    let _ =
-        crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
+    crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
     // 拦截 Block：消息不进历史、不计费——插件的责任
 
     // 若全部工具调用被拦截（effective 为空）或 AssistantMessage 被 Block，无需执行
@@ -517,7 +515,7 @@ async fn record_tool_result(
             content: result.content,
         },
     });
-    let _ = crate::history::emit_to_history(ctx, event).await;
+    crate::history::emit_to_history(ctx, event).await;
 }
 
 /// 非阻塞清空结果通道：已完成结果逐条落库并记入已答集

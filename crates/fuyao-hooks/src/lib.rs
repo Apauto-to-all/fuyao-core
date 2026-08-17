@@ -1,16 +1,21 @@
 //! 钩子系统
 //!
-//! 拦截钩子（同步串行，可取消带原因，panic 防护）+ 观察钩子（异步串行）。
-//! 按优先级排序执行（finalize 装配期一次排定）。
+//! 拦截钩子（同步串行，原地修改事件，可阻止带原因，panic 防护）+
+//! 观察钩子（异步串行，Arc 共享只读，panic 防护 + 超时防护）。
+//! 两类钩子统一按优先级排序执行（priority 降序、同优先级按注册序，
+//! finalize 装配期一次排定）。
 //!
 //! Void/Modifying 分离模式：
-//! - 拦截钩子（Intercept）：串行执行，可修改数据或阻止操作
-//! - 观察钩子（Observe）：串行执行，只读副作用（日志、持久化、统计）
+//! - 拦截钩子（Intercept）：串行执行，原地修改数据或阻止操作
+//! - 观察钩子（Observe）：串行执行，只读副作用（日志、持久化、统计），
+//!   多钩子共享同一份只读事件（Arc）
 //!
 //! 插件两层模型：
 //! - [`Plugin`]（工厂模板）：引擎级，构造时持配置；每 session 调用 `create_instance` 生成实例
 //! - [`PluginInstance`]（session 实例）：session 级，持 per-session 独立状态，
 //!   register 时注册 hook 并接收该 session 的 [`SessionSender`]
+//! - [`simple_plugin`]：无状态插件快捷构造，一个闭包即插件（省去两层样板），
+//!   与完整两层模型共存
 //!
 //! 注册表装配后冻结：register 只发生在 session 装配期，finalize 排定后以
 //! `Arc<HooksRegistry>` 只读共享（运行期无锁，hook 持共享状态需自行内部同步）。
@@ -23,10 +28,10 @@ mod types;
 
 pub use plugin::{
     NamedPluginInstance, Plugin, PluginHost, PluginInstallError, PluginInstance, SessionSender,
-    panic_payload_to_string,
+    SimplePlugin, panic_payload_to_string, simple_plugin,
 };
 pub use registry::HooksRegistry;
-pub use types::{InterceptResult, OutputInterceptFn, OutputObserveFn};
+pub use types::{OutputInterceptFn, OutputObserveFn};
 
 /// 共享钩子注册表
 ///

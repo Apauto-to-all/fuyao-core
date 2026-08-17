@@ -14,7 +14,8 @@ use fuyao_api::message::input::UserMessageSource;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_guard::LoopGuardPlugin;
-use fuyao_hooks::{HooksRegistry, InterceptResult, Plugin, SessionSender, SharedHooks};
+use fuyao_hooks::{HooksRegistry, Plugin, SessionSender, SharedHooks};
+use std::sync::Arc;
 
 use fuyao_api::message::UserMessageMode;
 use fuyao_api::message::output::UserPayload as OutputUserPayload;
@@ -35,7 +36,7 @@ fn assembled_guard() -> SharedHooks {
     instance.register(&mut registry, &sender);
 
     registry.finalize();
-    std::sync::Arc::new(registry)
+    Arc::new(registry)
 }
 
 /// 构造用户主动消息事件（source=User，触发完全重置）
@@ -90,25 +91,23 @@ async fn tool_repeat_triggers_warn_then_inject_via_intercept() {
     // 默认 tool_repeat_threshold=4，连续 4 次相同调用后第 5 次触发检测
     for _ in 0..5 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.hook_output_observe(event).await;
+        hooks.hook_output_observe(Arc::new(event)).await;
     }
 
     // observe 应已产生 pending（Warn 或更高级别，取决于升级链）
-    // 验证 intercept 将检测信息注入 ToolResult（Warn 追加前缀保留原文，Inject 替换内容）
-    let tr = make_tool_result("read", "原始文件内容");
-    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
-    match result {
-        InterceptResult::Pass(modified) => match modified {
-            OutputEvent::ToolResult(tr) => {
-                assert!(
-                    tr.payload.content.contains("循环检测"),
-                    "检测触发后应注入循环检测信息，实际：{}",
-                    tr.payload.content
-                );
-            }
-            _ => panic!("intercept 应返回 ToolResult 事件"),
-        },
-        InterceptResult::Block(_) => panic!("不应 Block"),
+    // 验证 intercept 原地修改 ToolResult 内容注入警告（Warn 追加前缀保留原文，Inject 替换内容）
+    let mut event = OutputEvent::ToolResult(make_tool_result("read", "原始文件内容"));
+    let blocked = hooks.hook_output_intercept(&mut event);
+    assert!(blocked.is_none(), "不应阻止事件");
+    match event {
+        OutputEvent::ToolResult(tr) => {
+            assert!(
+                tr.payload.content.contains("循环检测"),
+                "检测触发后应注入循环检测信息，实际：{}",
+                tr.payload.content
+            );
+        }
+        _ => panic!("intercept 后事件应仍为 ToolResult"),
     }
 }
 
@@ -121,20 +120,20 @@ async fn tool_sequence_pattern_triggers_escalation() {
     for i in 0..7 {
         let tool = if i % 2 == 0 { "read" } else { "grep" };
         let event = OutputEvent::ToolCall(make_tool_call(tool, r#"{"pattern":"x"}"#));
-        hooks.hook_output_observe(event).await;
+        hooks.hook_output_observe(Arc::new(event)).await;
     }
 
-    // 检测触发后，intercept 应修改 ToolResult（pending 非空）
-    let tr = make_tool_result("read", "结果");
-    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
-    if let InterceptResult::Pass(OutputEvent::ToolResult(tr)) = result {
+    // 检测触发后，intercept 应原地修改 ToolResult（pending 非空）
+    let mut event = OutputEvent::ToolResult(make_tool_result("read", "结果"));
+    assert!(hooks.hook_output_intercept(&mut event).is_none());
+    if let OutputEvent::ToolResult(tr) = event {
         assert!(
             tr.payload.content.contains("循环检测"),
             "序列模式检测后应注入修改，实际：{}",
             tr.payload.content
         );
     } else {
-        panic!("应放行修改后的 ToolResult");
+        panic!("事件应仍为 ToolResult");
     }
 }
 
@@ -151,7 +150,7 @@ async fn text_repetition_triggers_detection() {
     let long_text = "重复内容重复内容重复内容".repeat(20);
     for _ in 0..15 {
         let event = OutputEvent::Chunk(make_chunk(Some(&long_text), None));
-        hooks.hook_output_observe(event).await;
+        hooks.hook_output_observe(Arc::new(event)).await;
     }
     // 文本检测触发后 pending_severity 被设置；intercept 处理 Chunk 时清理 pending
     // 这里不硬断言具体级别（受 Jaccard 阈值影响），只验证链路不 panic
@@ -162,7 +161,7 @@ async fn chunk_with_reasoning_accumulates() {
     // reasoning 内容也应被累积（不影响 content 检测）
     let hooks = assembled_guard();
     let event = OutputEvent::Chunk(make_chunk(Some("正文"), Some("思考过程")));
-    hooks.hook_output_observe(event).await;
+    hooks.hook_output_observe(Arc::new(event)).await;
     // 不 panic 即通过
 }
 
@@ -178,20 +177,24 @@ async fn user_message_fully_resets_state() {
     // 制造 pending（重复工具调用）
     for _ in 0..5 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.hook_output_observe(event).await;
+        hooks.hook_output_observe(Arc::new(event)).await;
     }
 
     // 用户主动消息 → 完全重置
-    hooks.hook_output_observe(make_user_event_from_user()).await;
+    hooks
+        .hook_output_observe(Arc::new(make_user_event_from_user()))
+        .await;
 
-    // 重置后 intercept 不再注入（pending 已清空）
-    let tr = make_tool_result("read", "结果");
-    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
-    if let InterceptResult::Pass(OutputEvent::ToolResult(tr)) = result {
+    // 重置后 intercept 不再注入（pending 已清空），原样放行
+    let mut event = OutputEvent::ToolResult(make_tool_result("read", "结果"));
+    assert!(hooks.hook_output_intercept(&mut event).is_none());
+    if let OutputEvent::ToolResult(tr) = event {
         assert_eq!(
             tr.payload.content, "结果",
             "用户消息重置后 intercept 应放行原始内容"
         );
+    } else {
+        panic!("事件应仍为 ToolResult");
     }
 }
 
@@ -203,7 +206,7 @@ async fn plugin_injected_message_only_clears_pending() {
     // 制造工具历史
     for _ in 0..3 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.hook_output_observe(event).await;
+        hooks.hook_output_observe(Arc::new(event)).await;
     }
 
     // 插件注入消息事件
@@ -218,12 +221,12 @@ async fn plugin_injected_message_only_clears_pending() {
             }),
         },
     });
-    hooks.hook_output_observe(plugin_msg).await;
+    hooks.hook_output_observe(Arc::new(plugin_msg)).await;
 
     // 再次喂入同一工具调用，应立即触发检测（历史保留 → 热状态）
     for _ in 0..3 {
         let event = OutputEvent::ToolCall(make_tool_call("read", r#"{"path":"x"}"#));
-        hooks.hook_output_observe(event).await;
+        hooks.hook_output_observe(Arc::new(event)).await;
     }
     // 不硬断言级别，只验证链路不 panic（插件注入后检测仍热）
 }
@@ -237,7 +240,7 @@ async fn intercept_passes_through_non_tool_result() {
     // 非 ToolResult 事件（如 Assistant）应直接 Pass 不修改
     let hooks = assembled_guard();
 
-    let event = OutputEvent::Assistant(fuyao_api::message::output::AssistantMessage {
+    let mut event = OutputEvent::Assistant(fuyao_api::message::output::AssistantMessage {
         base: EventBase::default(),
         payload: fuyao_api::message::output::AssistantPayload {
             content: Some("助手回复".to_string()),
@@ -251,25 +254,21 @@ async fn intercept_passes_through_non_tool_result() {
             cached_tokens: 0,
         },
     });
-    let result = hooks.hook_output_intercept(&event);
-    match result {
-        InterceptResult::Pass(e) => {
-            assert!(matches!(e, OutputEvent::Assistant(_)), "应原样放行");
-        }
-        InterceptResult::Block(_) => panic!("非 ToolResult 不应被 Block"),
-    }
+    let blocked = hooks.hook_output_intercept(&mut event);
+    assert!(blocked.is_none(), "非 ToolResult 不应被阻止");
+    assert!(matches!(event, OutputEvent::Assistant(_)), "应原样放行");
 }
 
 #[tokio::test]
 async fn intercept_tool_result_without_pending_passes_original() {
     // 无 pending 时，intercept 放行原始 ToolResult
     let hooks = assembled_guard();
-    let tr = make_tool_result("read", "干净的结果");
-    let result = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
-    if let InterceptResult::Pass(OutputEvent::ToolResult(tr)) = result {
+    let mut event = OutputEvent::ToolResult(make_tool_result("read", "干净的结果"));
+    assert!(hooks.hook_output_intercept(&mut event).is_none());
+    if let OutputEvent::ToolResult(tr) = event {
         assert_eq!(tr.payload.content, "干净的结果");
     } else {
-        panic!("应放行原始 ToolResult");
+        panic!("事件应仍为 ToolResult");
     }
 }
 
@@ -283,30 +282,35 @@ async fn full_assembly_handles_mixed_event_stream() {
     let hooks = assembled_guard();
 
     // 1. 用户消息（重置）
-    hooks.hook_output_observe(make_user_event_from_user()).await;
+    hooks
+        .hook_output_observe(Arc::new(make_user_event_from_user()))
+        .await;
 
     // 2. 几个不重复的工具调用
     hooks
-        .hook_output_observe(OutputEvent::ToolCall(make_tool_call(
+        .hook_output_observe(Arc::new(OutputEvent::ToolCall(make_tool_call(
             "read",
             r#"{"path":"a"}"#,
-        )))
+        ))))
         .await;
     hooks
-        .hook_output_observe(OutputEvent::ToolCall(make_tool_call(
+        .hook_output_observe(Arc::new(OutputEvent::ToolCall(make_tool_call(
             "write",
             r#"{"path":"b"}"#,
-        )))
+        ))))
         .await;
 
     // 3. 文本块
     hooks
-        .hook_output_observe(OutputEvent::Chunk(make_chunk(Some("正常输出"), None)))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk(
+            Some("正常输出"),
+            None,
+        ))))
         .await;
 
     // 4. 工具结果经 intercept
-    let tr = make_tool_result("read", "a 的内容");
-    let _ = hooks.hook_output_intercept(&OutputEvent::ToolResult(tr));
+    let mut tr = OutputEvent::ToolResult(make_tool_result("read", "a 的内容"));
+    let _ = hooks.hook_output_intercept(&mut tr);
 
     // 不 panic 即通过——混合正常事件流不应误触发检测
 }

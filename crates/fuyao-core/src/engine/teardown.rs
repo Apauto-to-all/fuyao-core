@@ -90,16 +90,20 @@ impl Engine {
     /// 引擎关闭是危险操作，不混入对话级的事件流（不走 send），
     /// 由独立的关闭方法触发。
     ///
-    /// 关闭流程（「显式关闭 + 等待退出 + 强制中止兜底」三层保障）：
+    /// 关闭流程（「显式关闭 + 等待退出 + 强制中止兜底」三层保障 + 工厂级清理）：
     /// 1. shutdown flag 置位（`AtomicBool::store(true)`）→ 后续 `send` 立即返回 `Err(Shutdown)`，
     ///    `recv` 先 drain 残余事件再返回 None（不丢 shutdown 前最后几条产出）
     /// 2. cancel 引擎级 shutdown_token → 所有 session task 的 select! 同时收到 cancelled 信号
     /// 3. 每个 session task 优雅退出：select! 监听 cancelled → break 主循环 →
     ///    退出前调一次 `store.update(session)` 落库（保护 in-flight 状态，失败仅 warn 不阻塞）
     /// 4. **并发**收尾所有 task（每个 handle spawn 一个 [`end_one_session`] 进 JoinSet）：
-    ///    每个 task 独立享 `SHUTDOWN_TASK_TIMEOUT` 超时预算，超时则 `abort_handle.abort()` 兜底强杀。
+    ///    每个 task 独立享 `SHUTDOWN_TASK_TIMEOUT` 超时预算，超时则 `abort_handle.abort()` 兜底强杀；
+    ///    收尾内含该 session 插件实例的逆序 dispose（生命周期闭环，见 [`end_one_session`]）。
     ///    并发退出总耗时 ≈ `max(各 task 退出时间)`（JoinSet 同时调度），不受 session 数量影响
     /// 5. 发 INFO 日志（含正常退出 / panic / 超时 abort 计数）
+    /// 6. `plugin_host.dispose_all()` 工厂级清理：逆序调用所有 Plugin 工厂 dispose
+    ///    （关闭共享连接 / 刷盘等引擎级资源）。无活跃 session 的提前返回分支同样执行——
+    ///    工厂资源不依赖 session 存在过。
     ///
     /// **并发等待的理由**：多 session 并发活跃时，各 task 的落库路径会竞争 SQLite WAL 写锁，
     /// 串行 await 会让总耗时退化成 `sum(各 task 退出时间)`；用 JoinSet 并发等待把总耗时压成
@@ -122,12 +126,14 @@ impl Engine {
 
         let total = handles.len();
         if total == 0 {
+            // 无活跃 session 也需要清理工厂资源（插件工厂持有引擎级共享依赖）
+            self.plugin_host.dispose_all();
             tracing::info!(total = 0, "引擎关闭完成（无活跃 session）");
             return;
         }
 
         // 4. 并发收尾：每个 handle spawn 一个 end_one_session
-        //    （内含 cancel+超时+abort 兜底，与 end_session 单 session 版本共用同一份收尾逻辑）
+        //    （内含 cancel+超时+abort 兜底+插件实例 dispose，与 end_session 单 session 版本共用同一份收尾逻辑）
         let mut set: JoinSet<(SessionId, SessionExitOutcome)> = JoinSet::new();
         for (id, handle) in handles {
             set.spawn(async move {
@@ -173,6 +179,10 @@ impl Engine {
             aborted = aborted_ids.len(),
             "引擎关闭完成（所有 session task 已处理）"
         );
+
+        // 5. 工厂级清理：所有 session 收尾完成后逆序 dispose 全部插件工厂
+        //    （实例级 dispose 已在各 end_one_session 内完成，这里只清引擎级工厂资源）
+        self.plugin_host.dispose_all();
     }
 }
 
@@ -188,7 +198,7 @@ enum SessionExitOutcome {
     Aborted,
 }
 
-/// 单个 session task 的收尾（cancel + 超时等待 + abort 兜底）
+/// 单个 session task 的收尾（cancel + 超时等待 + abort 兜底 + 插件实例 dispose）
 ///
 /// `Engine::end_session`（单 session 销毁）与 `Engine::shutdown`（全部 session 销毁）
 /// 共用本 helper，保证两条路径的收尾逻辑完全一致——差异只在"动哪个 token"：
@@ -203,6 +213,8 @@ enum SessionExitOutcome {
 ///    - `Ok(Ok(()))`：task 正常完成 → `Finished`
 ///    - `Ok(Err(e))`：task panic → `Panicked(format_join_error(e))`
 ///    - `Err(_)`：超时 → `abort_handle.abort()` 强杀 + 等 abort 完成 → `Aborted`
+/// 3. task 退出处理后（三个 outcome 分支统一走）：逆序 dispose 该 session 的
+///    插件实例（后注册的先销毁），单个实例 panic 不阻塞其余（catch_unwind 防护）
 ///
 /// 注：调用方必须保证进入本 helper 前 `handle.shutdown_token` 已被 cancel
 /// （否则 task 可能永远不会退出，纯靠超时 abort 兜底）。本 helper 不自己 cancel
@@ -210,8 +222,10 @@ enum SessionExitOutcome {
 async fn end_one_session(handle: SessionHandle) -> SessionExitOutcome {
     // 先拿独立 abort 句柄：超时分支需要它来强杀，而 handle.task 会被 timeout 消费
     let abort_handle = handle.task.abort_handle();
+    // 插件实例集合先取出：task 收尾后统一 dispose（与 task 的所有权分离）
+    let plugin_instances = handle.plugin_instances;
 
-    match tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, handle.task).await {
+    let outcome = match tokio::time::timeout(SHUTDOWN_TASK_TIMEOUT, handle.task).await {
         Ok(Ok(())) => SessionExitOutcome::Finished,
         Ok(Err(join_err)) => SessionExitOutcome::Panicked(format_join_error(join_err)),
         Err(_) => {
@@ -221,7 +235,25 @@ async fn end_one_session(handle: SessionHandle) -> SessionExitOutcome {
             abort_handle.abort();
             SessionExitOutcome::Aborted
         }
+    };
+
+    // dispose 在 task 退出处理完成后统一调用（正常 / panic / 超时 abort 三分支都走）：
+    // 保证插件观察到的 session 状态已落定（task 内最后的落库与状态更新已结束）。
+    // 逆序（后注册的先 dispose）与装配顺序对称，逐个调用，单个 panic 记 WARN 后继续
+    for (name, instance) in plugin_instances.into_iter().rev() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| instance.dispose()));
+        if let Err(payload) = result {
+            tracing::warn!(
+                plugin = %name,
+                phase = "dispose",
+                recovered = true,
+                cause = %fuyao_hooks::panic_payload_to_string(&*payload),
+                "插件实例 dispose panic 已恢复"
+            );
+        }
     }
+
+    outcome
 }
 
 /// 把 `JoinError` 格式化为可读字符串（用于日志）

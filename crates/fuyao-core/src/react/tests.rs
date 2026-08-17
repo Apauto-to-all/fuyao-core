@@ -2429,7 +2429,7 @@ async fn cost_accumulated_per_assistant_message() {
 
 // ===== emit_to_history 端到端拦截同步测试 =====
 
-use fuyao_hooks::{HooksRegistry, InterceptResult};
+use fuyao_hooks::HooksRegistry;
 
 /// 拦截修改最终 Assistant content 后：
 /// - DB 里的 Message 携带修改后内容
@@ -2441,20 +2441,17 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     )]));
     let tools = Arc::new(ToolRegistry::builder().build());
 
-    // 注册拦截器：给 Assistant content 加前缀 "[脱敏]"
+    // 注册拦截器：给 Assistant content 加前缀 "[脱敏]"（原地修改）
     let mut reg = HooksRegistry::default();
     reg.register_output_intercept(
         0,
-        Arc::new(|ev: &OutputEvent| {
-            if let OutputEvent::Assistant(m) = ev {
-                let mut modified = m.clone();
-                if let Some(c) = &mut modified.payload.content {
-                    *c = format!("[脱敏]{c}");
-                }
-                InterceptResult::Pass(OutputEvent::Assistant(modified))
-            } else {
-                InterceptResult::Pass(ev.clone())
+        Arc::new(|ev: &mut OutputEvent| {
+            if let OutputEvent::Assistant(m) = ev
+                && let Some(c) = &mut m.payload.content
+            {
+                *c = format!("[脱敏]{c}");
             }
+            None
         }),
     );
     reg.finalize();
@@ -2508,11 +2505,11 @@ async fn intercept_block_skips_final_assistant_in_history() {
     let mut reg = HooksRegistry::default();
     reg.register_output_intercept(
         0,
-        Arc::new(|ev: &OutputEvent| {
+        Arc::new(|ev: &mut OutputEvent| {
             if matches!(ev, OutputEvent::Assistant(_)) {
-                InterceptResult::Block("拦截 assistant".to_string())
+                Some("拦截 assistant".to_string())
             } else {
-                InterceptResult::Pass(ev.clone())
+                None
             }
         }),
     );
@@ -2559,14 +2556,11 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     let mut reg = HooksRegistry::default();
     reg.register_output_intercept(
         0,
-        Arc::new(|ev: &OutputEvent| {
+        Arc::new(|ev: &mut OutputEvent| {
             if let OutputEvent::User(m) = ev {
-                let mut modified = m.clone();
-                modified.payload.content = format!("[脱敏]{}", modified.payload.content);
-                InterceptResult::Pass(OutputEvent::User(modified))
-            } else {
-                InterceptResult::Pass(ev.clone())
+                m.payload.content = format!("[脱敏]{}", m.payload.content);
             }
+            None
         }),
     );
     reg.finalize();

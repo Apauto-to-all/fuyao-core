@@ -164,3 +164,58 @@ pub fn text_events(content: &str) -> Vec<StreamEvent> {
         },
     ]
 }
+
+// ===== 插件 dispose 生命周期测试 fixture =====
+
+use fuyao_core::{Plugin, PluginInstance, SessionSender};
+use std::sync::Arc;
+
+/// 记录 dispose 调用的测试插件（手写 fake：实现两层 trait 记名，不注册任何钩子）
+///
+/// 实例销毁写 `instance:{name}`、工厂销毁写 `factory:{name}` 进共享流水，
+/// 用于断言销毁顺序（后注册的先销毁）与时机（实例 dispose 先于工厂 dispose）。
+pub struct DisposeRecordingPlugin {
+    /// 插件名（流水条目的标识）
+    pub name: &'static str,
+    /// dispose 事件流水（实例 + 工厂共用一份，按调用顺序记录）
+    pub log: Arc<Mutex<Vec<String>>>,
+}
+
+impl Plugin for DisposeRecordingPlugin {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn create_instance(&self) -> Box<dyn PluginInstance> {
+        Box::new(DisposeRecordingInstance {
+            name: self.name,
+            log: Arc::clone(&self.log),
+        })
+    }
+
+    fn dispose(&self) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("factory:{}", self.name));
+    }
+}
+
+/// [`DisposeRecordingPlugin`] 的 session 实例：不注册钩子，只在 dispose 时记名
+pub struct DisposeRecordingInstance {
+    /// 插件名（流水条目的标识）
+    pub name: &'static str,
+    /// dispose 事件流水（与工厂共享同一份）
+    pub log: Arc<Mutex<Vec<String>>>,
+}
+
+impl PluginInstance for DisposeRecordingInstance {
+    fn register(&self, _hooks: &mut fuyao_hooks::HooksRegistry, _sender: &SessionSender) {}
+
+    fn dispose(&self) {
+        self.log
+            .lock()
+            .unwrap()
+            .push(format!("instance:{}", self.name));
+    }
+}

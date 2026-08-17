@@ -408,7 +408,8 @@ impl Engine {
         let shutdown_token = self.shutdown_token.child_token();
 
         // 装配该 session 的 hooks（per-session：create_instances + register + finalize）
-        let hooks =
+        // 实例集合随 hooks 一起产出，存进 SessionHandle 供 session 结束时逆序 dispose
+        let (hooks, plugin_instances) =
             self.assemble_session_hooks(&session_id, tx_inbound.clone(), tx_interrupt.clone());
 
         // 装配 SessionCtx（会话级共享依赖的 owned 视图）+ SessionRx（入站通道集合）。
@@ -448,6 +449,7 @@ impl Engine {
                 task,
                 shutdown_token,
                 session_params,
+                plugin_instances,
             },
             rx_event,
         )
@@ -461,14 +463,20 @@ impl Engine {
     /// 2. 每个 `instance.register(&mut registry, &sender)` 注册到该 session 私有的
     ///    registry（sender 绑该插件名，register panic 单独防护）
     /// 3. `registry.finalize()` 排定优先级，冻结后包 `Arc` 只读共享
+    /// 4. 实例集合随 hooks 一起返回——`SessionHandle` 持有，session 结束时逆序 dispose
+    ///    （生命周期闭环：注册进 registry 的闭包只持弱引用视角，实例本体的销毁义务
+    ///    由 handle 承载）
     ///
-    /// 失败容错：插件实例化失败（重名等）该 session 以**空 hooks** 运行（不硬 panic，让 session 还能用）。
+    /// 返回 `(共享 hooks, 插件实例集合)`。
+    ///
+    /// 失败容错：插件实例化失败（重名等）该 session 以**空 hooks** 运行（不硬 panic，让 session 还能用），
+    /// 此时实例集合也为空（无实例可 dispose）。
     fn assemble_session_hooks(
         &self,
         session_id: &SessionId,
         tx_inbound: mpsc::Sender<fuyao_api::message::output::UserMessage>,
         tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
-    ) -> SharedHooks {
+    ) -> (SharedHooks, Vec<NamedPluginInstance>) {
         let mut registry = HooksRegistry::new();
 
         // 1. 工厂生产实例（同步，host 内部已含 create_instance panic 防护）
@@ -480,7 +488,7 @@ impl Engine {
                     cause = %e,
                     "插件实例化失败（重名或装配错误），该 session 将以空 hooks 运行"
                 );
-                return Arc::new(registry);
+                return (Arc::new(registry), Vec::new());
             }
         };
 
@@ -506,6 +514,8 @@ impl Engine {
 
         // 3. 排定优先级后冻结，包 Arc 只读共享（运行期无锁）
         registry.finalize();
-        Arc::new(registry)
+
+        // 4. hooks 与实例集合一起交还：hooks 进 SessionCtx 运行，实例进 SessionHandle 待 dispose
+        (Arc::new(registry), instances)
     }
 }
