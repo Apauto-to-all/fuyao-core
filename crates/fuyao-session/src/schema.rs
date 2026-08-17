@@ -7,12 +7,23 @@
 //! - sessions 加 `compression_count` + `last_compacted_seq`（压缩边界元数据）
 //! - messages 加 `seq`（session 内单调递增投影序号）+ `kind`（消息类型）
 //! - messages 加 `UNIQUE(session_id, seq)` 约束
-//! - 新增 `idx_messages_session_seq` + `idx_messages_session_kind_seq` 索引
+//! - 新增 `idx_messages_session_kind_seq` 索引（session_id+seq 查询走
+//!   `UNIQUE(session_id, seq)` 约束自带的隐式索引，无需另建显式索引）
 //!
 //! v3 改动（会话列表排序与工作目录区分）：
 //! - sessions 加 `workspace`（工作目录路径，创建时定死，供列表按项目过滤）
 //! - sessions 加 `last_active_at`（最近活动时间，每次 update 刷新，供列表按最近活动倒序）
 //! - 新增 `idx_sessions_last_active`（支撑按最近活动倒序的列表查询）
+//!
+//! 索引设计：显式索引只为有真实查询的路径而建，每个索引可对应到具体 SQL——
+//! - `idx_sessions_last_active`：list_all 的 `ORDER BY last_active_at DESC`
+//! - `idx_messages_session_kind_seq`：kind 过滤类查询（消息计数 / compaction 边界定位）
+//! - `idx_todos_session`：todo 列表的 `WHERE session_id` + `ORDER BY sort_order`
+//!
+//! session_id+seq 类查询（全量加载 / 游标分页 / 可见窗口过滤 / seq 分配）全部走
+//! `UNIQUE(session_id, seq)` 约束的隐式索引；无查询使用的列（timestamp / started_at）
+//! 不建索引，也不建与约束隐式索引列完全相同的冗余显式索引——每多一个索引，
+//! 每条 INSERT 都要多维护一份索引写入。
 //!
 //! `parent_session_id` 字段历史：
 //! - 最初为「链式分裂压缩方案」引入，后随方案废弃而删除（一并删除 `idx_sessions_parent`）
@@ -76,10 +87,7 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(session_id, seq)
 );
 
-CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_session_kind_seq ON messages(session_id, kind, seq);
 
 CREATE TABLE IF NOT EXISTS todos (

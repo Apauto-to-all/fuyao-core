@@ -63,7 +63,8 @@ impl super::SessionStore {
     ///
     /// # 性能
     ///
-    /// 几次索引查询(走 `idx_messages_session_kind_seq` / `idx_messages_session_seq`)
+    /// 几次索引查询(走 `idx_messages_session_kind_seq` /
+    /// `UNIQUE(session_id, seq)` 约束自带的隐式索引)
     /// + 内存拼接,复杂度低;仅在构造 LLM 请求时调一次,不在流式热路径。
     pub async fn load_visible_messages(
         &self,

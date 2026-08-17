@@ -70,7 +70,16 @@ impl SessionStore {
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(storage.busy_timeout_secs));
+            .busy_timeout(Duration::from_secs(storage.busy_timeout_secs))
+            // 页缓存上限：负值语义为 KiB（-64000 = 每连接 64MB），页按需分配、不预占内存。
+            // 历史会话反复读取的热页（可见窗口 / 分页浏览）留在进程内存，避免每次
+            // 读写都穿透到系统页缓存之外；池内每条连接独立持有一份缓存。
+            .pragma("cache_size", "-64000")
+            // mmap 上限 1GB：把数据库文件以只读 mmap 映射进进程地址空间，读路径直接
+            // 访问映射页，省去每次读取的 read 系统调用；按需缺页加载、不预占内存，
+            // 与页缓存配合加速大库冷读。设上限而非全量映射，防超大库无界占用地址空间；
+            // 写路径仍走页缓存正常回写，不受影响。
+            .pragma("mmap_size", "1073741824");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(storage.max_connections)
@@ -98,5 +107,40 @@ impl SessionStore {
     /// 数据库文件路径
     pub fn db_path(&self) -> &PathBuf {
         &self.db_path
+    }
+
+    /// 刷新查询计划统计
+    ///
+    /// 执行 `PRAGMA optimize`：让 SQLite 按需对部分表触发内部 ANALYZE，
+    /// 更新索引列的数据分布统计，使复合索引的选择依据在长期运行后仍保持新鲜。
+    /// 该操作幂等且通常耗时很小，适合在存储收尾（如引擎关闭）前调用一次。
+    ///
+    /// # 错误
+    /// SQL 执行失败时返回 [`SessionError`]。
+    pub async fn optimize(&self) -> Result<(), SessionError> {
+        sqlx::query("PRAGMA optimize").execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 构造临时存储（隔离的临时目录）
+    async fn temp_store() -> SessionStore {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let db_path = dir.path().join("test.db");
+        std::mem::forget(dir);
+        SessionStore::new(db_path).await.expect("创建存储失败")
+    }
+
+    #[tokio::test]
+    async fn optimize_succeeds_on_fresh_store() {
+        let store = temp_store().await;
+        // 幂等操作：临时库上执行应成功（内部按需决定是否触发 ANALYZE）
+        store.optimize().await.unwrap();
+        // 重复调用同样成功（幂等性）
+        store.optimize().await.unwrap();
     }
 }

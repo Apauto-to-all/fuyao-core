@@ -1,7 +1,8 @@
 //! 消息持久化与查询
 //!
 //! messages 表的全部操作归此:
-//! - 写入:`insert_message`(消息进 DB 的唯一入口,事件级落库)
+//! - 写入:`insert_message`(事件级落库的唯一入口)/ `insert_messages_batch`
+//!   (单事务批量落库,整段历史搬运用)
 //! - 计数:`count_messages`(只数普通消息,排除压缩边界)
 //! - 查询:
 //!   - `load_full_history`(全量,审计用,seq 升序)
@@ -18,6 +19,7 @@
 //!
 //! seq 生成规则:插入时事务内 `SELECT COALESCE(MAX(seq), 0) + 1 FROM messages
 //! WHERE session_id = ?`,事务保证并发安全。普通消息与 compaction 边界消息共享同一 seq 序列。
+//! 批量路径(`insert_messages_batch`)事务内取一次起点后连续递增分配,规则相同。
 
 use super::row::MessageRow;
 use crate::error::SessionError;
@@ -65,42 +67,7 @@ impl super::SessionStore {
         .fetch_one(&mut *tx)
         .await?;
 
-        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
-        let tool_calls_json = msg
-            .tool_calls
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-
-        // 图片列表存 JSON 数组(`[{mime_type, data}]`),空列表存 NULL
-        let images_json = (!msg.images.is_empty())
-            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
-
-        sqlx::query(
-            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        )
-        .bind(session_id)
-        .bind(msg.model_id.as_deref())
-        .bind(msg.role.as_str())
-        .bind(msg.content.as_deref())
-        .bind(images_json.as_deref())
-        .bind(msg.tool_call_id.as_deref())
-        .bind(tool_calls_json.as_deref())
-        .bind(msg.tool_name.as_deref())
-        .bind(msg.timestamp)
-        .bind(msg.prompt_tokens)
-        .bind(msg.completion_tokens)
-        .bind(msg.reasoning_tokens)
-        .bind(msg.cached_tokens)
-        .bind(msg.cost)
-        .bind(msg.finish_reason.as_deref())
-        .bind(msg.reasoning.as_deref())
-        .bind(next_seq)
-        .bind(msg.kind.as_str())
-        .execute(&mut *tx)
-        .await?;
+        Self::insert_message_row(&mut tx, session_id, msg, next_seq).await?;
 
         // 普通消息(kind=Message):事务内原子累加 sessions 表统计字段。
         // compaction 边界消息由 mark_compaction 独立路径处理,不走本分支,不误增计数。
@@ -140,11 +107,155 @@ impl super::SessionStore {
         Ok(next_seq)
     }
 
+    /// 批量消息落库:单事务内连续分配 seq 逐条 INSERT,统计一次聚合写回
+    ///
+    /// 面向一次搬运整段历史的场景(如 fork 派生会话复制可见消息)。与
+    /// [`Self::insert_message`] 单条路径的语义一致:
+    /// - **seq 分配**:事务内一次 `SELECT COALESCE(MAX(seq), 0) + 1` 取起点,随后逐条
+    ///   递增(事务保证并发安全),分配结果回填到各 `msg.seq`
+    /// - **统计累加**:条件与单条路径逐条累加完全等价——仅 `kind=Message` 的普通消息
+    ///   参与,`message_count` 按普通消息条数、`tool_call_count` 按 `role=Tool` 条数、
+    ///   token 四项与 cost 按各自值求和,一次 UPDATE 聚合写回;
+    ///   `last_active_at = unixepoch()` 刷新一次即为终态(逐条路径刷新多次终态相同)
+    /// - **原子性**:整批一个事务,任一条失败全部回滚,不产生"落了一半"的中间态
+    ///
+    /// 空切片直接返回(no-op):不开事务、不写任何行、不刷新统计。
+    ///
+    /// 费用精度:`f64` 求和与单条路径的逐条累加同为浮点加法,超大批量同样存在
+    /// 漂移风险,真值源仍是 `messages.cost` 列(需要精确总额时 `SUM(cost)` 重算)。
+    pub async fn insert_messages_batch(
+        &self,
+        session_id: &str,
+        msgs: &mut [Message],
+    ) -> Result<(), SessionError> {
+        // 空切片 no-op:不开空事务、不做 MAX(seq) 查询
+        if msgs.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+
+        let base_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // 顺序 INSERT,seq 从起点连续递增分配(与单条路径逐条取 MAX+1 的结果一致)
+        for (offset, msg) in msgs.iter().enumerate() {
+            Self::insert_message_row(&mut tx, session_id, msg, base_seq + offset as i64).await?;
+        }
+
+        // 统计聚合:全部聚合值只对 kind=Message 的普通消息求和(与单条路径的
+        // UPDATE 触发条件一致——整批无普通消息时同样不触碰 sessions 行,
+        // compaction 边界消息不增计数、不计 token/费用、不刷新 last_active_at)。
+        // 求和顺序与切片顺序一致,终态与逐条累加等价。
+        let normal: Vec<&Message> = msgs
+            .iter()
+            .filter(|m| matches!(m.kind, fuyao_api::MessageKind::Message))
+            .collect();
+        if !normal.is_empty() {
+            let message_delta: i64 = normal.len() as i64;
+            let tool_delta: i64 = normal
+                .iter()
+                .filter(|m| matches!(m.role, fuyao_api::MessageRole::Tool))
+                .count() as i64;
+            let prompt_sum: i64 = normal.iter().map(|m| m.prompt_tokens).sum();
+            let completion_sum: i64 = normal.iter().map(|m| m.completion_tokens).sum();
+            let reasoning_sum: i64 = normal.iter().map(|m| m.reasoning_tokens).sum();
+            let cached_sum: i64 = normal.iter().map(|m| m.cached_tokens).sum();
+            let cost_sum: f64 = normal.iter().map(|m| m.cost).sum();
+
+            sqlx::query(
+                "UPDATE sessions SET
+                    message_count = message_count + ?2,
+                    tool_call_count = tool_call_count + ?3,
+                    total_prompt_tokens = total_prompt_tokens + ?4,
+                    total_completion_tokens = total_completion_tokens + ?5,
+                    total_reasoning_tokens = total_reasoning_tokens + ?6,
+                    total_cached_tokens = total_cached_tokens + ?7,
+                    total_cost = total_cost + ?8,
+                    last_active_at = unixepoch()
+                 WHERE id = ?1",
+            )
+            .bind(session_id)
+            .bind(message_delta)
+            .bind(tool_delta)
+            .bind(prompt_sum)
+            .bind(completion_sum)
+            .bind(reasoning_sum)
+            .bind(cached_sum)
+            .bind(cost_sum)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        // seq 回填放在 commit 成功之后(与单条路径一致:失败路径不动调用方数据)
+        for (offset, msg) in msgs.iter_mut().enumerate() {
+            msg.seq = base_seq + offset as i64;
+        }
+
+        Ok(())
+    }
+
+    /// 在事务内以指定 seq 插入一条消息行(单条与批量两条落库路径共用的 INSERT)
+    ///
+    /// seq 由调用方分配(单条路径逐条取 MAX+1,批量路径取一次起点后连续递增),
+    /// 本函数只负责写行,不触碰 sessions 统计——统计累加条件在两条路径各自维护。
+    async fn insert_message_row(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        session_id: &str,
+        msg: &Message,
+        seq: i64,
+    ) -> Result<(), SessionError> {
+        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
+        let tool_calls_json = msg
+            .tool_calls
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        // 图片列表存 JSON 数组(`[{mime_type, data}]`),空列表存 NULL
+        let images_json = (!msg.images.is_empty())
+            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
+
+        sqlx::query(
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        )
+        .bind(session_id)
+        .bind(msg.model_id.as_deref())
+        .bind(msg.role.as_str())
+        .bind(msg.content.as_deref())
+        .bind(images_json.as_deref())
+        .bind(msg.tool_call_id.as_deref())
+        .bind(tool_calls_json.as_deref())
+        .bind(msg.tool_name.as_deref())
+        .bind(msg.timestamp)
+        .bind(msg.prompt_tokens)
+        .bind(msg.completion_tokens)
+        .bind(msg.reasoning_tokens)
+        .bind(msg.cached_tokens)
+        .bind(msg.cost)
+        .bind(msg.finish_reason.as_deref())
+        .bind(msg.reasoning.as_deref())
+        .bind(seq)
+        .bind(msg.kind.as_str())
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     // ── 计数 ───────────────────────────────────────────────────
 
     /// 统计 session 的消息总数(只数普通消息,排除 compaction 边界)
     ///
-    /// 用于 session 元数据 message_count 维护。走 `idx_messages_session` 索引。
+    /// 用于 session 元数据 message_count 维护。走 `idx_messages_session_kind_seq` 索引
+    /// （session_id + kind 等值前缀）。
     /// 排除 `kind='compaction'`——压缩边界不是用户/助手的真实对话消息。
     pub async fn count_messages(&self, session_id: &str) -> Result<i64, SessionError> {
         let count: i64 = sqlx::query_scalar(
@@ -159,7 +270,8 @@ impl super::SessionStore {
     /// 统计 session 的 user 消息数(只数普通消息,排除 compaction 边界)
     ///
     /// 用于会话标题的首轮判定(user 消息数严格等于 1 ⇔ 全新会话且刚注入首条)。
-    /// 走 `idx_messages_session` 索引,COUNT 只返回单值,不加载消息体。
+    /// 走 `idx_messages_session_kind_seq` 索引(session_id + kind 等值前缀),
+    /// COUNT 只返回单值,不加载消息体。
     pub async fn count_user_messages(&self, session_id: &str) -> Result<i64, SessionError> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = 'message' AND role = 'user'",
@@ -214,7 +326,7 @@ impl super::SessionStore {
     ///
     /// # 索引
     ///
-    /// 走 `idx_messages_session_seq(session_id, seq)`,`WHERE session_id=? AND seq < ?`
+    /// 走 `UNIQUE(session_id, seq)` 约束自带的隐式索引,`WHERE session_id=? AND seq < ?`
     /// 是索引范围扫描。`(?2 IS NULL OR seq < ?2)` 让「第一页」与「翻页」共用一条 SQL。
     pub async fn list_messages_before(
         &self,
@@ -357,6 +469,162 @@ mod tests {
             2,
             "compaction 边界不影响 user 计数"
         );
+    }
+
+    // ===== insert_messages_batch 测试(单事务批量落库) =====
+
+    /// 构造一批混合消息:user(token 非零)/ assistant(四项 token + 费用)/ tool
+    fn make_mixed_batch() -> Vec<Message> {
+        vec![
+            {
+                let mut m = Message::user("问题".to_string());
+                m.prompt_tokens = 12;
+                m
+            },
+            {
+                let mut m = Message::assistant(Some("回复".to_string()));
+                m.prompt_tokens = 100;
+                m.completion_tokens = 40;
+                m.reasoning_tokens = 8;
+                m.cached_tokens = 60;
+                m.cost = 0.015;
+                m
+            },
+            Message::tool_result("call_1".to_string(), "bash".to_string(), "结果".to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn insert_messages_batch_assigns_contiguous_seq_from_existing_max() {
+        // 批量 seq 分配:从现有 MAX(seq)+1 起连续递增,并回填到每条 msg.seq
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        // 预置 2 条单条消息占住 seq 1、2
+        insert_user(&store, &session.id, "已有1").await;
+        insert_user(&store, &session.id, "已有2").await;
+
+        let mut batch = vec![
+            Message::user("批量1".to_string()),
+            Message::assistant(Some("批量2".to_string())),
+            Message::user("批量3".to_string()),
+        ];
+        store
+            .insert_messages_batch(&session.id, &mut batch)
+            .await
+            .unwrap();
+
+        // 回填值:3、4、5 连续
+        assert_eq!(batch[0].seq, 3, "批量起点应为现有 MAX(seq)+1");
+        assert_eq!(batch[1].seq, 4);
+        assert_eq!(batch[2].seq, 5);
+        for pair in batch.windows(2) {
+            assert_eq!(pair[1].seq - pair[0].seq, 1, "seq 应连续递增");
+        }
+
+        // DB 侧:全量 seq 与单条路径的分配形态无差异
+        let full = store.load_full_history(&session.id).await.unwrap();
+        let seqs: Vec<i64> = full.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn insert_messages_batch_aggregates_same_as_single_path() {
+        // 等价性:同一批数据,批量一次落库 vs 逐条 insert_message,
+        // sessions 表各统计字段的终态必须完全一致
+        let store = temp_store().await;
+        let single = fuyao_api::Session::new(None, None, None);
+        store.create(&single).await.unwrap();
+        let batched = fuyao_api::Session::new(None, None, None);
+        store.create(&batched).await.unwrap();
+
+        for mut m in make_mixed_batch() {
+            store.insert_message(&single.id, &mut m).await.unwrap();
+        }
+        let mut batch = make_mixed_batch();
+        store
+            .insert_messages_batch(&batched.id, &mut batch)
+            .await
+            .unwrap();
+
+        let s = store.get(&single.id).await.unwrap().unwrap();
+        let b = store.get(&batched.id).await.unwrap().unwrap();
+        assert_eq!(b.message_count, s.message_count);
+        assert_eq!(b.tool_call_count, s.tool_call_count);
+        assert_eq!(b.total_prompt_tokens, s.total_prompt_tokens);
+        assert_eq!(b.total_completion_tokens, s.total_completion_tokens);
+        assert_eq!(b.total_reasoning_tokens, s.total_reasoning_tokens);
+        assert_eq!(b.total_cached_tokens, s.total_cached_tokens);
+        assert!(
+            (b.total_cost - s.total_cost).abs() < 1e-9,
+            "费用聚合应与逐条累加等价"
+        );
+
+        // 绝对值锚定(防止两条路径同错):user/assistant/tool 混合计数语义——
+        // 3 条普通消息各 +1 message_count,tool 单独 +1 tool_call_count,
+        // token 与费用按各自值求和
+        assert_eq!(b.message_count, 3);
+        assert_eq!(b.tool_call_count, 1);
+        assert_eq!(b.total_prompt_tokens, 112);
+        assert_eq!(b.total_completion_tokens, 40);
+        assert_eq!(b.total_reasoning_tokens, 8);
+        assert_eq!(b.total_cached_tokens, 60);
+        assert!((b.total_cost - 0.015).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn insert_messages_batch_skips_compaction_kind_in_counters() {
+        // 混入 compaction 边界消息:行照常落库(共享 seq 序列)但不进任何计数
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        insert_user(&store, &session.id, "预置").await;
+
+        let mut batch = vec![
+            Message::user("批量普通".to_string()),
+            {
+                let mut m = Message::assistant(Some("摘要载体".to_string()));
+                m.kind = MessageKind::Compaction;
+                m
+            },
+            Message::tool_result("c9".to_string(), "grep".to_string(), "命中".to_string()),
+        ];
+        store
+            .insert_messages_batch(&session.id, &mut batch)
+            .await
+            .unwrap();
+
+        // 4 行全部落库(compaction 行也在),count_messages 只数普通消息 = 3
+        let full = store.load_full_history(&session.id).await.unwrap();
+        assert_eq!(full.len(), 4);
+        assert_eq!(store.count_messages(&session.id).await.unwrap(), 3);
+
+        // 计数只认普通消息:预置 + 批量 user/tool 各计数,compaction 不计;tool 单独 +1
+        let s = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(s.message_count, 3);
+        assert_eq!(s.tool_call_count, 1);
+    }
+
+    #[tokio::test]
+    async fn insert_messages_batch_empty_slice_is_noop() {
+        // 空切片:no-op——不报错、不落行、统计保持初始值
+        let store = temp_store().await;
+        let session = fuyao_api::Session::new(None, None, None);
+        store.create(&session).await.unwrap();
+
+        let mut empty: Vec<Message> = Vec::new();
+        store
+            .insert_messages_batch(&session.id, &mut empty)
+            .await
+            .unwrap();
+
+        assert_eq!(store.count_messages(&session.id).await.unwrap(), 0);
+        let s = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(s.message_count, 0);
+        assert_eq!(s.tool_call_count, 0);
+        assert_eq!(s.total_cost, 0.0);
     }
 
     // ===== load_full_history 测试 =====

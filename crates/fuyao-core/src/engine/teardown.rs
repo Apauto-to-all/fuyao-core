@@ -104,6 +104,10 @@ impl Engine {
     /// 6. `plugin_host.dispose_all()` 工厂级清理：逆序调用所有 Plugin 工厂 dispose
     ///    （关闭共享连接 / 刷盘等引擎级资源）。无活跃 session 的提前返回分支同样执行——
     ///    工厂资源不依赖 session 存在过。
+    /// 7. 刷新存储层查询计划统计（`store.optimize()`）：
+    ///    触发 SQLite 按需 ANALYZE 更新数据分布统计，保持复合索引选择依据长期新鲜；
+    ///    失败仅 WARN 不阻断关闭。无活跃 session 的提前返回分支同样执行——
+    ///    统计新鲜度不依赖 session 是否存在过。
     ///
     /// **并发等待的理由**：多 session 并发活跃时，各 task 的落库路径会竞争 SQLite WAL 写锁，
     /// 串行 await 会让总耗时退化成 `sum(各 task 退出时间)`；用 JoinSet 并发等待把总耗时压成
@@ -128,6 +132,8 @@ impl Engine {
         if total == 0 {
             // 无活跃 session 也需要清理工厂资源（插件工厂持有引擎级共享依赖）
             self.plugin_host.dispose_all();
+            // 收尾刷新查询计划统计（此刻 store 仍存活，是最后的维护时机）
+            self.optimize_store_stats().await;
             tracing::info!(total = 0, "引擎关闭完成（无活跃 session）");
             return;
         }
@@ -183,6 +189,24 @@ impl Engine {
         // 5. 工厂级清理：所有 session 收尾完成后逆序 dispose 全部插件工厂
         //    （实例级 dispose 已在各 end_one_session 内完成，这里只清引擎级工厂资源）
         self.plugin_host.dispose_all();
+
+        // 6. 存储层收尾：刷新查询计划统计（所有 session task 已退出、store 仍存活，
+        //    是最后的维护时机；失败仅 WARN 不阻断关闭流程）
+        self.optimize_store_stats().await;
+    }
+
+    /// 关闭收尾时刷新存储层查询计划统计
+    ///
+    /// 在所有 session task 已退出、store 仍存活的收尾时机调用：触发 SQLite
+    /// 按需 ANALYZE 更新数据分布统计，保持复合索引选择依据长期新鲜。
+    /// 失败仅记 WARN（`cause=`）不阻断关闭流程，成功记 DEBUG。
+    async fn optimize_store_stats(&self) {
+        match self.store.optimize().await {
+            Ok(()) => tracing::debug!("引擎关闭收尾：查询计划统计已刷新"),
+            Err(cause) => {
+                tracing::warn!(cause = %cause, "引擎关闭收尾：刷新查询计划统计失败（不影响关闭流程）")
+            }
+        }
     }
 }
 

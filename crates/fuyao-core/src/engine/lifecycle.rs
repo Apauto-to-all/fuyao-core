@@ -131,8 +131,8 @@ impl Engine {
     /// - **系统提示词**：取 sessions 表持久化的 `system_prompt` 原值，不从 `agent_config` 重建
     ///   （源 session 的提示词可能已被压缩重建过，重建值才是模型真正看到的）
     /// - **可见消息**：用 `load_visible_messages`（尊重 compaction 边界），**不用** `load_full_history`
-    ///   （后者含压缩前旧消息 + 副本，仅审计用）。逐条 `insert_message` 写入新 session，
-    ///   自动分配新 seq（与压缩 `apply` 的 copy-to-new-seq 模式一致）
+    ///   （后者含压缩前旧消息 + 副本，仅审计用）。`insert_messages_batch` 单事务批量写入
+    ///   新 session，自动分配新 seq（与压缩 `apply` 的 copy-to-new-seq 模式一致）
     /// - **派生归属**：`parent_session_id = None`（独立 session，非子任务）
     ///
     /// # SessionParams 处理
@@ -303,15 +303,19 @@ impl Engine {
     ///
     /// # 复制语义
     /// - **system_prompt**：取源 session 持久化原值，不从 `agent_config` 重建
-    /// - **可见消息**：用 `load_visible_messages`（尊重 compaction 边界），逐条 `insert_message`
-    ///   写入新 session，自动分配新 seq（与压缩 `apply` 的 copy-to-new-seq 模式一致）
+    /// - **可见消息**：用 `load_visible_messages`（尊重 compaction 边界），
+    ///   `insert_messages_batch` 单事务批量写入新 session，seq 连续重新分配
+    ///   （与压缩 `apply` 的 copy-to-new-seq 模式一致；消息复制整批原子，
+    ///   全部成功或全部回滚）
     /// - **message_count**：对齐复制的**普通消息**条数（排除 compaction 边界，
     ///   与 `emit_to_history` / `count_messages` 计数语义一致）
     /// - **统计字段**（token / 费用）：从 0 起算，不继承源 session
     ///
     /// # 错误
     /// - [`EngineError::SessionNotFound`]：源 session id 在数据库中不存在
-    /// - [`EngineError::Storage`]：复制消息或落库失败（此时新 session 行未落库，DB 无残留）
+    /// - [`EngineError::Storage`]：复制消息或落库失败。新 session 元数据行是独立事务
+    ///   先落库，复制阶段整批原子回滚——失败时仅剩一条无消息的孤立 session 行
+    ///   （未装配登记、不进调度表，不影响引擎调度）
     pub(super) async fn build_forked_session(
         &self,
         source_id: &SessionId,
@@ -333,8 +337,8 @@ impl Engine {
             .await?;
 
         // 3. 构造新 session：系统提示词复制源值，parent_session_id 由调用方决定
-        //    计数字段（message_count 等）从 0 起算——下方逐条 insert_message 复制消息时，
-        //    事务内会按消息 kind/role 原子累加（普通消息 +1 message_count，role=Tool +1 tool_call_count），
+        //    计数字段（message_count 等）从 0 起算——下方批量复制消息时，
+        //    事务内会按消息 kind/role 一次性聚合累加（普通消息 +1 message_count，role=Tool +1 tool_call_count），
         //    复制完成后 DB 里的计数值自然对齐复制的消息条数。
         let mut new_session =
             Session::new(source.workspace.clone(), None, source.system_prompt.clone());
@@ -344,17 +348,16 @@ impl Engine {
         //    id 随机生成，主键冲突时由 create_with_retry 重新生成重试。
         self.store.create_with_retry(&mut new_session).await?;
 
-        // 5. 逐条复制可见消息到新 session（clone 后强制 seq=0，insert_message 分配新 seq）
-        //    与压缩 apply 的 copy-to-new-seq 模式一致：不包外层事务，单条失败即返回 Err
-        //    （此时新 session 行已落库但未装配登记，为 DB 中的孤立行，不影响引擎调度）
-        //    每条 insert_message 事务内同时累加 sessions 计数——复制完全等于"重新产生这些消息"
-        for msg in &visible {
-            let mut clone = msg.clone();
-            clone.seq = 0;
-            self.store
-                .insert_message(&new_session.id, &mut clone)
-                .await?;
-        }
+        // 5. 批量复制可见消息到新 session：visible 所有权直接移交批量落库
+        //    （seq 由批量方法统一重新分配，覆盖源 session 带来的旧值，无需逐条 clone 重置）
+        //    与压缩 apply 的 copy-to-new-seq 模式一致：整批单事务原子，全部成功或全部回滚，
+        //    失败即返回 Err（此时新 session 元数据行已先落库但未装配登记，为无消息的孤立行，
+        //    不影响引擎调度）
+        //    批量落库事务内一次性聚合累加 sessions 计数——复制完全等于"重新产生这些消息"
+        let mut copies = visible;
+        self.store
+            .insert_messages_batch(&new_session.id, &mut copies)
+            .await?;
 
         Ok(new_session)
     }
