@@ -67,6 +67,10 @@ impl Discovery {
     /// `id` 为纯模型名、`provider_id` 独立字段；调用方按需拼成 `provider_id/id` 设给
     /// model_id。`provider_name`（供应商显示名）来自同链注册的 Provider 配置缓存，
     /// 仅供展示，不参与身份与路由。
+    ///
+    /// 顺序契约：按 `provider_id` 字母序分组，组内按模型 `id` 字母序——注册缓存为
+    /// HashMap（遍历序每次进程启动随机），排序保证列表跨启动稳定，消费方（UI
+    /// 下拉等）可直接沿用本序呈现。
     pub fn list_models(&self) -> Vec<ModelOption> {
         // Provider 注册缓存建 id → 显示名映射；key 两边均为注册时的小写化形态，直接命中
         let provider_names: HashMap<String, String> =
@@ -74,7 +78,7 @@ impl Discovery {
                 .into_iter()
                 .map(|(id, provider)| (id, provider.name))
                 .collect();
-        fuyao_provider::list_models(&self.agent_paths)
+        let mut options: Vec<ModelOption> = fuyao_provider::list_models(&self.agent_paths)
             .into_iter()
             .map(|(full_id, model)| {
                 // 缓存 key 形如 "provider/model"，拆成独立 provider 与纯模型 id
@@ -95,7 +99,10 @@ impl Discovery {
                     model,
                 }
             })
-            .collect()
+            .collect();
+        // 注册 key 为小写形态，普通字节序比较即字典序；先供应商后模型，两层排序
+        options.sort_by(|a, b| (&a.provider_id, &a.id).cmp(&(&b.provider_id, &b.id)));
+        options
     }
 }
 
@@ -254,6 +261,44 @@ mod tests {
             models[0].provider_name, "orphan",
             "Provider 缺失时 provider_name 应回退为供应商 id"
         );
+
+        fuyao_provider::clear_cache(&agent_paths);
+    }
+
+    /// 乱序注册多供应商多模型后列举，输出应按 (provider_id, id) 字母序稳定排列
+    ///
+    /// 注册缓存为 HashMap（遍历序随机），排序契约保证列表顺序与注册顺序无关、
+    /// 跨进程启动稳定，UI 下拉可直接沿用。
+    #[test]
+    fn list_models_sorted_by_provider_then_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_paths = AgentPaths {
+            fuyao_home: temp.path().to_path_buf(),
+            agent_id: Some("global/sorted_models".to_string()),
+            ..Default::default()
+        };
+        let cache_key = fuyao_provider::agent_paths_cache_key(&agent_paths);
+        // 故意按字母逆序注册：供应商 zhipu 在前、sensenova 在后，组内模型同理
+        fuyao_provider::register_provider("zhipu", test_provider("智谱"), &cache_key);
+        fuyao_provider::register_provider("sensenova", test_provider("商汤"), &cache_key);
+        fuyao_provider::register_model("zhipu/glm-5.2", test_model("glm-5.2"), &cache_key);
+        fuyao_provider::register_model("zhipu/glm-4.7", test_model("glm-4.7"), &cache_key);
+        fuyao_provider::register_model("sensenova/sense-6.5", test_model("sense-6.5"), &cache_key);
+        fuyao_provider::register_model("sensenova/sense-5.0", test_model("sense-5.0"), &cache_key);
+
+        let models = Discovery::new(agent_paths.clone()).list_models();
+
+        let got: Vec<(String, String)> = models
+            .iter()
+            .map(|m| (m.provider_id.clone(), m.id.clone()))
+            .collect();
+        let want = vec![
+            ("sensenova".to_string(), "sense-5.0".to_string()),
+            ("sensenova".to_string(), "sense-6.5".to_string()),
+            ("zhipu".to_string(), "glm-4.7".to_string()),
+            ("zhipu".to_string(), "glm-5.2".to_string()),
+        ];
+        assert_eq!(got, want, "应先按 provider_id 后按模型 id 字母序排列");
 
         fuyao_provider::clear_cache(&agent_paths);
     }
