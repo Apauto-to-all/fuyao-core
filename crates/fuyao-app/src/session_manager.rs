@@ -134,7 +134,7 @@ impl SessionManager {
 
     // ── 会话回退 ───────────────────────────────────────────────
 
-    /// 把会话回退到目标消息（删目标 seq 之后的所有消息 + 重算 count 类与压缩元数据）
+    /// 把会话回退到目标消息之前（删目标消息及其后的所有消息 + 重算 count 类与压缩元数据）
     ///
     /// 复用存储层单事务原子执行体 [`SessionStore::rollback_to`](fuyao_session::SessionStore::rollback_to)
     /// （删消息 + 重算 + 局部 UPDATE），执行成功返回 `Ok(())`，无返回载荷——回退后的
@@ -637,8 +637,8 @@ mod tests {
     // ===== rollback_session：直调存储层回退执行体 =====
 
     #[tokio::test]
-    async fn rollback_session_deletes_after_target_and_recounts() {
-        // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 a2；状态经读路径对齐
+    async fn rollback_session_deletes_target_and_after_recounts() {
+        // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 u2, a2；状态经读路径对齐
         let manager = temp_manager().await;
         let sid = seed_session(&manager, None).await;
         seed_user_message(&manager, &sid, "u1").await;
@@ -649,23 +649,23 @@ mod tests {
         // 回退目标取 u2 的 seq（插入顺序 1/2/3/4，u2 = seq3）
         manager.rollback_session(&sid, 3).await.unwrap();
 
-        // DB：只剩 u1, a1, u2，目标 u2 保留为最新一条（seq 倒序，最新在前）
+        // DB：目标 u2 与其后的 a2 一并删除，只剩 u1, a1（seq 倒序，最新在前）
         let msgs = manager
             .list_messages(&sid, None, Some(10))
             .await
             .unwrap()
             .items;
-        assert_eq!(msgs.len(), 3, "只删目标之后的消息");
-        assert_eq!(msgs[0].seq, 3, "最新一条是目标 u2");
+        assert_eq!(msgs.len(), 2, "目标及其后的消息一并删除");
+        assert_eq!(msgs[0].seq, 2, "最新一条是 a1");
 
         // session 行 count 已被事务重算
         let loaded = manager.store.get(&sid).await.unwrap().unwrap();
-        assert_eq!(loaded.message_count, 3);
+        assert_eq!(loaded.message_count, 2);
     }
 
     #[tokio::test]
-    async fn rollback_session_compaction_target_keeps_boundary_metadata() {
-        // compaction 目标：压缩边界保留，元数据仍指向它
+    async fn rollback_session_compaction_target_discards_the_compaction() {
+        // compaction 目标：压缩消息本体及之后一并删除，元数据随之清空
         let manager = temp_manager().await;
         let sid = seed_session(&manager, None).await;
         seed_user_message(&manager, &sid, "u1").await;
@@ -678,19 +678,19 @@ mod tests {
 
         manager.rollback_session(&sid, comp_seq).await.unwrap();
 
-        // 删了压缩边界之后的 u2，边界本身保留为最新一条
+        // 压缩消息与 u2 都被删，只剩 u1
         let msgs = manager
             .list_messages(&sid, None, Some(10))
             .await
             .unwrap()
             .items;
-        assert_eq!(msgs.len(), 2, "删掉压缩边界之后的 u2");
-        assert_eq!(msgs[0].seq, comp_seq, "最新一条是压缩边界");
+        assert_eq!(msgs.len(), 1, "压缩消息本体与其后的 u2 一并删除");
+        assert_eq!(msgs[0].seq, 1, "只剩最早的 u1");
 
-        // 压缩元数据仍指向保留的边界
+        // 压缩元数据已清空
         let loaded = manager.store.get(&sid).await.unwrap().unwrap();
-        assert_eq!(loaded.last_compacted_seq, Some(comp_seq));
-        assert_eq!(loaded.compression_count, 1);
+        assert_eq!(loaded.last_compacted_seq, None);
+        assert_eq!(loaded.compression_count, 0);
     }
 
     #[tokio::test]

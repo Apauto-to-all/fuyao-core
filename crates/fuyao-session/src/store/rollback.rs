@@ -1,18 +1,18 @@
 //! 对话回退
 //!
-//! [`SessionStore::rollback_to`] 把会话回退到某个目标消息：删除目标 seq 之后的所有消息，
-//! 重算被影响的 count 类字段与压缩元数据，保护消费类字段（token / cost）不动。
+//! [`SessionStore::rollback_to`] 把会话回退到某个目标消息**之前**：删除目标消息及其后
+//! 的所有消息，重算被影响的 count 类字段与压缩元数据，保护消费类字段（token / cost）不动。
 //!
 //! # 回退语义
 //!
-//! 统一规则「删目标 seq 之后的所有消息，目标保留」，不分 user / compaction 分支——
+//! 统一规则「删目标消息及其后的所有消息」，不分 user / compaction 分支——
 //! 压缩消息只是「目标恰好是 compaction」或「被删范围含 compaction」的特例，统一规则天然覆盖。
 //!
 //! ## 回退点约束
 //!
 //! 只有 user 消息或 compaction 消息能作为回退目标：
-//! - user 消息：自然语义「回到这条用户消息，从它重新开始」
-//! - compaction 消息：自然语义「回到这次压缩完成的状态」
+//! - user 消息：自然语义「删掉这条用户消息及之后，回到发送它之前的时刻」
+//! - compaction 消息：自然语义「废弃这次压缩及之后的所有消息」
 //!
 //! assistant / tool 消息是中间态，回退到它们语义不完整（assistant 的 tool_call 可能无
 //! 配对结果、tool 结果孤立存在会破坏配对），应拒绝。
@@ -26,7 +26,7 @@
 //! | 消费类（token / cost） | **不动**（账本记的是真实发生过的消费，回退不抹账） |
 //!
 //! 压缩元数据重算即重新统计剩余消息里的 compaction 情况：被删的 compaction 消息自然不计入，
-//! `last_compacted_seq` 自动落到被删 compaction 消息的上一条（若无则置空）——这就是
+//! `last_compacted_seq` 自动落到剩余消息里最新一条 compaction（若无则置空）——这就是
 //! 「动了压缩消息，统一回退到上一个压缩边界」的实现，无需特殊代码分支。
 //!
 //! # 单事务原子
@@ -39,11 +39,11 @@ use crate::error::SessionError;
 use fuyao_api::MessageKind;
 
 impl super::SessionStore {
-    /// 把会话回退到目标消息（删目标 seq 之后的所有消息 + 重算 count 类与压缩元数据）
+    /// 把会话回退到目标消息之前（删目标消息及其后的所有消息 + 重算 count 类与压缩元数据）
     ///
     /// 单事务原子操作，四步：
     /// 1. 校验目标消息存在 + role/kind 合法（只能是 user 或 compaction）
-    /// 2. 删除目标 seq 之后的所有消息——`RETURNING` 带回被删行的 (role, kind)，
+    /// 2. 删除目标消息及其后的所有消息——`RETURNING` 带回被删行的 (role, kind)，
     ///    Rust 侧聚合成删除计数写进日志
     /// 3. 重算 count 类字段（message_count / tool_call_count）与压缩元数据
     ///    （last_compacted_seq / compression_count）——四个标量聚合进单条查询
@@ -51,7 +51,7 @@ impl super::SessionStore {
     ///
     /// # 参数
     /// - `session_id`:被回退的会话
-    /// - `target_seq`:回退目标消息的 seq（目标本身保留，删它之后的）
+    /// - `target_seq`:回退目标消息的 seq（目标及其后的消息一并删除）
     ///
     /// # 返回
     /// `Ok(())`——无返回载荷。回退后的会话状态经读路径获取：
@@ -91,12 +91,12 @@ impl super::SessionStore {
             )));
         }
 
-        // 3. 删除目标 seq 之后的所有消息，RETURNING 带回被删行的 (role, kind)——
+        // 3. 删除目标消息及其后的所有消息，RETURNING 带回被删行的 (role, kind)——
         //    删除与删除计数一次往返完成。计数仅用于日志（INFO 重建故事）：
         //    deleted_count = user 消息数 + compaction 消息数（不含 assistant/tool）
         //    deleted_total = 全部被删消息数（含 assistant/tool）
         let deleted_rows: Vec<(String, String)> = sqlx::query_as(
-            "DELETE FROM messages WHERE session_id = ?1 AND seq > ?2 RETURNING role, kind",
+            "DELETE FROM messages WHERE session_id = ?1 AND seq >= ?2 RETURNING role, kind",
         )
         .bind(session_id)
         .bind(target_seq)
@@ -157,7 +157,7 @@ impl super::SessionStore {
             deleted_total = deleted_total,
             message_count = message_count,
             last_compacted_seq = ?last_compacted_seq,
-            "对话已回退到目标消息"
+            "对话已回退到目标消息之前"
         );
 
         Ok(())
@@ -169,7 +169,7 @@ mod tests {
     use super::super::SessionStore;
     use crate::error::SessionError;
     use crate::store::compaction::CompressionReason;
-    use fuyao_api::{Message, MessageKind};
+    use fuyao_api::Message;
 
     /// 构造临时存储（隔离的临时目录）
     async fn temp_store() -> SessionStore {
@@ -209,8 +209,8 @@ mod tests {
     // ===== 回退到 user 消息 =====
 
     #[tokio::test]
-    async fn rollback_to_user_deletes_subsequent_and_recounts() {
-        // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 a2 → message_count 从 4 变 3
+    async fn rollback_to_user_deletes_target_and_after_recounts() {
+        // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 u2, a2 → message_count 从 4 变 2
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -227,21 +227,21 @@ mod tests {
 
         store.rollback_to(&session.id, u2).await.unwrap();
 
-        // DB 状态：只剩 3 条消息，最后一条是目标 u2
+        // DB 状态：目标 u2 与其后的 a2 一并删除，只剩 u1, a1
         let full = store.load_full_history(&session.id).await.unwrap();
-        assert_eq!(full.len(), 3);
-        assert_eq!(full[2].content.as_deref(), Some("u2"), "最后一条是 u2");
+        assert_eq!(full.len(), 2);
+        assert_eq!(full[1].content.as_deref(), Some("a1"), "最后一条是 a1");
 
-        // session 元数据已重算并写回：3 条 message kind，无 tool 结果
+        // session 元数据已重算并写回：2 条 message kind，无 tool 结果
         let loaded = store.get(&session.id).await.unwrap().unwrap();
-        assert_eq!(loaded.message_count, 3);
+        assert_eq!(loaded.message_count, 2);
         assert_eq!(loaded.tool_call_count, 0);
     }
 
     #[tokio::test]
     async fn rollback_to_user_with_tool_calls_recounts_tool_count() {
         // 场景：u1, a1(带 tool_call), t1(结果), u2, a2(带 tool_call), t2(结果)
-        //       → 回退到 u2 → 删 a2, t2 → tool_call_count 从 2 变 1
+        //       → 回退到 u2 → 删 u2, a2, t2 → tool_call_count 从 2 变 1
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -267,20 +267,20 @@ mod tests {
 
         store.rollback_to(&session.id, u2).await.unwrap();
 
-        // 删了 a2, t2 → tool_call_count 从 2 变 1，剩余 4 条消息
+        // 删了 u2, a2, t2 → tool_call_count 从 2 变 1，剩余 3 条消息
         let loaded = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(loaded.tool_call_count, 1, "删了一条 tool 结果，剩余 1");
-        assert_eq!(loaded.message_count, 4, "剩余 u1, a1, t1, u2");
+        assert_eq!(loaded.message_count, 3, "剩余 u1, a1, t1");
         let full = store.load_full_history(&session.id).await.unwrap();
-        assert_eq!(full.len(), 4, "删了 a2 + t2 共 2 条");
+        assert_eq!(full.len(), 3, "删了 u2 + a2 + t2 共 3 条");
     }
 
     // ===== 回退到 compaction 消息 =====
 
     #[tokio::test]
-    async fn rollback_to_compaction_keeps_target_and_metadata() {
+    async fn rollback_to_compaction_discards_it_and_clears_metadata() {
         // 场景：u1, a1, [compaction@seq3], u2, a2 → 回退到 compaction@seq3
-        //       → 删 u2, a2 → compaction 保留，last_compacted_seq 仍指向它
+        //       → 删 compaction, u2, a2 → 压缩元数据清空
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -296,18 +296,21 @@ mod tests {
 
         store.rollback_to(&session.id, comp_seq).await.unwrap();
 
-        // compaction 保留，last_compacted_seq 仍指向它，compression_count 仍 1
+        // compaction 本体被删，压缩元数据随之清空
         let loaded = store.get(&session.id).await.unwrap().unwrap();
-        assert_eq!(loaded.last_compacted_seq, Some(comp_seq));
-        assert_eq!(loaded.compression_count, 1);
+        assert_eq!(loaded.last_compacted_seq, None);
+        assert_eq!(loaded.compression_count, 0);
 
-        // message_count 重算：剩余 u1, a1, compaction → 2 条 message kind（排除 compaction）
+        // message_count 重算：剩余 u1, a1 → 2 条 message kind
         assert_eq!(loaded.message_count, 2);
 
-        // compaction 消息仍在
+        // 剩余消息里已无 compaction
         let full = store.load_full_history(&session.id).await.unwrap();
-        assert_eq!(full.len(), 3);
-        assert_eq!(full[2].kind, MessageKind::Compaction);
+        assert_eq!(full.len(), 2);
+        assert!(
+            !full.iter().any(|m| m.seq == comp_seq),
+            "compaction 本体应被删除"
+        );
     }
 
     // ===== 回退跨压缩边界 =====
@@ -315,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_across_compaction_boundary_falls_back_metadata() {
         // 场景：u1, [c1@2], u2, [c2@4], u3, a3
-        //       → 回退到 u2@seq3 → 删 c2, u3, a3 → last_compacted_seq 落到 c1
+        //       → 回退到 u2@seq3 → 删 u2, c2, u3, a3 → last_compacted_seq 落到 c1
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -340,16 +343,16 @@ mod tests {
         assert_eq!(loaded.last_compacted_seq, Some(c1));
         assert_eq!(loaded.compression_count, 1);
 
-        // 剩余：u1, c1, u2 → c2 已删
+        // 剩余：u1, c1 → c2 已删
         let full = store.load_full_history(&session.id).await.unwrap();
-        assert_eq!(full.len(), 3);
-        assert!(full.iter().all(|m| m.seq <= u2));
+        assert_eq!(full.len(), 2);
+        assert!(full.iter().all(|m| m.seq <= c1));
         assert!(!full.iter().any(|m| m.seq == c2), "c2 应在删除范围内被清理");
     }
 
     #[tokio::test]
     async fn rollback_across_all_compactions_clears_metadata() {
-        // 场景：u1, [c1@2], [c2@3], u2 → 回退到 u1 → 删 c1, c2, u2 → 全清
+        // 场景：u1, [c1@2], [c2@3], u2 → 回退到 u1 → 全删（含 u1 本体）→ 全清
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -367,15 +370,14 @@ mod tests {
 
         store.rollback_to(&session.id, u1).await.unwrap();
 
-        // 所有 compaction 都被删 → last_compacted_seq 置 None，compression_count 归 0
+        // 回退到首条：连 u1 一起删，会话消息清空，所有元数据归零
         let loaded = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(loaded.last_compacted_seq, None);
         assert_eq!(loaded.compression_count, 0);
+        assert_eq!(loaded.message_count, 0);
 
-        // 剩余：只有 u1
         let full = store.load_full_history(&session.id).await.unwrap();
-        assert_eq!(full.len(), 1);
-        assert_eq!(full[0].content.as_deref(), Some("u1"));
+        assert!(full.is_empty(), "回退到首条应删到空");
     }
 
     // ===== 目标合法性校验 =====
@@ -468,16 +470,16 @@ mod tests {
         assert_eq!(loaded.total_cached_tokens, 200);
         assert_eq!(loaded.total_cost, 0.05, "total_cost 不动");
 
-        // count 类字段已重算（u1 保留，a1 删除）
-        assert_eq!(loaded.message_count, 1);
+        // count 类字段已重算（u1 与 a1 一并删除，消息清空）
+        assert_eq!(loaded.message_count, 0);
         assert_eq!(loaded.tool_call_count, 0);
     }
 
-    // ===== 边界：回退到最后一条消息（无可删内容） =====
+    // ===== 边界：回退到会话唯一一条消息（删到空） =====
 
     #[tokio::test]
-    async fn rollback_to_last_message_deletes_nothing() {
-        // 目标就是最新消息 → seq 之后无消息 → 无删除，元数据不变
+    async fn rollback_to_only_message_empties_session() {
+        // 目标就是最新且唯一消息 → 连它一起删 → 会话消息清空，元数据归零
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -486,9 +488,8 @@ mod tests {
         store.rollback_to(&session.id, u1).await.unwrap();
 
         let loaded = store.get(&session.id).await.unwrap().unwrap();
-        assert_eq!(loaded.message_count, 1);
+        assert_eq!(loaded.message_count, 0);
         let full = store.load_full_history(&session.id).await.unwrap();
-        assert_eq!(full.len(), 1);
-        assert_eq!(full[0].content.as_deref(), Some("u1"));
+        assert!(full.is_empty(), "唯一消息也应被删除");
     }
 }
