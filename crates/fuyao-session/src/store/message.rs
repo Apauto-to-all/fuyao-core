@@ -3,12 +3,12 @@
 //! messages 表的全部操作归此:
 //! - 写入:`insert_message`(事件级落库的唯一入口)/ `insert_messages_batch`
 //!   (单事务批量落库,整段历史搬运用)
-//! - 计数:`count_messages`(只数普通消息,排除压缩边界)
+//! - 计数:`count_user_messages`(只数 user 角色普通消息,标题首轮判定用)
 //! - 查询:
 //!   - `load_full_history`(全量,审计用,seq 升序)
 //!   - `list_messages_before`(游标分页,给人看的历史浏览,seq 倒序)
 //!
-//! 给 LLM 构造 `ChatRequest` 的「可见窗口」查询(压缩感知动态拼接)在 [`super::visible_window`]
+//! 给 LLM 构造 `ChatRequest` 的「可见窗口」查询(压缩感知)在 [`super::visible_window`]
 //! 模块,与本模块的「给人看的」查询路径正交。
 //!
 //! # 设计要点
@@ -301,21 +301,6 @@ impl super::SessionStore {
 
     // ── 计数 ───────────────────────────────────────────────────
 
-    /// 统计 session 的消息总数(只数普通消息,排除 compaction 边界)
-    ///
-    /// 用于 session 元数据 message_count 维护。走 `idx_messages_session_kind_seq` 索引
-    /// （session_id + kind 等值前缀）。
-    /// 排除 `kind='compaction'`——压缩边界不是用户/助手的真实对话消息。
-    pub async fn count_messages(&self, session_id: &str) -> Result<i64, SessionError> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?1 AND kind = 'message'",
-        )
-        .bind(session_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(count)
-    }
-
     /// 统计 session 的 user 消息数(只数普通消息,排除 compaction 边界)
     ///
     /// 用于会话标题的首轮判定(user 消息数严格等于 1 ⇔ 全新会话且刚注入首条)。
@@ -421,7 +406,7 @@ mod tests {
         store.insert_message(sid, &mut msg).await.unwrap();
     }
 
-    // ===== insert_message / count_messages 测试 =====
+    // ===== insert_message 测试 =====
 
     #[tokio::test]
     async fn insert_message_assigns_sequential_seq() {
@@ -463,28 +448,6 @@ mod tests {
         // DB 列为 flat 数组形态：id / name / arguments 三字段平铺，无嵌套 function 层
         let flat = serde_json::to_string(calls).unwrap();
         assert_eq!(flat, r#"[{"id":"call_1","name":"bash","arguments":"{}"}]"#);
-    }
-
-    #[tokio::test]
-    async fn count_messages_excludes_compaction_boundary() {
-        let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
-
-        insert_user(&store, &session.id, "a").await;
-        insert_user(&store, &session.id, "b").await;
-        assert_eq!(store.count_messages(&session.id).await.unwrap(), 2);
-
-        // 压缩边界消息(kind='compaction')不计入
-        store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
-            .await
-            .unwrap();
-        assert_eq!(
-            store.count_messages(&session.id).await.unwrap(),
-            2,
-            "count_messages 应排除 compaction 边界"
-        );
     }
 
     #[tokio::test]
@@ -645,10 +608,9 @@ mod tests {
             .await
             .unwrap();
 
-        // 4 行全部落库(compaction 行也在),count_messages 只数普通消息 = 3
+        // 4 行全部落库(compaction 行也在),message_count 只数普通消息 = 3
         let full = store.load_full_history(&session.id).await.unwrap();
         assert_eq!(full.len(), 4);
-        assert_eq!(store.count_messages(&session.id).await.unwrap(), 3);
 
         // 计数只认普通消息:预置 + 批量 user/tool 各计数,compaction 不计;tool 单独 +1
         let s = store.get(&session.id).await.unwrap().unwrap();
@@ -669,7 +631,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.count_messages(&session.id).await.unwrap(), 0);
         let s = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(s.message_count, 0);
         assert_eq!(s.tool_call_count, 0);

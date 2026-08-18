@@ -2,7 +2,7 @@
 //!
 //! 本文件聚焦**跨方法的持久化往返契约**——单测的空白带：
 //!
-//! - 消息插入 → count_messages / load_visible_messages 的统计与可见消息一致性
+//! - 消息插入 → load_visible_messages 的可见消息一致性
 //! - session 元数据(message_count / tool_call_count / 各 token 总计 / cost)的持久化往返:
 //!   这些字段由 insert_message 事务内原子累加(assistant 消息贡献 token/cost,
 //!   tool 消息贡献 tool_call_count),经 store.get 读回验证无漂移
@@ -24,7 +24,7 @@ use fuyao_api::{ImageContent, Message, MessageKind, MessageRole, Session};
 
 #[tokio::test]
 async fn visible_messages_match_inserted_count() {
-    // 插入 N 条消息后，count_messages 与 load_visible_messages 长度应一致（未经压缩）
+    // 插入 N 条消息后，load_visible_messages 长度应等于插入数（未经压缩）
     let store = temp_store().await;
     let session = Session::new(None, None, None);
     store.create(&session).await.unwrap();
@@ -34,9 +34,7 @@ async fn visible_messages_match_inserted_count() {
         store.insert_message(&session.id, &mut msg).await.unwrap();
     }
 
-    let counted = store.count_messages(&session.id).await.unwrap();
     let visible = store.load_visible_messages(&session.id).await.unwrap();
-    assert_eq!(counted, 5, "count_messages 应等于插入数");
     assert_eq!(visible.len(), 5, "可见消息数应等于插入数");
 }
 
@@ -322,7 +320,7 @@ async fn count_and_list_all_reflect_multiple_sessions() {
         store.create(&session).await.unwrap();
     }
 
-    assert_eq!(store.count().await.unwrap(), 3);
+    assert_eq!(store.count_with_filter(None).await.unwrap(), 3);
     let listed = store.list_all(None, 100, 0).await.unwrap();
     assert_eq!(listed.len(), 3);
 }

@@ -187,18 +187,10 @@ impl super::SessionStore {
         Ok(rows.into_iter().map(Session::from).collect())
     }
 
-    /// 获取会话总数
-    pub async fn count(&self) -> Result<i64, SessionError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(count)
-    }
-
     /// 获取会话总数(可选按工作目录过滤)
     ///
     /// 与 [`list_all`](Self::list_all) 的 `workspace_filter` 配对,供上层计算分页总页数。
-    /// `workspace_filter` 为 `None` 时等价于 [`count`](Self::count)。
+    /// `workspace_filter` 为 `None` 时统计全部会话。
     pub async fn count_with_filter(
         &self,
         workspace_filter: Option<&str>,
@@ -416,7 +408,7 @@ mod tests {
             "删会话后任务列表应清空，无孤儿"
         );
         // messages 表该 session 的行也清空（count 全量查）
-        assert_eq!(store.count().await.unwrap(), 0);
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 0);
     }
 
     #[tokio::test]
@@ -440,9 +432,9 @@ mod tests {
     #[tokio::test]
     async fn store_count_returns_correct_count() {
         let store = temp_store().await;
-        assert_eq!(store.count().await.unwrap(), 0);
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 0);
         store.create(&Session::new(None, None, None)).await.unwrap();
-        assert_eq!(store.count().await.unwrap(), 1);
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 1);
     }
 
     // ===== create_with_retry：主键冲突重试 =====
@@ -477,7 +469,7 @@ mod tests {
         let loaded = store.get(&conflict.id).await.unwrap().unwrap();
         assert_eq!(loaded.title.as_deref(), Some("冲突方"));
         // DB 现有两条
-        assert_eq!(store.count().await.unwrap(), 2);
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 2);
     }
 
     #[tokio::test]
@@ -598,7 +590,7 @@ mod tests {
         assert_eq!(store.count_with_filter(Some("/proj-a")).await.unwrap(), 2);
         assert_eq!(store.count_with_filter(Some("/proj-b")).await.unwrap(), 1);
         assert_eq!(store.count_with_filter(None).await.unwrap(), 3);
-        assert_eq!(store.count().await.unwrap(), 3);
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 3);
     }
 
     #[tokio::test]

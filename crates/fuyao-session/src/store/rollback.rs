@@ -183,7 +183,7 @@ impl super::SessionStore {
             .count() as i64;
 
         // 4. 重算 count 类字段与压缩元数据（基于删除后的剩余消息），四个标量聚合成单条查询
-        //    message_count：只数普通消息（kind='message'），与 count_messages 口径一致
+        //    message_count：只数普通消息（kind='message'）
         //    tool_call_count：数 tool 结果消息数（一次调用对应一条 tool 结果）
         //    last_compacted_seq：剩余消息里最新一条 compaction 的 seq，无则置空（MAX 空集为 NULL）
         //    compression_count：剩余消息里 compaction 的条数

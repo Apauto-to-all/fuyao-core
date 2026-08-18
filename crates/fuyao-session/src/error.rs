@@ -13,10 +13,6 @@ pub enum SessionError {
     #[error("sqlx 错误: {0}")]
     SqlxError(#[from] sqlx::Error),
 
-    /// 无效状态（如 SessionStore 未初始化）
-    #[error("无效状态: {0}")]
-    InvalidState(String),
-
     /// 会话未找到
     #[error("会话未找到: {0}")]
     NotFound(String),
@@ -49,9 +45,6 @@ mod tests {
         // 非 Database 类 sqlx 错误（如连接断）不算主键冲突，不应触发重试
         let io_err = SessionError::IoError(std::io::Error::other("磁盘故障"));
         assert!(!io_err.is_primary_key_conflict());
-
-        let invalid_state = SessionError::InvalidState("未初始化".into());
-        assert!(!invalid_state.is_primary_key_conflict());
 
         let not_found = SessionError::NotFound("xxx".into());
         assert!(!not_found.is_primary_key_conflict());

@@ -274,10 +274,5 @@ mod tests {
         // 子 session 的压缩元数据指针为空:复制消息行不触碰 sessions 压缩元数据,
         // 只有对子 session 执行 mark_compaction 才会写入
         assert!(child_meta.last_compacted_seq.is_none());
-
-        assert_eq!(
-            store.count_messages(&child.id).await.unwrap(),
-            non_compaction_count as i64
-        );
     }
 }

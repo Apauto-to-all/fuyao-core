@@ -143,8 +143,8 @@ impl Engine {
     ///
     /// # 统计字段初值
     /// 新 session 的费用 / token 统计从 0 起算（派生会话自身的开销独立计量，不继承源 session 的花费）；
-    /// `message_count` 设为复制的**普通消息**条数（排除 compaction 边界，与 `emit_to_history` /
-    /// `count_messages` 的计数语义一致——`mark_compaction` 不 bump 该计数）。
+    /// `message_count` 设为复制的**普通消息**条数（排除 compaction 边界，与 `emit_to_history`
+    /// 的计数语义一致——`mark_compaction` 不 bump 该计数）。
     ///
     /// # 返回
     /// `(new_session_id, rx)`——rx 是新 session 的 per-session 出站通道。
@@ -308,7 +308,7 @@ impl Engine {
     ///   （与压缩 `apply` 的 copy-to-new-seq 模式一致；消息复制整批原子，
     ///   全部成功或全部回滚）
     /// - **message_count**：对齐复制的**普通消息**条数（排除 compaction 边界，
-    ///   与 `emit_to_history` / `count_messages` 计数语义一致）
+    ///   与 `emit_to_history` 计数语义一致）
     /// - **统计字段**（token / 费用）：从 0 起算，不继承源 session
     ///
     /// # 错误

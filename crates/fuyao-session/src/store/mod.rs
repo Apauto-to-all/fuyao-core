@@ -8,7 +8,7 @@
 //! - [`session`]：sessions 表的全部操作——生命周期读写（create/get/delete/list）+
 //!   单字段局部更新（update_system_prompt / update_title / end_session）
 //! - [`message`]：messages 表的全部操作——写入（insert，事务内同时累加 sessions
-//!   计数 / 费用）/ 计数（count）/ 查询（load_full_history 全量审计 /
+//!   计数 / 费用）/ 计数（count_user_messages）/ 查询（load_full_history 全量审计 /
 //!   list_messages_before 游标分页浏览）
 //! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason，局部 UPDATE
 //!   sessions 的 compression_count / last_compacted_seq）
@@ -43,7 +43,6 @@ use std::time::Duration;
 /// 持有 SqlitePool 连接池，提供 Session + Message 的 CRUD。
 /// 连接池可经 [`pool`](Self::pool) 对外共享，供引擎层或兄弟模块复用同一连接池。
 pub struct SessionStore {
-    db_path: PathBuf,
     pool: SqlitePool,
 }
 
@@ -98,12 +97,7 @@ impl SessionStore {
         }
 
         tracing::info!(db_path = %db_path.display(), "会话存储初始化完成");
-        Ok(Self { db_path, pool })
-    }
-
-    /// 数据库文件路径
-    pub fn db_path(&self) -> &PathBuf {
-        &self.db_path
+        Ok(Self { pool })
     }
 
     /// 刷新查询计划统计
