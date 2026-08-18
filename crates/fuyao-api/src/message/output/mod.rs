@@ -14,7 +14,6 @@
 //! - `title`: 会话标题更新（首轮对话后异步生成）
 //! - `retry`: LLM 重试事件（重试前发，前端据此渲染「N 秒后重试」提示）
 //! - `child_session`: 子任务 session 生命周期（子代理 / 后台任务派生时发出）
-//! - `rollback`: 对话回退（回退完成后发出，前端据此显示通知 + 填输入框）
 
 mod assistant;
 mod child_session;
@@ -42,7 +41,7 @@ pub use compression::{
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use retry::{RetryMessage, RetryPayload};
-pub use rollback::{RollbackMessage, RollbackPayload};
+pub use rollback::RollbackPayload;
 pub use title::{TitleMessage, TitlePayload};
 pub use tool_call::{ToolCallMessage, ToolCallPayload};
 pub use tool_result::{ToolResultMessage, ToolResultPayload};
@@ -77,8 +76,6 @@ pub enum OutputEvent {
     /// 子任务 session 生命周期（子代理 / 后台任务派生时发，前端据此追踪 child_session_id
     /// 并把后续 session_id == child_session_id 的事件归到此任务的渲染区）
     ChildSession(ChildSessionMessage),
-    /// 对话回退（回退完成后发出，前端据此显示「已回退 N 条」通知 + 把目标用户消息填输入框）
-    Rollback(RollbackMessage),
 }
 
 impl OutputEvent {
@@ -99,7 +96,6 @@ impl OutputEvent {
             OutputEvent::Title(m) => &mut m.base,
             OutputEvent::Retry(m) => &mut m.base,
             OutputEvent::ChildSession(m) => &mut m.base,
-            OutputEvent::Rollback(m) => &mut m.base,
         }
     }
 }

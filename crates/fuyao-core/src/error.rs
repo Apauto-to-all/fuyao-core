@@ -41,4 +41,16 @@ pub enum EngineError {
     /// 这是「同步校验错误」——调用函数瞬间即可判断，符合 01 文档错误处理原则。
     #[error("引擎已关闭")]
     Shutdown,
+
+    /// 会话停止超时：`Engine::stop_session` 在超时预算内未等到 turn 完全静默
+    ///
+    /// turn 可能卡在不响应中断信号的环节（如工具不响应取消、压缩 LLM 调用超长）。
+    /// 调用方不得继续依赖「已静默」前提做后续 DB 操作（如数据库回退），可重试停止。
+    #[error("会话停止超时（{timeout_secs}s）：session={session_id}")]
+    StopTimeout {
+        /// 停止目标的 session id
+        session_id: String,
+        /// 等待 turn 静默的超时预算（秒）
+        timeout_secs: u64,
+    },
 }

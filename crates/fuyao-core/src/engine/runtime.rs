@@ -44,8 +44,8 @@ impl Engine {
     /// 所有对话级输入事件从一个口进，靠 session id 区分对话，按事件类型分流：
     /// - `User`：入队，触发 ReAct 循环。模型配置从 session 的 `SessionParams` 现读（见 [`update_session_params`](Self::update_session_params)）
     /// - `Interrupt`：发出中断信号，打断对应对话的当前执行
-    /// - `Compress` / `Rollback`：控制类命令，转 ControlCommand 投控制通道，task 在 turn 边界自执行；
-    ///   结果经 per-session 出口以对应 OutputEvent 流出（Compression / Rollback）
+    /// - `Compress`：控制类命令，转 ControlCommand 投控制通道，task 在 turn 边界自执行；
+    ///   结果经 per-session 出口以对应 OutputEvent 流出（Compression）
     ///
     /// 入队即返回，不阻塞——不等大模型想完。
     /// 后续产出从该 session 的 per-session rx 流出（由 create_session 等返回）。
@@ -99,18 +99,6 @@ impl Engine {
                     OutboundAction::Control(
                         handle.tx_control.clone(),
                         fuyao_api::ControlCommand::Compress,
-                    )
-                }
-                InputEvent::Rollback(req) => {
-                    // 控制通道：对话回退请求转化为 ControlCommand::Rollback，送主循环 turn 边界消费。
-                    // task 在 turn 边界自执行回退（删目标 seq 之后的消息 + 重算会话状态），
-                    // 结果经 per-session 出口以 OutputEvent::Rollback 事件流出。
-                    // 与 Compress 同构——控制通道是 fire-and-forget 载体，回执由事件出口承担。
-                    OutboundAction::Control(
-                        handle.tx_control.clone(),
-                        fuyao_api::ControlCommand::Rollback {
-                            target_seq: req.payload.target_seq,
-                        },
                     )
                 }
             }

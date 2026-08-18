@@ -14,12 +14,13 @@ pub(crate) mod types;
 
 mod lifecycle;
 mod runtime;
+mod stop;
 mod subagent_ops;
 mod teardown;
 #[cfg(test)]
 mod tests;
 
-use crate::engine::types::{SessionHandle, SharedQueue};
+use crate::engine::types::{SessionHandle, SharedQueue, TurnPhase};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;

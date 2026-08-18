@@ -32,9 +32,9 @@
 //! # 单事务原子
 //!
 //! 全部步骤在一个 SQLite 事务内完成，避免中途失败留下脏状态。返回 [`RollbackResult`]——
-//! 持久化层只陈述「删了什么、重算成什么」的领域事实；把它投影成对外事件载荷
+//! 持久化层只陈述「删了什么、重算成什么」的领域事实；把它投影成对外载荷
 //! （`RollbackPayload` + `UserPayload`，含 mode/source 等应用语义）是消费方
-//! （如活跃 session 回退的 `handle_control` → `run_rollback`）的职责。
+//! （会话管理门面 `SessionManager::rollback_session`）的职责。
 
 use super::row::MessageRow;
 use crate::error::SessionError;
@@ -48,12 +48,12 @@ use fuyao_api::MessageKind;
 ///
 /// # 投影约定
 ///
-/// 消费方（`fuyao-core` 的回退发起路径）据此投影成对外事件载荷：
+/// 消费方（会话管理门面 `SessionManager::rollback_session`）据此投影成对外载荷：
 /// - 7 个标量字段 1:1 拷贝进 `RollbackPayload`
 /// - `target_message: Option<Message>` → `Option<UserPayload>`：取 content/images，
 ///   按「回退后目标消息将作为新 guide 重新发送」补 `mode=Guide` / `source=User`
 ///
-/// 这种领域结果与 wire 载荷的分层，使持久化层不依赖任何 output 事件类型——依赖方向保持
+/// 这种领域结果与 wire 载荷的分层，使持久化层不依赖任何 output 载荷类型——依赖方向保持
 /// `fuyao-session → fuyao-api(domain: Message)`，正向。
 #[derive(Debug, Clone)]
 pub struct RollbackResult {
@@ -108,8 +108,7 @@ impl super::SessionStore {
     /// # 返回
     /// [`RollbackResult`]，含锚点 seq、删除计数（界面通知用）、目标消息本体
     /// （user→Some 含 content+images / compaction→None）、重算后的 4 个状态字段。
-    /// 消费方据此投影成 `RollbackMessage`（补 envelope + wire 投影）发出，即为
-    /// `OutputEvent::Rollback`。
+    /// 消费方据此投影成 `RollbackPayload`（wire 投影）直接返调用方。
     ///
     /// # 错误
     /// - [`SessionError::NotFound`]:session_id 不存在，或 target_seq 在该 session 中无对应消息

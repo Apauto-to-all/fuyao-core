@@ -183,6 +183,19 @@ impl App {
         self.engine.send(id, event).await
     }
 
+    /// 停止会话当前 turn（屏障语义，直接代理 [`Engine::stop_session`]）
+    ///
+    /// 返回即该 session 的 DB 已静默（在跑 turn 已完全终止、中断收尾落库完毕），
+    /// session 保持存活——与 [`end_session`](Self::end_session) 的销毁语义正交。
+    /// 管理型同步方法，不走消息总线。
+    ///
+    /// 典型消费方是「先停后改库」的应用编排（如数据库回退）：本方法成功返回后，
+    /// 再经 [`SessionManager`](crate::SessionManager) 做存储层写操作，两步之间
+    /// 不存在该 session 的并发写库。
+    pub async fn stop_session(&self, id: &SessionId, reason: &str) -> Result<(), EngineError> {
+        self.engine.stop_session(id, reason).await
+    }
+
     /// 出站事件单一出口（fan_out 接收端）
     ///
     /// 从 fan_out 通道消费事件——所有常规 session 的 forwarder 都把事件推到这里。

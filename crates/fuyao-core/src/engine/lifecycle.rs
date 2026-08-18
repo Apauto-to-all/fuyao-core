@@ -401,6 +401,11 @@ impl Engine {
         // 不让 emit 阻塞反压到 ReAct turn 推进）
         let (tx_event, rx_event) = mpsc::unbounded_channel::<OutputEvent>();
 
+        // turn 相位通道：task 侧 sender 进 SessionCtx（进 turn 区间置 Running / 退出回 Idle），
+        // Engine 侧 receiver 进 SessionHandle（stop_session 屏障等待用）
+        let (turn_phase_tx, turn_phase_rx) =
+            tokio::sync::watch::channel(crate::engine::types::TurnPhase::Idle);
+
         // 该 session 的关闭信号（引擎级 shutdown_token 的 child_token）
         //   Engine::shutdown 调 root.cancel → 所有 child 同时 cancel
         //   未来扩展「单 session 销毁」时可单独 cancel 这个 child
@@ -429,6 +434,7 @@ impl Engine {
         .pending(Arc::clone(&pending))
         .compression_config(fuyao_api::get_config().session.compression.clone())
         .shutdown_token(shutdown_token.clone())
+        .turn_phase(turn_phase_tx)
         .subagent_ops(Some(self.subagent_ops_weak()))
         .build();
         let rx = react::SessionRx {
@@ -445,6 +451,7 @@ impl Engine {
                 tx_inbound,
                 tx_interrupt,
                 tx_control,
+                turn_phase_rx,
                 task,
                 shutdown_token,
                 session_params,

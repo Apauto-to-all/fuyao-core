@@ -30,7 +30,6 @@ mod builders;
 mod compression;
 pub(crate) mod queue;
 pub(crate) mod retry;
-mod rollback;
 #[cfg(test)]
 mod tests;
 mod title;
@@ -38,6 +37,8 @@ pub(crate) mod turn;
 
 use crate::emit::Emitter;
 use crate::engine::types::SharedQueue;
+use crate::engine::types::TurnPhase;
+use crate::engine::types::TurnPhaseGuard;
 use crate::interrupt::notify_idle;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
@@ -49,6 +50,7 @@ use fuyao_provider::{ProviderRegistry, StreamUsage};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// session 的共享依赖（引擎级共享能力的 owned 视图）
@@ -98,6 +100,12 @@ pub(crate) struct SessionCtx {
     /// 目前只在主循环 idle select! 监听；未来若需 turn 中途响应，可在 turn.rs
     /// 的 select! 中段也加一路监听（行为同中断，但优先级更高）。
     pub shutdown_token: CancellationToken,
+    /// turn 相位发送端（与 SessionHandle.turn_phase_rx 的接收端同源）
+    ///
+    /// 主循环进入 turn 区间（会写库：pre-turn 压缩 → 注入 → run_turn）时经
+    /// [`TurnPhaseGuard`] 置 Running、区间结束回 Idle。Engine::stop_session 据
+    /// 相位实现「等 turn 完全终止（含收尾落库）」的屏障语义。
+    pub turn_phase: watch::Sender<TurnPhase>,
     /// 引擎派生子 session 的能力弱引用（注入工具 ctx，子代理类工具用）
     ///
     /// 引擎级共享，跨 session 不变；放 SessionCtx 让 turn.rs 调 execute_tools 时
@@ -142,6 +150,7 @@ pub(crate) struct SessionCtxBuilder {
     pending: Option<SharedQueue>,
     compression_config: Option<CompressionConfig>,
     shutdown_token: Option<CancellationToken>,
+    turn_phase: Option<watch::Sender<TurnPhase>>,
     subagent_ops: Option<Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>>,
 }
 
@@ -167,6 +176,12 @@ impl SessionCtxBuilder {
     /// 覆盖关闭信号（默认新建 token；生产传引擎级 shutdown 的 child_token）
     pub(crate) fn shutdown_token(mut self, token: CancellationToken) -> Self {
         self.shutdown_token = Some(token);
+        self
+    }
+
+    /// 覆盖 turn 相位发送端（默认新建 watch 通道，初值 Idle；生产传装配期创建的 sender）
+    pub(crate) fn turn_phase(mut self, tx: watch::Sender<TurnPhase>) -> Self {
+        self.turn_phase = Some(tx);
         self
     }
 
@@ -200,6 +215,9 @@ impl SessionCtxBuilder {
             last_usage: Arc::new(Mutex::new(None)),
             compression_config: self.compression_config.unwrap_or_default(),
             shutdown_token: self.shutdown_token.unwrap_or_default(),
+            turn_phase: self
+                .turn_phase
+                .unwrap_or_else(|| watch::channel(TurnPhase::Idle).0),
             subagent_ops: self.subagent_ops.flatten(),
             is_child: self.is_child,
             title_gate: std::sync::atomic::AtomicBool::new(false),
@@ -242,6 +260,7 @@ impl SessionCtx {
             pending: None,
             compression_config: None,
             shutdown_token: None,
+            turn_phase: None,
             subagent_ops: None,
         }
     }
@@ -322,6 +341,11 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                 msgs = queue::consume_all_guide(&ctx.guide);
             }
             if !msgs.is_empty() {
+                // === turn 相位守卫 ===
+                // 本区块会写库（pre-turn 压缩 → 注入 → run_turn 全程，含中断收尾补发）：
+                // 进入前置 Running、区块结束（含提前 return / panic）回 Idle。
+                // Engine::stop_session 据相位等待——相位回 Idle 即本 session DB 已静默。
+                let _turn_phase = TurnPhaseGuard::enter(&ctx.turn_phase);
                 // === 上下文压缩检查（pre-turn）===
                 // 同步执行：调一次 LLM(tools=[]) 拿摘要 → mark_compaction 落库
                 // 失败 log warn 跳过本次压缩，主流程继续
@@ -442,6 +466,5 @@ async fn handle_inbound_user(ctx: &SessionCtx, inbound: OutputUserMessage) {
 async fn handle_control(ctx: &SessionCtx, cmd: ControlCommand) {
     match cmd {
         ControlCommand::Compress => compression::run_manual_compression(ctx).await,
-        ControlCommand::Rollback { target_seq } => rollback::run_rollback(ctx, target_seq).await,
     }
 }

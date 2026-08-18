@@ -448,7 +448,6 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),
         OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
-        OutputEvent::Rollback(m) => m.base.session_id.as_deref(),
     }
 }
 
@@ -2807,186 +2806,30 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     assert_eq!(ended.content, "压缩摘要");
 }
 
-/// 回退命令经控制通道执行：删目标 seq 之后的消息 + 重算 session count + 发 Rollback 事件。
-///
-/// 验证 handle_control 的 Rollback 分支：
-/// 1. 调 store.rollback_to（删消息 + 单事务内重算 count 类字段并局部 UPDATE sessions 表）
-/// 2. 经 dispatch 发 OutputEvent::Rollback 事件
-///
-/// DB 唯一数据源——重算结果直接写进 sessions 表，下轮读路径从 DB 取即最新值。
-///
-/// 预置 user1(seq1) + assistant(seq2) + user2(seq3)，回退到 user1（target_seq=1），
-/// 期待删掉 seq2/seq3、DB session 的 message_count 重算为 1、收到 Rollback 事件。
-#[tokio::test]
-async fn rollback_command_deletes_and_refreshes_session() {
-    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
-    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-
-    // 预置三条消息：user1 → assistant → user2（insert 回填 seq，1/2/3）
-    let mut u1 = fuyao_api::Message::user("第一条用户消息".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u1)
-        .await
-        .unwrap();
-    let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut a1)
-        .await
-        .unwrap();
-    let mut u2 = fuyao_api::Message::user("第二条用户消息".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u2)
-        .await
-        .unwrap();
-
-    // 执行回退命令：回到第一条 user 消息（target_seq = u1.seq）
-    handle_control(&h.ctx, ControlCommand::Rollback { target_seq: u1.seq }).await;
-
-    // 1. 收到 Rollback 事件，payload 字段符合预期
-    let events = collect_events(&mut h.rx_event).await;
-    let rollback = events
-        .iter()
-        .find_map(|e| match e {
-            OutputEvent::Rollback(m) => Some(m),
-            _ => None,
-        })
-        .expect("应收到 Rollback 事件");
-    assert_eq!(
-        rollback.payload.target_seq, u1.seq,
-        "target_seq 应为回退目标"
-    );
-    assert_eq!(
-        rollback.payload.deleted_total, 2,
-        "应删掉 assistant + user2 共 2 条"
-    );
-    assert_eq!(
-        rollback.payload.deleted_count, 1,
-        "deleted_count 口径（user+compaction）应为 1（仅 user2）"
-    );
-    assert_eq!(
-        rollback.payload.message_count, 1,
-        "重算后 message_count 应为 1"
-    );
-    assert_eq!(rollback.base.session_id.as_deref(), Some("test_session"));
-
-    // 2. DB session 行的 count 类字段已被 rollback_to 事务内重算并写回
-    let db_session = h
-        .ctx
-        .store
-        .get(&h.session_id)
-        .await
-        .expect("get 不应失败")
-        .expect("session 应已落库");
-    assert_eq!(db_session.message_count, 1, "DB message_count 应已重算");
-    assert_eq!(db_session.tool_call_count, 0);
-    assert_eq!(db_session.compression_count, 0);
-    assert!(db_session.last_compacted_seq.is_none());
-
-    // 3. DB 实际只剩 target 这一条
-    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
-    assert_eq!(msgs.len(), 1, "DB 应只剩目标消息");
-    assert_eq!(msgs[0].seq, u1.seq);
-    assert_eq!(msgs[0].role, fuyao_api::MessageRole::User);
-}
-
-/// 回退到非法目标（assistant 消息）：校验在 store 层原子完成，
-/// 发 Error 事件、DB 不变、DB session 行不变。
-#[tokio::test]
-async fn rollback_to_invalid_target_emits_error_and_keeps_db() {
-    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response("ok")]));
-    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-
-    // user1(seq1) + assistant(seq2)
-    let mut u1 = fuyao_api::Message::user("用户消息".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u1)
-        .await
-        .unwrap();
-    let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut a1)
-        .await
-        .unwrap();
-    // insert_message 事务内已累加 message_count，落库后从 DB 读作基线
-    let db_before = h
-        .ctx
-        .store
-        .get(&h.session_id)
-        .await
-        .expect("get 不应失败")
-        .expect("session 应已落库");
-
-    // 回退到 assistant（非法目标——中间态不可作回退点）
-    handle_control(&h.ctx, ControlCommand::Rollback { target_seq: a1.seq }).await;
-
-    // 收到 Error 事件（可恢复）
-    let events = collect_events(&mut h.rx_event).await;
-    let has_error = events
-        .iter()
-        .any(|e| matches!(e, OutputEvent::Error(m) if m.payload.recoverable));
-    assert!(has_error, "非法目标应发可恢复的 Error 事件");
-
-    // DB 不变（两条消息都在），DB session 行不变
-    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
-    assert_eq!(msgs.len(), 2, "非法回退不应改动 DB");
-    let db_after = h
-        .ctx
-        .store
-        .get(&h.session_id)
-        .await
-        .expect("get 不应失败")
-        .expect("session 应已落库");
-    assert_eq!(
-        db_after.message_count, db_before.message_count,
-        "DB session message_count 不应变"
-    );
-}
-
 /// ReAct 间隙检查点：控制通道有待处理的 StopTurn 命令时，run_turn 在 loop 顶部
-/// 立即捕获并执行，不调用 LLM 直接 return。
+/// 立即捕获并执行，不调本轮对话 LLM 直接 return。
 ///
-/// 验证：预置消息 + 预先投递 Rollback → run_turn 进 loop 顶部间隙检查 → 执行回退 →
-/// return（无 Chunk / Assistant 事件，LLM 未被调用）+ 收到 Rollback 事件 + DB 已删消息。
+/// 验证：预置消息 + 预先投递 Compress → run_turn 进 loop 顶部间隙检查 →
+/// 执行压缩（Compression 事件 + 摘要 LLM 调用一次）→ return HaltedByCommand
+/// （无 Chunk / Assistant 事件，对话 LLM 未被调用）。
 #[tokio::test]
-async fn react_gap_checkpoint_catches_rollback_before_llm() {
-    // 即使 MockProvider 配了响应，间隙检查在 build_chat_request 之前，LLM 根本不会被调
+async fn react_gap_checkpoint_catches_compress_before_llm() {
+    use fuyao_api::message::output::CompressionPayload;
+
+    // 压缩会调一次摘要 LLM（MockProvider 的唯一响应）；对话 LLM 即使配了响应也不该被调
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
-        "不该被调用",
+        "压缩摘要",
     )]));
-    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    let mut h = make_harness(provider.clone(), Arc::new(ToolRegistry::builder().build())).await;
+    // 预置多条可见消息（压缩对象），run_turn 的对话请求未发出
+    preload_user(&h, "第一段对话内容").await;
+    preload_user(&h, "第二段对话内容").await;
+    preload_user(&h, "第三段对话内容").await;
 
-    // 预置三条消息：user1(seq1) → assistant(seq2) → user2(seq3)
-    let mut u1 = fuyao_api::Message::user("第一条用户消息".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u1)
-        .await
-        .unwrap();
-    let mut a1 = fuyao_api::Message::assistant(Some("助手回复".to_string()));
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut a1)
-        .await
-        .unwrap();
-    let mut u2 = fuyao_api::Message::user("第二条用户消息".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u2)
-        .await
-        .unwrap();
+    // 预先投递 Compress 到控制通道
+    h.tx_control.send(ControlCommand::Compress).await.unwrap();
 
-    // 预先投递 Rollback（回到第一条 user 消息）到控制通道
-    h.tx_control
-        .send(ControlCommand::Rollback { target_seq: u1.seq })
-        .await
-        .unwrap();
-
-    // run_turn 进 loop 顶部间隙检查点：捕获 Rollback → 执行 → return HaltedByCommand
+    // run_turn 进 loop 顶部间隙检查点：捕获 Compress → 执行 → return HaltedByCommand
     let outcome = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
@@ -3002,101 +2845,35 @@ async fn react_gap_checkpoint_catches_rollback_before_llm() {
 
     let events = collect_events(&mut h.rx_event).await;
 
-    // 收到 Rollback 事件
-    let has_rollback = events
-        .iter()
-        .any(|e| matches!(e, OutputEvent::Rollback(m) if m.payload.target_seq == u1.seq));
-    assert!(has_rollback, "间隙检查应执行回退并发出 Rollback 事件");
+    // 压缩被执行：Started / Ended 事件成对出现
+    let has_started = events.iter().any(|e| {
+        matches!(
+            e,
+            OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Started(_))
+        )
+    });
+    let has_ended = events.iter().any(|e| {
+        matches!(
+            e,
+            OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Ended(_))
+        )
+    });
+    assert!(has_started, "间隙检查应执行压缩并发出 Started 事件");
+    assert!(has_ended, "间隙检查应执行压缩并发出 Ended 事件");
 
-    // LLM 未被调用：无 Chunk / Assistant 事件
+    // 对话 LLM 未被调用：无 Chunk / Assistant 事件，provider 仅被摘要 LLM 调用过一次
     let has_llm_output = events
         .iter()
         .any(|e| matches!(e, OutputEvent::Chunk(_) | OutputEvent::Assistant(_)));
     assert!(
         !has_llm_output,
-        "间隙检查在 LLM 调用前 return，不应有任何 LLM 产出事件"
+        "间隙检查在对话 LLM 调用前 return，不应有任何对话产出事件"
     );
-
-    // DB 已删消息（只剩目标 seq1），DB session 行 count 已被 rollback_to 事务重算
-    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
-    assert_eq!(msgs.len(), 1, "回退应已删除目标 seq 之后的消息");
-    assert_eq!(msgs[0].seq, u1.seq);
-    let db_session = h
-        .ctx
-        .store
-        .get(&h.session_id)
-        .await
-        .expect("get 不应失败")
-        .expect("session 应已落库");
-    assert_eq!(db_session.message_count, 1, "DB session 应已重算");
-}
-
-/// 间隙检查点 FIFO 忠实执行：多条命令按入队顺序逐条执行。
-///
-/// 投两条 Rollback（第一条回退到 seq1，第二条非法——seq1 已是最后一条，回退到它无后续可删
-/// 但合法），验证两条都被执行（两次 Rollback 事件）、run_turn 退出。
-#[tokio::test]
-async fn react_gap_checkpoint_drains_multiple_commands_in_order() {
-    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
-        "不该被调用",
-    )]));
-    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-
-    // 预置 user1(seq1) + assistant(seq2) + user2(seq3)
-    let mut u1 = fuyao_api::Message::user("用户1".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u1)
-        .await
-        .unwrap();
-    let mut a1 = fuyao_api::Message::assistant(Some("回复".to_string()));
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut a1)
-        .await
-        .unwrap();
-    let mut u2 = fuyao_api::Message::user("用户2".to_string());
-    h.ctx
-        .store
-        .insert_message(&h.session_id, &mut u2)
-        .await
-        .unwrap();
-
-    // 投两条 Rollback：第一条回到 seq1（删 seq2/3），第二条回到 seq1（此时只剩 seq1，无后续可删，合法）
-    h.tx_control
-        .send(ControlCommand::Rollback { target_seq: u1.seq })
-        .await
-        .unwrap();
-    h.tx_control
-        .send(ControlCommand::Rollback { target_seq: u1.seq })
-        .await
-        .unwrap();
-
-    let outcome = turn::run_turn(
-        &h.ctx,
-        &mut h.rx_inbound,
-        &mut h.rx_interrupt,
-        &mut h.rx_control,
-        test_params(),
-    )
-    .await;
-    assert!(
-        matches!(outcome, turn::TurnOutcome::HaltedByCommand),
-        "含 StopTurn 命令的批次应让 run_turn 返回 HaltedByCommand"
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        1,
+        "provider 仅应被摘要 LLM 调用一次，对话 LLM 不应被调用"
     );
-
-    let events = collect_events(&mut h.rx_event).await;
-    // 两条命令都被执行：两次 Rollback 事件
-    let rollback_count = events
-        .iter()
-        .filter(|e| matches!(e, OutputEvent::Rollback(_)))
-        .count();
-    assert_eq!(rollback_count, 2, "间隙检查应 FIFO 逐条执行所有待处理命令");
-
-    // DB 最终只剩 seq1（第一条删了 seq2/3，第二条回退到 seq1 无后续可删）
-    let msgs = h.ctx.store.load_full_history(&h.session_id).await.unwrap();
-    assert_eq!(msgs.len(), 1);
-    assert_eq!(msgs[0].seq, u1.seq);
 }
 
 /// run_turn 正常完成（AI 给最终回复，无工具调用）应返回 `Completed`。

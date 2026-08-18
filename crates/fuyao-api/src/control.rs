@@ -15,16 +15,6 @@
 pub enum ControlCommand {
     /// 手动触发上下文压缩（跳过阈值 / 反抖动，触发原因标记为 manual）
     Compress,
-    /// 对话回退：删目标 seq 之后的所有消息并重算会话状态
-    ///
-    /// 携带 `target_seq`（回退到的目标消息 seq）。目标必须是用户消息或压缩消息，
-    /// 合法性由 store 层回退执行体（`SessionStore::rollback_to`）在单事务内原子校验。
-    ///
-    /// 与 `Compress` 在控制通道里地位对等：都是 DB 写命令，都靠 task 在 turn 边界
-    /// 串行执行保证安全，都不抢占在途 turn。回退结果经 per-session 出口以
-    /// `OutputEvent::Rollback` 事件流出，**不走请求-响应通道**——控制通道是
-    /// fire-and-forget 的命令载体，回执由事件出口承担（同压缩）。
-    Rollback { target_seq: i64 },
 }
 
 /// 控制命令对 turn 的处置指令
@@ -51,8 +41,6 @@ impl ControlCommand {
         match self {
             // 手动压缩：压缩后原始消息被摘要替代，turn 持有的消息列表 / 边界失效 → StopTurn
             ControlCommand::Compress => TurnDirective::StopTurn,
-            // 回退：删了消息 + 重算 count，turn 持有的 session 状态失效 → StopTurn
-            ControlCommand::Rollback { .. } => TurnDirective::StopTurn,
         }
     }
 }

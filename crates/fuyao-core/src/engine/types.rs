@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,49 @@ pub type SessionId = String;
 /// 复用同一类型避免无意义的拆解/重组（也消除字段丢失风险）。
 pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<OutputUserMessage>>>;
 
+/// 会话执行流的 turn 相位（Engine 与 session task 共享的运行状态）
+///
+/// task 侧在进入「会写库的 turn 区间」（pre-turn 压缩 → 注入 → run_turn）前置
+/// `Running`、区间结束后回 `Idle`；Engine 侧的 [`crate::engine::stop_session`]
+/// 据 watch 值判断是否有 turn 在跑，并等回 `Idle` 实现屏障语义——
+/// session task 是该 session DB 写入的唯一执行者，相位回 `Idle` 即代表
+/// 本 session 已无任何在途写库（中断收尾的补发落库在 turn 返回前已完成）。
+///
+/// watch 通道承载：task 持 sender（经 `SessionCtx.turn_phase`）更新，
+/// Engine 持 receiver（经 `SessionHandle.turn_phase_rx`）等待。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnPhase {
+    /// 无 turn 在跑：task 停在主循环边界 / idle select!
+    Idle,
+    /// turn 区间运行中：pre-turn 压缩 → 注入 → run_turn 全程（含中断收尾落库）
+    Running,
+}
+
+/// turn 区间的相位守卫：构造置 `Running`，drop 回 `Idle`
+///
+/// Drop 语义保证提前 return / panic 时相位也能回 `Idle`——相位回落的时点
+/// 晚于 turn 的全部落库（含中断收尾补发），回落即代表 DB 已静默。
+/// watch sender 发送失败（Engine 侧 receiver 已全部 drop，session 已移出调度表）
+/// 时忽略——无等待方，相位无观察者。
+pub(crate) struct TurnPhaseGuard {
+    tx: watch::Sender<TurnPhase>,
+}
+
+impl TurnPhaseGuard {
+    /// 进入 turn 区间：置 `Running`
+    pub(crate) fn enter(tx: &watch::Sender<TurnPhase>) -> Self {
+        // 接收端全 drop 时 send 失败：无等待方，忽略即可
+        let _ = tx.send(TurnPhase::Running);
+        Self { tx: tx.clone() }
+    }
+}
+
+impl Drop for TurnPhaseGuard {
+    fn drop(&mut self) {
+        let _ = self.tx.send(TurnPhase::Idle);
+    }
+}
+
 /// 活跃 session 的句柄
 ///
 /// Engine 的调度表（session_id → SessionHandle）持有它。
@@ -37,6 +81,7 @@ pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<OutputUserMessage>>>;
 /// - `tx_inbound`：入站通道（User 消息送进 session task 过管道）
 /// - `tx_interrupt`：中断通道，select! 中断点监听（与队列正交）
 /// - `tx_control`：控制通道，承载命令主循环做事的信号（手动压缩等），turn 边界消费
+/// - `turn_phase_rx`：turn 相位接收端（stop_session 屏障等待用）
 /// - `session_params`：对话级参数共享句柄，Engine 写（update_session_params）、task 现读现用
 /// - `task`：session 独立执行流任务句柄（shutdown 时 await 等退出 / 超时 abort 兜底）
 /// - `shutdown_token`：该 session 的关闭信号（Engine::shutdown 时 cancel）
@@ -56,6 +101,11 @@ pub(crate) struct SessionHandle {
     /// 承载「命令主循环做事」的信号（手动压缩等）。主循环在 turn 边界消费，
     /// 不入 ReAct 队列、不抢占在途 turn。新增 B 类功能加 ControlCommand 变体，不开新通道。
     pub tx_control: Sender<ControlCommand>,
+    /// turn 相位接收端（与 SessionCtx.turn_phase 的 sender 同源）
+    ///
+    /// task 侧进 turn 区间置 Running / 退出回 Idle；stop_session 借此实现
+    /// 「等 turn 完全终止（含收尾落库）」的屏障语义。
+    pub turn_phase_rx: watch::Receiver<TurnPhase>,
     /// 对话级参数共享句柄（与 SessionCtx.session_params 指向同一份）
     ///
     /// Engine 的 update_session_params 经此写回；task 内的消费点（跑 turn、压缩）

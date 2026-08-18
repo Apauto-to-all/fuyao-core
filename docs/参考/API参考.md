@@ -44,7 +44,7 @@ let fuyao = fuyao_app::start(EngineParams {
     agent_paths: AgentPaths::default(),
 }).await?;
 // fuyao: fuyao_app::FuyaoApp { app, sessions }
-//   app: App         —— 运行时交互（create / send / recv / end）
+//   app: App         —— 运行时交互（create / send / stop / recv / end）
 //   sessions: SessionManager —— 会话检索（list_sessions / session_count）
 let app = fuyao.app;               // 跑对话
 let sessions = fuyao.sessions;     // 查历史
@@ -64,11 +64,13 @@ let sessions = fuyao.sessions;     // 查历史
 | 派生对话（fork） | `app.fork_session` | `&SessionId`（源）/ `SessionParams` | `Result<SessionId, EngineError>`（`parent_session_id = None`，独立 session） |
 | 创建子任务 session | `app.create_child_session` | `&SessionId`（父）/ `ChildSessionSource` / `SessionParams` | `Result<(SessionId, UnboundedReceiver<OutputEvent>), EngineError>`（rx **不进 fan_out**，返调用方独占消费） |
 | 入事件 | `app.send` | `&SessionId` / `InputEvent` | `Result<(), EngineError>` |
+| 停止会话 turn | `app.stop_session` | `&SessionId` / `&str（reason）` | `Result<(), EngineError>`（屏障语义：返回即该 session 在跑 turn 已完全终止、中断收尾落库已全部完成——DB 静默；session 保持存活，不写 ended_at） |
 | 出事件 | `app.recv` | — | `Option<OutputEvent>`（单一出口，所有主 session 的事件汇聚于此） |
 | 销毁单对话 | `app.end_session` | `&SessionId` / `&str（end_reason）` | `Result<(), EngineError>` |
 | 关闭 | `app.shutdown` | 消费 `self` | `()`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop） |
 | 列历史会话 | `sessions.list_sessions` | `Option<&str>`（workspace 过滤）/ `i64` limit / `i64` offset | `Result<Vec<Session>, SessionError>`（按 `last_active_at` 倒序） |
 | 会话总数 | `sessions.session_count` | `Option<&str>`（workspace 过滤） | `Result<i64, SessionError>` |
+| 对话回退 | `sessions.rollback_session` | `&str（session_id）` / `i64（target_seq）` | `Result<RollbackPayload, SessionError>`（请求-响应直接返回载荷、不经事件流；安全顺序「先停后滚」——先 `app.stop_session` 屏障停 turn 再回退，两步之间无该 session 的并发写库） |
 
 > **子 session 不进 fan_out**：子任务 session（`create_child_session` 产出）的 rx 直接返调用方独占消费——子代理 tool handler 用它取最终回复，fire-and-forget 后台任务 spawn 独立 task 消费。UI 出口只暴露主对话，避免子任务事件污染主对话流。
 

@@ -20,6 +20,9 @@ pub enum InterruptSource {
     Hook,
     /// 引擎关闭时由 shutdown 流程触发（让活跃 session 立即落库退出）
     Shutdown,
+    /// 引擎停止原语（stop_session）触发：应用编排层为管理操作（回退 / 删除等）清场，
+    /// 打断在跑 turn 并等待其完全终止
+    Stop,
 }
 
 /// 中断事件 envelope
