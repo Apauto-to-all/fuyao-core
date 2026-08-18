@@ -249,19 +249,22 @@ fn append_placeholder(content: &str, placeholder: &str) -> String {
 /// `base` 复刻原消息的 timestamp / session_id，并把 seq 直接填入——历史回放与实时事件
 /// 同构：进历史事件落库后 seq 同样填进 base.seq，前端拿到同一来源的 seq，
 /// 游标分页据此连续定位，无需区分实时 / 历史。
-fn message_to_event(msg: &Message) -> Option<OutputEvent> {
+///
+/// 按值消费 `Message`：字段所有权直接移交进事件 payload——消息投影后不再使用，
+/// 所有权移交使 content / reasoning / 图片 base64 / tool result 等大体积字段全程零拷贝。
+fn message_to_event(msg: Message) -> Option<OutputEvent> {
     // base 复刻原消息时间戳与会话标识；seq 直接填入，与实时事件同源同构
     let base = EventBase {
         seq: Some(msg.seq),
         timestamp: msg.timestamp,
-        session_id: Some(msg.session_id.clone()),
+        session_id: Some(msg.session_id),
     };
     match msg.role {
         MessageRole::User => Some(OutputEvent::User(OutputUserMessage {
             base,
             payload: UserPayload {
-                content: msg.content.clone().unwrap_or_default(),
-                images: msg.images.clone(),
+                content: msg.content.unwrap_or_default(),
+                images: msg.images,
                 // mode / source 未持久化，按普通用户消息兜底
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
@@ -270,10 +273,10 @@ fn message_to_event(msg: &Message) -> Option<OutputEvent> {
         MessageRole::Assistant => Some(OutputEvent::Assistant(AssistantMessage {
             base,
             payload: AssistantPayload {
-                content: msg.content.clone(),
-                reasoning: msg.reasoning.clone(),
+                content: msg.content,
+                reasoning: msg.reasoning,
                 tool_calls: parse_tool_calls(msg.tool_calls.as_deref()),
-                finish_reason: msg.finish_reason.clone(),
+                finish_reason: msg.finish_reason,
                 completion_tokens: msg.completion_tokens,
                 prompt_tokens: msg.prompt_tokens,
                 // Message 未单独存 total_tokens，按 prompt + completion 求和近似
@@ -285,9 +288,9 @@ fn message_to_event(msg: &Message) -> Option<OutputEvent> {
         MessageRole::Tool => Some(OutputEvent::ToolResult(ToolResultMessage {
             base,
             payload: ToolResultPayload {
-                tool_call_id: msg.tool_call_id.clone().unwrap_or_default(),
-                tool_name: msg.tool_name.clone().unwrap_or_default(),
-                content: msg.content.clone().unwrap_or_default(),
+                tool_call_id: msg.tool_call_id.unwrap_or_default(),
+                tool_name: msg.tool_name.unwrap_or_default(),
+                content: msg.content.unwrap_or_default(),
             },
         })),
         // 系统消息是 prompt 构造，非对话内容，不进历史回放流
@@ -323,12 +326,16 @@ fn parse_tool_calls(tool_calls: Option<&[ToolCallData]>) -> Option<Vec<ToolCallP
 /// 得正序（旧在前、新在后），使历史回放流与实时流时序一致。
 ///
 /// 游标分页标准模式：存储层 `ORDER BY seq DESC`（倒序取数利于游标定位边界），业务层
-/// 翻成正序返回——用户看对话是旧→新。`.iter().rev()` 反向遍历 DESC 输入即得 ASC，
-/// 一次到位，不再额外翻转。
+/// 翻成正序返回——用户看对话是旧→新。`.into_iter().rev()` 按值反向消费 DESC 输入
+/// 即得 ASC，一次到位，消息字段所有权零拷贝移交进事件。
 ///
 /// `system` 消息投影为 `None` 会被跳过，故返回长度可能小于输入。
 pub fn messages_to_events(messages: Vec<Message>) -> Vec<OutputEvent> {
-    messages.iter().rev().filter_map(message_to_event).collect()
+    messages
+        .into_iter()
+        .rev()
+        .filter_map(message_to_event)
+        .collect()
 }
 
 #[cfg(test)]
@@ -571,7 +578,7 @@ mod tests {
         });
         let paths = AgentPaths::default();
         let msg = event_to_message(&ev, Some("test/m1"), &paths).expect("应投影成功");
-        let replayed = message_to_event(&msg).expect("应投影回事件");
+        let replayed = message_to_event(msg).expect("应投影回事件");
         let OutputEvent::Assistant(m) = replayed else {
             panic!("应为 Assistant 变体");
         };
@@ -590,7 +597,7 @@ mod tests {
             m.content = Some("你好".into());
         });
 
-        let event = message_to_event(&msg).expect("user 应投影成事件");
+        let event = message_to_event(msg).expect("user 应投影成事件");
         let OutputEvent::User(OutputUserMessage { base, payload }) = event else {
             panic!("应为 User 变体，实际：{event:?}");
         };
@@ -616,7 +623,7 @@ mod tests {
         });
 
         let OutputEvent::User(OutputUserMessage { payload, .. }) =
-            message_to_event(&msg).expect("user 应投影")
+            message_to_event(msg).expect("user 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -629,7 +636,7 @@ mod tests {
         // content = None 时 UserPayload.content 兜底空串（而非 panic）
         let msg = make_msg(MessageRole::User, 3, &|_| {});
         let OutputEvent::User(OutputUserMessage { payload, .. }) =
-            message_to_event(&msg).expect("user 应投影")
+            message_to_event(msg).expect("user 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -649,7 +656,7 @@ mod tests {
         });
 
         let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
-            message_to_event(&msg).expect("assistant 应投影")
+            message_to_event(msg).expect("assistant 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -686,7 +693,7 @@ mod tests {
         });
 
         let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
-            message_to_event(&msg).expect("assistant 应投影")
+            message_to_event(msg).expect("assistant 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -715,7 +722,7 @@ mod tests {
         });
 
         let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
-            message_to_event(&msg).expect("assistant 应投影")
+            message_to_event(msg).expect("assistant 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -731,7 +738,7 @@ mod tests {
             m.tool_calls = Some(vec![]);
         });
         let OutputEvent::Assistant(AssistantMessage { payload, .. }) =
-            message_to_event(&msg).expect("assistant 应投影")
+            message_to_event(msg).expect("assistant 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -747,7 +754,7 @@ mod tests {
         });
 
         let OutputEvent::ToolResult(ToolResultMessage { base, payload }) =
-            message_to_event(&msg).expect("tool 应投影")
+            message_to_event(msg).expect("tool 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -762,7 +769,7 @@ mod tests {
         // tool_call_id / tool_name / content 缺失时兜底空串，不 panic
         let msg = make_msg(MessageRole::Tool, 10, &|_| {});
         let OutputEvent::ToolResult(ToolResultMessage { payload, .. }) =
-            message_to_event(&msg).expect("tool 应投影")
+            message_to_event(msg).expect("tool 应投影")
         else {
             panic!("变体类型不符");
         };
@@ -777,7 +784,7 @@ mod tests {
         let msg = make_msg(MessageRole::System, 11, &|m| {
             m.content = Some("你是助手".into());
         });
-        assert!(message_to_event(&msg).is_none());
+        assert!(message_to_event(msg).is_none());
     }
 
     #[test]
