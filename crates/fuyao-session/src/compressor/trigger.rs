@@ -36,10 +36,7 @@ mod tests {
         CompressionConfig {
             enabled: true,
             threshold: 0.85,
-            keep_ratio: 0.05,
-            keep_tokens_max: 8000,
             summary_max_tokens: 4096,
-            tokens_per_image: 1000,
             skip_child: true,
         }
     }

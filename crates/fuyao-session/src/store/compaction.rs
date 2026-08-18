@@ -6,11 +6,11 @@
 //! # 设计要点
 //!
 //! - session_id 永不变,压缩不创建新会话
-//! - 压缩 = 插入一条 `kind='compaction'` 边界消息 + 更新 sessions 元数据,不复制 keep_recent
+//! - 压缩 = 插入一条 `kind='compaction'` 边界消息 + 更新 sessions 元数据
 //! - 旧消息物理保留(不删除、不归档),可审计可恢复
 //! - 统计字段(token 累计)压缩不重置
 //!
-//! 可见窗口的读取(给 LLM 构造请求用的动态拼接)见 [`super::message::SessionStore::load_visible_messages`]。
+//! 可见窗口的读取侧只暴露最新摘要及其后消息,见 [`super::visible_window::SessionStore::load_visible_messages`]。
 //! 给人看的全量历史见 [`super::message::SessionStore::load_full_history`]。
 
 use crate::error::SessionError;
@@ -230,12 +230,9 @@ mod tests {
         let mut m3 = Message::user("压缩后消息".to_string());
         store.insert_message(&parent.id, &mut m3).await.unwrap();
 
-        let source_visible = store
-            .load_visible_messages(&parent.id, usize::MAX)
-            .await
-            .unwrap();
-        // 源可见 = 动态拼接窗口:[compaction 边界, 父消息1, 父回复, 压缩后消息]
-        assert_eq!(source_visible.len(), 4);
+        let source_visible = store.load_visible_messages(&parent.id).await.unwrap();
+        // 源可见 = [compaction 边界, 压缩后消息]:父消息1 与父回复在摘要之前,已被覆盖
+        assert_eq!(source_visible.len(), 2);
 
         // 构造子 session(复制源系统提示词 + 标记 parent_session_id)
         // message_count 不预设:从 0 起算,下方逐条 insert_message 复制消息时,
@@ -257,10 +254,7 @@ mod tests {
         }
 
         // 子 session 的可见窗口应与源一致
-        let child_visible = store
-            .load_visible_messages(&child.id, usize::MAX)
-            .await
-            .unwrap();
+        let child_visible = store.load_visible_messages(&child.id).await.unwrap();
         assert_eq!(child_visible.len(), source_visible.len());
         assert_eq!(child_visible[0].kind, MessageKind::Compaction);
         assert_eq!(child_visible[0].content.as_deref(), Some("父摘要"));
@@ -277,7 +271,8 @@ mod tests {
         assert_eq!(child_meta.message_count, non_compaction_count as i64);
         assert_eq!(child_meta.total_prompt_tokens, 0);
         assert_eq!(child_meta.total_cost, 0.0);
-        // 子 session 从未压缩过:自己的压缩指针为空(源的压缩边界只是被复制成普通行)
+        // 子 session 的压缩元数据指针为空:复制消息行不触碰 sessions 压缩元数据,
+        // 只有对子 session 执行 mark_compaction 才会写入
         assert!(child_meta.last_compacted_seq.is_none());
 
         assert_eq!(

@@ -28,14 +28,10 @@ fn default_cfg() -> CompressionConfig {
 
 #[test]
 fn default_config_is_enabled_with_reasonable_threshold() {
-    // 钉死默认配置语义：默认开启、阈值 0.85、保留比例 0.05
+    // 钉死默认配置语义：默认开启、阈值 0.85
     let cfg = default_cfg();
     assert!(cfg.enabled, "压缩默认应开启");
     assert!((cfg.threshold - 0.85).abs() < 1e-9, "默认阈值应为 0.85");
-    assert!(
-        (cfg.keep_ratio - 0.05).abs() < 1e-9,
-        "默认保留比例应为 0.05"
-    );
 }
 
 #[test]

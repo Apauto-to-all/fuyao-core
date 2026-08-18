@@ -1,7 +1,7 @@
 //! 会话配置（上下文压缩 + SQLite 存储）
 //!
-//! 迁移自 `fuyao-session/src/compressor`（压缩阈值/窗口/fallback）与
-//! `fuyao-session/src/store.rs`（busy_timeout / 连接数）的硬编码。
+//! 定义上下文压缩的触发阈值与摘要输出上限、SQLite 存储的
+//! busy_timeout / 连接数，以及标题自动生成参数。
 
 use serde::Deserialize;
 
@@ -15,13 +15,6 @@ use serde::Deserialize;
 /// - `context_length` 从模型注册表（`model.limit.context`，加载期已校验必为正整数）
 ///   解析；模型未注册时调用方无从判定阈值，跳过压缩判定
 /// - `summary_max_tokens` 作为输出预留扣除
-///
-/// 保留窗口按模型上下文比例动态计算（替代固定 `keep_tokens`）：
-/// ```text
-/// 实际保留 = min(context_length × keep_ratio, keep_tokens_max)
-/// ```
-/// - 小上下文模型（如 32K）按比例保留较少，避免撑爆
-/// - 大上下文模型（如 200K+）受 `keep_tokens_max` 上限保护，避免保留过多
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CompressionConfig {
@@ -29,14 +22,8 @@ pub struct CompressionConfig {
     pub enabled: bool,
     /// 触发阈值（0.0~1.0），prompt_tokens / (context_length - summary_max_tokens) 超过此值时触发
     pub threshold: f64,
-    /// 保留窗口的相对比例（0.0~1.0），实际保留 = min(context_length × keep_ratio, keep_tokens_max)
-    pub keep_ratio: f64,
-    /// 保留窗口的 token 上限（tail 段，防止超长上下文模型保留过多）
-    pub keep_tokens_max: usize,
     /// 摘要 LLM 输出上限（token）
     pub summary_max_tokens: usize,
-    /// 压缩 token 估算：每张图固定占用 token（不按 base64 字符数，避免撑爆触发误压缩），原 `compressor/window.rs TOKENS_PER_IMAGE = 1000`
-    pub tokens_per_image: usize,
     /// 是否跳过子 session（有 parent_session_id）的上下文压缩
     ///
     /// 子代理以 Fresh 模式派生、一次性运行，只把最终回复文本作为 tool_result 回喂父 Agent，
@@ -51,28 +38,9 @@ impl Default for CompressionConfig {
         Self {
             enabled: true,
             threshold: 0.85,
-            keep_ratio: 0.05,
-            keep_tokens_max: 8000,
             summary_max_tokens: 4096,
-            tokens_per_image: 1000,
             skip_child: true,
         }
-    }
-}
-
-impl CompressionConfig {
-    /// 按模型上下文比例计算实际保留 token 数
-    ///
-    /// 公式：`min(context_length × keep_ratio, keep_tokens_max)`
-    ///
-    /// - 小上下文模型（如 32K × 0.05 = 1600）：保留较少
-    /// - 大上下文模型（如 200K × 0.05 = 10000）：被 `keep_tokens_max`（默认 8000）截断
-    ///
-    /// 当 `context_length` 或 `keep_ratio` 为 0 时返回 0；下游 `select_recent` 内部
-    /// 保证至少保留最后一条消息，不会因此丢失活跃任务。
-    pub fn effective_keep_tokens(&self, context_length: u32) -> usize {
-        let ratio_amount = (context_length as f64 * self.keep_ratio) as usize;
-        ratio_amount.min(self.keep_tokens_max)
     }
 }
 
@@ -144,56 +112,8 @@ mod tests {
         let c = CompressionConfig::default();
         assert!(c.enabled);
         assert!((c.threshold - 0.85).abs() < f64::EPSILON);
-        assert!((c.keep_ratio - 0.05).abs() < f64::EPSILON);
-        assert_eq!(c.keep_tokens_max, 8000);
         assert_eq!(c.summary_max_tokens, 4096);
-        assert_eq!(c.tokens_per_image, 1000);
         assert!(c.skip_child);
-    }
-
-    #[test]
-    fn effective_keep_tokens_uses_ratio_for_small_context() {
-        // 小上下文：32K × 0.05 = 1600，未被 max 截断
-        let cfg = CompressionConfig::default();
-        assert_eq!(cfg.effective_keep_tokens(32_000), 1600);
-    }
-
-    #[test]
-    fn effective_keep_tokens_capped_by_max_for_large_context() {
-        // 大上下文：200K × 0.05 = 10000，被 max=8000 截断
-        let cfg = CompressionConfig::default();
-        assert_eq!(cfg.effective_keep_tokens(200_000), 8000);
-    }
-
-    #[test]
-    fn effective_keep_tokens_returns_zero_for_zero_context() {
-        // context_length=0 → 返回 0；select_recent 内部保证至少保留最后一条
-        let cfg = CompressionConfig::default();
-        assert_eq!(cfg.effective_keep_tokens(0), 0);
-    }
-
-    #[test]
-    fn effective_keep_tokens_returns_zero_for_zero_ratio() {
-        // 用户极端配置：keep_ratio=0 → 永远返回 0
-        let cfg = CompressionConfig {
-            keep_ratio: 0.0,
-            ..CompressionConfig::default()
-        };
-        assert_eq!(cfg.effective_keep_tokens(128_000), 0);
-    }
-
-    #[test]
-    fn effective_keep_tokens_uses_custom_ratio_and_max() {
-        // 用户调高比例到 0.1，max 调到 12000
-        let cfg = CompressionConfig {
-            keep_ratio: 0.1,
-            keep_tokens_max: 12_000,
-            ..CompressionConfig::default()
-        };
-        // 64K × 0.1 = 6400（未被 max 截断）
-        assert_eq!(cfg.effective_keep_tokens(64_000), 6400);
-        // 200K × 0.1 = 20000，被 max=12000 截断
-        assert_eq!(cfg.effective_keep_tokens(200_000), 12_000);
     }
 
     #[test]
@@ -219,7 +139,6 @@ mod tests {
 max_connections = 10
 [session.compression]
 threshold = 0.9
-tokens_per_image = 2000
 "#;
         #[derive(Deserialize)]
         struct Wrap {
@@ -230,9 +149,6 @@ tokens_per_image = 2000
         // 缺省字段
         assert_eq!(w.session.storage.busy_timeout_secs, 5);
         assert!((w.session.compression.threshold - 0.9).abs() < f64::EPSILON);
-        assert!((w.session.compression.keep_ratio - 0.05).abs() < f64::EPSILON);
-        assert_eq!(w.session.compression.keep_tokens_max, 8000);
-        assert_eq!(w.session.compression.tokens_per_image, 2000);
     }
 
     /// compression 配置不包含任何上下文长度回退项：模型上下文长度只来自模型清单的

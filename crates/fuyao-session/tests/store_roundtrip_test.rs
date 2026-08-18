@@ -2,7 +2,7 @@
 //!
 //! 本文件聚焦**跨方法的持久化往返契约**——单测的空白带：
 //!
-//! - 消息插入 → count_messages / load_visible_messages 的统计与可见窗口一致性
+//! - 消息插入 → count_messages / load_visible_messages 的统计与可见消息一致性
 //! - session 元数据(message_count / tool_call_count / 各 token 总计 / cost)的持久化往返:
 //!   这些字段由 insert_message 事务内原子累加(assistant 消息贡献 token/cost,
 //!   tool 消息贡献 tool_call_count),经 store.get 读回验证无漂移
@@ -19,7 +19,7 @@ use common::temp_store;
 use fuyao_api::{ImageContent, Message, MessageKind, MessageRole, Session};
 
 // ============================================================================
-// 消息可见窗口与统计一致性
+// 消息可见性与统计一致性
 // ============================================================================
 
 #[tokio::test]
@@ -35,10 +35,7 @@ async fn visible_messages_match_inserted_count() {
     }
 
     let counted = store.count_messages(&session.id).await.unwrap();
-    let visible = store
-        .load_visible_messages(&session.id, usize::MAX)
-        .await
-        .unwrap();
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
     assert_eq!(counted, 5, "count_messages 应等于插入数");
     assert_eq!(visible.len(), 5, "可见消息数应等于插入数");
 }
@@ -62,10 +59,7 @@ async fn messages_preserve_role_and_content_on_roundtrip() {
         .await
         .unwrap();
 
-    let visible = store
-        .load_visible_messages(&session.id, usize::MAX)
-        .await
-        .unwrap();
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
     assert_eq!(visible.len(), 2);
     assert_eq!(visible[0].role, MessageRole::User);
     assert_eq!(visible[0].content.as_deref(), Some("用户提问"));
@@ -94,10 +88,7 @@ async fn images_preserve_on_roundtrip() {
     let mut msg = Message::user_with_images("看图说话".to_string(), images.clone());
     store.insert_message(&session.id, &mut msg).await.unwrap();
 
-    let visible = store
-        .load_visible_messages(&session.id, usize::MAX)
-        .await
-        .unwrap();
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].images.len(), 2);
     assert_eq!(visible[0].images, images);
@@ -117,10 +108,7 @@ async fn no_images_roundtrips_empty() {
     let mut msg = Message::user("纯文本".to_string());
     store.insert_message(&session.id, &mut msg).await.unwrap();
 
-    let visible = store
-        .load_visible_messages(&session.id, usize::MAX)
-        .await
-        .unwrap();
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
     assert!(visible[0].images.is_empty());
 }
 
@@ -307,14 +295,8 @@ async fn multiple_sessions_isolate_messages() {
         store.insert_message(&session_b.id, &mut msg).await.unwrap();
     }
 
-    let visible_a = store
-        .load_visible_messages(&session_a.id, usize::MAX)
-        .await
-        .unwrap();
-    let visible_b = store
-        .load_visible_messages(&session_b.id, usize::MAX)
-        .await
-        .unwrap();
+    let visible_a = store.load_visible_messages(&session_a.id).await.unwrap();
+    let visible_b = store.load_visible_messages(&session_b.id).await.unwrap();
 
     assert_eq!(visible_a.len(), 3);
     assert_eq!(visible_b.len(), 2);

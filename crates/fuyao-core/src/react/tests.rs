@@ -469,7 +469,7 @@ async fn preload_user(h: &TestHarness, content: &str) {
 async fn visible_messages(h: &TestHarness) -> Vec<fuyao_api::Message> {
     h.ctx
         .store
-        .load_visible_messages(&h.session_id, usize::MAX)
+        .load_visible_messages(&h.session_id)
         .await
         .expect("加载可见消息失败")
 }
@@ -789,7 +789,7 @@ async fn guide_via_channel_consumed_after_tool_batch() {
     let msgs = h
         .ctx
         .store
-        .load_visible_messages(&h.session_id, usize::MAX)
+        .load_visible_messages(&h.session_id)
         .await
         .expect("加载可见消息失败");
     let pos = |needle: &str| {
@@ -935,7 +935,7 @@ async fn inbound_during_streaming_consumed_at_final_reply() {
     let msgs = h
         .ctx
         .store
-        .load_visible_messages(&h.session_id, usize::MAX)
+        .load_visible_messages(&h.session_id)
         .await
         .expect("加载可见消息失败");
     let pos = |needle: &str| {
@@ -1028,7 +1028,7 @@ async fn interrupt_after_inbound_preserves_guide_queue() {
     let msgs = h
         .ctx
         .store
-        .load_visible_messages(&h.session_id, usize::MAX)
+        .load_visible_messages(&h.session_id)
         .await
         .expect("加载可见消息失败");
     let users: Vec<String> = msgs
@@ -1422,10 +1422,7 @@ async fn rapid_fire_messages_answered_in_single_turn() {
     );
 
     // DB 顺序：user(问题1) → assistant(回复1) → user(问题2) → assistant(回复2)
-    let msgs = store
-        .load_visible_messages("test_session", usize::MAX)
-        .await
-        .unwrap();
+    let msgs = store.load_visible_messages("test_session").await.unwrap();
     let pos = |needle: &str| {
         msgs.iter()
             .position(|m| m.content.as_deref() == Some(needle))
@@ -1574,10 +1571,7 @@ async fn interrupted_turn_preserves_guide_until_new_inbound() {
     assert!(guide.lock().unwrap().is_empty(), "恢复消费后 guide 应跑空");
 
     // B 与 C 都应进 DB（旧剩余 + 新消息一起跑，不丢）
-    let msgs = store
-        .load_visible_messages("test_session", usize::MAX)
-        .await
-        .unwrap();
+    let msgs = store.load_visible_messages("test_session").await.unwrap();
     let users: Vec<_> = msgs
         .iter()
         .filter(|m| matches!(m.role, MessageRole::User))
@@ -1677,7 +1671,7 @@ async fn interrupt_during_streaming() {
     let visible: Vec<_> = h
         .ctx
         .store
-        .load_visible_messages(&h.session_id, usize::MAX)
+        .load_visible_messages(&h.session_id)
         .await
         .unwrap();
     let interrupted_row = visible
@@ -1743,7 +1737,7 @@ async fn interrupt_during_streaming_reasoning_only() {
     let visible: Vec<_> = h
         .ctx
         .store
-        .load_visible_messages(&h.session_id, usize::MAX)
+        .load_visible_messages(&h.session_id)
         .await
         .unwrap();
     let interrupted_row = visible
@@ -2167,7 +2161,7 @@ async fn messages_persisted_to_db() {
     let reloaded = h
         .ctx
         .store
-        .load_visible_messages(&session_id, usize::MAX)
+        .load_visible_messages(&session_id)
         .await
         .expect("load_visible_messages 不应失败");
     assert!(
@@ -2480,8 +2474,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     );
 
     // 2. 下轮 build_chat_request 用的是修改后内容（端到端一致性）
-    let request =
-        super::builders::build_chat_request(h.ctx.store.as_ref(), &h.session_id, usize::MAX).await;
+    let request = super::builders::build_chat_request(h.ctx.store.as_ref(), &h.session_id).await;
     let assistant_in_request = request
         .messages
         .iter()
@@ -2591,11 +2584,7 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     crate::history::inject_user_messages(&ctx, msgs).await;
 
     // 验证：DB 里的 content 是拦截后的（带 [脱敏] 前缀）
-    let visible: Vec<_> = ctx
-        .store
-        .load_visible_messages(&session_id, usize::MAX)
-        .await
-        .unwrap();
+    let visible: Vec<_> = ctx.store.load_visible_messages(&session_id).await.unwrap();
     assert_eq!(visible.len(), 2, "两条 user 消息应都进 DB");
     assert_eq!(
         visible[0].content.as_deref(),
@@ -2778,8 +2767,8 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     )]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
     // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门——harness 未注册模型，
-    // context_length 解析为 None 仅影响 CompressionStarted 事件里的展示值与
-    // keep 预算，不影响压缩能否执行。
+    // context_length 解析为 None 仅影响 CompressionStarted 事件里的展示值，
+    // 不影响压缩能否执行。
     preload_user(&h, "第一段对话内容").await;
     preload_user(&h, "第二段对话内容").await;
     preload_user(&h, "第三段对话内容").await;

@@ -119,8 +119,6 @@ fn to_chat_message(m: &Message) -> ChatMessage {
 /// - `provider`：LLM provider（用 `stream_chat()` 流式接口）
 /// - `model_id`：摘要用哪个模型（一般与主对话一致）
 /// - `options`：复用自 session 的流式选项（思考配置原样带；tools 在内部强制清空）
-/// - `context_length`：模型上下文长度（用于按比例计算保留窗口预算）
-/// - `cfg`：压缩配置
 /// - `on_delta`：流式增量回调。每个 TextDelta 调一次 `(Some(content), None)`，
 ///   每个 ReasoningDelta 调一次 `(None, Some(reasoning))`。调用方据此发 Compression Delta 事件。
 ///   回调是同步的（fnMut 不能 await），调用方若需异步处理应通过 channel 转发。

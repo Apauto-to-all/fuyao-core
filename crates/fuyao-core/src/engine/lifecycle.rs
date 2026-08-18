@@ -328,13 +328,9 @@ impl Engine {
             .await?
             .ok_or_else(|| EngineError::SessionNotFound(source_id.clone()))?;
 
-        // 2. 加载源 session 的可见消息（动态拼接窗口），fork 用 keep_tokens_max 上限保留
-        //    最大近期范围——子会话可能换模型，用配置上限避免复制时丢失内容
-        let keep_tokens = fuyao_api::get_config().session.compression.keep_tokens_max;
-        let visible = self
-            .store
-            .load_visible_messages(source_id, keep_tokens)
-            .await?;
+        // 2. 加载源 session 的可见消息（可见窗口 = 最新 compaction 摘要 + 摘要后全部消息），
+        //    fork 完整复制源会话可见窗口——子会话继承压缩边界之后的上下文
+        let visible = self.store.load_visible_messages(source_id).await?;
 
         // 3. 构造新 session：系统提示词复制源值，parent_session_id 由调用方决定
         //    计数字段（message_count 等）从 0 起算——下方批量复制消息时，

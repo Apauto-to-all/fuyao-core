@@ -179,7 +179,7 @@ async fn run_compression(
     model: &builders::ResolvedModel,
     provider: &std::sync::Arc<dyn fuyao_provider::Provider>,
 ) {
-    // 上下文长度未知（模型未注册）时按 0：仅影响 Started 事件展示值与 keep 预算，
+    // 上下文长度未知（模型未注册）时按 0：仅影响 Started 事件展示值，
     // 摘要 LLM 调用会因模型不存在在 provider 处失败，不在压缩侧兜底
     let context_length = model.context_length.unwrap_or(0);
 
@@ -207,12 +207,11 @@ async fn run_compression(
     )
     .await;
 
-    // 从 DB 加载可见窗口：与主对话同口径（effective_keep_tokens 按 context_length 算），
-    // 前缀缓存可复用。generate_summary 内部不切窗，把传入 messages 全量发给 LLM
-    let keep_tokens = ctx.compression_config.effective_keep_tokens(context_length);
+    // 从 DB 加载可见窗口：与主对话同口径，前缀缓存可复用。
+    // generate_summary 内部不切窗，把传入 messages 全量发给 LLM
     let visible_messages = match ctx
         .store
-        .load_visible_messages(ctx.emitter.session_id(), keep_tokens)
+        .load_visible_messages(ctx.emitter.session_id())
         .await
     {
         Ok(m) => m,
@@ -320,7 +319,7 @@ async fn run_compression(
     // 等 Delta 消费者把剩余积压推完
     let _ = (&mut delta_consumer).await;
 
-    // 落地层：写 compaction 边界消息（不复制 keep_recent——可见窗口在读取侧动态拼接）
+    // 落地层：写 compaction 边界消息（可见窗口 = 最新摘要 + 摘要后消息，读取侧动态拼接）
     // reason 透传给 mark_compaction，保证 DB 审计列（tool_name）与 Started/Ended 事件 reason 一致
     match ctx
         .store

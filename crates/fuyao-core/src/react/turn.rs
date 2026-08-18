@@ -163,14 +163,6 @@ pub(crate) async fn run_turn(
     let model = resolved.model.clone();
     let options = resolved.options.clone();
 
-    // 可见窗口的 keep_recent token 预算：按当前模型上下文比例算（与压缩侧同口径）
-    // context_length 已由 resolve_model 一并解析（resolved.context_length）；模型未注册
-    // 时为 None——保留预算按 0（仅影响已压缩会话的近期消息附带量），该模型的 LLM
-    // 调用自会在 provider 处失败，无需此处兜底
-    let keep_tokens = ctx
-        .compression_config
-        .effective_keep_tokens(resolved.context_length.unwrap_or(0));
-
     loop {
         // === 控制通道间隙检查点 ===
         // 每轮 ReAct 开始前非阻塞排空控制通道。时机安全：上一轮工具结果已落库、
@@ -199,9 +191,8 @@ pub(crate) async fn run_turn(
         // 每次 loop 顶部新建；retry.rs 在重试时清空复用，保证不携带上一次的部分结果。
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));
         // 本轮的 ChatRequest（重试间复用同一份——一次 LLM 调用内 DB 历史不变）
-        // 消息已不在内存，每次构造时从 DB 查可见窗口（动态拼接，按 keep_tokens 截近期）
-        let request =
-            build_chat_request(ctx.store.as_ref(), ctx.emitter.session_id(), keep_tokens).await;
+        // 消息已不在内存，每次构造时从 DB 查可见窗口（动态拼接）
+        let request = build_chat_request(ctx.store.as_ref(), ctx.emitter.session_id()).await;
 
         // 中断点①：流式期间（含重试 sleep 期间——select! drop future 即取消 sleep）
         // run_stream_with_retry 内部按错误类型自动重试，发 OutputEvent::Retry 给 UI。

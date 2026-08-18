@@ -294,12 +294,12 @@ async fn index_write_amplification_old_vs_new() {
     }
 }
 
-// ── 基准三：读取路径（每次 LLM 调用前的可见窗口重读成本）──
+// ── 基准三：读取路径（每次 LLM 调用前的可见消息重读成本）──
 //
 // 真实调用形态：每个 ReAct 迭代调一次 load_visible_messages + 一次 store.get
-// （system_prompt 现读）。本基准量化单次调用的绝对成本，以及三个变量：
-// 纯文本 vs 带图（图片 base64 JSON 反序列化）、未压缩全量路径 vs 已压缩三段路径
-// （后者读入区间全部行但只保留尾部预算内的——读放大直接可见）。
+// （system_prompt 现读）。本基准量化单次调用的绝对成本，以及两个对比维度：
+// 纯文本 vs 带图（图片 base64 JSON 反序列化）、未压缩全量路径 vs 已压缩路径
+// （后者只读摘要行与压缩边界之后的新消息，行数远小于全量）。
 
 /// 构造读取路径基准会话：n 条混合消息（复用 fork 基准的消息形态，含数 KB 工具输出），
 /// 可选每 k 条附 1 张 150KB 级 base64 图（模拟多模态消息的大字段）
@@ -357,13 +357,12 @@ async fn read_path_visible_window_cost() {
     const READ_ROUNDS: usize = 10;
     const NEWER: usize = 20;
     let store = temp_store().await;
-    let keep_tokens = fuyao_api::get_config().session.compression.keep_tokens_max;
 
     // ① 纯文本 · 未压缩（全量路径）——LLM 全部都要看，读满 400 条
     let sid_text = setup_read_session(&store, N, None).await;
     let stats = sample_calls(READ_ROUNDS, || async {
         store
-            .load_visible_messages(&sid_text, keep_tokens)
+            .load_visible_messages(&sid_text)
             .await
             .expect("加载失败")
             .len()
@@ -376,7 +375,7 @@ async fn read_path_visible_window_cost() {
         "（全量路径，400 条全部进 LLM）",
     );
 
-    // ② 纯文本 · 已压缩（三段路径）——读入 400+20 条，只保留尾部预算内 + 新消息
+    // ② 纯文本 · 已压缩——可见消息 = 摘要 + 压缩边界之后的 20 条新消息
     store
         .mark_compaction(
             &sid_text,
@@ -392,28 +391,25 @@ async fn read_path_visible_window_cost() {
         .unwrap();
     let stats = sample_calls(READ_ROUNDS, || async {
         store
-            .load_visible_messages(&sid_text, keep_tokens)
+            .load_visible_messages(&sid_text)
             .await
             .expect("加载失败")
             .len()
     })
     .await;
-    let total_rows = N + 1 + NEWER; // 原始 400 + 1 条摘要边界 + 20 条新消息
+    let visible_rows = 1 + NEWER; // 1 条摘要 + 20 条压缩后新消息
     report(
-        &format!("纯文本·已压缩 读{total_rows}条"),
+        &format!("纯文本·已压缩 读{visible_rows}条"),
         stats,
         READ_ROUNDS,
-        &format!(
-            "（三段路径：读入 {total_rows} 条，仅保留尾部 {} token 预算 + 摘要 + 新消息）",
-            keep_tokens
-        ),
+        &format!("（已压缩路径：摘要 + 压缩边界后 {NEWER} 条新消息）"),
     );
 
     // ③ 带图 · 未压缩——每 8 条 1 张 150KB base64，量化图片反序列化成本
     let sid_img = setup_read_session(&store, N, Some(8)).await;
     let stats = sample_calls(READ_ROUNDS, || async {
         store
-            .load_visible_messages(&sid_img, keep_tokens)
+            .load_visible_messages(&sid_img)
             .await
             .expect("加载失败")
             .len()

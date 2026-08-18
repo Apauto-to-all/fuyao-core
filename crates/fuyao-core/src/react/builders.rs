@@ -25,9 +25,9 @@ use std::collections::HashMap;
 /// 供调用方写回 session（见 turn.rs 物化逻辑）+ 落进 assistant 消息 + 喂费用计算。
 /// 三者从 `ModelConfig.model_id` 拆分而来（model_id 必须非空，空值在 resolve_model 即报错）。
 ///
-/// `context_length` 一并解析进来——主对话 keep_tokens 预算、压缩阈值门、中断补发
-/// 三处消费点共用一份解析（`None` 表示模型未注册、上下文长度未知），
-/// 调用方直接读 `resolved.context_length`，口径天然一致。
+/// `context_length` 一并解析进来——压缩阈值门、压缩事件展示等消费点共用一份解析
+/// （`None` 表示模型未注册、上下文长度未知），调用方直接读 `resolved.context_length`，
+/// 口径天然一致。
 #[derive(Debug)]
 pub(crate) struct ResolvedModel {
     /// 完整模型 ID（`"provider_id/model_id"` 形，写回 session / 落库 / 计费用）
@@ -41,9 +41,9 @@ pub(crate) struct ResolvedModel {
     /// 模型上下文长度（查注册表 `model.limit.context`，查不到为 `None`）
     ///
     /// `None` 表示模型未注册（注册表无此条目）——不编造任何数字，由各消费点
-    /// 自行决定降级语义：keep_tokens 预算按 0、压缩判定直接跳过；
+    /// 自行决定降级语义：压缩判定直接跳过；
     /// 该模型的 turn 调用自会在 provider 调用处失败，无需此处兜底。
-    /// keep_tokens 预算、压缩阈值门等各消费点共用一份，避免散算漂移。
+    /// 压缩阈值门等各消费点共用一份，避免散算漂移。
     pub context_length: Option<u32>,
 }
 
@@ -59,12 +59,8 @@ pub(crate) struct ResolvedModel {
 /// **配对兜底**：OpenAI/Anthropic 协议要求每个 assistant 的 tool_call 都有对应的
 /// tool 结果消息。被拦截 Block、中断的工具调用不会有结果——这里在拼消息时
 /// 为缺结果的 tool_call 补一条 error tool_result（content 标记中断）。
-pub(crate) async fn build_chat_request(
-    store: &SessionStore,
-    session_id: &str,
-    keep_tokens: usize,
-) -> ChatRequest {
-    let history = match store.load_visible_messages(session_id, keep_tokens).await {
+pub(crate) async fn build_chat_request(store: &SessionStore, session_id: &str) -> ChatRequest {
+    let history = match store.load_visible_messages(session_id).await {
         Ok(msgs) => msgs,
         Err(e) => {
             tracing::warn!(
@@ -150,7 +146,7 @@ pub(crate) async fn build_chat_request(
 ///
 /// 集中此片段，供 [`resolve_model`]（首轮解析）与压缩侧 / 中断补发侧等独立调用点共用。
 /// 返回 `None` 表示模型未注册（注册表查不到该条目）——不编造任何数字，由调用方
-/// 决定降级语义（压缩判定跳过 / keep_tokens 预算按 0）。`context` 为 0 的条目
+/// 决定降级语义（压缩判定直接跳过）。`context` 为 0 的条目
 /// 视同未声明（配置加载层已保证 toml 声明的 context 必为正整数，0 只可能来自
 /// 程序化注册的残缺条目），同样返回 `None`。
 /// `get_model` 查全局静态缓存（非 IO），本函数保持纯计算。
@@ -219,7 +215,7 @@ pub(crate) fn resolve_model(
         reasoning_effort,
     };
 
-    // context_length 与主对话 keep_tokens 预算、压缩阈值门共用一份（集中此处解析）
+    // context_length 供压缩阈值门等消费点共用一份（集中此处解析）
     let context_length = resolve_context_length(model_id, agent_paths);
 
     Ok(ResolvedModel {
@@ -372,7 +368,7 @@ mod tests {
         )
         .await;
 
-        let request = build_chat_request(&store, &session.id, usize::MAX).await;
+        let request = build_chat_request(&store, &session.id).await;
 
         // 应有：user + assistant + 1 真实结果 + 2 补充 error 结果 = 5 条
         let tool_msgs: Vec<_> = request
@@ -413,7 +409,7 @@ mod tests {
         )
         .await;
 
-        let request = build_chat_request(&store, &session.id, usize::MAX).await;
+        let request = build_chat_request(&store, &session.id).await;
         let tool_count = request
             .messages
             .iter()
@@ -434,7 +430,7 @@ mod tests {
         )
         .await;
 
-        let request = build_chat_request(&store, &session.id, usize::MAX).await;
+        let request = build_chat_request(&store, &session.id).await;
         assert_eq!(request.messages.len(), 2, "无工具调用时消息数不变");
     }
 
