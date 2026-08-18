@@ -26,8 +26,6 @@ mod session;
 mod todo;
 mod visible_window;
 
-// 回退结果的领域类型对外导出（供消费方 fuyao-core 投影成 wire 载荷）
-pub use rollback::RollbackResult;
 // 压缩原因持久层枚举对外导出（供消费方 fuyao-core 从事件层枚举转换后落库）
 pub use compaction::CompressionReason;
 

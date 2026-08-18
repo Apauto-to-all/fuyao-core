@@ -22,7 +22,6 @@ mod compression;
 mod error;
 mod interrupt;
 mod retry;
-mod rollback;
 mod title;
 mod tool_call;
 mod tool_result;
@@ -41,7 +40,6 @@ pub use compression::{
 pub use error::{ErrorMessage, ErrorPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use retry::{RetryMessage, RetryPayload};
-pub use rollback::RollbackPayload;
 pub use title::{TitleMessage, TitlePayload};
 pub use tool_call::{ToolCallMessage, ToolCallPayload};
 pub use tool_result::{ToolResultMessage, ToolResultPayload};

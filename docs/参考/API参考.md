@@ -70,7 +70,7 @@ let sessions = fuyao.sessions;     // 查历史
 | 关闭 | `app.shutdown` | 消费 `self` | `()`（两段式：engine.shutdown → forwarder 退出 → 停 MCP → drop） |
 | 列历史会话 | `sessions.list_sessions` | `Option<&str>`（workspace 过滤）/ `i64` limit / `i64` offset | `Result<Vec<Session>, SessionError>`（按 `last_active_at` 倒序） |
 | 会话总数 | `sessions.session_count` | `Option<&str>`（workspace 过滤） | `Result<i64, SessionError>` |
-| 对话回退 | `sessions.rollback_session` | `&str（session_id）` / `i64（target_seq）` | `Result<RollbackPayload, SessionError>`（请求-响应直接返回载荷、不经事件流；安全顺序「先停后滚」——先 `app.stop_session` 屏障停 turn 再回退，两步之间无该 session 的并发写库） |
+| 对话回退 | `sessions.rollback_session` | `&str（session_id）` / `i64（target_seq）` | `Result<(), SessionError>`（无返回载荷，回退后的会话状态经读路径获取——`list_messages` / `get_session`；安全顺序「先停后滚」——先 `app.stop_session` 屏障停 turn 再回退，两步之间无该 session 的并发写库） |
 
 > **子 session 不进 fan_out**：子任务 session（`create_child_session` 产出）的 rx 直接返调用方独占消费——子代理 tool handler 用它取最终回复，fire-and-forget 后台任务 spawn 独立 task 消费。UI 出口只暴露主对话，避免子任务事件污染主对话流。
 

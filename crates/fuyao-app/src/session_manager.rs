@@ -19,9 +19,6 @@
 
 use std::sync::Arc;
 
-use fuyao_api::UserMessageMode;
-use fuyao_api::message::input::UserMessageSource;
-use fuyao_api::message::output::{RollbackPayload, UserPayload};
 use fuyao_session::SessionStore;
 
 /// 会话管理器：持有会话存储句柄，对外提供会话检索 / 浏览 / 元数据编辑接口
@@ -139,11 +136,10 @@ impl SessionManager {
 
     /// 把会话回退到目标消息（删目标 seq 之后的所有消息 + 重算 count 类与压缩元数据）
     ///
-    /// 复用存储层单事务原子执行体（[`SessionStore::rollback_to`]
-    /// （fuyao_session::SessionStore::rollback_to）：删消息 + 重算 + 局部 UPDATE），
-    /// 把领域结果投影成 wire 载荷 [`RollbackPayload`] 直接返回——请求-响应语义，
-    /// 不经事件流。`target_message` 按「回退后目标消息将作为新 guide 重新发送」补
-    /// `mode=Guide` / `source=User`，应用层据此填输入框。
+    /// 复用存储层单事务原子执行体 [`SessionStore::rollback_to`](fuyao_session::SessionStore::rollback_to)
+    /// （删消息 + 重算 + 局部 UPDATE），执行成功返回 `Ok(())`，无返回载荷——回退后的
+    /// 会话状态经既有读路径获取：`list_messages` 看剩余消息流，`get_session` 看重算后的
+    /// session 行；目标用户消息的本体内容调用方本就持有（回退点由调用方选定）。
     ///
     /// # 运行态责任边界
     ///
@@ -151,10 +147,6 @@ impl SessionManager {
     /// 其后续落库会与回退结果竞争（回退被新写入部分抵消、重算计数漂移）。
     /// 需要安全回退的调用方应先经运行时门面 [`App::stop_session`](crate::App::stop_session)
     /// 屏障停 turn 再回退——「先停后滚」的顺序是回退安全性的承重前提，不可倒置。
-    ///
-    /// # 返回
-    /// [`RollbackPayload`]：锚点 seq、删除计数（界面通知口径）、目标消息本体
-    /// （user → Some 含 content+images / compaction → None）、重算后的 4 个状态字段。
     ///
     /// # 错误
     /// - [`fuyao_session::SessionError::NotFound`]：session_id 不存在，或 target_seq
@@ -165,26 +157,8 @@ impl SessionManager {
         &self,
         session_id: &str,
         target_seq: i64,
-    ) -> Result<RollbackPayload, fuyao_session::SessionError> {
-        let result = self.store.rollback_to(session_id, target_seq).await?;
-        // 领域结果 → wire 投影：7 个标量 1:1 拷贝；target_message 取 content/images，
-        // 按「回退后目标消息将作为新 guide 重新发送」补 mode/source——原消息的
-        // mode/source 语义不再适用（应用语义留在本门面，不入 store 层）
-        Ok(RollbackPayload {
-            target_seq: result.target_seq,
-            deleted_count: result.deleted_count,
-            deleted_total: result.deleted_total,
-            target_message: result.target_message.as_ref().map(|m| UserPayload {
-                content: m.content.clone().unwrap_or_default(),
-                images: m.images.clone(),
-                mode: UserMessageMode::Guide,
-                source: UserMessageSource::User,
-            }),
-            message_count: result.message_count,
-            tool_call_count: result.tool_call_count,
-            last_compacted_seq: result.last_compacted_seq,
-            compression_count: result.compression_count,
-        })
+    ) -> Result<(), fuyao_session::SessionError> {
+        self.store.rollback_to(session_id, target_seq).await
     }
 
     // ── 消息查询 ───────────────────────────────────────────────
@@ -660,12 +634,11 @@ mod tests {
         );
     }
 
-    // ===== rollback_session：rollback_to + wire 投影 =====
+    // ===== rollback_session：直调存储层回退执行体 =====
 
     #[tokio::test]
-    async fn rollback_session_projects_target_user_message() {
-        // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 a2
-        // 期待：payload 标量对齐领域结果，target_message 为 Some 且补 mode=Guide / source=User
+    async fn rollback_session_deletes_after_target_and_recounts() {
+        // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 a2；状态经读路径对齐
         let manager = temp_manager().await;
         let sid = seed_session(&manager, None).await;
         seed_user_message(&manager, &sid, "u1").await;
@@ -674,32 +647,25 @@ mod tests {
         seed_assistant_message(&manager, &sid, "a2").await;
 
         // 回退目标取 u2 的 seq（插入顺序 1/2/3/4，u2 = seq3）
-        let target_seq = 3;
-        let payload = manager.rollback_session(&sid, target_seq).await.unwrap();
+        manager.rollback_session(&sid, 3).await.unwrap();
 
-        assert_eq!(payload.target_seq, target_seq);
-        assert_eq!(payload.deleted_total, 1, "只删了 a2（assistant）");
-        assert_eq!(payload.deleted_count, 0, "a2 不计入用户通知口径");
-        assert_eq!(payload.message_count, 3, "剩余 u1, a1, u2");
+        // DB：只剩 u1, a1, u2，目标 u2 保留为最新一条（seq 倒序，最新在前）
+        let msgs = manager
+            .list_messages(&sid, None, Some(10))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(msgs.len(), 3, "只删目标之后的消息");
+        assert_eq!(msgs[0].seq, 3, "最新一条是目标 u2");
 
-        // 投影核心：目标 user 消息 → UserPayload（content 完整带回 + 按「将作为新
-        // guide 重新发送」补 mode/source——供应用层直接填输入框）
-        let target = payload
-            .target_message
-            .expect("user 目标应有 target_message");
-        assert_eq!(target.content, "u2");
-        assert_eq!(target.mode, UserMessageMode::Guide);
-        assert_eq!(target.source, UserMessageSource::User);
-        assert!(target.images.is_empty());
-
-        // DB 状态：session 行 count 已被 rollback_to 事务重算
+        // session 行 count 已被事务重算
         let loaded = manager.store.get(&sid).await.unwrap().unwrap();
         assert_eq!(loaded.message_count, 3);
     }
 
     #[tokio::test]
-    async fn rollback_session_compaction_target_has_no_message() {
-        // compaction 目标 → target_message 置 None（摘要不填输入框），压缩元数据对齐
+    async fn rollback_session_compaction_target_keeps_boundary_metadata() {
+        // compaction 目标：压缩边界保留，元数据仍指向它
         let manager = temp_manager().await;
         let sid = seed_session(&manager, None).await;
         seed_user_message(&manager, &sid, "u1").await;
@@ -710,16 +676,21 @@ mod tests {
             .unwrap();
         seed_user_message(&manager, &sid, "u2").await;
 
-        let payload = manager.rollback_session(&sid, comp_seq).await.unwrap();
+        manager.rollback_session(&sid, comp_seq).await.unwrap();
 
-        assert_eq!(payload.target_seq, comp_seq);
-        assert!(
-            payload.target_message.is_none(),
-            "compaction 目标不填输入框"
-        );
-        assert_eq!(payload.deleted_count, 1, "删了 u2（user 口径）");
-        assert_eq!(payload.last_compacted_seq, Some(comp_seq));
-        assert_eq!(payload.compression_count, 1);
+        // 删了压缩边界之后的 u2，边界本身保留为最新一条
+        let msgs = manager
+            .list_messages(&sid, None, Some(10))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(msgs.len(), 2, "删掉压缩边界之后的 u2");
+        assert_eq!(msgs[0].seq, comp_seq, "最新一条是压缩边界");
+
+        // 压缩元数据仍指向保留的边界
+        let loaded = manager.store.get(&sid).await.unwrap().unwrap();
+        assert_eq!(loaded.last_compacted_seq, Some(comp_seq));
+        assert_eq!(loaded.compression_count, 1);
     }
 
     #[tokio::test]

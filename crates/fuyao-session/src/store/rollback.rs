@@ -31,64 +31,12 @@
 //!
 //! # 单事务原子
 //!
-//! 全部步骤在一个 SQLite 事务内完成，避免中途失败留下脏状态。返回 [`RollbackResult`]——
-//! 持久化层只陈述「删了什么、重算成什么」的领域事实；把它投影成对外载荷
-//! （`RollbackPayload` + `UserPayload`，含 mode/source 等应用语义）是消费方
-//! （会话管理门面 `SessionManager::rollback_session`）的职责。
+//! 全部步骤在一个 SQLite 事务内完成，避免中途失败留下脏状态。变更本体无返回载荷：
+//! 回退是纯存储变更，调用方需要的后续状态（剩余消息、重算后的会话元数据）一律经
+//! 既有读路径获取——`load_full_history` 看剩余消息，`get` 看 session 行。
 
-use super::row::MessageRow;
 use crate::error::SessionError;
-use fuyao_api::Message;
 use fuyao_api::MessageKind;
-
-/// 回退执行结果（领域类型）
-///
-/// 单事务原子执行后产出。持久化层只负责陈述事实——「目标锚点」「删除计数」「目标消息本体」
-/// 「重算后的状态字段」——不含任何 wire 投影语义（如 `mode`/`source`）。
-///
-/// # 投影约定
-///
-/// 消费方（会话管理门面 `SessionManager::rollback_session`）据此投影成对外载荷：
-/// - 7 个标量字段 1:1 拷贝进 `RollbackPayload`
-/// - `target_message: Option<Message>` → `Option<UserPayload>`：取 content/images，
-///   按「回退后目标消息将作为新 guide 重新发送」补 `mode=Guide` / `source=User`
-///
-/// 这种领域结果与 wire 载荷的分层，使持久化层不依赖任何 output 载荷类型——依赖方向保持
-/// `fuyao-session → fuyao-api(domain: Message)`，正向。
-#[derive(Debug, Clone)]
-pub struct RollbackResult {
-    /// 回退到的目标 seq（位置锚点）
-    ///
-    /// 回退后它是当前最新消息的 seq。上层据此定位「现在在哪」，后续一切操作
-    /// （可见窗口、继续对话）都以它为起点。
-    pub target_seq: i64,
-    /// 删除的「用户消息数 + 压缩消息数」
-    ///
-    /// 界面通知用——「已回退 N 条消息」对用户有意义的口径是「撤了几轮对话 + 撤了几次压缩」，
-    /// 不含附属的 assistant / tool 响应。
-    pub deleted_count: i64,
-    /// 删除的全部消息数（含 assistant / tool）
-    ///
-    /// 审计 / 前端备用。回退会删目标 seq 之后的所有消息（含中间态），总数与
-    /// `deleted_count` 的差就是被一并清理的 assistant / tool 消息数。
-    pub deleted_total: i64,
-    /// 目标消息本体（完整领域形态）
-    ///
-    /// - 目标是 user 消息 → `Some`，含 content + images（消费方据此填输入框）
-    /// - 目标是 compaction 消息 → `None`，压缩摘要不填输入框
-    pub target_message: Option<Message>,
-    /// 重算后的消息总数
-    pub message_count: i64,
-    /// 重算后的工具调用总数
-    pub tool_call_count: i64,
-    /// 重算后的最新压缩边界 seq
-    ///
-    /// 回退跨压缩边界时会变：若删掉了所有 compaction 消息，置 `None`（从未压缩）；
-    /// 否则落到剩余消息里最新一条 compaction 消息的 seq。
-    pub last_compacted_seq: Option<i64>,
-    /// 重算后的压缩次数
-    pub compression_count: i32,
-}
 
 impl super::SessionStore {
     /// 把会话回退到目标消息（删目标 seq 之后的所有消息 + 重算 count 类与压缩元数据）
@@ -96,7 +44,7 @@ impl super::SessionStore {
     /// 单事务原子操作，四步：
     /// 1. 校验目标消息存在 + role/kind 合法（只能是 user 或 compaction）
     /// 2. 删除目标 seq 之后的所有消息——`RETURNING` 带回被删行的 (role, kind)，
-    ///    Rust 侧聚合成 `deleted_count` / `deleted_total` 供返回值反馈
+    ///    Rust 侧聚合成删除计数写进日志
     /// 3. 重算 count 类字段（message_count / tool_call_count）与压缩元数据
     ///    （last_compacted_seq / compression_count）——四个标量聚合进单条查询
     /// 4. 局部 UPDATE sessions 写回 4 个重算字段——token/cost 原值不动
@@ -106,36 +54,27 @@ impl super::SessionStore {
     /// - `target_seq`:回退目标消息的 seq（目标本身保留，删它之后的）
     ///
     /// # 返回
-    /// [`RollbackResult`]，含锚点 seq、删除计数（界面通知用）、目标消息本体
-    /// （user→Some 含 content+images / compaction→None）、重算后的 4 个状态字段。
-    /// 消费方据此投影成 `RollbackPayload`（wire 投影）直接返调用方。
+    /// `Ok(())`——无返回载荷。回退后的会话状态经读路径获取：
+    /// `load_full_history` 看剩余消息，`get` 看重算后的 session 行。
     ///
     /// # 错误
     /// - [`SessionError::NotFound`]:session_id 不存在，或 target_seq 在该 session 中无对应消息
     /// - [`SessionError::InvalidRollbackTarget`]:目标消息非 user 且非 compaction（assistant / tool 中间态）
-    pub async fn rollback_to(
-        &self,
-        session_id: &str,
-        target_seq: i64,
-    ) -> Result<RollbackResult, SessionError> {
+    pub async fn rollback_to(&self, session_id: &str, target_seq: i64) -> Result<(), SessionError> {
         let mut tx = self.pool.begin().await?;
 
         // 1. 校验 session 存在（避免给不存在的 session 操作）
         super::session::require_session(&mut tx, session_id).await?;
 
-        // 2. 取目标消息本身（提取 content/images 填输入框 + 拿 role/kind 校验）
-        let target_row = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages WHERE session_id = ?1 AND seq = ?2",
-        )
-        .bind(session_id)
-        .bind(target_seq)
-        .fetch_optional(&mut *tx)
-        .await?;
+        // 2. 取目标消息的 role/kind 做合法性判定
+        let target_row: Option<(String, String)> =
+            sqlx::query_as("SELECT role, kind FROM messages WHERE session_id = ?1 AND seq = ?2")
+                .bind(session_id)
+                .bind(target_seq)
+                .fetch_optional(&mut *tx)
+                .await?;
 
-        let Some(target_row) = target_row else {
+        let Some((role, kind)) = target_row else {
             return Err(SessionError::NotFound(format!(
                 "session={session_id} 中无 seq={target_seq} 的消息"
             )));
@@ -146,27 +85,16 @@ impl super::SessionStore {
         // compaction 消息的 role 是 assistant（摘要由助手产出，以 assistant 身份
         // 参与对话流），但它是压缩边界这一事实只由 kind 表达——故 compaction
         // 一律靠 kind 识别，与 role 无关。
-        let is_user = target_row.role == "user";
-        let is_compaction = target_row.kind == MessageKind::Compaction.as_str();
-        if !is_user && !is_compaction {
+        if role != "user" && kind != MessageKind::Compaction.as_str() {
             return Err(SessionError::InvalidRollbackTarget(format!(
-                "seq={target_seq}（role={}, kind={}）",
-                target_row.role, target_row.kind
+                "seq={target_seq}（role={role}, kind={kind}）"
             )));
         }
 
-        // 目标消息本体（领域形态）：user → Some（含 content+images，复用 MessageRow 转换，
-        // images 反序列化由 row 层统一负责）；compaction → None（摘要不填输入框）
-        let target_message: Option<Message> = if is_user {
-            Some(target_row.into())
-        } else {
-            None
-        };
-
         // 3. 删除目标 seq 之后的所有消息，RETURNING 带回被删行的 (role, kind)——
-        //    删除与删除计数一次往返完成。计数口径：
-        //    deleted_count = user 消息数 + compaction 消息数（界面通知口径，不含 assistant/tool）
-        //    deleted_total = 全部被删消息数（含 assistant/tool，审计用）
+        //    删除与删除计数一次往返完成。计数仅用于日志（INFO 重建故事）：
+        //    deleted_count = user 消息数 + compaction 消息数（不含 assistant/tool）
+        //    deleted_total = 全部被删消息数（含 assistant/tool）
         let deleted_rows: Vec<(String, String)> = sqlx::query_as(
             "DELETE FROM messages WHERE session_id = ?1 AND seq > ?2 RETURNING role, kind",
         )
@@ -232,16 +160,7 @@ impl super::SessionStore {
             "对话已回退到目标消息"
         );
 
-        Ok(RollbackResult {
-            target_seq,
-            deleted_count,
-            deleted_total,
-            target_message,
-            message_count,
-            tool_call_count,
-            last_compacted_seq,
-            compression_count,
-        })
+        Ok(())
     }
 }
 
@@ -306,38 +225,17 @@ mod tests {
         let before = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(before.message_count, 4);
 
-        let result = store.rollback_to(&session.id, u2).await.unwrap();
+        store.rollback_to(&session.id, u2).await.unwrap();
 
-        // 目标 u2 保留，删了 a2（1 条 assistant）
-        assert_eq!(result.target_seq, u2);
-        assert_eq!(
-            result.deleted_count, 0,
-            "删的 a2 是 assistant，不计入 deleted_count"
-        );
-        assert_eq!(result.deleted_total, 1, "deleted_total 含 assistant");
-        let target = result
-            .target_message
-            .as_ref()
-            .expect("user 目标应有 target_message");
-        assert_eq!(
-            target.content.as_deref(),
-            Some("u2"),
-            "user 目标 → content = u2"
-        );
-        assert!(target.images.is_empty());
-
-        // message_count 重算：剩余 u1, a1, u2 → 4 条里 3 条是 message kind
-        assert_eq!(result.message_count, 3);
-        assert_eq!(result.tool_call_count, 0);
-
-        // DB 状态：只剩 3 条消息
+        // DB 状态：只剩 3 条消息，最后一条是目标 u2
         let full = store.load_full_history(&session.id).await.unwrap();
         assert_eq!(full.len(), 3);
         assert_eq!(full[2].content.as_deref(), Some("u2"), "最后一条是 u2");
 
-        // session 元数据已写回
+        // session 元数据已重算并写回：3 条 message kind，无 tool 结果
         let loaded = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(loaded.message_count, 3);
+        assert_eq!(loaded.tool_call_count, 0);
     }
 
     #[tokio::test]
@@ -367,12 +265,14 @@ mod tests {
         store.insert_message(&session.id, &mut a2).await.unwrap(); // seq 5
         insert_tool(&store, &session.id, "call_2", "结果2").await; // seq 6
 
-        let result = store.rollback_to(&session.id, u2).await.unwrap();
+        store.rollback_to(&session.id, u2).await.unwrap();
 
-        // 删了 a2, t2 → tool_call_count 从 2 变 1
-        assert_eq!(result.tool_call_count, 1, "删了一条 tool 结果，剩余 1");
-        assert_eq!(result.deleted_total, 2, "删了 a2 + t2 共 2 条");
-        assert_eq!(result.deleted_count, 0, "a2/t2 都不是 user/compaction");
+        // 删了 a2, t2 → tool_call_count 从 2 变 1，剩余 4 条消息
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.tool_call_count, 1, "删了一条 tool 结果，剩余 1");
+        assert_eq!(loaded.message_count, 4, "剩余 u1, a1, t1, u2");
+        let full = store.load_full_history(&session.id).await.unwrap();
+        assert_eq!(full.len(), 4, "删了 a2 + t2 共 2 条");
     }
 
     // ===== 回退到 compaction 消息 =====
@@ -394,23 +294,15 @@ mod tests {
         insert_user(&store, &session.id, "u2").await; // seq 4
         insert_assistant(&store, &session.id, "a2").await; // seq 5
 
-        let result = store.rollback_to(&session.id, comp_seq).await.unwrap();
-
-        assert_eq!(result.target_seq, comp_seq);
-        assert!(
-            result.target_message.is_none(),
-            "compaction 目标 → target_message 置空（不填输入框）"
-        );
-        // 删了 u2, a2 → deleted_count=1（u2 是 user），deleted_total=2
-        assert_eq!(result.deleted_count, 1);
-        assert_eq!(result.deleted_total, 2);
+        store.rollback_to(&session.id, comp_seq).await.unwrap();
 
         // compaction 保留，last_compacted_seq 仍指向它，compression_count 仍 1
-        assert_eq!(result.last_compacted_seq, Some(comp_seq));
-        assert_eq!(result.compression_count, 1);
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.last_compacted_seq, Some(comp_seq));
+        assert_eq!(loaded.compression_count, 1);
 
         // message_count 重算：剩余 u1, a1, compaction → 2 条 message kind（排除 compaction）
-        assert_eq!(result.message_count, 2);
+        assert_eq!(loaded.message_count, 2);
 
         // compaction 消息仍在
         let full = store.load_full_history(&session.id).await.unwrap();
@@ -441,15 +333,12 @@ mod tests {
         insert_user(&store, &session.id, "u3").await; // seq 5
         insert_assistant(&store, &session.id, "a3").await; // seq 6
 
-        let result = store.rollback_to(&session.id, u2).await.unwrap();
-
-        // 删了 c2, u3, a3 → deleted_count=2（c2 是 compaction + u3 是 user），deleted_total=3
-        assert_eq!(result.deleted_count, 2);
-        assert_eq!(result.deleted_total, 3);
+        store.rollback_to(&session.id, u2).await.unwrap();
 
         // last_compacted_seq 落到 c1，compression_count 从 2 变 1
-        assert_eq!(result.last_compacted_seq, Some(c1));
-        assert_eq!(result.compression_count, 1);
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.last_compacted_seq, Some(c1));
+        assert_eq!(loaded.compression_count, 1);
 
         // 剩余：u1, c1, u2 → c2 已删
         let full = store.load_full_history(&session.id).await.unwrap();
@@ -460,9 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_across_all_compactions_clears_metadata() {
-        // 场景：[c1@1], u1, a1, [c2@4], u2 → 回退到 u1@seq2 → 删 c2, u2
-        //       （注：c1@seq1 < u1@seq2，不在删除范围）
-        //       改造场景：u1, [c1@2], [c2@3], u2 → 回退到 u1 → 删 c1, c2, u2 → 全清
+        // 场景：u1, [c1@2], [c2@3], u2 → 回退到 u1 → 删 c1, c2, u2 → 全清
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
@@ -478,15 +365,12 @@ mod tests {
             .unwrap(); // seq 3
         insert_user(&store, &session.id, "u2").await; // seq 4
 
-        let result = store.rollback_to(&session.id, u1).await.unwrap();
-
-        // 删了 c1, c2, u2 → deleted_count=3（2 compaction + 1 user），deleted_total=3
-        assert_eq!(result.deleted_count, 3);
-        assert_eq!(result.deleted_total, 3);
+        store.rollback_to(&session.id, u1).await.unwrap();
 
         // 所有 compaction 都被删 → last_compacted_seq 置 None，compression_count 归 0
-        assert_eq!(result.last_compacted_seq, None);
-        assert_eq!(result.compression_count, 0);
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.last_compacted_seq, None);
+        assert_eq!(loaded.compression_count, 0);
 
         // 剩余：只有 u1
         let full = store.load_full_history(&session.id).await.unwrap();
@@ -571,9 +455,9 @@ mod tests {
         a1.cost = 0.05;
         store.insert_message(&session.id, &mut a1).await.unwrap(); // seq 2
 
-        let result = store.rollback_to(&session.id, u1).await.unwrap();
+        store.rollback_to(&session.id, u1).await.unwrap();
 
-        // 返回值不含消费字段——它们在 DB 原值保留
+        // 消费账本不动——token/cost 原值保留
         let loaded = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(
             loaded.total_prompt_tokens, 12345,
@@ -585,56 +469,26 @@ mod tests {
         assert_eq!(loaded.total_cost, 0.05, "total_cost 不动");
 
         // count 类字段已重算（u1 保留，a1 删除）
-        assert_eq!(loaded.message_count, result.message_count);
-        assert_eq!(loaded.tool_call_count, result.tool_call_count);
+        assert_eq!(loaded.message_count, 1);
+        assert_eq!(loaded.tool_call_count, 0);
     }
 
     // ===== 边界：回退到最后一条消息（无可删内容） =====
 
     #[tokio::test]
     async fn rollback_to_last_message_deletes_nothing() {
-        // 目标就是最新消息 → seq 之后无消息 → deleted_*=0，count 不变
+        // 目标就是最新消息 → seq 之后无消息 → 无删除，元数据不变
         let store = temp_store().await;
         let session = fuyao_api::Session::new(None, None, None);
         store.create(&session).await.unwrap();
         let u1 = insert_user(&store, &session.id, "u1").await; // seq 1
 
-        let result = store.rollback_to(&session.id, u1).await.unwrap();
+        store.rollback_to(&session.id, u1).await.unwrap();
 
-        assert_eq!(result.deleted_count, 0);
-        assert_eq!(result.deleted_total, 0);
-        assert_eq!(result.message_count, 1);
-        let target = result
-            .target_message
-            .as_ref()
-            .expect("user 目标应有 target_message");
-        assert_eq!(target.content.as_deref(), Some("u1"));
-        assert!(target.images.is_empty());
-    }
-
-    // ===== target_message 完整性：content + images 整体保留 =====
-
-    #[tokio::test]
-    async fn rollback_target_message_preserves_content_and_images() {
-        // user 消息带图片回填到输入框时，content + images 都应完整带回（整体不拆散）
-        let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
-
-        let img = fuyao_api::ImageContent {
-            mime_type: "image/png".to_string(),
-            data: "aGVsbG8=".to_string(),
-        };
-        let mut m1 = Message::user_with_images("看图".to_string(), vec![img.clone()]);
-        store.insert_message(&session.id, &mut m1).await.unwrap();
-        insert_assistant(&store, &session.id, "回复").await;
-
-        let result = store.rollback_to(&session.id, m1.seq).await.unwrap();
-        let target = result
-            .target_message
-            .as_ref()
-            .expect("user 目标应有 target_message");
-        assert_eq!(target.content.as_deref(), Some("看图"));
-        assert_eq!(target.images, vec![img], "images 应完整保留");
+        let loaded = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(loaded.message_count, 1);
+        let full = store.load_full_history(&session.id).await.unwrap();
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].content.as_deref(), Some("u1"));
     }
 }
