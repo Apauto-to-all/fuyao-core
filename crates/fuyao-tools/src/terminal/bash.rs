@@ -129,9 +129,8 @@ mod tests {
                 .unwrap()
                 .contains("hello_world_test")
         );
-        assert_eq!(parsed["success"], true);
+        assert_eq!(parsed["exit_code"], 0);
     }
-
     #[tokio::test]
     async fn bash_impl_workdir_param() {
         let args = serde_json::json!({

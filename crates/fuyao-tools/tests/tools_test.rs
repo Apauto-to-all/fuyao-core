@@ -340,11 +340,8 @@ async fn todowrite_without_todos_reads_empty_list() {
     let entry = get_tool("todowrite").unwrap();
     let result = call_tool(&entry.handler, json!({}), &ctx).await;
 
-    assert!(
-        result.get("success").is_some(),
-        "todowrite 应返回结果信封，实际：{result}"
-    );
-    assert_eq!(result["success"], true);
+    // wire 形态为结果对象原文（无信封字段），空列表时摘要 total 为 0
+    assert_eq!(result["summary"]["total"], 0, "实际：{result}");
     assert!(result["todos"].is_array(), "todos 应为数组");
     assert!(
         result["todos"].as_array().unwrap().is_empty(),
@@ -372,7 +369,6 @@ async fn todowrite_writes_then_persists() {
     .await;
 
     // 写入结果回显两条任务 + 摘要
-    assert_eq!(result["success"], true);
     let todos = result["todos"].as_array().expect("todos 应为数组");
     assert_eq!(todos.len(), 2, "应回显 2 条任务");
     assert_eq!(todos[0]["content"], "任务一");

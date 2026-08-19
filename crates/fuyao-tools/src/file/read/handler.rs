@@ -114,7 +114,7 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
         result: selected,
         path: original_path.to_string(),
         total_count,
-        truncated: if truncated { Some(true) } else { None },
+        truncated,
         hint: if truncated {
             Some(format!(
                 "结果已截断（共 {total_count} 个条目）。建议使用 glob 按模式缩小范围"
@@ -296,7 +296,7 @@ pub async fn read_file_impl(
         file_size,
         offset,
         limit: content_lines.len(),
-        truncated: if truncated { Some(true) } else { None },
+        truncated,
         hint: if truncated {
             if char_capped {
                 Some(format!(

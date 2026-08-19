@@ -46,8 +46,8 @@ pub struct ReadResult {
     /// 实际返回的读取数量（文件为实际收集行数；受行窗口与字符预算双边界约束，可小于请求值）
     pub limit: usize,
     /// 是否截断
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -63,8 +63,8 @@ pub struct DirectoryResult {
     /// 总条目数
     pub total_count: usize,
     /// 是否截断
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -81,4 +81,9 @@ pub struct DirectoryEntry {
     /// 文件大小（字节，仅文件）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+}
+
+/// 用于 serde skip_serializing_if 的辅助函数
+fn is_false(b: &bool) -> bool {
+    !*b
 }

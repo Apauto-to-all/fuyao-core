@@ -44,6 +44,5 @@ pub struct TodoWriteResult {
     /// 任务列表
     pub todos: Vec<serde_json::Value>,
     /// 摘要统计
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<TodoSummary>,
+    pub summary: TodoSummary,
 }

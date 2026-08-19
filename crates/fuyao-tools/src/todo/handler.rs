@@ -150,7 +150,7 @@ pub async fn todo_handler(
         .collect();
 
     let result = TodoWriteResult {
-        summary: Some(build_summary(&result_items)),
+        summary: build_summary(&result_items),
         todos,
     };
 

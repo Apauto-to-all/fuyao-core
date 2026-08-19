@@ -8,9 +8,7 @@ pub struct PaginationResult {
     pub content: String,
     /// 内容总长度
     pub total_length: usize,
-    /// 是否有更多内容
-    pub has_more: bool,
-    /// 下一页偏移量
+    /// 下一页偏移量（None = 已到末尾）
     pub next_offset: Option<usize>,
 }
 
@@ -36,7 +34,6 @@ pub fn apply_pagination(content: &str, offset: usize, limit: usize) -> Paginatio
         return PaginationResult {
             content: String::new(),
             total_length,
-            has_more: false,
             next_offset: None,
         };
     }
@@ -53,7 +50,6 @@ pub fn apply_pagination(content: &str, offset: usize, limit: usize) -> Paginatio
     PaginationResult {
         content: paginated_content,
         total_length,
-        has_more,
         next_offset,
     }
 }
@@ -92,7 +88,6 @@ mod tests {
         let result = apply_pagination(content, 0, 5);
         assert_eq!(result.content, "Hello");
         assert_eq!(result.total_length, 13);
-        assert!(result.has_more);
         assert_eq!(result.next_offset, Some(5));
     }
 
@@ -102,7 +97,6 @@ mod tests {
         let result = apply_pagination(content, 100, 10);
         assert!(result.content.is_empty());
         assert_eq!(result.total_length, 5);
-        assert!(!result.has_more);
         assert!(result.next_offset.is_none());
     }
 
@@ -111,7 +105,6 @@ mod tests {
         let content = "12345";
         let result = apply_pagination(content, 0, 5);
         assert_eq!(result.content, "12345");
-        assert!(!result.has_more);
         assert!(result.next_offset.is_none());
     }
 }

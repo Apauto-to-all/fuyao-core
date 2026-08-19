@@ -104,7 +104,6 @@ pub async fn webfetch_handler(
             offset,
             limit,
             total_length: pagination.total_length,
-            has_more: pagination.has_more,
             next_offset: pagination.next_offset,
             redirect_url: None,
         };
@@ -244,7 +243,6 @@ pub async fn webfetch_handler(
         offset,
         limit,
         total_length: pagination.total_length,
-        has_more: pagination.has_more,
         next_offset: pagination.next_offset,
         redirect_url: None,
     };

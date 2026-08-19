@@ -35,11 +35,9 @@ fn kill_process(child: &mut tokio::process::Child) {
 /// 命令执行结果
 #[derive(Debug)]
 pub struct TerminalResult {
-    /// 是否成功（exit_code == 0）
-    pub success: bool,
     /// 标准输出（stdout + stderr 合并）
     pub output: String,
-    /// 进程退出码
+    /// 进程退出码（哨兵值语义见 `BashToolResult::exit_code`）
     pub exit_code: i32,
     /// 执行错误信息
     pub error: Option<String>,
@@ -53,8 +51,6 @@ pub struct TerminalResult {
     pub execution_time_ms: Option<f64>,
     /// 退出码解读
     pub exit_code_meaning: Option<String>,
-    /// Shell 类型
-    pub shell_type: &'static str,
 }
 
 // =========== 命令执行 ===========
@@ -108,7 +104,6 @@ pub async fn execute_command(
         Err(e) => {
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             return TerminalResult {
-                success: false,
                 output: String::new(),
                 exit_code: -1,
                 error: Some(format!("命令执行失败: {e}")),
@@ -117,7 +112,6 @@ pub async fn execute_command(
                 working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                 execution_time_ms: Some(elapsed_ms),
                 exit_code_meaning: None,
-                shell_type: shell_info.shell_type,
             };
         }
     };
@@ -155,7 +149,6 @@ pub async fn execute_command(
 
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             TerminalResult {
-                success: false,
                 output: String::new(),
                 exit_code: -1,
                 error: Some("命令被取消".to_string()),
@@ -164,7 +157,6 @@ pub async fn execute_command(
                 working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                 execution_time_ms: Some(elapsed_ms),
                 exit_code_meaning: None,
-                shell_type: shell_info.shell_type,
             }
         }
         wait_res = tokio::time::timeout(timeout, child.wait()) => match wait_res {
@@ -190,7 +182,6 @@ pub async fn execute_command(
                 let exit_code_meaning = interpret_exit_code(command, exit_code);
 
                 TerminalResult {
-                    success: exit_code == 0,
                     output: combined,
                     exit_code,
                     error: None,
@@ -199,13 +190,11 @@ pub async fn execute_command(
                     working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                     execution_time_ms: Some(elapsed_ms),
                     exit_code_meaning,
-                    shell_type: shell_info.shell_type,
                 }
             }
             Ok(Err(e)) => {
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                 TerminalResult {
-                    success: false,
                     output: String::new(),
                     exit_code: -1,
                     error: Some(format!("命令执行错误: {e}")),
@@ -214,7 +203,6 @@ pub async fn execute_command(
                     working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                     execution_time_ms: Some(elapsed_ms),
                     exit_code_meaning: None,
-                    shell_type: shell_info.shell_type,
                 }
             }
             Err(_) => {
@@ -226,7 +214,6 @@ pub async fn execute_command(
 
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                 TerminalResult {
-                    success: false,
                     output: String::new(),
                     exit_code: 124,
                     error: Some(format!("命令在 {} 秒后超时", timeout.as_secs())),
@@ -235,7 +222,6 @@ pub async fn execute_command(
                     working_dir: working_dir.map(|p| p.to_string_lossy().to_string()),
                     execution_time_ms: Some(elapsed_ms),
                     exit_code_meaning: None,
-                    shell_type: shell_info.shell_type,
                 }
             }
         },
@@ -250,14 +236,13 @@ pub async fn execute_command(
 /// LLM 需要 exit_code / output 等字段自行判断，不整体折成错误信封。
 pub fn format_result(result: TerminalResult) -> ToolOutput {
     // 无输出时填充提示，避免 AI 误判为异常
-    let output = if result.output.trim().is_empty() && result.success {
+    let output = if result.output.trim().is_empty() && result.exit_code == 0 {
         "（无输出）".to_string()
     } else {
         result.output
     };
 
     let output = BashToolResult {
-        success: result.success,
         output,
         exit_code: result.exit_code,
         error: result.error,
@@ -268,7 +253,6 @@ pub fn format_result(result: TerminalResult) -> ToolOutput {
             .execution_time_ms
             .map(|ms| (ms * 10.0).round() / 10.0),
         exit_code_meaning: result.exit_code_meaning,
-        shell_type: result.shell_type.to_string(),
     };
     ToolOutput::ok(serde_json::to_value(&output).unwrap_or_default())
 }
@@ -280,7 +264,6 @@ mod tests {
     #[test]
     fn format_result_success() {
         let result = TerminalResult {
-            success: true,
             output: "hello".to_string(),
             exit_code: 0,
             error: None,
@@ -289,20 +272,16 @@ mod tests {
             working_dir: Some("/tmp".to_string()),
             execution_time_ms: Some(100.0),
             exit_code_meaning: None,
-            shell_type: "bash",
         };
         let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["success"], true);
         assert_eq!(parsed["output"], "hello");
         assert_eq!(parsed["exit_code"], 0);
-        assert_eq!(parsed["shell_type"], "bash");
     }
 
     #[test]
     fn format_result_timeout() {
         let result = TerminalResult {
-            success: false,
             output: String::new(),
             exit_code: 124,
             error: Some("命令在 1 秒后超时".to_string()),
@@ -311,7 +290,6 @@ mod tests {
             working_dir: None,
             execution_time_ms: Some(1000.0),
             exit_code_meaning: None,
-            shell_type: "bash",
         };
         let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -323,7 +301,6 @@ mod tests {
     fn format_result_empty_output_success() {
         // 成功但无输出时，填充"（无输出）"提示
         let result = TerminalResult {
-            success: true,
             output: String::new(),
             exit_code: 0,
             error: None,
@@ -332,7 +309,6 @@ mod tests {
             working_dir: None,
             execution_time_ms: Some(50.0),
             exit_code_meaning: None,
-            shell_type: "bash",
         };
         let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -343,7 +319,6 @@ mod tests {
     fn format_result_empty_output_failure() {
         // 失败且无输出时，不填充提示
         let result = TerminalResult {
-            success: false,
             output: String::new(),
             exit_code: 1,
             error: Some("命令执行失败".to_string()),
@@ -352,7 +327,6 @@ mod tests {
             working_dir: None,
             execution_time_ms: Some(50.0),
             exit_code_meaning: None,
-            shell_type: "bash",
         };
         let json = format_result(result).to_wire();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -385,10 +359,10 @@ mod tests {
         )
         .await;
         assert!(!result.timed_out, "大输出命令不应超时: {:?}", result.error);
-        assert!(
-            result.success,
-            "命令应正常退出: exit_code={}",
-            result.exit_code
+        assert_eq!(
+            result.exit_code, 0,
+            "命令应正常退出: error={:?}",
+            result.error
         );
         assert!(result.output.contains("0123456789abcdef"));
     }

@@ -18,11 +18,11 @@ pub struct BashArgs {
 /// bash 工具返回结果
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct BashToolResult {
-    /// 是否成功（exit_code == 0）
-    pub success: bool,
     /// 标准输出（stdout + stderr 合并）
     pub output: String,
-    /// 进程退出码
+    /// 进程退出码。
+    /// 正常退出为进程真实退出码；非正常路径用哨兵值：-1 = 命令未能产生真实退出码
+    /// （spawn 失败 / 取消 / 等待错误，具体原因见 error），124 = 超时被强杀
     pub exit_code: i32,
     /// 执行错误信息
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,8 +42,6 @@ pub struct BashToolResult {
     /// 退出码解读
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code_meaning: Option<String>,
-    /// Shell 类型
-    pub shell_type: String,
 }
 
 /// 用于 serde skip_serializing_if 的辅助函数

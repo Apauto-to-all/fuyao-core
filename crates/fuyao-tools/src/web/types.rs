@@ -62,9 +62,7 @@ pub struct WebFetchResult {
     pub limit: usize,
     /// 内容总长度
     pub total_length: usize,
-    /// 是否有更多内容
-    pub has_more: bool,
-    /// 下一页偏移量
+    /// 下一页偏移量（出现即表示还有更多内容）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
     /// 跨域名重定向时的目标 URL
