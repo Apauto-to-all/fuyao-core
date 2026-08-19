@@ -93,6 +93,12 @@ pub async fn execute_command(
         cmd.process_group(0);
     }
 
+    // Windows: shell 子进程不分配控制台窗口，GUI 宿主派生时不闪现终端窗口
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(super::shell::CREATE_NO_WINDOW);
+    }
+
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }

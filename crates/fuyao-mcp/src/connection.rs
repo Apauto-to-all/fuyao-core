@@ -424,6 +424,12 @@ async fn serve_http(
     Ok((svc, convert_tools(&tools)))
 }
 
+/// Windows 进程创建标志 CREATE_NO_WINDOW：派生子进程不分配控制台窗口。
+/// GUI 进程（自身无控制台）派生控制台程序时，系统默认为新子进程分配一个
+/// 可见终端窗口，MCP stdio 子进程须带此标志抑制闪窗
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// 构建 stdio 传输并完成初始 serve
 ///
 /// 解析命令（Windows 兼容）+ 注入安全环境变量，发起 serve 并列出全部工具。
@@ -447,11 +453,17 @@ async fn serve_stdio(
         cmd.env(k, v);
     }
 
-    let transport = TokioChildProcess::new(cmd.configure(|_| {})).map_err(|e| {
-        ConnectionError::InitialConnectFailed {
-            server: server_name.to_string(),
-            reason: e.to_string(),
-        }
+    let transport = TokioChildProcess::new(cmd.configure(|command| {
+        // Windows: MCP stdio 子进程无窗口运行，GUI 宿主派生时不闪现终端窗口
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        // 非 Windows 平台无此标志，占位消费参数避免未使用告警
+        #[cfg(not(windows))]
+        let _ = command;
+    }))
+    .map_err(|e| ConnectionError::InitialConnectFailed {
+        server: server_name.to_string(),
+        reason: e.to_string(),
     })?;
     let svc =
         ().serve(transport)

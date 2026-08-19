@@ -22,6 +22,12 @@ pub struct ShellInfo {
 /// shell 配置的自动探测值
 const SHELL_AUTO: &str = "auto";
 
+/// Windows 进程创建标志 CREATE_NO_WINDOW：派生子进程不分配控制台窗口。
+/// GUI 进程（自身无控制台）派生控制台程序时，系统默认为新子进程分配一个
+/// 可见终端窗口，探测 / 执行类子进程均须带此标志抑制闪窗
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// shell 显式名合法词表（与 `ShellInfo::shell_type` 同名）
 ///
 /// 供启动校验与错误提示共用；`auto` 不在其中（单独短路）。
@@ -231,7 +237,16 @@ fn which(name: &str) -> Option<String> {
         ("which", name.to_string())
     };
 
-    let output = std::process::Command::new(cmd).arg(&arg).output().ok()?;
+    let mut command = std::process::Command::new(cmd);
+    command.arg(&arg);
+    // Windows：探测命令无窗口运行，GUI 宿主派生 where 时不闪现终端窗口
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command.output().ok()?;
 
     if !output.status.success() {
         return None;
