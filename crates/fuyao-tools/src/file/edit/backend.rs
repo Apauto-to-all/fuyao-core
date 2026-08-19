@@ -31,6 +31,9 @@ use std::path::Path;
 /// - `replace_all`: 是否替换所有匹配
 /// - `path_display`: 显示路径（相对路径，用于错误信息和 diff）
 /// - `task_id`: 任务 ID（用于文件追踪）
+///
+/// 内部错误（安全检查、文件不存在、读写失败、无匹配等）经 `Err(String)` 返回，
+/// 由调用方折成 `ToolOutput::Err`——结果信封不携带错误字段。
 pub fn apply_replace(
     file_path: &Path,
     old_string: &str,
@@ -38,29 +41,13 @@ pub fn apply_replace(
     replace_all: bool,
     path_display: &str,
     task_id: &str,
-) -> EditReplaceResult {
+) -> Result<EditReplaceResult, String> {
     if let Some(safety_error) = check_edit_safety(path_display) {
-        return EditReplaceResult {
-            success: false,
-            path: path_display.to_string(),
-            matches: 0,
-            strategy: None,
-            diff: String::new(),
-            warning: None,
-            error: Some(safety_error),
-        };
+        return Err(safety_error);
     }
 
     if !file_path.exists() {
-        return EditReplaceResult {
-            success: false,
-            path: path_display.to_string(),
-            matches: 0,
-            strategy: None,
-            diff: String::new(),
-            warning: None,
-            error: Some(format!("文件不存在: {path_display}")),
-        };
+        return Err(format!("文件不存在: {path_display}"));
     }
 
     let stale_warning = check_file_staleness(path_display, task_id);
@@ -116,30 +103,20 @@ pub fn apply_replace(
         });
 
     if let Some(err) = error {
-        return EditReplaceResult {
-            success: false,
-            path: path_display.to_string(),
-            matches: 0,
-            strategy: None,
-            diff: String::new(),
-            warning: None,
-            error: Some(err),
-        };
+        return Err(err);
     }
 
     let diff = generate_unified_diff(&original_content, &new_content, path_display, path_display);
 
     update_read_timestamp(path_display, task_id);
 
-    EditReplaceResult {
-        success: true,
+    Ok(EditReplaceResult {
         path: path_display.to_string(),
         matches: match_count,
         strategy,
         diff,
         warning: stale_warning,
-        error: None,
-    }
+    })
 }
 
 /// 生成 unified diff 格式的差异文本
@@ -194,9 +171,9 @@ mod tests {
             false,
             &file_path.to_string_lossy(),
             "test_task",
-        );
+        )
+        .expect("替换应成功");
 
-        assert!(result.success);
         assert_eq!(result.matches, 1);
         assert!(result.strategy.is_some());
 
@@ -217,8 +194,8 @@ mod tests {
             "test_task",
         );
 
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("文件不存在"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("文件不存在"));
     }
 
     #[test]
@@ -232,7 +209,7 @@ mod tests {
             "test_task",
         );
 
-        assert!(!result.success);
+        assert!(result.is_err());
     }
 
     #[test]

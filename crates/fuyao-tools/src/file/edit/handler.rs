@@ -44,36 +44,32 @@ pub async fn edit_impl(
 
     let file_path = resolve_path(&path, workspace.as_deref());
 
-    let result = apply_replace(
+    let result = match apply_replace(
         &file_path,
         &old_string,
         &new_string,
         replace_all,
         &path,
         &task_id,
-    );
-
-    if !result.success {
-        let mut hint = String::new();
-        if let Some(ref err) = result.error
-            && err.contains("未找到")
-        {
-            hint = "\n\n[提示: old_string 未找到。使用 read 验证当前内容，或使用 grep 定位文本。]"
-                .to_string();
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let mut hint = String::new();
+            if e.contains("未找到") {
+                hint =
+                    "\n\n[提示: old_string 未找到。使用 read 验证当前内容，或使用 grep 定位文本。]"
+                        .to_string();
+            }
+            let err = ToolError::new(format!("{e}{hint}"))
+                .with("path", path.as_str())
+                .with(
+                    "suggestion",
+                    "请提供更多上下文使匹配唯一，或使用 replace_all=true 替换所有匹配",
+                );
+            return ToolOutput::Err(err);
         }
-        let mut err = ToolError::new(format!("{}{hint}", result.error.unwrap_or_default()))
-            .with("path", path.as_str())
-            .with(
-                "suggestion",
-                "请提供更多上下文使匹配唯一，或使用 replace_all=true 替换所有匹配",
-            );
-        if let Some(w) = result.warning {
-            err = err.with("warning", serde_json::json!(w));
-        }
-        return ToolOutput::Err(err);
-    }
+    };
 
-    // 成功路径：result.error 必为 None，由 skip_serializing_if 自动省略
     ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
 }
 
@@ -84,16 +80,13 @@ mod tests {
     #[test]
     fn edit_replace_result_serializes_all_fields() {
         let result = EditReplaceResult {
-            success: true,
             path: "test.rs".to_string(),
             matches: 1,
             diff: "--- a\n+++ b".to_string(),
             strategy: None,
             warning: None,
-            error: None,
         };
         let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["success"], true);
         assert_eq!(json["path"], "test.rs");
         assert_eq!(json["matches"], 1);
         assert_eq!(json["diff"], "--- a\n+++ b");
@@ -104,13 +97,11 @@ mod tests {
     #[test]
     fn edit_replace_result_serializes_optional_fields() {
         let result = EditReplaceResult {
-            success: true,
             path: "test.rs".to_string(),
             matches: 1,
             diff: "".to_string(),
             strategy: Some("fuzzy".to_string()),
             warning: Some("模糊匹配".to_string()),
-            error: None,
         };
         let json = serde_json::to_value(&result).unwrap();
         assert_eq!(json["strategy"], "fuzzy");

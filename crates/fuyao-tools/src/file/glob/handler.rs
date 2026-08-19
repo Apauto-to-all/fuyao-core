@@ -30,34 +30,24 @@ use std::time::Duration;
 /// - `pattern`: glob 模式（如 `*.rs`、`*.{ts,tsx}`）
 /// - `path`: 搜索根路径
 /// - `limit`: 最大返回数量
-fn search_files(pattern: &str, path: &str, limit: usize, cancel: &AtomicBool) -> GlobResult {
+///
+/// 内部错误（路径不存在、模式无效等）经 `Err(String)` 返回，由调用方折成
+/// `ToolOutput::Err`——结果信封不携带错误字段。
+fn search_files(
+    pattern: &str,
+    path: &str,
+    limit: usize,
+    cancel: &AtomicBool,
+) -> Result<GlobResult, String> {
     let search_path = crate::common::expand_tilde(path);
 
     if !search_path.exists() {
-        return GlobResult {
-            matches: Vec::new(),
-            total_count: 0,
-            truncated: false,
-            pattern: pattern.to_string(),
-            path: path.to_string(),
-            error: Some(format!("路径不存在: {path}")),
-            hint: None,
-        };
+        return Err(format!("路径不存在: {path}"));
     }
 
     let glob_pattern = match Pattern::new(pattern) {
         Ok(p) => p,
-        Err(e) => {
-            return GlobResult {
-                matches: Vec::new(),
-                total_count: 0,
-                truncated: false,
-                pattern: pattern.to_string(),
-                path: path.to_string(),
-                error: Some(format!("glob 模式无效: {e}")),
-                hint: None,
-            };
-        }
+        Err(e) => return Err(format!("glob 模式无效: {e}")),
     };
 
     let walker = WalkBuilder::new(&search_path)
@@ -120,15 +110,14 @@ fn search_files(pattern: &str, path: &str, limit: usize, cancel: &AtomicBool) ->
         })
         .collect();
 
-    GlobResult {
+    Ok(GlobResult {
         matches,
         total_count: total,
         truncated: total > limit,
         pattern: pattern.to_string(),
         path: path.to_string(),
-        error: None,
         hint: None,
-    }
+    })
 }
 
 /// 将 limit 钳制到 `[1, 配置硬上限]` 区间
@@ -178,36 +167,19 @@ pub async fn glob_impl(
         search_files(&pattern_owned, &resolved_path_clone, limit, &cancel_clone)
     });
     let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), join).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => GlobResult {
-            matches: Vec::new(),
-            total_count: 0,
-            truncated: false,
-            pattern: pattern.to_string(),
-            path: resolved_path.clone(),
-            error: Some(format!("搜索任务失败: {e}")),
-            hint: None,
+        Ok(Ok(r)) => match r {
+            Ok(g) => g,
+            Err(e) => return ToolOutput::error(e),
         },
+        Ok(Err(e)) => return ToolOutput::error(format!("搜索任务失败: {e}")),
         Err(_elapsed) => {
             // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
             cancel.store(true, Ordering::Release);
-            GlobResult {
-                matches: Vec::new(),
-                total_count: 0,
-                truncated: false,
-                pattern: pattern.to_string(),
-                path: resolved_path.clone(),
-                error: Some(format!(
-                    "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围或使用更具体的 pattern"
-                )),
-                hint: None,
-            }
+            return ToolOutput::error(format!(
+                "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围或使用更具体的 pattern"
+            ));
         }
     };
-
-    if let Some(err) = &result.error {
-        return ToolOutput::error(err);
-    }
 
     let mut result = result;
     if result.truncated {
@@ -222,36 +194,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn glob_result_error_field_not_serialized_when_none() {
-        let result = GlobResult {
-            matches: vec![],
-            total_count: 0,
-            truncated: false,
-            pattern: "*.rs".to_string(),
-            path: ".".to_string(),
-            error: None,
-            hint: None,
-        };
-        let json = serde_json::to_value(&result).unwrap();
-        assert!(json.get("error").is_none());
-    }
-
-    #[test]
-    fn glob_result_error_field_serialized_when_some() {
-        let result = GlobResult {
-            matches: vec![],
-            total_count: 0,
-            truncated: false,
-            pattern: "*.rs".to_string(),
-            path: ".".to_string(),
-            error: Some("路径不存在".to_string()),
-            hint: None,
-        };
-        let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["error"], "路径不存在");
-    }
-
-    #[test]
     fn glob_result_hint_not_serialized_when_none() {
         let result = GlobResult {
             matches: vec![],
@@ -259,7 +201,6 @@ mod tests {
             truncated: false,
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
-            error: None,
             hint: None,
         };
         let json = serde_json::to_value(&result).unwrap();
@@ -274,7 +215,6 @@ mod tests {
             truncated: true,
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
-            error: None,
             hint: Some("结果已截断".to_string()),
         };
         let json = serde_json::to_value(&result).unwrap();
@@ -302,7 +242,6 @@ mod tests {
             truncated: false,
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
-            error: None,
             hint: None,
         };
         assert!(!result.truncated);
@@ -316,7 +255,6 @@ mod tests {
             truncated: true,
             pattern: "*.rs".to_string(),
             path: ".".to_string(),
-            error: None,
             hint: None,
         };
         assert!(result.truncated);

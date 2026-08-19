@@ -24,7 +24,7 @@ use std::path::Path;
 ///
 /// # 返回
 ///
-/// 结果信封：成功时含 success、path、bytes_written、created 等字段；
+/// 结果信封：成功时含 path、bytes_written、created 等字段；
 /// 失败时为错误信封（error + suggestion / path 附加字段）。
 pub async fn write_file_impl(
     args: Value,
@@ -88,12 +88,6 @@ pub async fn write_file_impl(
     update_read_timestamp(&path, &task_id);
 
     let result = WriteResult {
-        success: true,
-        result: if existed {
-            "文件已覆盖".to_string()
-        } else {
-            "文件已创建".to_string()
-        },
         path: path.clone(),
         bytes_written,
         created: !existed,
@@ -110,6 +104,7 @@ mod tests {
     #[tokio::test]
     async fn write_new_file() {
         let dir = std::env::temp_dir().join("fuyao_test_write_full");
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         let file_path = dir.join("new.txt");
 
@@ -124,7 +119,7 @@ mod tests {
         )
         .await
         .to_wire();
-        assert!(result.contains("文件已创建"));
+        assert!(result.contains("\"created\":true"));
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "hello world");
@@ -150,7 +145,7 @@ mod tests {
         )
         .await
         .to_wire();
-        assert!(result.contains("文件已覆盖"));
+        assert!(result.contains("\"created\":false"));
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "new content");
@@ -161,6 +156,7 @@ mod tests {
     #[tokio::test]
     async fn write_creates_parent_dirs() {
         let dir = std::env::temp_dir().join("fuyao_test_write_mkdir_full");
+        std::fs::remove_dir_all(&dir).ok();
         let file_path = dir.join("sub1/sub2/test.txt");
 
         let args = serde_json::json!({
@@ -174,7 +170,7 @@ mod tests {
         )
         .await
         .to_wire();
-        assert!(result.contains("文件已创建"));
+        assert!(result.contains("\"created\":true"));
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "nested");

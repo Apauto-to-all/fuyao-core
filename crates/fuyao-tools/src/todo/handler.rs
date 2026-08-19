@@ -150,10 +150,8 @@ pub async fn todo_handler(
         .collect();
 
     let result = TodoWriteResult {
-        success: true,
         summary: Some(build_summary(&result_items)),
         todos,
-        error: None,
     };
 
     ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())

@@ -67,6 +67,9 @@ fn truncate_line(line: &str) -> String {
 /// - `glob`: glob 过滤模式（如 `*.py`、`*.{ts,tsx}`，`!` 前缀排除）
 /// - `limit`: 最大返回数量
 /// - `context`: 匹配行的上下文行数
+///
+/// 内部错误（正则/路径/glob 无效等）经 `Err(String)` 返回，由调用方折成
+/// `ToolOutput::Err`——结果信封不携带错误字段。
 fn search_content(
     pattern: &str,
     path: &str,
@@ -74,35 +77,19 @@ fn search_content(
     limit: usize,
     context: usize,
     cancel: &AtomicBool,
-) -> GrepResult {
+) -> Result<GrepResult, String> {
     let matcher = match RegexMatcherBuilder::new()
         .case_insensitive(true)
         .line_terminator(Some(b'\n'))
         .build(pattern)
     {
         Ok(m) => m,
-        Err(e) => {
-            return GrepResult {
-                matches: Vec::new(),
-                truncated: false,
-                pattern: pattern.to_string(),
-                path: path.to_string(),
-                error: Some(format!("正则表达式无效: {e}")),
-                hint: None,
-            };
-        }
+        Err(e) => return Err(format!("正则表达式无效: {e}")),
     };
 
     let search_path = crate::common::expand_tilde(path);
     if !search_path.exists() {
-        return GrepResult {
-            matches: Vec::new(),
-            truncated: false,
-            pattern: pattern.to_string(),
-            path: path.to_string(),
-            error: Some(format!("路径不存在: {path}")),
-            hint: None,
-        };
+        return Err(format!("路径不存在: {path}"));
     }
 
     let mut searcher = SearcherBuilder::new()
@@ -123,29 +110,13 @@ fn search_content(
     if let Some(g) = glob {
         let mut override_builder = OverrideBuilder::new(&search_path);
         if let Err(e) = override_builder.add(g) {
-            return GrepResult {
-                matches: Vec::new(),
-                truncated: false,
-                pattern: pattern.to_string(),
-                path: path.to_string(),
-                error: Some(format!("glob 模式无效: {e}")),
-                hint: None,
-            };
+            return Err(format!("glob 模式无效: {e}"));
         }
         match override_builder.build() {
             Ok(overrides) => {
                 walker.overrides(overrides);
             }
-            Err(e) => {
-                return GrepResult {
-                    matches: Vec::new(),
-                    truncated: false,
-                    pattern: pattern.to_string(),
-                    path: path.to_string(),
-                    error: Some(format!("glob 模式无效: {e}")),
-                    hint: None,
-                };
-            }
+            Err(e) => return Err(format!("glob 模式无效: {e}")),
         }
     }
 
@@ -204,14 +175,13 @@ fn search_content(
         }
     }
 
-    GrepResult {
+    Ok(GrepResult {
         matches,
         truncated: found_extra,
         pattern: pattern.to_string(),
         path: path.to_string(),
-        error: None,
         hint: None,
-    }
+    })
 }
 
 /// grep 工具的异步入口
@@ -266,34 +236,19 @@ pub async fn grep_impl(
         }
     });
     let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), join).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => GrepResult {
-            matches: Vec::new(),
-            truncated: false,
-            pattern: pattern.to_string(),
-            path: resolved_path.clone(),
-            error: Some(format!("搜索任务失败: {e}")),
-            hint: None,
+        Ok(Ok(r)) => match r {
+            Ok(g) => g,
+            Err(e) => return ToolOutput::error(e),
         },
+        Ok(Err(e)) => return ToolOutput::error(format!("搜索任务失败: {e}")),
         Err(_elapsed) => {
             // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
             cancel.store(true, Ordering::Release);
-            GrepResult {
-                matches: Vec::new(),
-                truncated: false,
-                pattern: pattern.to_string(),
-                path: resolved_path.clone(),
-                error: Some(format!(
-                    "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围、使用更具体的 pattern，或通过 glob 参数限定文件类型"
-                )),
-                hint: None,
-            }
+            return ToolOutput::error(format!(
+                "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围、使用更具体的 pattern，或通过 glob 参数限定文件类型"
+            ));
         }
     };
-
-    if let Some(err) = &result.error {
-        return ToolOutput::error(err);
-    }
 
     let mut result = result;
     redact_content_in_result(&mut result.matches);
@@ -309,36 +264,6 @@ pub async fn grep_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn grep_result_error_field_not_serialized_when_none() {
-        let result = GrepResult {
-            matches: vec![],
-            truncated: false,
-            pattern: "test".to_string(),
-            path: ".".to_string(),
-            error: None,
-            hint: None,
-        };
-        let json = serde_json::to_value(&result).unwrap();
-        assert!(json.get("error").is_none());
-        // 序列化结果不含 total_count 字段
-        assert!(json.get("total_count").is_none());
-    }
-
-    #[test]
-    fn grep_result_error_field_serialized_when_some() {
-        let result = GrepResult {
-            matches: vec![],
-            truncated: false,
-            pattern: "test".to_string(),
-            path: ".".to_string(),
-            error: Some("正则表达式无效".to_string()),
-            hint: None,
-        };
-        let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["error"], "正则表达式无效");
-    }
 
     #[test]
     fn grep_match_serializes_all_fields() {

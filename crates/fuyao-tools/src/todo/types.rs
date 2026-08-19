@@ -41,14 +41,9 @@ pub struct TodoSummary {
 /// Todo 工具结果
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TodoWriteResult {
-    /// 是否成功
-    pub success: bool,
     /// 任务列表
     pub todos: Vec<serde_json::Value>,
     /// 摘要统计
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<TodoSummary>,
-    /// 错误信息
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }

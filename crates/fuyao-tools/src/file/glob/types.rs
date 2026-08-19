@@ -33,7 +33,7 @@ fn default_limit() -> i64 {
 pub struct GlobResult {
     /// 匹配的文件列表
     pub matches: Vec<GlobMatch>,
-    /// 总匹配数
+    /// 总匹配数（全量统计，非截断哨兵值）
     pub total_count: usize,
     /// 是否截断
     pub truncated: bool,
@@ -41,9 +41,6 @@ pub struct GlobResult {
     pub pattern: String,
     /// 搜索路径
     pub path: String,
-    /// 错误信息
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,

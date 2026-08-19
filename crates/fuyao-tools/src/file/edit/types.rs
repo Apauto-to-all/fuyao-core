@@ -19,8 +19,6 @@ pub struct EditArgs {
 /// 查找替换结果
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EditReplaceResult {
-    /// 是否成功
-    pub success: bool,
     /// 文件路径
     pub path: String,
     /// 匹配次数
@@ -33,7 +31,4 @@ pub struct EditReplaceResult {
     /// 警告信息
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
-    /// 错误信息
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }

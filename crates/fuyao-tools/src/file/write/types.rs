@@ -14,10 +14,6 @@ pub struct WriteArgs {
 /// 文件写入结果
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WriteResult {
-    /// 是否成功
-    pub success: bool,
-    /// 结果描述（"文件已创建" 或 "文件已覆盖"）
-    pub result: String,
     /// 文件路径
     pub path: String,
     /// 写入字节数

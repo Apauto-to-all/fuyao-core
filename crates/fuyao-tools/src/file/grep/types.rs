@@ -44,9 +44,6 @@ pub struct GrepResult {
     pub pattern: String,
     /// 搜索路径
     pub path: String,
-    /// 错误信息
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
     /// 截断提示
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
