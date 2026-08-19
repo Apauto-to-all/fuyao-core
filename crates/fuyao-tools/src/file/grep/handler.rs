@@ -7,7 +7,7 @@
 //!
 //! 使用 `grep-regex` 构建正则匹配器，`grep-searcher` 逐行搜索，
 //! `ignore::WalkBuilder` 遍历目录树（自动遵守 .gitignore）。
-//! 支持 include 参数过滤文件类型（如 *.py、*.{ts,tsx}）。
+//! 支持 glob 参数以 glob 语法过滤文件（如 *.py、*.{ts,tsx}，`!` 前缀排除）。
 //! 支持 context 参数显示匹配行的上下文。
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
@@ -20,6 +20,7 @@ use grep_regex::RegexMatcherBuilder;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::sinks::UTF8;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,18 +56,21 @@ fn truncate_line(line: &str) -> String {
 ///
 /// 使用 `grep-regex` 构建正则匹配器，`grep-searcher` 逐行搜索文件内容。
 /// 通过 `ignore::WalkBuilder` 遍历目录树，自动遵守 .gitignore 规则。
+/// glob 参数经 `OverrideBuilder` 编译后挂载到遍历器——无斜杠模式自动跨
+/// 目录匹配（`*.rs` 匹配任意层级下的 .rs 文件），`!` 前缀表示排除；
+/// 遍历时目录级剪枝，不匹配的目录直接跳过。
 ///
 /// # 参数
 ///
 /// - `pattern`: 正则表达式
 /// - `path`: 搜索根路径
-/// - `include`: 文件过滤模式（如 `*.py`、`*.{ts,tsx}`）
+/// - `glob`: glob 过滤模式（如 `*.py`、`*.{ts,tsx}`，`!` 前缀排除）
 /// - `limit`: 最大返回数量
 /// - `context`: 匹配行的上下文行数
 fn search_content(
     pattern: &str,
     path: &str,
-    include: Option<&str>,
+    glob: Option<&str>,
     limit: usize,
     context: usize,
     cancel: &AtomicBool,
@@ -80,7 +84,6 @@ fn search_content(
         Err(e) => {
             return GrepResult {
                 matches: Vec::new(),
-                total_count: 0,
                 truncated: false,
                 pattern: pattern.to_string(),
                 path: path.to_string(),
@@ -94,7 +97,6 @@ fn search_content(
     if !search_path.exists() {
         return GrepResult {
             matches: Vec::new(),
-            total_count: 0,
             truncated: false,
             pattern: pattern.to_string(),
             path: path.to_string(),
@@ -109,23 +111,55 @@ fn search_content(
         .after_context(context)
         .build();
 
-    let walker = WalkBuilder::new(&search_path)
+    let mut walker = WalkBuilder::new(&search_path);
+    walker
         .hidden(true)
         .git_ignore(true)
         .git_global(true)
-        .git_exclude(true)
-        .build();
+        .git_exclude(true);
+
+    // glob 过滤：OverrideBuilder 编译为覆盖规则挂载到遍历器，编译失败直接报错
+    // （替代静默失配——无效模式对调用方可见，可据此修正）
+    if let Some(g) = glob {
+        let mut override_builder = OverrideBuilder::new(&search_path);
+        if let Err(e) = override_builder.add(g) {
+            return GrepResult {
+                matches: Vec::new(),
+                truncated: false,
+                pattern: pattern.to_string(),
+                path: path.to_string(),
+                error: Some(format!("glob 模式无效: {e}")),
+                hint: None,
+            };
+        }
+        match override_builder.build() {
+            Ok(overrides) => {
+                walker.overrides(overrides);
+            }
+            Err(e) => {
+                return GrepResult {
+                    matches: Vec::new(),
+                    truncated: false,
+                    pattern: pattern.to_string(),
+                    path: path.to_string(),
+                    error: Some(format!("glob 模式无效: {e}")),
+                    hint: None,
+                };
+            }
+        }
+    }
 
     let mut matches: Vec<GrepMatch> = Vec::new();
-    let mut total_count = 0usize;
+    // 收集满后是否仍发现更多匹配——截断判定的唯一依据
+    let mut found_extra = false;
 
-    for entry in walker.flatten() {
+    for entry in walker.build().flatten() {
         // 协作式取消：超时后由调用方置位，立即退出遍历
         if cancel.load(Ordering::Acquire) {
             break;
         }
-        // 已收集满且确认存在更多匹配，无需继续遍历
-        if total_count > limit {
+        // 已确认存在更多匹配，无需继续遍历
+        if found_extra {
             break;
         }
         let file_type = match entry.file_type() {
@@ -136,13 +170,6 @@ fn search_content(
             continue;
         }
 
-        if let Some(inc) = include {
-            let name = entry.file_name().to_string_lossy();
-            if !match_glob_pattern(&name, inc) {
-                continue;
-            }
-        }
-
         let file_path = entry.path();
         let file_path_str = file_path.to_string_lossy().to_string();
 
@@ -150,8 +177,6 @@ fn search_content(
             &matcher,
             file_path,
             UTF8(|line_num, line| {
-                total_count += 1;
-
                 if matches.len() < limit {
                     matches.push(GrepMatch {
                         file: file_path_str.clone(),
@@ -164,10 +189,12 @@ fn search_content(
                             None
                         },
                     });
+                    Ok(true)
+                } else {
+                    // 收集满后再确认一个额外匹配即可判定截断，随后停止当前文件扫描
+                    found_extra = true;
+                    Ok(false)
                 }
-
-                // 收集满后再统计一条额外匹配即可确认截断，随后停止当前文件扫描
-                Ok(total_count <= limit)
             }),
         );
 
@@ -177,40 +204,14 @@ fn search_content(
         }
     }
 
-    // 截断判定：跳过收集后仍存在更多匹配（总数超过已收集数）
-    let truncated = total_count > matches.len();
     GrepResult {
         matches,
-        total_count,
-        truncated,
+        truncated: found_extra,
         pattern: pattern.to_string(),
         path: path.to_string(),
         error: None,
         hint: None,
     }
-}
-
-/// 文件名通配符匹配
-///
-/// 支持两种模式：
-/// - `*.rs` → 匹配以 .rs 结尾的文件名
-/// - `*.{ts,tsx}` → 匹配以 .ts 或 .tsx 结尾的文件名
-fn match_glob_pattern(name: &str, pattern: &str) -> bool {
-    // 支持 *.rs
-    if let Some(suffix) = pattern.strip_prefix("*.") {
-        return name.ends_with(&format!(".{suffix}"));
-    }
-    // 支持 *.{ts,tsx}
-    if pattern.starts_with("*.{")
-        && let Some(inner) = pattern
-            .strip_prefix("*.{")
-            .and_then(|s| s.strip_suffix('}'))
-    {
-        return inner
-            .split(',')
-            .any(|ext| name.ends_with(&format!(".{}", ext.trim())));
-    }
-    name == pattern
 }
 
 /// grep 工具的异步入口
@@ -224,7 +225,7 @@ pub async fn grep_impl(
     let GrepArgs {
         pattern,
         path,
-        include,
+        glob,
         limit,
         context,
     } = match parse_args(args) {
@@ -257,7 +258,7 @@ pub async fn grep_impl(
             search_content(
                 &pattern,
                 &resolved_path,
-                include.as_deref(),
+                glob.as_deref(),
                 limit,
                 context_lines,
                 &cancel_clone,
@@ -268,7 +269,6 @@ pub async fn grep_impl(
         Ok(Ok(r)) => r,
         Ok(Err(e)) => GrepResult {
             matches: Vec::new(),
-            total_count: 0,
             truncated: false,
             pattern: pattern.to_string(),
             path: resolved_path.clone(),
@@ -280,12 +280,11 @@ pub async fn grep_impl(
             cancel.store(true, Ordering::Release);
             GrepResult {
                 matches: Vec::new(),
-                total_count: 0,
                 truncated: false,
                 pattern: pattern.to_string(),
                 path: resolved_path.clone(),
                 error: Some(format!(
-                    "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围、使用更具体的 pattern，或通过 include 参数限定文件类型"
+                    "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围、使用更具体的 pattern，或通过 glob 参数限定文件类型"
                 )),
                 hint: None,
             }
@@ -301,7 +300,7 @@ pub async fn grep_impl(
 
     if result.truncated {
         result.hint =
-            Some("结果已截断。请使用更具体的 pattern 或 include 参数缩小搜索范围。".to_string());
+            Some("结果已截断。请使用更具体的 pattern 或 glob 参数缩小搜索范围。".to_string());
     }
 
     ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
@@ -315,7 +314,6 @@ mod tests {
     fn grep_result_error_field_not_serialized_when_none() {
         let result = GrepResult {
             matches: vec![],
-            total_count: 0,
             truncated: false,
             pattern: "test".to_string(),
             path: ".".to_string(),
@@ -324,13 +322,14 @@ mod tests {
         };
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.get("error").is_none());
+        // 序列化结果不含 total_count 字段
+        assert!(json.get("total_count").is_none());
     }
 
     #[test]
     fn grep_result_error_field_serialized_when_some() {
         let result = GrepResult {
             matches: vec![],
-            total_count: 0,
             truncated: false,
             pattern: "test".to_string(),
             path: ".".to_string(),
@@ -407,7 +406,87 @@ mod tests {
         let max = fuyao_api::get_config().tools.limits.search_max_results;
         assert_eq!(json["matches"].as_array().map(Vec::len), Some(max));
         assert_eq!(json["truncated"], serde_json::json!(true));
-        assert_eq!(json["total_count"], serde_json::json!(max + 1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// glob 参数按扩展名过滤搜索范围：不匹配的文件不参与内容匹配
+    #[tokio::test]
+    async fn grep_glob_filters_files_by_extension() {
+        let dir = std::env::temp_dir().join("fuyao_test_grep_glob_filter");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "needle in rust\n").unwrap();
+        std::fs::write(dir.join("b.md"), "needle in markdown\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": dir.to_string_lossy().to_string(),
+            "glob": "*.rs"
+        });
+        let output = grep_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        let matches = json["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches[0]["file"].as_str().unwrap().ends_with("a.rs"),
+            "实际：{matches:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// glob 参数 `!` 前缀排除匹配文件，其余文件照常搜索
+    #[tokio::test]
+    async fn grep_glob_excludes_with_bang_prefix() {
+        let dir = std::env::temp_dir().join("fuyao_test_grep_glob_exclude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "needle in rust\n").unwrap();
+        std::fs::write(dir.join("b.md"), "needle in markdown\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": dir.to_string_lossy().to_string(),
+            "glob": "!*.md"
+        });
+        let output = grep_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        let matches = json["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches[0]["file"].as_str().unwrap().ends_with("a.rs"),
+            "实际：{matches:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 无效 glob 模式返回明确错误，替代静默零结果
+    #[tokio::test]
+    async fn grep_glob_invalid_pattern_returns_error() {
+        let dir = std::env::temp_dir().join("fuyao_test_grep_glob_invalid");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), "needle\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": dir.to_string_lossy().to_string(),
+            "glob": "[invalid"
+        });
+        let output = grep_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        // 无效 glob 经 ToolOutput::Err 通道返回（带明确消息），而非 Value 内的 error 字段
+        let message = match output {
+            ToolOutput::Err(e) => e.message,
+            other => panic!("期望 Err 结果: {other:?}"),
+        };
+        assert!(message.contains("glob 模式无效"), "实际：{message}");
 
         std::fs::remove_dir_all(&dir).ok();
     }

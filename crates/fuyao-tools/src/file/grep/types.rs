@@ -15,8 +15,8 @@ pub struct GrepArgs {
     /// 搜索路径
     #[serde(default = "default_path")]
     pub path: String,
-    /// 文件过滤模式（如 *.py、*.{ts,tsx}）
-    pub include: Option<String>,
+    /// glob 过滤模式（如 *.rs、*.{ts,tsx}，`!` 前缀排除；无斜杠模式跨目录匹配）
+    pub glob: Option<String>,
     /// 最大结果数
     #[serde(default = "default_limit")]
     pub limit: i64,
@@ -38,8 +38,6 @@ fn default_limit() -> i64 {
 pub struct GrepResult {
     /// 匹配的行列表
     pub matches: Vec<GrepMatch>,
-    /// 总匹配数
-    pub total_count: usize,
     /// 是否截断
     pub truncated: bool,
     /// 搜索模式

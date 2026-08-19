@@ -7,7 +7,7 @@
 //!
 //! 使用 `grep-regex` 构建正则匹配器，`grep-searcher` 逐行搜索，
 //! `ignore::WalkBuilder` 遍历目录树（自动遵守 .gitignore）。
-//! 支持 include 参数过滤文件类型（如 *.py、*.{ts,tsx}）。
+//! 支持 glob 参数以 glob 语法过滤文件（如 *.py、*.{ts,tsx}，`!` 前缀排除）。
 //! 支持 context 参数显示匹配行的上下文。
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
@@ -33,7 +33,7 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
             .required()
             .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))
             .default(json!(DEFAULT_PATH))
-            .string("include", "文件过滤模式（如 *.py、*.{ts,tsx}）")
+            .string("glob", "glob 过滤模式（如 *.rs、*.{ts,tsx}，`!` 前缀排除）")
             .integer(
                 "limit",
                 format!("最大结果数（默认 {DEFAULT_LIMIT}，有硬上限，超出自动截断）"),
