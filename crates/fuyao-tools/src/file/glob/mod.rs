@@ -23,7 +23,10 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
     insert_tool(
         map,
         ToolEntry::new(
-            ToolDefinition::builder("glob", "按 glob 模式递归搜索文件名，遵守 .gitignore 规则")
+            ToolDefinition::builder(
+                "glob",
+                "按 glob 模式递归搜索文件名，遵守 .gitignore 规则。比终端 find 更安全、结构化、跨平台一致，搜索文件名优先使用本工具",
+            )
                 .string("pattern", "标准 glob 模式")
                 .required()
                 .string("path", format!("搜索路径（默认 {DEFAULT_PATH}）"))

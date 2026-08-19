@@ -27,7 +27,7 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
         ToolEntry::new(
             ToolDefinition::builder(
                 "grep",
-                "按正则表达式搜索文件内容（大小写不敏感），遵守 .gitignore 规则",
+                "按正则表达式搜索文件内容（大小写不敏感），遵守 .gitignore 规则。比终端 grep 更安全、结构化、跨平台一致，搜索内容优先使用本工具",
             )
             .string("pattern", "正则表达式（大小写不敏感）")
             .required()
