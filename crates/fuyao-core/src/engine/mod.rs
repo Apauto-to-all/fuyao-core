@@ -13,6 +13,7 @@
 pub(crate) mod types;
 
 mod lifecycle;
+mod provider_ops;
 mod runtime;
 mod stop;
 mod subagent_ops;

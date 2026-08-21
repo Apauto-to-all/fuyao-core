@@ -146,9 +146,13 @@ pub(crate) async fn run_turn(
     let provider: Arc<dyn Provider> = match ctx.providers.get(&resolved.provider_id) {
         Some(p) => p,
         None => {
+            // 含完整实体标识（provider_id + model_id）与可用列表：供应商删除 /
+            // 反注册后的下一轮在此报错，用户与上层（选择器回退兜底）据此定位
             let msg = format!(
-                "Provider '{}' 未注册（可用: {:?}）",
+                "Provider '{}' 未注册（model_id: '{}'，可用: {:?}）——供应商可能已被删除或未运行时注册，\
+                 相关会话需切换到可用模型",
                 resolved.provider_id,
+                resolved.model_id,
                 ctx.providers.provider_ids()
             );
             tracing::warn!(

@@ -18,7 +18,7 @@ pub use provider::{
 };
 pub use registry::{
     ProviderRegistry, agent_paths_cache_key, clear_cache, get_model, get_provider, list_models,
-    list_providers, register_model, register_provider,
+    list_providers, register_model, register_provider, unregister_model, unregister_provider,
 };
 pub use resolver::{get_base_url, parse_model_id, resolve_api_key};
 pub use stream_decoder::StreamAggregator;

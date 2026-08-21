@@ -73,6 +73,35 @@ pub fn register_model(full_id: &str, model: Model, agent_paths_key: &str) {
         .insert(full_id.to_lowercase(), model);
 }
 
+/// 反注册 Provider：从指定 agent_paths 的缓存移除一条 Provider 配置
+///
+/// 运行时移除路径（供应商删除后的内存一致性）：key 大小写归一同 register。
+/// 移除不存在的条目为幂等 no-op。
+///
+/// # Arguments
+/// * `provider_id` - Provider ID
+/// * `agent_paths_key` - agent_paths 缓存 key
+pub fn unregister_provider(provider_id: &str, agent_paths_key: &str) {
+    let mut cache = lock(&PROVIDER_CACHE);
+    if let Some(providers) = cache.get_mut(agent_paths_key) {
+        providers.remove(&provider_id.to_lowercase());
+    }
+}
+
+/// 反注册 Model：从指定 agent_paths 的缓存移除一条 Model 配置
+///
+/// key 大小写归一同 register；移除不存在的条目为幂等 no-op。
+///
+/// # Arguments
+/// * `full_id` - 完整模型 ID（provider_id/model_id）
+/// * `agent_paths_key` - agent_paths 缓存 key
+pub fn unregister_model(full_id: &str, agent_paths_key: &str) {
+    let mut cache = lock(&MODEL_CACHE);
+    if let Some(models) = cache.get_mut(agent_paths_key) {
+        models.remove(&full_id.to_lowercase());
+    }
+}
+
 /// 获取 Provider
 ///
 /// # Arguments
@@ -270,6 +299,68 @@ mod tests {
         clear_cache(&paths);
 
         assert!(get_provider("aliyun", &paths).is_none());
+        assert!(get_model("aliyun/qwen3.6-plus", &paths).is_none());
+    }
+
+    // ===== 反注册（运行时移除的内存一致性） =====
+
+    /// 反注册 Provider：移除后 get 不到；大小写归一；移除不存在的幂等 no-op
+    #[test]
+    fn unregister_provider_removes_and_is_idempotent() {
+        let paths = unique_paths("unreg_provider");
+        let key = agent_paths_cache_key(&paths);
+        register_provider("aliyun", create_test_provider("aliyun"), &key);
+
+        unregister_provider("ALIYUN", &key);
+        assert!(
+            get_provider("aliyun", &paths).is_none(),
+            "大小写归一后应移除"
+        );
+
+        // 再移除（条目已不存在）不 panic、不影响缓存结构
+        unregister_provider("aliyun", &key);
+        assert!(get_provider("aliyun", &paths).is_none());
+    }
+
+    /// 反注册 Provider 不波及其他条目（Model 缓存与别的 Provider 动）
+    #[test]
+    fn unregister_provider_keeps_other_entries_intact() {
+        let paths = unique_paths("unreg_prov_keeps_others");
+        let key = agent_paths_cache_key(&paths);
+        register_provider("aliyun", create_test_provider("aliyun"), &key);
+        register_provider("other", create_test_provider("other"), &key);
+        register_model("other/m2", create_test_model("m2"), &key);
+
+        unregister_provider("aliyun", &key);
+
+        assert!(
+            get_provider("other", &paths).is_some(),
+            "其他 provider 不受波及"
+        );
+        assert!(
+            get_model("other/m2", &paths).is_some(),
+            "其他模型条目不受波及"
+        );
+        clear_cache(&paths);
+    }
+
+    /// 反注册 Model：移除后 get 不到；大小写归一；幂等 no-op
+    #[test]
+    fn unregister_model_removes_and_is_idempotent() {
+        let paths = unique_paths("unreg_model");
+        let key = agent_paths_cache_key(&paths);
+        register_model(
+            "aliyun/qwen3.6-plus",
+            create_test_model("qwen3.6-plus"),
+            &key,
+        );
+
+        unregister_model("Aliyun/QWEN3.6-PLUS", &key);
+        assert!(
+            get_model("aliyun/qwen3.6-plus", &paths).is_none(),
+            "大小写归一后应移除"
+        );
+        unregister_model("aliyun/qwen3.6-plus", &key);
         assert!(get_model("aliyun/qwen3.6-plus", &paths).is_none());
     }
 }
