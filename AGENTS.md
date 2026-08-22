@@ -77,6 +77,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 - 注释必须保留或更完善：禁止删除原有注释，新代码必须添加完整注释
 - 注释只描述代码本身：禁止在代码注释里出现任何"出处/对标"话语——不论动词（参考/对齐/学/借鉴/移植/搬自/对应…，不穷举）其他文件、文档、项目、链接等干扰话语。设计依据要写就重述为代码自身的设计陈述，不带出处。改完 .rs 必须自检注释是否命中禁项。
+- 文档语言：项目一切文档（`docs/` 下所有文件，含 `AGENTS.md`、`CONTEXT.md`、ADR、agent 配置文件 `docs/agents/*`）必须以中文为主——正文中文，仅技术标识符（命令、代码、配置键名、库名、专有名词等）保留原文。第三方 skill 自带的英文 seed 模板仅作结构骨架参考，内容必须用中文重写，禁止原样复制英文产物
 - 发送给 LLM 的所有文本必须使用中文，包括提示词、标签、占位符
 - 目前是开发阶段，禁止做任何兼容处理，对于废弃的代码，直接删除，禁止进行兼容保留
 - 项目干净：不被使用的函数、多余的导出，**先判断**是否有价值，如果有就保留，并且用 `// TODO:` 标记并说明用途，如果该代码目前不使用，可以使用 `//` 把代码完整注释掉，便于后续直接启用。对于废弃代码，无用代码，死代码，直接删除
@@ -141,3 +142,17 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 **敏感信息红线**：禁止记录 API Key / Token / 用户输入全文 / 文件内容 / 含密钥命令。错误信息含密钥需脱敏。
 
 **高频热路径不记 INFO**：流式 chunk / 循环每次迭代用 DEBUG 或不记。
+
+## Agent skills
+
+### Issue tracker
+
+issue 以本地 Markdown 文件追踪，存放于 `.scratch/<feature>/`。见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用默认五个分诊标签（needs-triage / needs-info / ready-for-agent / ready-for-human / wontfix）。见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+单上下文布局：根目录 `CONTEXT.md` + `docs/adr/`。见 `docs/agents/domain.md`。
