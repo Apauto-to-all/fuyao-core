@@ -33,8 +33,7 @@ pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
 pub use provider_manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 pub use session_manager::SessionManager;
-// 透出 fuyao-api 的列举选项类型，让二次开发只依赖 fuyao-app 即可消费 Discovery
-// 与 ProviderManager::list_providers 的结果
+// 透出 fuyao-api 的列举选项类型，二次开发只依赖 fuyao-app 即可消费列举结果
 pub use fuyao_api::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
 };
@@ -51,18 +50,16 @@ pub enum SetupError {
     Storage(String),
 }
 
-/// 装配产物：运行时交互入口 + 会话管理入口 + 选择支持入口 + 供应商管理入口
+/// 装配产物：运行时交互入口 + 会话管理入口 + 选择支持入口
 ///
-/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到四个正交门面：
+/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到三个正交门面：
 /// - [`app`](self::FuyaoApp::app)：运行时交互（create / send / recv / 对话生命周期）
 /// - [`sessions`](self::FuyaoApp::sessions)：会话管理查询（列会话 / 查历史）
 /// - [`discovery`](self::FuyaoApp::discovery)：选择支持（列 agent_id / Agent 定义）
-/// - [`providers`](self::FuyaoApp::providers)：供应商管理（供应商与模型的
-///   创建 / 更新 / 删除，写回 global 层；列供应商与旗下模型，直读落盘）
 ///
 /// 前两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
-/// 各持一份 `Arc` 克隆，零拷贝共享连接池）；[`discovery`] 与 [`providers`]
-/// 仅凭路径构造，不依赖引擎运行时。
+/// 各持一份 `Arc` 克隆，零拷贝共享连接池）；[`discovery`] 仅凭路径构造，
+/// 不依赖引擎运行时。
 pub struct FuyaoApp {
     /// 运行时交互门面（对话的进行）
     pub app: App,
@@ -70,8 +67,6 @@ pub struct FuyaoApp {
     pub sessions: SessionManager,
     /// 选择支持门面（列举 agent_id / Agent 定义）
     pub discovery: Discovery,
-    /// 供应商管理门面（供应商与模型的 CRUD 写回 + 唯一列举接口）
-    pub providers: ProviderManager,
 }
 
 /// 一键启动：init_engine → build_tool_registry → 创建 store → Engine::new → 装配
@@ -112,10 +107,9 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
             .map_err(|e| SetupError::Storage(e.to_string()))?,
     );
 
-    // 5. 构造选择支持门面与供应商管理门面（持有启动时的完整路径身份，含 agent_id）
-    //    在 Engine::new 消费 params 前 clone 出 agent_paths，供两者零参数查询复用。
+    // 5. 构造选择支持门面（持有启动时的完整路径身份，含 agent_id）
+    //    在 Engine::new 消费 params 前 clone 出 agent_paths，供其零参数查询复用。
     let discovery = Discovery::new(params.agent_paths.clone());
-    let providers = ProviderManager::new(params.agent_paths.clone());
 
     // 6. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
@@ -124,12 +118,10 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
     tracing::info!("引擎启动完成");
 
     // 7. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）+ 选择支持门面
-    //    + 供应商管理门面
     Ok(FuyaoApp {
         app: App::new(engine, mcp_manager, log_guard),
         sessions: SessionManager::new(store),
         discovery,
-        providers,
     })
 }
 

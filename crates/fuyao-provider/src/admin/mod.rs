@@ -10,7 +10,7 @@
 //! 模块内分工（扁平文件，各管一件事）：
 //! - [`error`]：管理面公开错误（面向最终用户，含修正建议）与配置加载错误映射
 //! - [`spec`]：写回载荷类型（[`ProviderSpec`]）与入参校验（fail-loud，写入前拦下）
-//! - [`global_store`]：global 层两落点（fuyao.toml / .env）的文件定位与读写句柄
+//! - [`global_files`]：global 层两落点（fuyao.toml / .env）的文件读写函数
 //! - [`toml_patch`]：fuyao.toml 段级变更原语（insert / patch / remove）
 //! - [`serialize`]：领域对象 → TOML 表的序列化（含 models 整表替换）
 //! - [`env_file`]：.env 单行级原语（格式化 / upsert / 组合备写）
@@ -37,14 +37,14 @@
 
 mod env_file;
 mod error;
-mod global_store;
+mod global_files;
 mod serialize;
 mod spec;
 mod toml_patch;
 
 pub use env_file::{format_env_line, prepare_env_upsert, upsert_env_line};
 pub use error::{ProviderAdminError, map_config_error};
-pub use global_store::GlobalStore;
+pub use global_files::{read_global_env, read_global_toml, write_global_env, write_global_toml};
 pub use spec::{
     ProviderModelSpec, ProviderSpec, ProviderSpecData, validate_provider_id, validate_spec,
 };

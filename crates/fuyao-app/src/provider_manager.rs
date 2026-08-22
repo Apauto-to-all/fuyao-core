@@ -1,10 +1,9 @@
 //! 供应商管理门面：供应商与模型配置的创建 / 更新 / 删除 / 列举接口
 //!
-//! 与 [`crate::SessionManager`]（会话管理门面）、[`crate::Discovery`]（选择支持
-//! 门面）平级正交的第三个管理面：供应商与模型配置是**全局资源**（跨工作区
-//! 共享），本门面把「领域存储 = global 层 fuyao.toml + .env」的增量写回编排成
-//! 供应商粒度的三个变更原语。底层功能（写回落存储、段级 patch、fail-loud
-//! 校验、错误映射）在 fuyao-provider 的 admin 域。
+//! 供应商与模型配置是**全局资源**（跨工作区共享）：本门面把「领域存储 =
+//! global 层 fuyao.toml + .env」的增量写回编排成供应商粒度的三个变更原语。
+//! 底层功能（写回落存储、段级 patch、fail-loud 校验、错误映射）在
+//! fuyao-provider 的 admin 域。
 //!
 //! # 单一事实源
 //!
@@ -18,32 +17,28 @@
 
 use fuyao_api::{AgentPaths, ProviderModelOption, ProviderOption, load_config};
 use fuyao_provider::admin::{
-    GlobalStore, insert_provider, map_config_error, patch_provider, prepare_env_upsert,
-    remove_provider, validate_provider_id, validate_spec,
+    insert_provider, map_config_error, patch_provider, prepare_env_upsert, read_global_env,
+    read_global_toml, remove_provider, validate_provider_id, validate_spec, write_global_env,
+    write_global_toml,
 };
 
 pub use fuyao_provider::admin::{ProviderAdminError, ProviderModelSpec, ProviderSpec};
 
 /// 供应商管理器：封装 global 层 fuyao.toml / .env 的供应商与模型增量写回
 ///
-/// 持有 [`AgentPaths`]（构造时注入一次）：路径身份决定写回落点
-/// （`fuyao_home` 下的 global 层文件）与三层落盘定位。与
-/// [`crate::SessionManager`] 同属「独立管理面封装领域存储 CRUD」的组织形态。
+/// 持有 [`AgentPaths`]（构造时注入一次）：`fuyao_home` 决定读写落点。
 pub struct ProviderManager {
     /// 路径身份（启动时注入，供应商管理全程只读）
     agent_paths: AgentPaths,
-    /// global 层写回落存储句柄（fuyao.toml + .env）
-    store: GlobalStore,
 }
 
 impl ProviderManager {
     /// 构造供应商管理门面
     ///
-    /// 公开构造：管理操作是纯文件写回 + 三层落盘读取，不依赖引擎装配，上层
-    /// 可在引擎启动前独立使用。
+    /// 公开构造：纯文件读写，无引擎依赖，任何时机可用。典型传
+    /// [`AgentPaths::default`]（仅 global 层）。
     pub fn new(agent_paths: AgentPaths) -> Self {
-        let store = GlobalStore::new(&agent_paths.fuyao_home);
-        Self { agent_paths, store }
+        Self { agent_paths }
     }
 
     // ── 供应商管理列举（直读落盘）───────────────────────────────
@@ -59,12 +54,12 @@ impl ProviderManager {
     /// 如 UI 下拉可直接沿用本序呈现）。
     ///
     /// # 错误
-    /// 配置加载失败（TOML 语法 / IO / providers 段校验 / providers 段出现在
-    /// 非 global 层）整体 fail-loud，映射为 [`ProviderAdminError`]（`TomlParse` /
-    /// `Io` / `Invalid`）——坏配置下列表不可用与 CRUD 一致，引导用户先修复配置。
+    /// 配置加载失败（TOML 语法 / IO / providers 段校验）整体 fail-loud，映射为
+    /// [`ProviderAdminError`]（`TomlParse` / `Io` / `Invalid`）——坏配置下列表
+    /// 不可用与 CRUD 一致，引导用户先修复配置。
     pub fn list_providers(&self) -> Result<Vec<ProviderOption>, ProviderAdminError> {
-        // 合并加载取完整值（含 providers 段的 fail-loud 校验）；无任何配置 = 空列表。
-        // providers 只存在于 global 层，合并结果的 providers 即 global 层落盘内容
+        // 加载配置取 providers（无任何配置 = 空列表）；providers 只存在于
+        // global 层，结果的 providers 即 global 落盘内容
         let config = load_config(&self.agent_paths).map_err(map_config_error)?;
         let providers = config.map(|c| c.providers).unwrap_or_default();
 
@@ -115,7 +110,7 @@ impl ProviderManager {
         // toml 侧失败时 .env 不动
         let env_write = match (&spec.api_key_env_var, &spec.api_key) {
             (Some(env_var), Some(api_key)) => Some(prepare_env_upsert(
-                &self.store.read_env()?,
+                &read_global_env(&self.agent_paths)?,
                 env_var,
                 api_key,
             )?),
@@ -124,11 +119,11 @@ impl ProviderManager {
         let has_api_key = spec.api_key.is_some();
         let data = spec.into_data();
 
-        let mut doc = self.store.read_toml()?;
+        let mut doc = read_global_toml(&self.agent_paths)?;
         insert_provider(&mut doc, provider_id, &data)?;
-        self.store.write_toml(&doc)?;
+        write_global_toml(&self.agent_paths, &doc)?;
         if let Some(next) = env_write {
-            self.store.write_env(&next)?;
+            write_global_env(&self.agent_paths, &next)?;
         }
 
         tracing::info!(
@@ -162,7 +157,7 @@ impl ProviderManager {
         // .env 先备好新内容，提交推迟到 toml 写盘成功后
         let env_write = match (&spec.api_key_env_var, &spec.api_key) {
             (Some(env_var), Some(api_key)) => Some(prepare_env_upsert(
-                &self.store.read_env()?,
+                &read_global_env(&self.agent_paths)?,
                 env_var,
                 api_key,
             )?),
@@ -171,11 +166,11 @@ impl ProviderManager {
         let has_api_key = spec.api_key.is_some();
         let model_count = spec.models.len();
 
-        let mut doc = self.store.read_toml()?;
+        let mut doc = read_global_toml(&self.agent_paths)?;
         patch_provider(&mut doc, provider_id, &spec)?;
-        self.store.write_toml(&doc)?;
+        write_global_toml(&self.agent_paths, &doc)?;
         if let Some(next) = env_write {
-            self.store.write_env(&next)?;
+            write_global_env(&self.agent_paths, &next)?;
         }
 
         tracing::info!(
@@ -198,9 +193,9 @@ impl ProviderManager {
     pub fn delete_provider(&self, provider_id: &str) -> Result<(), ProviderAdminError> {
         validate_provider_id(provider_id)?;
 
-        let mut doc = self.store.read_toml()?;
+        let mut doc = read_global_toml(&self.agent_paths)?;
         remove_provider(&mut doc, provider_id)?;
-        self.store.write_toml(&doc)?;
+        write_global_toml(&self.agent_paths, &doc)?;
 
         tracing::info!(
             provider_id = %provider_id,
@@ -229,47 +224,24 @@ mod tests {
 
     // ===== list_providers：直读落盘 =====
 
-    /// 构造三层齐全的 AgentPaths（agent 层经 global 前缀的 agent_id 落在
-    /// fuyao_home 下，workspace 层独立临时目录）
-    fn layered_agent_paths(test_name: &str) -> (AgentPaths, tempfile::TempDir, tempfile::TempDir) {
+    /// 构造仅 global 层的 AgentPaths（fuyao_home 注入临时目录，agent_id /
+    /// workspace 均空——与典型用法 `AgentPaths::default` 同构）
+    fn global_agent_paths() -> (AgentPaths, tempfile::TempDir) {
         let home = tempfile::tempdir().unwrap();
-        let ws = tempfile::tempdir().unwrap();
         let agent_paths = AgentPaths {
-            agent_id: Some(format!("global/{test_name}")),
-            workspace: Some(ws.path().to_path_buf()),
+            agent_id: None,
+            workspace: None,
             extra_dirs: Vec::new(),
             fuyao_home: home.path().to_path_buf(),
         };
-        (agent_paths, home, ws)
-    }
-
-    /// 非 global 层（agent / workspace）出现 providers 段：列表 fail-loud，
-    /// 错误信息指明应移除的文件
-    #[test]
-    fn list_fails_loud_when_providers_in_workspace_layer() {
-        let (agent_paths, _home, ws) = layered_agent_paths("providers_in_ws");
-        let ws_root = ws.path().join(".fuyao");
-        std::fs::create_dir_all(&ws_root).unwrap();
-        std::fs::write(
-            ws_root.join("fuyao.toml"),
-            "[providers.beta]\nname = \"B\"\n",
-        )
-        .unwrap();
-
-        let err = ProviderManager::new(agent_paths)
-            .list_providers()
-            .unwrap_err();
-        assert!(
-            matches!(err, ProviderAdminError::Invalid(_)),
-            "应 fail-loud：{err}"
-        );
+        (agent_paths, home)
     }
 
     /// 写盘后列表立即可见（不经注册缓存刷新）：create_provider（含内嵌模型）
     /// 完成即出现在列表，管理字段（base_url / 指针）齐备
     #[test]
     fn list_reflects_disk_write_immediately() {
-        let (agent_paths, _home, _ws) = layered_agent_paths("disk_write_visible");
+        let (agent_paths, _home) = global_agent_paths();
         let manager = ProviderManager::new(agent_paths.clone());
 
         // 未注册任何缓存、未写盘：空列表
@@ -310,7 +282,7 @@ mod tests {
     /// 乱序落盘多供应商多模型，输出按 (provider_id, model id) 字母序稳定排列
     #[test]
     fn list_sorted_stably() {
-        let (agent_paths, home, _ws) = layered_agent_paths("sorted_providers");
+        let (agent_paths, home) = global_agent_paths();
         // 故意按字母逆序写盘
         std::fs::write(
             home.path().join("fuyao.toml"),
@@ -346,7 +318,7 @@ mod tests {
     /// global 层 TOML 语法坏：列表整体 fail-loud（与 CRUD 同口径）
     #[test]
     fn list_bad_toml_fails_loud() {
-        let (agent_paths, home, _ws) = layered_agent_paths("bad_toml");
+        let (agent_paths, home) = global_agent_paths();
         std::fs::write(home.path().join("fuyao.toml"), "not [ valid").unwrap();
 
         let err = ProviderManager::new(agent_paths)
