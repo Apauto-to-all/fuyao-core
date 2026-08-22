@@ -11,28 +11,20 @@
 //! 工具注入时机：新架构无事后注册的 EngineHandle，工具必须在 `Engine::new` 前收集成
 //! `ToolRegistry` 一次性注入（启动引擎时装配）。
 
-mod app;
-mod discovery;
-mod init;
-mod logging;
-mod mcp;
-mod provider_manager;
-mod session_manager;
-mod tools;
+mod bootstrap;
+mod manager;
+mod runtime;
 
 use std::sync::Arc;
 
 use fuyao_api::EngineParams;
-use fuyao_core::{Engine, PluginHost, ToolRegistry, ToolRegistryBuilder};
-use fuyao_mcp::MCPManager;
+use fuyao_core::{Engine, PluginHost};
 use fuyao_session::SessionStore;
 
-pub use app::App;
-pub use discovery::{Discovery, list_agent_ids};
-pub use init::{InitError, InitResult, init_engine};
-pub use logging::LogGuard;
-pub use provider_manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
-pub use session_manager::SessionManager;
+pub use bootstrap::{InitError, InitResult, LogGuard, build_tool_registry, init_engine};
+pub use manager::list_agent_ids;
+pub use manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
+pub use runtime::{App, Discovery, SessionManager};
 // 透出 fuyao-api 的列举选项类型，二次开发只依赖 fuyao-app 即可消费列举结果
 pub use fuyao_api::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
@@ -81,7 +73,7 @@ pub struct FuyaoApp {
 /// 分步装配，再自行创建 store、调 `Engine::new` + [`App::new`] + [`SessionManager::new`]。
 pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
     // 1. 配置 / 日志 / Provider 准备（init_engine 内部取出 agent_paths 供子流程定位路径）
-    let init::InitResult {
+    let InitResult {
         provider,
         log_guard,
     } = init_engine(&params).await.map_err(|e| {
@@ -123,42 +115,4 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
         sessions: SessionManager::new(store),
         discovery,
     })
-}
-
-/// 收集工具（内置 + MCP），汇总成引擎可注入的 `ToolRegistry`
-///
-/// - 内置工具：`fuyao-tools` 静态表，按 `[tools.enabled]` 过滤。
-/// - MCP 工具：`[mcp_servers]` 配置驱动，无配置时跳过（返回的 manager 为 None）。
-///
-/// 返回 `(ToolRegistry, MCPManager)`。调用方持有 MCPManager 保活，否则底层
-/// server 连接断开、MCP 工具 handler 失效。
-pub async fn build_tool_registry() -> (ToolRegistry, Option<Arc<MCPManager>>) {
-    let mut builder = ToolRegistryBuilder::default();
-
-    // 1. 内置工具
-    builder = builder.register_all(tools::collect_builtin_tools());
-
-    // 2. MCP 工具（有配置时启动 server 并收集）
-    let mcp_manager = if let Some((manager, mcp_entries)) = mcp::collect_mcp_tools().await {
-        builder = builder.register_all(mcp_entries);
-        Some(manager)
-    } else {
-        None
-    };
-
-    let registry = builder.build();
-
-    // 全局层未知名对账（与定义层 tools 同款逻辑：静默忽略 + WARN，用户错误用户承担）。
-    // 已知名取注册表全部（内置 + MCP），避免已配置的 MCP 工具名被误报未知。
-    for name in
-        fuyao_api::unknown_tool_names(&fuyao_api::get_config().tools.enabled, registry.names())
-    {
-        tracing::warn!(
-            tool_name = %name,
-            layer = "global",
-            "工具配置引用了未知的工具名，已忽略"
-        );
-    }
-
-    (registry, mcp_manager)
 }

@@ -21,7 +21,7 @@
 //! let fuyao_app::InitResult { provider, log_guard } = fuyao_app::init_engine(&params).await?;
 //! ```
 
-use crate::logging::LogGuard;
+use crate::bootstrap::LogGuard;
 use fuyao_api::{
     AgentPaths, EngineParams, FuyaoConfig, is_config_set, load_config, load_env, set_config,
 };
@@ -131,7 +131,7 @@ pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError>
         .as_ref()
         .map(|c| c.logging.clone())
         .unwrap_or_default();
-    let log_guard = crate::logging::init_logging(&logging_config, agent_paths);
+    let log_guard = crate::bootstrap::init_logging(&logging_config, agent_paths);
 
     // 5. 注册 Provider/Model 配置到注册表（带缓存，重复调用幂等）
     ensure_registered(agent_paths, config.as_ref())?;

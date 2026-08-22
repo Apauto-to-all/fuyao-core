@@ -123,7 +123,7 @@ impl SessionManager {
     /// todos + messages + sessions，三者要么全删要么全留。
     ///
     /// # 返回
-    /// - `Ok(true)`：会话存在并已删除
+    /// - `Ok(true)`：会话存在，删除成功
     /// - `Ok(false)`：会话不存在（无 session 行被删，但该 id 的残留 todos / messages 仍被清理）
     pub async fn delete_session(
         &self,

@@ -20,7 +20,7 @@ use fuyao_mcp::MCPManager;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::logging::LogGuard;
+use crate::bootstrap::LogGuard;
 
 /// fan_out 通道容量（app 层消费缓冲）
 ///
