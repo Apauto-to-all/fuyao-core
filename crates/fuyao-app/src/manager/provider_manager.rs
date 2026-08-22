@@ -13,7 +13,8 @@
 //! - **供应商 id 不可变**：id 是会话缓存与历史引用的字符串锚点，换 id 走
 //!   「建新 + 删旧」；模型 id 随 models 整表替换自由变更。
 //! - **写入不等于立即生效**：本门面只负责写盘。写盘结果经配置加载读回语义
-//!   一致；存活 engine 的「立即可用」由调用方经引擎侧运行时注册原语编排刷新。
+//!   一致；存活 engine 的「立即可用」由调用方经引擎侧 `reload_providers`
+//!   全量对齐编排刷新。
 
 use fuyao_api::{AgentPaths, ProviderModelOption, ProviderOption, load_config};
 use fuyao_provider::admin::{
@@ -97,7 +98,7 @@ impl ProviderManager {
     /// 载荷即完整期望状态：`name` / `base_url` / `api_key_env_vars` 指针 /
     /// 全部模型一次写盘落齐。`api_key` 为 `Some` 时把明文 upsert 进 .env 的
     /// 指定变量（同名覆盖、异名新加）；`None` 不动 .env。已存在的 id 拒绝
-    /// 创建。写盘成功后由调用方编排存活 engine 的运行时注册。
+    /// 创建。写盘成功后由调用方调 `reload_providers` 刷新存活 engine。
     pub fn create_provider(
         &self,
         provider_id: &str,

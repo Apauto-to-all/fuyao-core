@@ -10,7 +10,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 | 术语 | 代码标识 | 含义 |
 | --- | --- | --- |
-| 引擎 | `Engine` | 能力共享层，启动一次装配 provider / store / 工具 / 插件工厂；对外四动作 `create_session` / `resume_session` / `send` / `shutdown`，另有 `fork_session` / `create_child_session` / `stop_session` / `register_provider` 等扩展 |
+| 引擎 | `Engine` | 能力共享层，启动一次装配 provider / store / 工具 / 插件工厂；对外四动作 `create_session` / `resume_session` / `send` / `shutdown`，另有 `fork_session` / `create_child_session` / `stop_session` / `reload_providers` 等扩展 |
 | ReAct 循环 | `react` 模块 | 每 session 一个 tokio task：想 → 调一批工具 → 消费 guide 队列 → 再想 → 最终回复 |
 | 轮次 | `run_turn` / `TurnOutcome` | 单轮 ReAct 的执行与退出原因（`Completed` / `HaltedByCommand` / `Interrupted`） |
 | dispatch 管道 | `dispatch` | 统一输出处理链：`intercept`（同步原地修改 / 阻止）→ `deliver`（发送 + 观察） |

@@ -136,7 +136,7 @@ impl ProviderRegistry {
     /// 启动期批量装配，运行期增量刷新，两路径写入同一实例表。
     ///
     /// 实例的构造依赖 [`cache`] 中的配置（api_key / base_url 解析链），调用方
-    /// 须先 `register_provider` 配置再调本方法（引擎侧的运行时注册原语
+    /// 须先 `register_provider` 配置再调本方法（引擎侧的 `reload_providers`
     /// 已封装该顺序）。
     pub fn register(&self, provider_id: &str, instance: Arc<dyn ProviderTrait>) {
         let mut instances = recover(self.instances.write());

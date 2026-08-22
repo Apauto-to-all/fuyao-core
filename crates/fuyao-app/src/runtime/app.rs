@@ -196,28 +196,20 @@ impl App {
         self.engine.stop_session(id, reason).await
     }
 
-    /// 向存活 engine 注入一个供应商（直接代理 [`Engine::register_provider`]）
+    /// 刷新存活 engine 的供应商注册表（直接代理 [`Engine::reload_providers`]）
     ///
-    /// 供应商写盘后的内存注册原语：配置进注册缓存 + 实例进本 engine 的注册表，
-    /// 下一 turn 立即可用。同步执行（纯 CPU + 本地文件读，无 await 点）。
-    /// 多 engine 场景的全池刷新编排属上层职责——每台 engine 各调一次本方法。
-    ///
-    /// # 错误（均含实体标识）
-    /// 三层配置加载失败 / 该 provider_id 未落盘 / API Key 解析落空 →
-    /// [`EngineError::Provider`]，信息直指排查方向。
-    pub fn register_provider(&self, provider_id: &str) -> Result<(), EngineError> {
-        self.engine.register_provider(provider_id)
-    }
-
-    /// 从存活 engine 移除一个供应商（直接代理 [`Engine::unregister_provider`]）
-    ///
-    /// 供应商删除后的内存一致性动作：实例与缓存条目（含旗下全部模型）一并
-    /// 清除，运行中 turn 持旧实例跑完本轮，下一轮解析缺失由 turn 层报错。
+    /// 供应商落盘变更后的内存对齐原语：把注册表重建为当前落盘状态（新增 /
+    /// 修改刷新实例、删除清除实例与缓存），下一 turn 生效。同步执行（纯
+    /// CPU + 本地文件读，无 await 点）。多 engine 场景的全池刷新编排属上层
+    /// 职责——每台 engine 各调一次本方法。
     ///
     /// # 返回
-    /// 实例是否实际被移除（false = 本就不在注册表，幂等）。
-    pub fn unregister_provider(&self, provider_id: &str) -> bool {
-        self.engine.unregister_provider(provider_id)
+    /// 实例构造被跳过的供应商 id 名单（空 = 全部成功注册）。
+    ///
+    /// # 错误
+    /// 三层配置加载失败 → [`EngineError::Provider`]，信息直指排查方向。
+    pub fn reload_providers(&self) -> Result<Vec<String>, EngineError> {
+        self.engine.reload_providers()
     }
 
     /// 出站事件单一出口（fan_out 接收端）
@@ -432,19 +424,20 @@ mod tests {
         App::new(engine, None, LogGuard::default())
     }
 
-    /// 代理 register_provider：调用抵达内部 engine（成功返回即完成缓存注册 +
-    /// 实例入表的全链路——注册表插入是链路最后一步，Ok 即全部生效）
+    /// 代理 reload_providers：调用抵达内部 engine（落盘供应商注册进缓存 +
+    /// 实例入表；落盘删除的清除），成功返回即完成全链路对齐
     #[tokio::test]
-    async fn register_provider_proxy_populates_internal_engine() {
+    async fn reload_providers_proxy_aligns_internal_engine() {
         let home = tempfile::tempdir().unwrap();
-        let paths = unique_paths("app_proxy_register", home.path());
+        let paths = unique_paths("app_proxy_reload", home.path());
         write_global_config(home.path(), "alpha");
         let app = bare_app(paths.clone()).await;
 
-        app.register_provider("alpha").expect("代理注册应成功");
+        let skipped = app.reload_providers().expect("代理刷新应成功");
 
-        // 注册链路把 Provider 与旗下 Model 写进进程级缓存（按路径身份隔离），
-        // 缓存可查是注册已执行的公开可见证据
+        assert!(skipped.is_empty(), "key 齐备不应有跳过：{skipped:?}");
+        // 刷新链路把 Provider 与旗下 Model 写进进程级缓存（按路径身份隔离），
+        // 缓存可查是刷新已执行的公开可见证据
         assert!(
             fuyao_provider::get_provider("alpha", &paths).is_some(),
             "Provider 配置缓存应可查"
@@ -452,33 +445,6 @@ mod tests {
         assert!(
             fuyao_provider::get_model("alpha/m1", &paths).is_some(),
             "模型缓存条目应可查"
-        );
-
-        fuyao_provider::clear_cache(&paths);
-    }
-
-    /// 代理 unregister_provider：bool 返回值即实例表移除结果（实际移除 true /
-    /// 本就不在表 false 幂等），缓存条目（含旗下模型）一并清除
-    #[tokio::test]
-    async fn unregister_provider_proxy_clears_internal_engine() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = unique_paths("app_proxy_unregister", home.path());
-        write_global_config(home.path(), "gamma");
-        let app = bare_app(paths.clone()).await;
-        app.register_provider("gamma").unwrap();
-
-        assert!(app.unregister_provider("gamma"), "实际移除应返回 true");
-        assert!(
-            fuyao_provider::get_provider("gamma", &paths).is_none(),
-            "Provider 配置缓存应已清"
-        );
-        assert!(
-            fuyao_provider::get_model("gamma/m1", &paths).is_none(),
-            "模型缓存条目应已清"
-        );
-        assert!(
-            !app.unregister_provider("gamma"),
-            "再次移除返回 false（幂等）"
         );
 
         fuyao_provider::clear_cache(&paths);

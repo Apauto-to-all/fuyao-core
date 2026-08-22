@@ -1,12 +1,15 @@
-//! 供应商运行时注册集成测试：写盘 → 内存注册 → 存活 engine 立即可用的端到端链路
+//! 供应商运行时刷新集成测试：写盘 → 内存对齐 → 存活 engine 立即可用的端到端链路
 //!
-//! 跨层协作验证（fuyao-app 管理面写盘 + fuyao-core 运行时注册原语 + 真实
-//! OpenAIProvider HTTP 行为），钉死两条核心契约：
+//! 跨层协作验证（fuyao-app 管理面写盘 + fuyao-core 运行时刷新原语 + 真实
+//! OpenAIProvider HTTP 行为），钉死三条核心契约：
 //! 1. **创建即生效**：引擎存活期间，经 ProviderManager 写盘新供应商后调
-//!    `Engine::register_provider`，新 session 的新 turn 直接路由到新供应商
+//!    `Engine::reload_providers`，新 session 的新 turn 直接路由到新供应商
 //!    （不经重启、不经缓存重装）；
-//! 2. **运行中 turn 零中断**：删除（反注册）发生在 turn 的 LLM 调用已发出之后，
-//!    该 turn 仍完整跑完；下一轮解析缺失时报错信息含实体标识（可诊断）。
+//! 2. **渐进配置**：落盘供应商的 API Key 缺失（指针变量未写 .env）时进跳过
+//!    名单、实例不注册，其他供应商照常可调用；
+//! 3. **运行中 turn 零中断**：删除（写盘 + 刷新对账）发生在 turn 的 LLM 调用
+//!    已发出之后，该 turn 仍完整跑完；下一轮解析缺失时报错信息含实体标识
+//!    （可诊断）。
 //!
 //! mock 策略：LLM HTTP 端点不可控（真实供应商 API），用手写 mini SSE server
 //! （tokio TcpListener）承接——「请求到达」信号让删除时机的判定确定性成立
@@ -229,13 +232,13 @@ fn write_provider_config(
 }
 
 // ============================================================================
-// 创建即生效：写盘 + 运行时注册 → 存活 engine 的新 turn 直接调用新供应商
+// 创建即生效：写盘 + 运行时刷新 → 存活 engine 的新 turn 直接调用新供应商
 // ============================================================================
 
-/// 引擎存活期间创建并运行时注册新供应商：新 session 的新 turn 不经重启即可
+/// 引擎存活期间创建供应商并刷新：新 session 的新 turn 不经重启即可
 /// 路由到新供应商（mock server 收到真实 HTTP 请求、回复完整抵达）
 #[tokio::test]
-async fn create_then_register_is_immediately_callable() {
+async fn create_then_reload_is_immediately_callable() {
     let (paths, home) = isolated_paths("rt_create_usable");
     let (tx_hit, mut rx_hit) = mpsc::channel(8);
     let base_url = spawn_sse_server(Duration::ZERO, tx_hit).await;
@@ -262,10 +265,9 @@ async fn create_then_register_is_immediately_callable() {
         )
         .expect("创建 beta 失败");
 
-    // 运行时注册（内存缓存 + 实例表）：此刻起存活 engine 对 beta 可调用
-    engine
-        .register_provider("beta")
-        .expect("运行时注册 beta 失败");
+    // 运行时刷新（内存缓存 + 实例表对齐落盘）：此刻起存活 engine 对 beta 可调用
+    let skipped = engine.reload_providers().expect("运行时刷新失败");
+    assert!(skipped.is_empty(), "key 齐备不应有跳过：{skipped:?}");
 
     // —— 新 turn 直接调用新供应商：session 以 beta/beta-m 发消息 ——
     let (session_id, mut rx_event) = engine
@@ -296,19 +298,78 @@ async fn create_then_register_is_immediately_callable() {
     fuyao_provider::clear_cache(&paths);
 }
 
-/// 运行时注册未落盘的供应商：报错（含实体标识与落盘指引）
+/// 渐进配置：落盘供应商的 API Key 缺失（指针变量未写 .env）时进跳过名单、
+/// 实例不注册（新 turn 报错含实体标识）；其他 key 齐备的供应商照常可调用
 #[tokio::test]
-async fn register_without_disk_write_errors() {
-    let (paths, home) = isolated_paths("rt_register_nodisk");
-    let (tx_hit, _rx_hit) = mpsc::channel(8);
+async fn reload_skips_missing_key_provider_and_keeps_others() {
+    let (paths, home) = isolated_paths("rt_reload_skip");
+    let (tx_hit, mut rx_hit) = mpsc::channel(8);
     let base_url = spawn_sse_server(Duration::ZERO, tx_hit).await;
     write_provider_config(home.path(), "alpha", &base_url, "alpha-m");
     let engine = assemble_engine(&paths).await;
 
-    let err = engine.register_provider("ghost").expect_err("未落盘应报错");
-    let msg = err.to_string();
-    assert!(msg.contains("ghost"), "错误含实体标识：{msg}");
-    assert!(msg.contains("未在三层"), "错误指向落盘前置条件：{msg}");
+    // 管理面创建 beta：api_key 为 None（不动 .env），指针变量 BETA_KEY 未写入
+    // 任何 .env，解析必然落空
+    let manager = ProviderManager::new(paths.clone());
+    manager
+        .create_provider(
+            "beta",
+            ProviderSpec {
+                name: "Beta".to_string(),
+                base_url: Some(base_url.clone()),
+                api_key_env_var: Some("BETA_KEY".to_string()),
+                api_key: None,
+                models: vec![ProviderModelSpec {
+                    id: "beta-m".to_string(),
+                    model: runtime_model("beta-m"),
+                }],
+            },
+        )
+        .expect("创建 beta 失败");
+
+    let skipped = engine.reload_providers().expect("刷新应成功");
+    assert_eq!(
+        skipped,
+        vec!["beta".to_string()],
+        "仅 key 缺失的 beta 进跳过名单"
+    );
+
+    // beta 实例未注册：以 beta/beta-m 发消息，报错含实体标识
+    let (session_id, mut rx_event) = engine
+        .create_session(params_with_model("beta/beta-m"))
+        .await
+        .expect("创建 session 失败");
+    engine
+        .send(&session_id, guide_message("你好"))
+        .await
+        .expect("发消息失败");
+    match wait_for_assistant(&mut rx_event).await {
+        Some(Err(msg)) => {
+            assert!(msg.contains("beta"), "错误信息含 provider 标识：{msg}");
+        }
+        other => panic!("key 缺失供应商的新 turn 应报错，实际：{other:?}"),
+    }
+
+    // alpha 照常可用：请求真实抵达 mock server、回复完整抵达
+    let (session_id, mut rx_event) = engine
+        .create_session(params_with_model("alpha/alpha-m"))
+        .await
+        .expect("创建 session 失败");
+    engine
+        .send(&session_id, guide_message("你好"))
+        .await
+        .expect("发消息失败");
+    tokio::time::timeout(Duration::from_secs(5), rx_hit.recv())
+        .await
+        .expect("mock server 应收到 alpha 的请求")
+        .expect("server 任务不应退出");
+    match wait_for_assistant(&mut rx_event).await {
+        Some(Ok(content)) => assert!(
+            content.contains("来自 mock 的回复"),
+            "回复应来自 mock：{content}"
+        ),
+        other => panic!("alpha 的 turn 应完整完成，实际：{other:?}"),
+    }
 
     engine.shutdown().await;
     fuyao_provider::clear_cache(&paths);
@@ -318,10 +379,10 @@ async fn register_without_disk_write_errors() {
 // 运行中 turn 零中断 + 下一轮缺失报错可诊断
 // ============================================================================
 
-/// turn 的 LLM 请求已发出后删除供应商（写盘 + 反注册）：本轮跑完，下一轮
+/// turn 的 LLM 请求已发出后删除供应商（写盘 + 刷新对账）：本轮跑完，下一轮
 /// 报错信息含实体标识
 #[tokio::test]
-async fn unregister_midturn_finishes_current_and_errors_next() {
+async fn delete_then_reload_midturn_finishes_current_and_errors_next() {
     let (paths, home) = isolated_paths("rt_midturn_delete");
     // 延迟响应拉开删除窗口：请求到达后先挂起，测试方在此期间完成删除
     let (tx_hit, mut rx_hit) = mpsc::channel(8);
@@ -344,10 +405,11 @@ async fn unregister_midturn_finishes_current_and_errors_next() {
         .expect("应收到第一轮请求到达信号")
         .expect("server 任务不应退出");
 
-    // 删除链路：管理面写盘（toml 段 + .env 变量）→ 引擎反注册（实例 + 缓存）
+    // 删除链路：管理面写盘（toml 段 + .env 变量）→ 引擎刷新对账（实例 + 缓存清除）
     let manager = ProviderManager::new(paths.clone());
     manager.delete_provider("beta").expect("写盘删除 beta 失败");
-    assert!(engine.unregister_provider("beta"), "反注册应实际移除实例");
+    let skipped = engine.reload_providers().expect("刷新失败");
+    assert!(skipped.is_empty(), "剩余供应商 key 齐备：{skipped:?}");
 
     // 零中断：第一轮照常完整完成（延迟响应抵达后 turn 收尾，Assistant 落地）
     match wait_for_assistant(&mut rx_event).await {
