@@ -196,6 +196,30 @@ impl App {
         self.engine.stop_session(id, reason).await
     }
 
+    /// 向存活 engine 注入一个供应商（直接代理 [`Engine::register_provider`]）
+    ///
+    /// 供应商写盘后的内存注册原语：配置进注册缓存 + 实例进本 engine 的注册表，
+    /// 下一 turn 立即可用。同步执行（纯 CPU + 本地文件读，无 await 点）。
+    /// 多 engine 场景的全池刷新编排属上层职责——每台 engine 各调一次本方法。
+    ///
+    /// # 错误（均含实体标识）
+    /// 三层配置加载失败 / 该 provider_id 未落盘 / API Key 解析落空 →
+    /// [`EngineError::Provider`]，信息直指排查方向。
+    pub fn register_provider(&self, provider_id: &str) -> Result<(), EngineError> {
+        self.engine.register_provider(provider_id)
+    }
+
+    /// 从存活 engine 移除一个供应商（直接代理 [`Engine::unregister_provider`]）
+    ///
+    /// 供应商删除后的内存一致性动作：实例与缓存条目（含旗下全部模型）一并
+    /// 清除，运行中 turn 持旧实例跑完本轮，下一轮解析缺失由 turn 层报错。
+    ///
+    /// # 返回
+    /// 实例是否实际被移除（false = 本就不在注册表，幂等）。
+    pub fn unregister_provider(&self, provider_id: &str) -> bool {
+        self.engine.unregister_provider(provider_id)
+    }
+
     /// 出站事件单一出口（fan_out 接收端）
     ///
     /// 从 fan_out 通道消费事件——所有常规 session 的 forwarder 都把事件推到这里。
@@ -353,5 +377,110 @@ async fn end_one_forward_task(session_id: SessionId, handle: JoinHandle<()>) {
                 "forwarder task 超时未退出，已强制 abort（兜底）"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fuyao_core::ToolRegistry;
+    use fuyao_hooks::PluginHost;
+
+    /// 构造测试用 AgentPaths（临时 fuyao_home + 唯一 agent_id，隔离进程级注册缓存）
+    fn unique_paths(test_name: &str, home: &std::path::Path) -> fuyao_api::AgentPaths {
+        fuyao_api::AgentPaths {
+            agent_id: Some(format!("global/{test_name}")),
+            workspace: None,
+            extra_dirs: Vec::new(),
+            fuyao_home: home.to_path_buf(),
+        }
+    }
+
+    /// 落盘一份含目标供应商的 global 层 fuyao.toml（明文 api_key 走 options，
+    /// 避免 .env 环境变量串扰）
+    fn write_global_config(home: &std::path::Path, provider_id: &str) {
+        let content = format!(
+            "[providers.{provider_id}]\n\
+             name = \"Test\"\n\
+             options = {{ api_key = \"sk-test\" }}\n\
+             [providers.{provider_id}.models.\"m1\"]\n\
+             name = \"m1\"\n\
+             limit = {{ context = 64000 }}\n"
+        );
+        std::fs::write(home.join("fuyao.toml"), content).expect("写测试配置失败");
+    }
+
+    /// 构造最小 App：空注册表 + 空工具表 + 空插件的裸 engine + 空 MCP + 空 log guard
+    ///
+    /// 供应商运行时注册不依赖装配期实例，裸 registry 起点即可验证代理链路。
+    async fn bare_app(paths: fuyao_api::AgentPaths) -> App {
+        let store = std::sync::Arc::new(
+            fuyao_session::SessionStore::new(paths.sessions_db_path())
+                .await
+                .expect("构造 SessionStore 失败"),
+        );
+        let engine = Engine::new(
+            fuyao_api::EngineParams {
+                agent_paths: paths.clone(),
+            },
+            fuyao_provider::ProviderRegistry::default(),
+            ToolRegistry::builder().build(),
+            PluginHost::new(),
+            store,
+        )
+        .await;
+        App::new(engine, None, LogGuard::default())
+    }
+
+    /// 代理 register_provider：调用抵达内部 engine（成功返回即完成缓存注册 +
+    /// 实例入表的全链路——注册表插入是链路最后一步，Ok 即全部生效）
+    #[tokio::test]
+    async fn register_provider_proxy_populates_internal_engine() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = unique_paths("app_proxy_register", home.path());
+        write_global_config(home.path(), "alpha");
+        let app = bare_app(paths.clone()).await;
+
+        app.register_provider("alpha").expect("代理注册应成功");
+
+        // 注册链路把 Provider 与旗下 Model 写进进程级缓存（按路径身份隔离），
+        // 缓存可查是注册已执行的公开可见证据
+        assert!(
+            fuyao_provider::get_provider("alpha", &paths).is_some(),
+            "Provider 配置缓存应可查"
+        );
+        assert!(
+            fuyao_provider::get_model("alpha/m1", &paths).is_some(),
+            "模型缓存条目应可查"
+        );
+
+        fuyao_provider::clear_cache(&paths);
+    }
+
+    /// 代理 unregister_provider：bool 返回值即实例表移除结果（实际移除 true /
+    /// 本就不在表 false 幂等），缓存条目（含旗下模型）一并清除
+    #[tokio::test]
+    async fn unregister_provider_proxy_clears_internal_engine() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = unique_paths("app_proxy_unregister", home.path());
+        write_global_config(home.path(), "gamma");
+        let app = bare_app(paths.clone()).await;
+        app.register_provider("gamma").unwrap();
+
+        assert!(app.unregister_provider("gamma"), "实际移除应返回 true");
+        assert!(
+            fuyao_provider::get_provider("gamma", &paths).is_none(),
+            "Provider 配置缓存应已清"
+        );
+        assert!(
+            fuyao_provider::get_model("gamma/m1", &paths).is_none(),
+            "模型缓存条目应已清"
+        );
+        assert!(
+            !app.unregister_provider("gamma"),
+            "再次移除返回 false（幂等）"
+        );
+
+        fuyao_provider::clear_cache(&paths);
     }
 }
