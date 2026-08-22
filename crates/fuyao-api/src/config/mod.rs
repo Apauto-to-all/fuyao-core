@@ -61,10 +61,7 @@ pub use tools::{
 // 加载相关
 pub use env::{load_env, load_env_missing};
 pub use error::ConfigError;
-pub use loader::{
-    ProviderSources, load_config, load_merged_config, load_provider_sources,
-    load_provider_sources_from,
-};
+pub use loader::{load_config, load_merged_config};
 
 /// Fuyao 全局配置聚合
 ///

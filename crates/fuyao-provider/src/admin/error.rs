@@ -30,16 +30,22 @@ pub enum ProviderAdminError {
     Io(String),
 }
 
-/// 把三层配置加载错误映射为公开错误变体
+/// 把配置加载错误映射为公开错误变体
 ///
 /// 列表 API 与 CRUD 共用同一 fail-loud 口径：语法坏 → `TomlParse`（先修复才能
-/// 继续管理），值校验失败（providers 段 / 模型必填项）→ `Invalid`，IO → `Io`。
+/// 继续管理），值校验失败（providers 段 / 模型必填项 / providers 段出现在
+/// 非 global 层）→ `Invalid`，IO → `Io`。
 pub fn map_config_error(e: fuyao_api::ConfigError) -> ProviderAdminError {
     match e {
         fuyao_api::ConfigError::TomlError(err) => ProviderAdminError::TomlParse(err.to_string()),
         fuyao_api::ConfigError::InvalidModel(msg) => ProviderAdminError::Invalid(msg),
         fuyao_api::ConfigError::InvalidProvidersSection(msg) => {
             ProviderAdminError::InvalidSection(msg)
+        }
+        fuyao_api::ConfigError::ProvidersOutsideGlobal(path) => {
+            ProviderAdminError::Invalid(format!(
+                "providers 段只允许出现在全局层 fuyao.toml，请移除该文件中的 providers 段: {path}"
+            ))
         }
         fuyao_api::ConfigError::IoError(err) => ProviderAdminError::Io(err.to_string()),
         fuyao_api::ConfigError::FileNotFound(path) => {

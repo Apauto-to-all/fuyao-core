@@ -6,7 +6,8 @@
 //! 3. 校验 `[tools.terminal].shell`（显式名非法 / 二进制定位失败即拒绝启动）
 //! 4. 初始化日志（tracing subscriber，按 `[logging]` 配置；guard 随返回值传出）
 //! 5. 注册 Provider/Model 到注册表（带缓存，重复调用幂等）
-//! 6. 批量构造所有已注册 Provider 的实例（`ProviderRegistry::from_registered`）
+//! 6. 校验配置中的模型引用（`[models.fast]` 悬空引用启动即报错）
+//! 7. 批量构造所有已注册 Provider 的实例（`ProviderRegistry::from_registered`）
 //!
 //! 返回 `(ProviderRegistry, 日志 guard)`，
 //! 由 [`crate::start`] 组装进 `Engine::new`。工具注册表
@@ -49,6 +50,10 @@ pub enum InitError {
     /// 终端 shell 配置非法（名字不在合法值内 / 对应可执行文件未找到）
     #[error("终端 shell 配置非法: {0}")]
     InvalidTerminalShell(String),
+
+    /// 配置中的模型引用悬空（引用的 provider/model 未注册）
+    #[error("模型引用无效: {0}")]
+    InvalidModelRef(String),
 }
 
 /// 引擎装配准备产物
@@ -83,6 +88,7 @@ pub struct InitResult {
 ///   workspace 来源缺 workspace 参数
 /// - [`InitError::InvalidTerminalShell`]：[tools.terminal].shell 显式名不在合法值内
 ///   或对应可执行文件未找到
+/// - [`InitError::InvalidModelRef`]：[models.fast] 引用的模型未注册
 /// - [`InitError::NoProviderAvailable`]：所有 Provider 实例创建失败
 /// - [`InitError::ConfigError`]：配置文件加载失败
 pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError> {
@@ -130,7 +136,11 @@ pub async fn init_engine(params: &EngineParams) -> Result<InitResult, InitError>
     // 5. 注册 Provider/Model 配置到注册表（带缓存，重复调用幂等）
     ensure_registered(agent_paths, config.as_ref())?;
 
-    // 6. 批量构造所有已注册 Provider 的实例（单个失败仅 WARN 跳过）
+    // 6. 模型引用校验闭环：[models.fast] 引用的模型必须存在于已注册目录，
+    //    悬空引用启动即报错（错误信息附可用模型列表，指明排查方向）
+    validate_model_refs(config.as_ref(), agent_paths)?;
+
+    // 7. 批量构造所有已注册 Provider 的实例（单个失败仅 WARN 跳过）
     let provider = ProviderRegistry::from_registered(agent_paths);
     if provider.is_empty() {
         return Err(InitError::NoProviderAvailable);
@@ -187,6 +197,41 @@ fn ensure_registered(
     Ok(())
 }
 
+/// 校验配置中的模型引用（`[models.fast]`）指向已注册的模型
+///
+/// 引用悬空（供应商未定义 / 模型不在其旗下）启动即报错——配置引用与供应商
+/// 目录之间的闭环校验，把「配了不生效」的死配置拦在启动期。错误信息附
+/// 可用模型列表，直接指明修正方向。
+fn validate_model_refs(
+    config: Option<&FuyaoConfig>,
+    agent_paths: &AgentPaths,
+) -> Result<(), InitError> {
+    use fuyao_provider::list_models;
+
+    // 未配置引用 = 无可校验项（fast 缺省时轻量任务回退到会话模型，运行期自洽）
+    let Some(fast) = config.and_then(|c| c.models.fast.as_ref()) else {
+        return Ok(());
+    };
+
+    // 注册缓存键已小写归一，引用同样小写比对（与运行期解析的大小写不敏感一致）
+    let models = list_models(agent_paths);
+    if models.contains_key(&fast.model.to_lowercase()) {
+        return Ok(());
+    }
+
+    let mut available: Vec<String> = models.keys().cloned().collect();
+    available.sort();
+    Err(InitError::InvalidModelRef(format!(
+        "[models.fast] 引用的模型 \"{}\" 不存在，已注册的模型：{}",
+        fast.model,
+        if available.is_empty() {
+            "（无）".to_string()
+        } else {
+            available.join(", ")
+        }
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +272,96 @@ mod tests {
         assert!(msg.contains("终端 shell 配置非法"), "{msg}");
         assert!(msg.contains("zsh"), "{msg}");
         assert!(msg.contains("合法值"), "{msg}");
+    }
+
+    /// InitError::InvalidModelRef 透传校验错误信息（含模型名与排查方向）
+    #[test]
+    fn init_error_invalid_model_ref_passes_message() {
+        let err = InitError::InvalidModelRef(
+            "[models.fast] 引用的模型 \"deepseek/none\" 不存在，已注册的模型：（无）".to_string(),
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("模型引用无效"), "{msg}");
+        assert!(msg.contains("deepseek/none"), "{msg}");
+    }
+
+    // ===== validate_model_refs：引用校验闭环 =====
+
+    /// 构造最小 Model 配置（元信息取默认值）
+    fn test_model(name: &str) -> fuyao_api::Model {
+        fuyao_api::Model {
+            name: name.to_string(),
+            cost: Default::default(),
+            limit: Default::default(),
+            reasoning_efforts: vec![],
+            modalities: Default::default(),
+        }
+    }
+
+    /// 悬空引用：报错且信息含引用名与可用模型列表
+    #[test]
+    fn validate_model_refs_rejects_dangling_reference() {
+        let paths = AgentPaths {
+            agent_id: Some("global/init_validate_dangling".to_string()),
+            ..Default::default()
+        };
+        let key = fuyao_provider::agent_paths_cache_key(&paths);
+        fuyao_provider::register_model(
+            "deepseek/deepseek-v4-flash",
+            test_model("deepseek-v4-flash"),
+            &key,
+        );
+
+        let config = FuyaoConfig {
+            models: fuyao_api::ModelSelection {
+                fast: Some(fuyao_api::ModelRef {
+                    model: "deepseek/none".to_string(),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        };
+        let err = validate_model_refs(Some(&config), &paths).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("deepseek/none"), "{msg}");
+        assert!(msg.contains("deepseek-v4-flash"), "应附可用模型列表：{msg}");
+
+        fuyao_provider::clear_cache(&paths);
+    }
+
+    /// 命中引用：通过（大小写不敏感）
+    #[test]
+    fn validate_model_refs_accepts_registered_reference() {
+        let paths = AgentPaths {
+            agent_id: Some("global/init_validate_hit".to_string()),
+            ..Default::default()
+        };
+        let key = fuyao_provider::agent_paths_cache_key(&paths);
+        fuyao_provider::register_model(
+            "deepseek/deepseek-v4-flash",
+            test_model("deepseek-v4-flash"),
+            &key,
+        );
+
+        let config = FuyaoConfig {
+            models: fuyao_api::ModelSelection {
+                fast: Some(fuyao_api::ModelRef {
+                    model: "DeepSeek/DeepSeek-V4-Flash".to_string(),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        };
+        assert!(validate_model_refs(Some(&config), &paths).is_ok());
+
+        fuyao_provider::clear_cache(&paths);
+    }
+
+    /// 未配置 fast / 无配置：无可校验项，直接通过
+    #[test]
+    fn validate_model_refs_passes_without_reference() {
+        let paths = AgentPaths::default();
+        assert!(validate_model_refs(None, &paths).is_ok());
+        assert!(validate_model_refs(Some(&FuyaoConfig::default()), &paths).is_ok());
     }
 }

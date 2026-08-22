@@ -37,7 +37,6 @@ pub use session_manager::SessionManager;
 // 与 ProviderManager::list_providers 的结果
 pub use fuyao_api::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
-    ProviderSource,
 };
 
 /// 装配错误
@@ -59,7 +58,7 @@ pub enum SetupError {
 /// - [`sessions`](self::FuyaoApp::sessions)：会话管理查询（列会话 / 查历史）
 /// - [`discovery`](self::FuyaoApp::discovery)：选择支持（列 agent_id / Agent 定义）
 /// - [`providers`](self::FuyaoApp::providers)：供应商管理（供应商与模型的
-///   创建 / 更新 / 删除，写回 global 层；列供应商与旗下模型，标注来源层）
+///   创建 / 更新 / 删除，写回 global 层；列供应商与旗下模型，直读落盘）
 ///
 /// 前两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
 /// 各持一份 `Arc` 克隆，零拷贝共享连接池）；[`discovery`] 与 [`providers`]

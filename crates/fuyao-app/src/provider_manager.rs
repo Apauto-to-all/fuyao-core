@@ -6,19 +6,17 @@
 //! 供应商粒度的三个变更原语。底层功能（写回落存储、段级 patch、fail-loud
 //! 校验、错误映射）在 fuyao-provider 的 admin 域。
 //!
-//! # 写回边界
+//! # 单一事实源
 //!
-//! - **落点只在 global 层**（`~/.fuyao/fuyao.toml`、`~/.fuyao/.env`）：供应商是
-//!   全局资源；agent / workspace 层是高级用户手写领地，管理 API 不触碰。
+//! - **供应商定义只存在于 global 层**（`~/.fuyao/fuyao.toml`、`~/.fuyao/.env`）：
+//!   配置加载对 agent / workspace 层出现的 `providers` 段直接报错，管理与加载
+//!   读写同一份落盘，不存在跨层覆盖。
 //! - **供应商 id 不可变**：id 是会话缓存与历史引用的字符串锚点，换 id 走
 //!   「建新 + 删旧」；模型 id 随 models 整表替换自由变更。
 //! - **写入不等于立即生效**：本门面只负责写盘。写盘结果经配置加载读回语义
 //!   一致；存活 engine 的「立即可用」由调用方经引擎侧运行时注册原语编排刷新。
 
-use fuyao_api::{
-    AgentPaths, ProviderModelOption, ProviderOption, ProviderSource, load_config,
-    load_provider_sources_from,
-};
+use fuyao_api::{AgentPaths, ProviderModelOption, ProviderOption, load_config};
 use fuyao_provider::admin::{
     GlobalStore, insert_provider, map_config_error, patch_provider, prepare_env_upsert,
     remove_provider, validate_provider_id, validate_spec,
@@ -48,65 +46,43 @@ impl ProviderManager {
         Self { agent_paths, store }
     }
 
-    // ── 供应商管理列举（带来源层，直读三层落盘）──────────────────
+    // ── 供应商管理列举（直读落盘）───────────────────────────────
 
-    /// 列举全部供应商与旗下模型，每个实体标注来源层（global / agent / workspace）
+    /// 列举全部供应商与旗下模型
     ///
-    /// 供应商管理与模型选择的唯一列举入口：实时读三层落盘（合并加载取完整值 +
-    /// 来源判定取各实体定义层），**不经注册缓存**——本门面写盘的新增 / 修改即刻
-    /// 反映在列表中，引擎启动前同样可用。旗下模型的 `id` 为纯模型名，调用方按需
+    /// 供应商管理与模型选择的唯一列举入口：实时读配置落盘（供应商定义的单一
+    /// 事实源在 global 层），**不经注册缓存**——本门面写盘的新增 / 修改即刻反映
+    /// 在列表中，引擎启动前同样可用。旗下模型的 `id` 为纯模型名，调用方按需
     /// 拼成 `provider_id/id` 设给 model_id。
-    ///
-    /// 供应商管理面的数据基础：三层深合并中 global 层优先级最低，来源不明的
-    /// 盲写会出现「UI 改了不生效」陷阱——本列表让各实体的定义层对调用方诚实
-    /// 可见，非 global 层实体据此只读展示。
-    ///
-    /// 来源判定语义：实体（供应商键 / 模型键）在多层出现时标**最高优先级层**
-    /// （与深合并覆盖方向一致）；供应商与旗下模型各自独立判定（同一供应商下
-    /// 不同模型可来自不同层）。
     ///
     /// 顺序契约：供应商按 id 字母序，组内模型按 id 字母序（跨启动稳定，消费方
     /// 如 UI 下拉可直接沿用本序呈现）。
     ///
     /// # 错误
-    /// 三层配置加载失败（TOML 语法 / IO / providers 段校验）整体 fail-loud，
-    /// 映射为 [`ProviderAdminError`]（`TomlParse` / `Io` / `Invalid`）——坏配置
-    /// 下列表不可用与 CRUD 一致，引导用户先修复配置。
+    /// 配置加载失败（TOML 语法 / IO / providers 段校验 / providers 段出现在
+    /// 非 global 层）整体 fail-loud，映射为 [`ProviderAdminError`]（`TomlParse` /
+    /// `Io` / `Invalid`）——坏配置下列表不可用与 CRUD 一致，引导用户先修复配置。
     pub fn list_providers(&self) -> Result<Vec<ProviderOption>, ProviderAdminError> {
-        // 合并加载取完整值（含 providers 段的 fail-loud 校验）；无任何配置 = 空列表
+        // 合并加载取完整值（含 providers 段的 fail-loud 校验）；无任何配置 = 空列表。
+        // providers 只存在于 global 层，合并结果的 providers 即 global 层落盘内容
         let config = load_config(&self.agent_paths).map_err(map_config_error)?;
         let providers = config.map(|c| c.providers).unwrap_or_default();
-
-        // 来源判定与合并加载走同一组三层路径，键形态与 providers 输出一致
-        let sources = load_provider_sources_from(&self.agent_paths).map_err(map_config_error)?;
 
         let mut options: Vec<ProviderOption> = providers
             .into_iter()
             .map(|(id, provider)| {
-                // 旗下模型：独立判定来源，按模型 id 字母序
+                // 旗下模型按模型 id 字母序
                 let mut models: Vec<ProviderModelOption> = provider
                     .models
                     .into_iter()
                     .map(|(model_id, model)| ProviderModelOption {
-                        id: model_id.clone(),
-                        // 判定表按原始键命中；极端场景（判定时层文件已变）缺项
-                        // 回退 Global——三层里只要定义过至少 global 在合并结果中
-                        source: sources
-                            .models
-                            .get(&format!("{id}/{model_id}"))
-                            .copied()
-                            .unwrap_or(ProviderSource::Global),
+                        id: model_id,
                         model,
                     })
                     .collect();
                 models.sort_by(|a, b| a.id.cmp(&b.id));
 
                 ProviderOption {
-                    source: sources
-                        .providers
-                        .get(&id)
-                        .copied()
-                        .unwrap_or(ProviderSource::Global),
                     id,
                     name: provider.name,
                     base_url: provider.options.base_url,
@@ -251,7 +227,7 @@ mod tests {
         }
     }
 
-    // ===== list_providers：来源层标注（直读三层落盘） =====
+    // ===== list_providers：直读落盘 =====
 
     /// 构造三层齐全的 AgentPaths（agent 层经 global 前缀的 agent_id 落在
     /// fuyao_home 下，workspace 层独立临时目录）
@@ -267,70 +243,32 @@ mod tests {
         (agent_paths, home, ws)
     }
 
-    /// 三层布局下各实体的来源判定：供应商取最高优先级定义层、模型独立判定
+    /// 非 global 层（agent / workspace）出现 providers 段：列表 fail-loud，
+    /// 错误信息指明应移除的文件
     #[test]
-    fn list_with_source_marks_layer_per_entity() {
-        let (agent_paths, home, ws) = layered_agent_paths("layered_sources");
-        // global 层：alpha（含 old-model）+ deepseek
-        std::fs::write(
-            home.path().join("fuyao.toml"),
-            "[providers.alpha]\nname = \"A\"\n\
-             [providers.alpha.models.old-model]\nname = \"old\"\nlimit = { context = 64000 }\n\
-             [providers.deepseek]\nname = \"D\"\n",
-        )
-        .unwrap();
-        // agent 层：charlie（含 cm）
-        let agent_dir = home.path().join("fuyao-agents").join("layered_sources");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(
-            agent_dir.join("fuyao.toml"),
-            "[providers.charlie]\nname = \"C\"\n\
-             [providers.charlie.models.cm]\nname = \"cm\"\nlimit = { context = 32000 }\n",
-        )
-        .unwrap();
-        // workspace 层：beta + 给 alpha 补 new-model
+    fn list_fails_loud_when_providers_in_workspace_layer() {
+        let (agent_paths, _home, ws) = layered_agent_paths("providers_in_ws");
         let ws_root = ws.path().join(".fuyao");
         std::fs::create_dir_all(&ws_root).unwrap();
         std::fs::write(
             ws_root.join("fuyao.toml"),
-            "[providers.beta]\nname = \"B\"\n\
-             [providers.alpha.models.new-model]\nname = \"new\"\nlimit = { context = 128000 }\n",
+            "[providers.beta]\nname = \"B\"\n",
         )
         .unwrap();
 
-        let list = ProviderManager::new(agent_paths).list_providers().unwrap();
-
-        let find = |id: &str| {
-            list.iter()
-                .find(|p| p.id == id)
-                .unwrap_or_else(|| panic!("应含供应商 {id}"))
-        };
-        // 供应商：多层出现的取最高优先级层，单层出现的记其定义层
-        assert_eq!(find("alpha").source, ProviderSource::Workspace);
-        assert_eq!(find("deepseek").source, ProviderSource::Global);
-        assert_eq!(find("charlie").source, ProviderSource::Agent);
-        assert_eq!(find("beta").source, ProviderSource::Workspace);
-        // 模型独立判定：同一供应商（alpha）下两个模型来源不同
-        let alpha = find("alpha");
-        let model_source = |mid: &str| {
-            alpha
-                .models
-                .iter()
-                .find(|m| m.id == mid)
-                .unwrap_or_else(|| panic!("alpha 应含模型 {mid}"))
-                .source
-        };
-        assert_eq!(model_source("old-model"), ProviderSource::Global);
-        assert_eq!(model_source("new-model"), ProviderSource::Workspace);
-        // 合并值的完整性：new-model 的 limit 来自 workspace 层声明
-        let new_model = alpha.models.iter().find(|m| m.id == "new-model").unwrap();
-        assert_eq!(new_model.model.limit.context, 128000);
+        let err = ProviderManager::new(agent_paths)
+            .list_providers()
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderAdminError::Invalid(_)),
+            "应 fail-loud：{err}"
+        );
     }
 
     /// 写盘后列表立即可见（不经注册缓存刷新）：create_provider（含内嵌模型）
-    /// 完成即出现在列表，来源为 Global，管理字段（base_url / 指针）齐备
+    /// 完成即出现在列表，管理字段（base_url / 指针）齐备
     #[test]
-    fn list_with_source_reflects_disk_write_immediately() {
+    fn list_reflects_disk_write_immediately() {
         let (agent_paths, _home, _ws) = layered_agent_paths("disk_write_visible");
         let manager = ProviderManager::new(agent_paths.clone());
 
@@ -359,7 +297,6 @@ mod tests {
         assert_eq!(list.len(), 1, "写盘后不经缓存刷新即可见");
         let provider = &list[0];
         assert_eq!(provider.id, "deepseek");
-        assert_eq!(provider.source, ProviderSource::Global);
         assert_eq!(provider.name, "DeepSeek");
         assert_eq!(
             provider.base_url.as_deref(),
@@ -368,13 +305,12 @@ mod tests {
         assert_eq!(provider.api_key_env_vars, vec!["MY_DEEPSEEK_KEY"]);
         assert_eq!(provider.models.len(), 1);
         assert_eq!(provider.models[0].id, "deepseek-v4-flash");
-        assert_eq!(provider.models[0].source, ProviderSource::Global);
     }
 
     /// 乱序落盘多供应商多模型，输出按 (provider_id, model id) 字母序稳定排列
     #[test]
-    fn list_with_source_sorted_stably() {
-        let (agent_paths, home, _ws) = layered_agent_paths("sorted_sources");
+    fn list_sorted_stably() {
+        let (agent_paths, home, _ws) = layered_agent_paths("sorted_providers");
         // 故意按字母逆序写盘
         std::fs::write(
             home.path().join("fuyao.toml"),
@@ -409,7 +345,7 @@ mod tests {
 
     /// global 层 TOML 语法坏：列表整体 fail-loud（与 CRUD 同口径）
     #[test]
-    fn list_with_source_bad_toml_fails_loud() {
+    fn list_bad_toml_fails_loud() {
         let (agent_paths, home, _ws) = layered_agent_paths("bad_toml");
         std::fs::write(home.path().join("fuyao.toml"), "not [ valid").unwrap();
 

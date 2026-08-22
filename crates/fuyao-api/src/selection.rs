@@ -4,11 +4,8 @@
 //! 与 fuyao-app（供应商列举）共用，避免类型分散在各 crate。统一原则：
 //! - `id` 为纯身份（不带来源/供应商前缀），前缀语义由独立字段承载；
 //! - 复用既有领域类型（[`crate::AgentDefinition`] / [`crate::Model`]），不重复平铺其字段；
-//! - 来源标注按列举用途取舍：Agent 定义的选择列表（[`DefinitionOption`]）面向
-//!   「选哪个」的决策，来源不参与身份，不携带；供应商管理列表
-//!   （[`ProviderOption`] / [`ProviderModelOption`]）面向「改哪个」的只读策略
-//!   （global 层在三层深合并中优先级最低，非 global 层定义的实体经管理 API 改写
-//!   会出现「改了不生效」），必须携带（[`ProviderSource`]）。
+//! - 供应商定义只存在于全局层 `fuyao.toml`（单一事实源），管理列表
+//!   （[`ProviderOption`] / [`ProviderModelOption`]）直接反映落盘内容。
 
 use crate::{AgentDefinition, Model};
 
@@ -56,39 +53,16 @@ pub struct DefinitionOption {
     pub definition: AgentDefinition,
 }
 
-/// 供应商 / 模型配置的来源层
+/// 可选供应商（管理列表项，含旗下模型）
 ///
-/// fuyao.toml 的三层深合并中各实体的「定义层」：同名实体在多层出现时高优先级层
-/// 胜出（workspace > agent > global）。来源标注服务于供应商管理面的只读策略——
-/// global 层优先级最低，对非 global 层定义的实体，写 global 层的部分改动会被
-/// 更高层覆盖（甚至整段删除都不干净），管理 API 只对 global 层定义的实体开放
-/// 写操作，其余只读展示。
-///
-/// 序列化为 PascalCase（与 [`AgentIdSource`] 一致）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub enum ProviderSource {
-    /// 全局层（`~/.fuyao/fuyao.toml`，优先级最低，管理 API 唯一可写层）
-    Global,
-    /// Agent 目录层（`{agent_root}/fuyao.toml`，手写领地）
-    Agent,
-    /// 工作目录层（`{workspace}/.fuyao/fuyao.toml`，优先级最高，手写领地）
-    Workspace,
-}
-
-/// 可选供应商（管理列表项，含来源层与旗下模型）
-///
-/// 供应商粒度的管理视图：`id` 为 `[providers.<id>]` 键；`source` 为该供应商的
-/// 定义层（三层中出现该键的最高优先级层）；`models` 为其旗下模型的同构列表。
-/// 不携带 API Key 明文（敏感信息红线）——`api_key_env_vars` 只给指针名。
+/// 供应商粒度的管理视图：`id` 为 `[providers.<id>]` 键；`models` 为其旗下模型的
+/// 同构列表。不携带 API Key 明文（敏感信息红线）——`api_key_env_vars` 只给指针名。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProviderOption {
     /// 供应商 id（`[providers.<id>]` 键，身份锚点，创建后不可变）
     pub id: String,
     /// 供应商显示名
     pub name: String,
-    /// 来源层（定义该供应商的最高优先级层）
-    pub source: ProviderSource,
     /// 自定义 base URL（None = 未配置，走供应商默认）
     pub base_url: Option<String>,
     /// API Key 环境变量指针名列表（只给变量名，不给明文）
@@ -97,17 +71,14 @@ pub struct ProviderOption {
     pub models: Vec<ProviderModelOption>,
 }
 
-/// 可选模型（管理列表项，含来源层）
+/// 可选模型（管理列表项）
 ///
 /// 模型粒度的管理视图：`id` 为纯模型名（`[providers.<id>.models.<mid>]` 键），
-/// `source` 为该模型的定义层——与所属供应商的来源独立判定（同一供应商下
-/// 不同模型可来自不同层）。
+/// 调用方按需拼成 `provider_id/id` 设给 model_id。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ProviderModelOption {
     /// 纯模型名（`[providers.<id>.models.<mid>]` 键，身份锚点，创建后不可变）
     pub id: String,
-    /// 来源层（定义该模型的最高优先级层）
-    pub source: ProviderSource,
     /// 完整模型元信息（复用领域类型）
     pub model: Model,
 }
@@ -128,35 +99,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn provider_source_serializes_pascal_case() {
-        assert_eq!(
-            serde_json::to_string(&ProviderSource::Global).unwrap(),
-            "\"Global\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProviderSource::Agent).unwrap(),
-            "\"Agent\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ProviderSource::Workspace).unwrap(),
-            "\"Workspace\""
-        );
-    }
-
     /// 管理列表载荷（ProviderOption / ProviderModelOption）整链可序列化，
     /// 且不出现 api_key 明文字段。
     #[test]
-    fn provider_option_serializes_with_source_and_no_secret() {
+    fn provider_option_serializes_without_secret() {
         let option = ProviderOption {
             id: "deepseek".to_string(),
             name: "深度求索".to_string(),
-            source: ProviderSource::Workspace,
             base_url: Some("https://api.deepseek.com".to_string()),
             api_key_env_vars: vec!["DEEPSEEK_API_KEY".to_string()],
             models: vec![ProviderModelOption {
                 id: "deepseek-v4-flash".to_string(),
-                source: ProviderSource::Global,
                 model: crate::Model {
                     name: "deepseek-v4-flash".to_string(),
                     cost: crate::ModelCost::default(),
@@ -168,14 +121,6 @@ mod tests {
         };
         let json = serde_json::to_string(&option).unwrap();
         assert!(json.contains("\"id\":\"deepseek\""), "id 应进 JSON：{json}");
-        assert!(
-            json.contains("\"source\":\"Workspace\""),
-            "供应商来源应进 JSON：{json}"
-        );
-        assert!(
-            json.contains("\"source\":\"Global\""),
-            "模型来源应进 JSON（与供应商来源独立判定）：{json}"
-        );
         assert!(
             json.contains("\"api_key_env_vars\":[\"DEEPSEEK_API_KEY\"]"),
             "指针名应进 JSON：{json}"
@@ -228,7 +173,6 @@ mod tests {
         // 验证整链可序列化
         let model = ProviderModelOption {
             id: "deepseek-v4-flash".to_string(),
-            source: ProviderSource::Global,
             model: crate::Model {
                 name: "DeepSeek V4 Flash".to_string(),
                 cost: crate::ModelCost::default(),
@@ -241,10 +185,6 @@ mod tests {
         assert!(
             json.contains("\"id\":\"deepseek-v4-flash\""),
             "id 应进 JSON：{json}"
-        );
-        assert!(
-            json.contains("\"source\":\"Global\""),
-            "source 应进 JSON：{json}"
         );
         assert!(
             json.contains("\"name\":\"DeepSeek V4 Flash\""),

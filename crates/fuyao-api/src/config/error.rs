@@ -29,4 +29,9 @@ pub enum ConfigError {
     /// 如误写 `providers = "deepseek"`、`providers = 123`、`providers = ["a"]`）
     #[error("供应商配置段无效: {0}")]
     InvalidProvidersSection(String),
+
+    /// `providers` 段出现在非 global 层——供应商定义的单一事实源在全局层
+    /// fuyao.toml，agent / workspace 层不得定义供应商
+    #[error("providers 段只允许出现在全局层 fuyao.toml，请移除该文件中的 providers 段: {0}")]
+    ProvidersOutsideGlobal(String),
 }

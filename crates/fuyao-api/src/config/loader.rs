@@ -8,6 +8,13 @@
 //! 否则高优先级覆盖低优先级。这样嵌套子段（如 `[tools.runner]`、`[llm.retry]`、
 //! `[session.compression]`）天然得到字段级合并，而非整段替换。
 //!
+//! ## providers 只允许在 global 层
+//!
+//! 供应商定义（`[providers]` 段）的单一事实源是全局层 `~/.fuyao/fuyao.toml`：
+//! agent / workspace 层的配置文件出现 `providers` 段即加载失败（fail-loud）。
+//! 供应商因此不参与跨层合并——管理面（CRUD 写回 global 层）与加载面读到的
+//! 永远是同一份定义，不存在「写进低优先级层被高优先级层盖掉」的分裂状态。
+//!
 //! ## providers 特殊处理
 //!
 //! Provider 段走 `providers::load_providers` 解析（serde 不支持 TOML 整数→f64 价格
@@ -16,7 +23,6 @@
 //! 解析失败（如模型缺 `limit.context`）产生 `ConfigError` 向上层传播——引擎启动时
 //! fail-loud。
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -25,7 +31,6 @@ use crate::AgentPaths;
 use crate::config::FuyaoConfig;
 use crate::config::error::ConfigError;
 use crate::config::providers::load_providers;
-use crate::selection::ProviderSource;
 
 /// 递归深合并两张 TOML 表
 ///
@@ -68,16 +73,28 @@ pub fn load_merged_config(
     let mut merged_table: toml::Table = toml::Table::new();
     let mut has_any_config = false;
 
-    // 从低优先级到高优先级逐层深合并
-    let paths: Vec<Option<&Path>> = vec![global_path, agent_path, workspace_path];
-    for path in paths.into_iter().flatten() {
-        if path.exists() {
-            let content = std::fs::read_to_string(path)?;
-            let table: toml::Table = toml::from_str(&content)?;
-            if !table.is_empty() {
-                has_any_config = true;
-                deep_merge_tables(&mut merged_table, &table);
-            }
+    // 从低优先级到高优先级逐层深合并。providers 段只允许在 global 层：
+    // agent / workspace 层出现该段即整体加载失败（fail-loud），见模块注释
+    let layers: [(Option<&Path>, bool); 3] = [
+        (global_path, true),
+        (agent_path, false),
+        (workspace_path, false),
+    ];
+    for (path, providers_allowed) in layers {
+        let Some(path) = path else { continue };
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(path)?;
+        let table: toml::Table = toml::from_str(&content)?;
+        if !providers_allowed && table.contains_key("providers") {
+            return Err(ConfigError::ProvidersOutsideGlobal(
+                path.display().to_string(),
+            ));
+        }
+        if !table.is_empty() {
+            has_any_config = true;
+            deep_merge_tables(&mut merged_table, &table);
         }
     }
 
@@ -105,81 +122,6 @@ pub fn load_merged_config(
     config.providers = providers;
 
     Ok(Some(config))
-}
-
-/// providers 实体的来源层判定结果
-///
-/// 三层深合并会抹掉每个实体（供应商 / 模型）最初写在哪一层的信息；本结构是
-/// 对该信息的独立重建——按「定义该实体键的最高优先级层」记录，供供应商管理
-/// 列表标注来源（管理面只对 global 层定义的实体开放写操作）。
-///
-/// 键形态与 [`load_merged_config`] 输出的 `FuyaoConfig.providers` 一致（原始大小写
-/// 的 `[providers.<id>]` / `[providers.<id>.models.<mid>]` 键），两边按同名键直接对上。
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct ProviderSources {
-    /// provider_id → 定义该供应商的最高优先级层
-    pub providers: HashMap<String, ProviderSource>,
-    /// "provider_id/model_id" → 定义该模型的最高优先级层（与所属供应商独立判定）
-    pub models: HashMap<String, ProviderSource>,
-}
-
-/// 逐层扫描一层的 providers 段，把出现的实体键记入来源表（后读的高优先级层覆盖）
-fn scan_layer_sources(table: &toml::Table, source: ProviderSource, out: &mut ProviderSources) {
-    let Some(providers) = table.get("providers").and_then(|v| v.as_table()) else {
-        return;
-    };
-    for (provider_id, entry) in providers {
-        out.providers.insert(provider_id.clone(), source);
-        // 模型键只在条目与 models 子段都是 table 时可见；结构异常（非 table 等）
-        // 由 load_providers 的 fail-loud 校验拦下，这里不重复判错
-        if let Some(models) = entry
-            .as_table()
-            .and_then(|t| t.get("models"))
-            .and_then(|v| v.as_table())
-        {
-            for model_id in models.keys() {
-                out.models
-                    .insert(format!("{provider_id}/{model_id}"), source);
-            }
-        }
-    }
-}
-
-/// 三层 providers 实体的来源层判定
-///
-/// 与 [`load_merged_config`] 走同一组三层路径，但**不合并值**——逐层独立读原始
-/// 文件、只看实体键出现在哪一层，从低优先级到高优先级扫描，后读层覆盖先读层，
-/// 得到每个供应商 / 模型的「定义层」（高优先级层胜出，与深合并的覆盖方向一致）。
-///
-/// 键名大小写保持各层文件里的原始写法；同实体跨层以不同大小写声明时按不同键
-/// 处理（合并语义中它们是同一个实体，但键形态以最高优先级层的写法为准进入
-/// `FuyaoConfig`——与该输出对齐时天然命中，无需归一）。
-///
-/// 单层的 TOML 语法错误传播为 [`ConfigError::TomlError`]（与整体加载同一 fail-loud
-/// 口径）；层文件不存在跳过；providers 段结构异常（非 table / 条目非 table）不在
-/// 此判错——值级校验归 [`load_providers`]，来源判定只重建键的层级归属。
-pub fn load_provider_sources(
-    global_path: Option<&Path>,
-    agent_path: Option<&Path>,
-    workspace_path: Option<&Path>,
-) -> Result<ProviderSources, ConfigError> {
-    let mut sources = ProviderSources::default();
-    // 从低优先级到高优先级逐层扫描，后读覆盖先读——终值即「最高优先级定义层」
-    let layers: [(Option<&Path>, ProviderSource); 3] = [
-        (global_path, ProviderSource::Global),
-        (agent_path, ProviderSource::Agent),
-        (workspace_path, ProviderSource::Workspace),
-    ];
-    for (path, source) in layers {
-        let Some(path) = path else { continue };
-        if !path.exists() {
-            continue;
-        }
-        let content = std::fs::read_to_string(path)?;
-        let table: toml::Table = toml::from_str(&content)?;
-        scan_layer_sources(&table, source, &mut sources);
-    }
-    Ok(sources)
 }
 
 /// 递归对 table 内所有 string 值做 ${VAR} 环境变量插值
@@ -241,27 +183,12 @@ fn interpolate_env_vars_string(s: &str) -> String {
 /// 优先级：工作目录 > Agent 目录 > 全局。
 pub fn load_config(agent_paths: &AgentPaths) -> Result<Option<FuyaoConfig>, ConfigError> {
     let paths = agent_paths.config_paths();
-    let all_paths = paths.all();
+    // 直接取类型化字段而非 all() 的位置下标——all() 会因层缺席而前移槽位，
+    // 位置映射会把文件送错层（providers 的层校验对此敏感）
     load_merged_config(
-        all_paths.get(2).copied(),  // global_（最低优先级）
-        all_paths.get(1).copied(),  // agent
-        all_paths.first().copied(), // workspace（最高优先级）
-    )
-}
-
-/// 从 `AgentPaths` 判定 providers 实体来源层
-///
-/// 与 [`load_config`] 走同一组三层路径（同一优先级方向），返回供应商 / 模型
-/// 实体的定义层标注，供管理列表组合「合并后的值 + 来源标注」。
-pub fn load_provider_sources_from(
-    agent_paths: &AgentPaths,
-) -> Result<ProviderSources, ConfigError> {
-    let paths = agent_paths.config_paths();
-    let all_paths = paths.all();
-    load_provider_sources(
-        all_paths.get(2).copied(),  // global_（最低优先级）
-        all_paths.get(1).copied(),  // agent
-        all_paths.first().copied(), // workspace（最高优先级）
+        paths.global_.as_deref(),
+        paths.agent.as_deref(),
+        paths.workspace.as_deref(),
     )
 }
 
@@ -384,7 +311,7 @@ terminal_default_timeout_secs = 240
     /// providers 数值容错解析（整数价格不被丢弃），limit.context 必填校验
     #[test]
     fn providers_parsing_via_loader_enforces_limit_context() {
-        let workspace = temp_config_path(
+        let global = temp_config_path(
             "providers",
             r#"
 [providers.aliyun]
@@ -397,20 +324,20 @@ input = 2
 "#,
         );
 
-        let cfg = load_merged_config(None, None, Some(&workspace))
+        let cfg = load_merged_config(Some(&global), None, None)
             .unwrap()
             .unwrap();
         let model = &cfg.providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.input, Some(2.0));
         assert_eq!(model.limit.context, 131_072);
 
-        let _ = std::fs::remove_file(&workspace);
+        let _ = std::fs::remove_file(&global);
     }
 
     /// 模型缺 limit.context：load_merged_config 整体失败，错误信息含模型名
     #[test]
     fn providers_missing_limit_context_fails_whole_load() {
-        let workspace = temp_config_path(
+        let global = temp_config_path(
             "providers_no_limit",
             r#"
 [providers.aliyun]
@@ -420,7 +347,7 @@ name = "qwen3.6-plus"
 "#,
         );
 
-        let err = load_merged_config(None, None, Some(&workspace)).unwrap_err();
+        let err = load_merged_config(Some(&global), None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("aliyun/qwen3.6-plus"),
@@ -431,6 +358,85 @@ name = "qwen3.6-plus"
             "错误信息应指向 limit.context：{msg}"
         );
 
+        let _ = std::fs::remove_file(&global);
+    }
+
+    /// providers 段出现在 workspace 层：整体加载失败（fail-loud），
+    /// 错误信息含该文件路径
+    #[test]
+    fn providers_in_workspace_layer_fails_loud() {
+        let workspace = temp_config_path(
+            "providers_in_ws",
+            r#"
+[providers.aliyun]
+name = "阿里云百炼"
+"#,
+        );
+
+        let err = load_merged_config(None, None, Some(&workspace)).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ProvidersOutsideGlobal(_)),
+            "应为 ProvidersOutsideGlobal：{err}"
+        );
+        assert!(
+            err.to_string().contains("providers_in_ws"),
+            "错误信息应含文件路径：{err}"
+        );
+
+        let _ = std::fs::remove_file(&workspace);
+    }
+
+    /// providers 段出现在 agent 层：同样拒绝（与 workspace 层同口径）
+    #[test]
+    fn providers_in_agent_layer_fails_loud() {
+        let agent = temp_config_path(
+            "providers_in_agent",
+            r#"
+[providers.deepseek]
+name = "DeepSeek"
+"#,
+        );
+
+        let err = load_merged_config(None, Some(&agent), None).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ProvidersOutsideGlobal(_)),
+            "应为 ProvidersOutsideGlobal：{err}"
+        );
+
+        let _ = std::fs::remove_file(&agent);
+    }
+
+    /// global 层定义 providers + workspace 层配置其他段：正常加载，
+    /// providers 只来自 global 层，其他段照常深合并
+    #[test]
+    fn global_providers_plus_workspace_other_sections_loads() {
+        let global = temp_config_path(
+            "mixed_global",
+            r#"
+[providers.deepseek]
+name = "DeepSeek"
+[providers.deepseek.models.deepseek-v4-flash]
+name = "deepseek-v4-flash"
+limit = { context = 128000 }
+"#,
+        );
+        let workspace = temp_config_path(
+            "mixed_ws",
+            r#"
+[llm]
+request_timeout_secs = 120
+"#,
+        );
+
+        let cfg = load_merged_config(Some(&global), None, Some(&workspace))
+            .unwrap()
+            .unwrap();
+        // providers 只来自 global 层
+        assert!(cfg.providers.contains_key("deepseek"));
+        // 其他段跨层合并照常
+        assert_eq!(cfg.llm.request_timeout_secs, 120);
+
+        let _ = std::fs::remove_file(&global);
         let _ = std::fs::remove_file(&workspace);
     }
 
@@ -519,152 +525,5 @@ args = ["${FUYAO_TEST_MCP_HOST}/srv.js", "literal"]
     fn interpolate_string_unclosed_keeps_literal() {
         let r = interpolate_env_vars_string("a${UNCLOSED");
         assert_eq!(r, "a${UNCLOSED");
-    }
-
-    // ===== providers 实体来源层判定 =====
-
-    /// 各层独立定义不同实体：来源各自记其定义层
-    #[test]
-    fn provider_sources_single_layer_definitions() {
-        let global = temp_config_path(
-            "src_global",
-            r#"
-[providers.deepseek]
-name = "DeepSeek"
-[providers.deepseek.models.deepseek-v4-flash]
-name = "deepseek-v4-flash"
-limit = { context = 128000 }
-"#,
-        );
-        let workspace = temp_config_path(
-            "src_ws",
-            r#"
-[providers.aliyun]
-name = "阿里云百炼"
-[providers.aliyun.models.qwen]
-name = "qwen"
-limit = { context = 131072 }
-"#,
-        );
-
-        let sources = load_provider_sources(Some(&global), None, Some(&workspace)).unwrap();
-
-        assert_eq!(
-            sources.providers["deepseek"],
-            ProviderSource::Global,
-            "global 独有的供应商标 Global"
-        );
-        assert_eq!(
-            sources.providers["aliyun"],
-            ProviderSource::Workspace,
-            "workspace 独有的供应商标 Workspace"
-        );
-        assert_eq!(
-            sources.models["deepseek/deepseek-v4-flash"],
-            ProviderSource::Global
-        );
-        assert_eq!(sources.models["aliyun/qwen"], ProviderSource::Workspace);
-
-        let _ = std::fs::remove_file(&global);
-        let _ = std::fs::remove_file(&workspace);
-    }
-
-    /// 同一供应商跨层出现：供应商标最高优先级层；旗下模型各自独立判定
-    /// （global 定义的模型仍标 global，workspace 新增的模型标 workspace）
-    #[test]
-    fn provider_and_model_sources_judged_independently() {
-        let global = temp_config_path(
-            "mix_global",
-            r#"
-[providers.alpha]
-name = "Alpha"
-[providers.alpha.models.old-model]
-name = "old-model"
-limit = { context = 64000 }
-"#,
-        );
-        let agent = temp_config_path(
-            "mix_agent",
-            r#"
-[providers.alpha.models.new-model]
-name = "new-model"
-limit = { context = 32000 }
-"#,
-        );
-
-        let sources = load_provider_sources(Some(&global), Some(&agent), None).unwrap();
-
-        assert_eq!(
-            sources.providers["alpha"],
-            ProviderSource::Agent,
-            "供应商实体在 agent 层也出现（哪怕只加模型），标最高优先级层"
-        );
-        assert_eq!(
-            sources.models["alpha/old-model"],
-            ProviderSource::Global,
-            "模型只在 global 定义，标 global"
-        );
-        assert_eq!(
-            sources.models["alpha/new-model"],
-            ProviderSource::Agent,
-            "模型在 agent 层定义，标 agent"
-        );
-
-        let _ = std::fs::remove_file(&global);
-        let _ = std::fs::remove_file(&agent);
-    }
-
-    /// 三层同定义同名模型：高优先级层覆盖（终值 = workspace）
-    #[test]
-    fn same_model_across_layers_takes_highest() {
-        let global = temp_config_path(
-            "override_global",
-            r#"
-[providers.alpha]
-name = "Alpha"
-[providers.alpha.models.m]
-name = "m"
-limit = { context = 64000 }
-"#,
-        );
-        let workspace = temp_config_path(
-            "override_ws",
-            r#"
-[providers.alpha.models.m]
-name = "m"
-limit = { context = 128000 }
-"#,
-        );
-
-        let sources = load_provider_sources(Some(&global), None, Some(&workspace)).unwrap();
-
-        assert_eq!(sources.models["alpha/m"], ProviderSource::Workspace);
-        assert_eq!(sources.providers["alpha"], ProviderSource::Workspace);
-
-        let _ = std::fs::remove_file(&global);
-        let _ = std::fs::remove_file(&workspace);
-    }
-
-    /// 全部层不存在 / 无 providers 段：空判定结果（合法状态）
-    #[test]
-    fn provider_sources_empty_when_no_layers() {
-        let sources = load_provider_sources(None, None, None).unwrap();
-        assert!(sources.providers.is_empty());
-        assert!(sources.models.is_empty());
-
-        let ws = temp_config_path("src_empty", "[llm]\nrequest_timeout_secs = 100\n");
-        let sources = load_provider_sources(None, None, Some(&ws)).unwrap();
-        assert!(sources.providers.is_empty(), "无 providers 段为空表");
-        let _ = std::fs::remove_file(&ws);
-    }
-
-    /// 某层文件语法坏：fail-loud 传播解析错误（与整体加载同口径）
-    #[test]
-    fn provider_sources_propagates_toml_error() {
-        let bad = temp_config_path("src_bad", "not [ valid toml");
-        let result = load_provider_sources(Some(&bad), None, None);
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::TomlError(_)));
-        let _ = std::fs::remove_file(&bad);
     }
 }

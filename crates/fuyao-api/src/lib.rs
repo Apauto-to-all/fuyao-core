@@ -32,10 +32,9 @@ pub use agent::{
 pub use config::{
     CompressionConfig, ConfigError, EngineConfig, FuyaoConfig, GuardConfig, HooksConfig,
     ImageConfig, LlmConfig, LogRotation, LoggingConfig, LoopGuardConfig, McpGlobalConfig, ModelRef,
-    ModelSelection, PluginsConfig, ProviderSources, RetryConfig, SessionConfig,
-    SessionStorageConfig, TerminalConfig, TitleConfig, ToolRunnerConfig, ToolsConfig,
-    ToolsLimitsConfig, get_config, is_config_set, load_config, load_env, load_env_missing,
-    load_merged_config, load_provider_sources, load_provider_sources_from, set_config,
+    ModelSelection, PluginsConfig, RetryConfig, SessionConfig, SessionStorageConfig,
+    TerminalConfig, TitleConfig, ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, get_config,
+    is_config_set, load_config, load_env, load_env_missing, load_merged_config, set_config,
     unknown_tool_names,
 };
 pub use control::{ControlCommand, TurnDirective};
@@ -57,7 +56,6 @@ pub use provider::{
 };
 pub use selection::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
-    ProviderSource,
 };
 pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
