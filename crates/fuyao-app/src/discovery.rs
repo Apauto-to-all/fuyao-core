@@ -8,7 +8,7 @@
 //!   `list_primary_definitions` / `list_subagent_definitions` 零参数——路径身份
 //!   启动时定下一次，调用方无需二次传参。
 //!
-//! model 列举属供应商管理域，见 [`crate::ProviderManager::list_models`]。
+//! 供应商与模型列举属供应商管理域，见 [`crate::ProviderManager::list_providers`]。
 
 use fuyao_api::{AgentIdOption, AgentPaths, DefinitionOption};
 use fuyao_prompt::AgentRegistry;

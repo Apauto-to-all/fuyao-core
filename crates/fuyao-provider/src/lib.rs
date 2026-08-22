@@ -1,8 +1,10 @@
 //! Provider 模块
 //!
-//! 供应商注册表、字段解析器、Provider trait 抽象。
+//! 供应商注册表、字段解析器、Provider trait 抽象、供应商管理功能底座
+//! （admin 域：写回 global 层的落存储原语与载荷校验；管理门面在装配层）。
 //! 基于 reqwest 自建 HTTP 客户端，不依赖 async-openai。
 
+pub mod admin;
 mod error;
 mod openai;
 mod provider;
@@ -10,6 +12,7 @@ mod registry;
 mod resolver;
 mod stream_decoder;
 
+pub use admin::{ProviderAdminError, ProviderModelSpec, ProviderSpec};
 pub use error::ProviderError;
 pub use openai::OpenAIProvider;
 pub use provider::{

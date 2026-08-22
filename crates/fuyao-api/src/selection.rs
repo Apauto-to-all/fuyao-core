@@ -1,12 +1,12 @@
 //! 选择支持的公共类型
 //!
 //! 集中定义「列举可选项」的数据结构，供 fuyao-prompt（agent_id / Agent 定义列举）
-//! 与 fuyao-app（model / 供应商列举）共用，避免类型分散在各 crate。统一原则：
+//! 与 fuyao-app（供应商列举）共用，避免类型分散在各 crate。统一原则：
 //! - `id` 为纯身份（不带来源/供应商前缀），前缀语义由独立字段承载；
 //! - 复用既有领域类型（[`crate::AgentDefinition`] / [`crate::Model`]），不重复平铺其字段；
-//! - 来源标注按列举用途取舍：Agent 定义与 model 的选择列表（[`DefinitionOption`] /
-//!   [`ModelOption`]）面向「选哪个」的决策，来源不参与身份，不携带；供应商管理
-//!   列表（[`ProviderOption`] / [`ProviderModelOption`]）面向「改哪个」的只读策略
+//! - 来源标注按列举用途取舍：Agent 定义的选择列表（[`DefinitionOption`]）面向
+//!   「选哪个」的决策，来源不参与身份，不携带；供应商管理列表
+//!   （[`ProviderOption`] / [`ProviderModelOption`]）面向「改哪个」的只读策略
 //!   （global 层在三层深合并中优先级最低，非 global 层定义的实体经管理 API 改写
 //!   会出现「改了不生效」），必须携带（[`ProviderSource`]）。
 
@@ -54,24 +54,6 @@ pub struct DefinitionOption {
     pub id: String,
     /// 完整 Agent 定义（复用领域类型）
     pub definition: AgentDefinition,
-}
-
-/// 可选 model
-///
-/// `id` 为纯模型名（不带 `provider/` 前缀），供应商由 `provider_id` 独立承载；
-/// 调用方按需拼成 `provider_id/id` 设给 `ModelConfig.model_id`。
-/// 面向模型选择场景，不携带来源字段；需要来源层标注的供应商管理场景
-/// 见 [`ProviderModelOption`]。
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ModelOption {
-    /// 纯模型名，如 "deepseek-v4-flash"
-    pub id: String,
-    /// 供应商 id，如 "deepseek"（身份，用于拼 model_id 路由）
-    pub provider_id: String,
-    /// 供应商显示名，如 "商汤 SenseNova"（来自 Provider 注册配置，仅展示用途）
-    pub provider_name: String,
-    /// 完整模型元信息（复用领域类型）
-    pub model: Model,
 }
 
 /// 供应商 / 模型配置的来源层
@@ -242,11 +224,11 @@ mod tests {
             "AgentDefinition.system_prompt 应进 JSON：{json}"
         );
 
-        // ModelOption：内嵌 Model（连带 ModelCost / ModelLimit / PriceTier），验证整链可序列化
-        let model = ModelOption {
+        // ProviderModelOption：内嵌 Model（连带 ModelCost / ModelLimit / PriceTier），
+        // 验证整链可序列化
+        let model = ProviderModelOption {
             id: "deepseek-v4-flash".to_string(),
-            provider_id: "deepseek".to_string(),
-            provider_name: "深度求索 DeepSeek".to_string(),
+            source: ProviderSource::Global,
             model: crate::Model {
                 name: "DeepSeek V4 Flash".to_string(),
                 cost: crate::ModelCost::default(),
@@ -261,12 +243,8 @@ mod tests {
             "id 应进 JSON：{json}"
         );
         assert!(
-            json.contains("\"provider_id\":\"deepseek\""),
-            "provider_id 应进 JSON：{json}"
-        );
-        assert!(
-            json.contains("\"provider_name\":\"深度求索 DeepSeek\""),
-            "provider_name 应进 JSON：{json}"
+            json.contains("\"source\":\"Global\""),
+            "source 应进 JSON：{json}"
         );
         assert!(
             json.contains("\"name\":\"DeepSeek V4 Flash\""),

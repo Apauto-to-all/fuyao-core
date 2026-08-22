@@ -17,7 +17,6 @@ mod init;
 mod logging;
 mod mcp;
 mod provider_manager;
-mod provider_store;
 mod session_manager;
 mod tools;
 
@@ -34,8 +33,12 @@ pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
 pub use provider_manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 pub use session_manager::SessionManager;
-// 透出 fuyao-api 的列举选项类型，让二次开发只依赖 fuyao-app 即可消费 Discovery 结果
-pub use fuyao_api::{AgentIdOption, AgentIdSource, DefinitionOption, ModelOption};
+// 透出 fuyao-api 的列举选项类型，让二次开发只依赖 fuyao-app 即可消费 Discovery
+// 与 ProviderManager::list_providers 的结果
+pub use fuyao_api::{
+    AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
+    ProviderSource,
+};
 
 /// 装配错误
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +59,7 @@ pub enum SetupError {
 /// - [`sessions`](self::FuyaoApp::sessions)：会话管理查询（列会话 / 查历史）
 /// - [`discovery`](self::FuyaoApp::discovery)：选择支持（列 agent_id / Agent 定义）
 /// - [`providers`](self::FuyaoApp::providers)：供应商管理（供应商与模型的
-///   创建 / 更新 / 删除，写回 global 层；列 model）
+///   创建 / 更新 / 删除，写回 global 层；列供应商与旗下模型，标注来源层）
 ///
 /// 前两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
 /// 各持一份 `Arc` 克隆，零拷贝共享连接池）；[`discovery`] 与 [`providers`]
@@ -68,7 +71,7 @@ pub struct FuyaoApp {
     pub sessions: SessionManager,
     /// 选择支持门面（列举 agent_id / Agent 定义）
     pub discovery: Discovery,
-    /// 供应商管理门面（供应商与模型的 CRUD 写回 + 列举 model）
+    /// 供应商管理门面（供应商与模型的 CRUD 写回 + 唯一列举接口）
     pub providers: ProviderManager,
 }
 

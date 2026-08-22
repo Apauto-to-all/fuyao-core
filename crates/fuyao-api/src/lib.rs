@@ -56,8 +56,8 @@ pub use provider::{
     Provider, ProviderOptions, ThinkingType,
 };
 pub use selection::{
-    AgentIdOption, AgentIdSource, DefinitionOption, ModelOption, ProviderModelOption,
-    ProviderOption, ProviderSource,
+    AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
+    ProviderSource,
 };
 pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};

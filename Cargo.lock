@@ -1016,7 +1016,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "toml_edit",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1120,6 +1119,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml_edit",
  "tracing",
 ]
 

@@ -17,7 +17,6 @@ fuyao-tools = { path = "../fuyao-tools" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-toml_edit.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
