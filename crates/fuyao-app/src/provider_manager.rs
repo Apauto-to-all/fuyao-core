@@ -1,28 +1,31 @@
-//! 供应商管理门面：供应商与模型粒度的创建 / 更新 / 删除（写回 global 层）
+//! 供应商管理门面：供应商粒度的创建 / 更新 / 删除（写回 global 层）
 //!
 //! 与 [`crate::SessionManager`]（会话管理门面）、[`crate::Discovery`]（选择支持
 //! 门面）平级正交的第三个管理面：供应商与模型配置是**全局资源**（跨工作区
 //! 共享），本门面把「领域存储 = global 层 fuyao.toml + .env」的增量写回封装成
-//! provider / model 两级 CRUD；写盘结果满足配置加载的必填校验规则（fail-loud）
-//! 与 `api_key_env_vars` 指针解析链，写前读后语义一致。
+//! 供应商粒度的三个变更原语；模型是供应商的组成内容（聚合成员），随供应商
+//! 载荷整体写入与替换，不设独立的模型接口。写盘结果满足配置加载的必填校验
+//! 规则（fail-loud）与 `api_key_env_vars` 指针解析链，写前读后语义一致。
 //!
 //! # 写回策略
 //!
 //! - **落点只在 global 层**（`~/.fuyao/fuyao.toml`、`~/.fuyao/.env`）：供应商是
 //!   全局资源；agent / workspace 层是高级用户手写领地，管理 API 不触碰。
 //! - **fuyao.toml 增量 patch**（toml_edit）：只动目标 `[providers.<id>]` 子树，
-//!   其余注释、未知字段、手写格式逐字保留。
+//!   其余注释、未知字段、手写格式逐字保留；段内 `models` 子表按载荷**整表
+//!   替换**（未携带的模型消失、载荷 id 即落盘键，模型 id 因此可变更）。
 //! - **密钥隔离**：api_key 明文只进 global 层 `.env`（单行级读-改-写，用户
-//!   手写的其他变量不动）；toml 里只写 `api_key_env_vars` 指针，变量名按
-//!   `{供应商 id 大写}_API_KEY` 约定生成。目标变量已有不同值时返回冲突信号
-//!   （`EnvKeyConflict`，不静默覆盖），由调用方决定是否以 `overwrite_api_key`
-//!   确认覆盖后重试。
+//!   手写的其他变量与注释不动）；toml 里只写 `api_key_env_vars` 指针。
+//! - **变量名用户自设**：`api_key_env_var` 与供应商 id 解耦（id 变更不影响
+//!   变量名），明文 upsert 同名覆盖、异名新加；.env 只增改不删除——变量与
+//!   值均归用户持有，删除供应商也不清理 .env。
 //!
-//! # id 不可变
+//! # 供应商 id 不可变
 //!
-//! 供应商 id（`[providers.<id>]` 键）与模型 id（`models` 子表的键）是会话缓存
-//! 与历史引用的字符串锚点，**创建后不可改名**——API 签名以 id 定位目标、不
-//! 接受新 id，改名需求以「删旧建新」满足。
+//! 供应商 id（`[providers.<id>]` 键）是会话缓存与历史引用的字符串锚点，
+//! **创建后不可改名**——API 签名以 id 定位目标、不接受新 id，换 id 需求以
+//! 「建新（沿用原变量名，.env 密钥行不动）+ 删旧」组合满足。模型 id 不是
+//! 独立锚点，随 models 整表替换自由变更。
 //!
 //! # 写入不等于立即生效
 //!
@@ -31,7 +34,7 @@
 //! / `Engine::unregister_provider`，内部完成缓存注册 + 实例表插入）承接，
 //! 在全部存活 engine 上的刷新编排属装配层职责，不在本门面内。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use fuyao_api::{
@@ -41,31 +44,25 @@ use fuyao_api::{
 use toml_edit::{Array, Item, Table};
 
 use crate::provider_store::{
-    self, EnvWriteError, GlobalStore, ProviderSpecData, generated_env_var_name, model_to_table,
-    provider_to_table, providers_table_mut,
+    self, GlobalStore, ProviderSpecData, provider_to_table, providers_table_mut,
 };
 
 /// 供应商管理错误
 ///
-/// 每个变体面向最终用户（含明确修正建议）；`EnvKeyConflict` 携带变量名而非
-/// 已有值——已存在的 api_key 可能是用户手写密钥，不进错误信息（敏感信息红线）。
+/// 每个变体面向最终用户（含明确修正建议）。
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderAdminError {
     /// 入参校验失败（id 非法、必填字段缺失、limit.context 非正整数等）
     #[error("供应商配置校验失败: {0}")]
     Invalid(String),
 
-    /// 创建目标已存在（供应商 / 模型 id 冲突）
+    /// 创建目标已存在（供应商 id 冲突）
     #[error("供应商配置已存在: {0}")]
     AlreadyExists(String),
 
     /// 更新 / 删除的目标不存在
     #[error("供应商配置不存在: {0}")]
     NotFound(String),
-
-    /// .env 目标变量已有不同的值且未确认覆盖（携带变量名，由调用方决定）
-    #[error("环境变量 {0} 已有手写值，未确认覆盖（以 overwrite_api_key = true 重试可覆盖）")]
-    EnvKeyConflict(String),
 
     /// global 层 fuyao.toml 解析失败（写回前需人工修复）
     #[error("global 层 fuyao.toml 解析失败: {0}")]
@@ -80,11 +77,25 @@ pub enum ProviderAdminError {
     Io(String),
 }
 
-/// 供应商写回载荷（create / update 共用）
+/// 供应商写回载荷的单个模型条目（模型 id + 全量字段）
+pub struct ProviderModelSpec {
+    /// 模型 id（`[providers.<id>.models.<mid>]` 的键）
+    pub id: String,
+    /// 模型全量字段
+    pub model: Model,
+}
+
+/// 供应商写回载荷（create / update 共用，完整期望状态）
 ///
-/// `api_key` 为 `None` 时不写 .env（密钥保持现状）；`Some` 表示把明文
-/// 写入 global 层 `.env` 的约定变量并同步 toml 指针（若 toml 段内残留
-/// `options.api_key` 明文，一并移除——明文密钥不进 toml）。
+/// 模型内嵌为全量列表：create 一次落齐全部模型；update 时 `models` 子表整表
+/// 替换为载荷内容（未携带的模型消失，模型 id 可随替换变更）。
+///
+/// `api_key_env_var` 是 .env 变量名指针，用户自设、与供应商 id 解耦——toml
+/// 落单值 `api_key_env_vars = [变量名]`（所见即所得），`None` 则移除指针键；
+/// id 变更或删旧建新时指针不变、.env 行不动，密钥天然保持。
+///
+/// `api_key` 为 `Some` 时把明文 upsert 进 .env 的该变量（同名覆盖、异名新
+/// 加）；`None` 不动 .env。.env 只增改不删除，变量与值均归用户持有。
 ///
 /// `base_url` / `name` 为完整期望状态：update 时 `base_url = None` 表示清除
 /// 该项（调用方提交表单的完整状态，而非增量）。
@@ -93,10 +104,28 @@ pub struct ProviderSpec {
     pub name: String,
     /// 自定义 base URL（None = 不配置 / 清除）
     pub base_url: Option<String>,
-    /// API Key 明文（None = 不动 .env）
+    /// API Key 环境变量名（None = 不配置指针；明文提供时必填）
+    pub api_key_env_var: Option<String>,
+    /// API Key 明文（None = 不动 .env；Some = upsert 进上述变量）
     pub api_key: Option<String>,
-    /// .env 目标变量已有不同值时是否覆盖（false = 返回冲突信号）
-    pub overwrite_api_key: bool,
+    /// 全量模型列表（create 落盘 / update 整表替换）
+    pub models: Vec<ProviderModelSpec>,
+}
+
+impl ProviderSpec {
+    /// 转存储层数据形态（api_key 明文不随行——.env 写入由管理器另行编排）
+    fn into_data(self) -> ProviderSpecData {
+        ProviderSpecData {
+            name: self.name,
+            base_url: self.base_url,
+            api_key_env_var: self.api_key_env_var,
+            models: self
+                .models
+                .into_iter()
+                .map(|entry| (entry.id, entry.model))
+                .collect(),
+        }
+    }
 }
 
 impl fmt::Debug for ProviderSpec {
@@ -105,6 +134,7 @@ impl fmt::Debug for ProviderSpec {
         f.debug_struct("ProviderSpec")
             .field("name", &self.name)
             .field("base_url", &self.base_url)
+            .field("api_key_env_var", &self.api_key_env_var)
             .field(
                 "api_key",
                 &if self.api_key.is_some() {
@@ -113,7 +143,7 @@ impl fmt::Debug for ProviderSpec {
                     "<未提供>"
                 },
             )
-            .field("overwrite_api_key", &self.overwrite_api_key)
+            .field("models", &self.models.len())
             .finish()
     }
 }
@@ -263,92 +293,78 @@ impl ProviderManager {
 
     // ── 供应商粒度 CRUD ──────────────────────────────────────────
 
-    /// 创建供应商：global 层 fuyao.toml 新增 `[providers.<id>]` 段
+    /// 创建供应商：global 层 fuyao.toml 新增 `[providers.<id>]` 段（含全量模型）
     ///
-    /// - id / 必填字段先校验（fail-loud），已存在的 id 拒绝创建
-    /// - toml 段内写 `name` / `options.base_url`（有则写）/ `api_key_env_vars`
-    ///   指针（约定变量 `{ID大写}_API_KEY`）；**不写 `options.api_key` 明文**
-    /// - `spec.api_key` 为 `Some` 时把明文写入 global 层 `.env` 的约定变量
-    ///   （单行增量）；目标变量已有不同值且未确认覆盖 → 整个创建失败返回
-    ///   [`ProviderAdminError::EnvKeyConflict`]，**两个文件都不动**
-    ///   （冲突在写盘前检查，不留半写状态）
-    ///
-    /// # 返回
-    /// 生成的 api_key 环境变量名（供表单只读展示）。
+    /// 载荷即完整期望状态：`name` / `base_url` / `api_key_env_vars` 指针 /
+    /// 全部模型一次写盘落齐。`api_key` 为 `Some` 时把明文 upsert 进 .env 的
+    /// 指定变量（同名覆盖、异名新加）；`None` 不动 .env。已存在的 id 拒绝
+    /// 创建。写盘成功后由调用方编排存活 engine 的运行时注册。
     pub fn create_provider(
         &self,
         provider_id: &str,
         spec: ProviderSpec,
-    ) -> Result<String, ProviderAdminError> {
+    ) -> Result<(), ProviderAdminError> {
         validate_provider_id(provider_id)?;
-        validate_provider_name(&spec.name)?;
-        if let Some(api_key) = &spec.api_key {
-            validate_api_key(api_key)?;
-        }
+        validate_spec(&spec)?;
 
-        let env_var = generated_env_var_name(provider_id);
-
-        // 冲突前置检查（写盘前）：.env 目标变量已有不同值 → 直接失败，不留半写状态
-        let env_write = self.prepare_env_write(&env_var, &spec)?;
+        let has_api_key = spec.api_key.is_some();
+        // .env 先备好新内容（含跨行值拒绝），提交推迟到 toml 写盘成功后
+        let env_write = self.prepare_env_write(&spec)?;
+        let data = spec.into_data();
 
         let mut doc = self.store.read_toml()?;
         let providers = providers_table_mut(&mut doc)?;
         if providers.contains_key(provider_id) {
             return Err(ProviderAdminError::AlreadyExists(format!(
-                "providers.{provider_id} 已存在（id 不可改名，如需换 id 请删除后新建）"
+                "providers.{provider_id} 已存在（id 不可改名，换 id 走「建新 + 删旧」）"
             )));
         }
-        let data = ProviderSpecData {
-            name: spec.name,
-            base_url: spec.base_url,
-        };
-        let table = provider_to_table(&data, &env_var);
-        providers.insert(provider_id, Item::Table(table));
+        providers.insert(provider_id, Item::Table(provider_to_table(&data)));
         self.store.write_toml(&doc)?;
 
         self.commit_env_write(env_write)?;
         tracing::info!(
             provider_id = %provider_id,
-            api_key_env_var = %env_var,
-            "供应商已创建（写回 global 层 fuyao.toml）"
+            model_count = data.models.len(),
+            has_api_key,
+            "供应商已创建（含全量模型，写回 global 层 fuyao.toml）"
         );
-        Ok(env_var)
+        Ok(())
     }
 
-    /// 更新供应商：patch 目标 `[providers.<id>]` 段内的管理字段
+    /// 更新供应商：目标段管理字段 patch + `models` 子表整表替换
     ///
-    /// 完整期望状态语义：`name` / `base_url` 覆盖为载荷值（`base_url = None`
-    /// 清除该项，options 子表随之在空时移除）；段内其他键（models、用户
-    /// 手写的未知字段）不动。
+    /// 完整期望状态语义：`name` / `base_url`（None 清除）、`api_key_env_vars`
+    /// 指针按载荷所见即所得（Some 落单值、None 移除键）、`models` 整表替换
+    /// 为载荷列表（未携带的模型消失，模型 id 可随替换变更）；段内其他键
+    /// （用户手写的未知字段）不动。
     ///
-    /// `api_key` 为 `Some` 时：明文写 .env 约定变量（冲突语义同
-    /// [`ProviderManager::create_provider`]，写盘前检查），同时移除段内残留的
-    /// `options.api_key` 明文并把约定变量并入 `api_key_env_vars`（用户自加的
-    /// 其他变量保留，只做去重追加）——保持两文件指针一致。
-    ///
-    /// id 经签名定位，API 不提供改名；目标不存在返回 `NotFound`。
+    /// `api_key` 为 `Some` 时把明文 upsert 进 .env（同名覆盖、异名新加），
+    /// 并移除段内残留的 `options.api_key` 明文（明文密钥不进 toml）；`None`
+    /// 不动 .env。id 经签名定位不可变（换 id 走「建新 + 删旧」）；目标不
+    /// 存在返回 `NotFound`。
     pub fn update_provider(
         &self,
         provider_id: &str,
         spec: ProviderSpec,
     ) -> Result<(), ProviderAdminError> {
         validate_provider_id(provider_id)?;
-        validate_provider_name(&spec.name)?;
-        if let Some(api_key) = &spec.api_key {
-            validate_api_key(api_key)?;
-        }
+        validate_spec(&spec)?;
 
-        let env_var = generated_env_var_name(provider_id);
-        let env_write = self.prepare_env_write(&env_var, &spec)?;
+        let has_api_key = spec.api_key.is_some();
+        let env_write = self.prepare_env_write(&spec)?;
+        // models 先取出（后续字段 patch 只借用其余字段，避免与移动交叠）
+        let model_pairs: Vec<(String, Model)> = spec
+            .models
+            .into_iter()
+            .map(|entry| (entry.id, entry.model))
+            .collect();
 
         let mut doc = self.store.read_toml()?;
-        let providers = providers_table_mut(&mut doc)?;
-        let table = crate::provider_store::provider_table_mut(providers, provider_id)?.ok_or_else(
-            || ProviderAdminError::NotFound(format!("providers.{provider_id} 不存在")),
-        )?;
+        let table = self.provider_table_or_not_found(&mut doc, provider_id)?;
 
         // name：覆盖为载荷值
-        table.insert("name", toml_edit::value(spec.name));
+        table.insert("name", toml_edit::value(spec.name.clone()));
 
         // base_url：Some 覆盖 / None 清除（options 兼容表头与内联两种手写形态，
         // 空则整体移除）
@@ -359,39 +375,44 @@ impl ProviderManager {
             None => options_remove_key(table, "base_url"),
         }
 
-        // api_key：明文走 .env，段内只保指针——移除残留明文（含内联形态）并把
-        // 约定变量并入指针
-        if spec.api_key.is_some() {
-            options_remove_key(table, "api_key");
-            let existing = crate::provider_store::read_provider_pointers(table);
-            let mut vars: Vec<String> = existing.api_key_env_vars;
-            if !vars.iter().any(|v| v == &env_var) {
-                vars.push(env_var.clone());
+        // 指针所见即所得：Some 落单值 / None 移除键
+        match &spec.api_key_env_var {
+            Some(env_var) => {
+                let mut vars = Array::new();
+                vars.push(toml_edit::Value::from(env_var.clone()));
+                table.insert("api_key_env_vars", toml_edit::value(vars));
             }
-            let mut arr = Array::new();
-            for var in vars {
-                arr.push(var);
+            None => {
+                table.remove("api_key_env_vars");
             }
-            table.insert("api_key_env_vars", toml_edit::value(arr));
         }
+
+        // 明文密钥不进 toml：写 .env 时连带移除段内残留明文（含内联形态）
+        if has_api_key {
+            options_remove_key(table, "api_key");
+        }
+
+        provider_store::replace_models_table(table, &model_pairs);
 
         self.store.write_toml(&doc)?;
         self.commit_env_write(env_write)?;
         tracing::info!(
             provider_id = %provider_id,
-            "供应商已更新（patch global 层 fuyao.toml 目标段）"
+            model_count = model_pairs.len(),
+            has_api_key,
+            "供应商已更新（管理字段 patch + models 整表替换）"
         );
         Ok(())
     }
 
-    /// 删除供应商：移除 `[providers.<id>]` 段（级联删其全部模型）并同步清理 .env
+    /// 删除供应商：移除 `[providers.<id>]` 段（级联其全部模型）
     ///
-    /// toml 侧只移除目标段（其他供应商与全局其他配置逐字保留；providers 段
-    /// 删空后连带移除空表头）；.env 侧清理约定变量 `{ID大写}_API_KEY` 的那一行
-    /// （该变量是管理 API 的产物；用户手写引用的其他变量不属管理面产物，不删）。
+    /// .env 是用户持有的资产（变量名用户自设、可能被多个供应商共享引用），
+    /// 删除不触碰 .env——密钥行由用户自行管理。toml 侧只移除目标段（其他
+    /// 供应商与全局其他配置逐字保留；providers 段删空后连带移除空表头）。
     ///
-    /// 既有会话对该供应商的引用不受删除阻挡（运行中 turn 跑完即止，后续取用
-    /// 报错由上层兜底）——删除后果的告知属调用方确认流程。
+    /// 既有会话对该供应商的引用不受删除阻挡（运行中 turn 跑完即止）——删除
+    /// 后果的告知属调用方确认流程。
     pub fn delete_provider(&self, provider_id: &str) -> Result<(), ProviderAdminError> {
         validate_provider_id(provider_id)?;
 
@@ -408,125 +429,9 @@ impl ProviderManager {
         }
         self.store.write_toml(&doc)?;
 
-        // .env 同步清理约定变量（无该行时原样跳过；跨行值拒绝删除见 EnvWriteError）
-        let env_var = generated_env_var_name(provider_id);
-        let content = self.store.read_env()?;
-        let next =
-            provider_store::remove_env_line(&content, &env_var).map_err(map_env_write_error)?;
-        if next != content {
-            self.store.write_env(&next)?;
-        }
         tracing::info!(
             provider_id = %provider_id,
-            "供应商已删除（含全部模型与 .env 密钥变量）"
-        );
-        Ok(())
-    }
-
-    // ── 模型粒度 CRUD ────────────────────────────────────────────
-
-    /// 在既有供应商下创建模型：新增 `[providers.<id>.models.<mid>]` 表
-    ///
-    /// 模型必填校验（name 非空、limit.context 正整数，fail-loud）；供应商不
-    /// 存在或模型 id 已占用时报错。
-    pub fn create_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-        model: Model,
-    ) -> Result<(), ProviderAdminError> {
-        validate_provider_id(provider_id)?;
-        validate_model_id(model_id)?;
-        validate_model(&model)?;
-
-        let mut doc = self.store.read_toml()?;
-        let table = self.provider_table_or_not_found(&mut doc, provider_id)?;
-        let models = crate::provider_store::models_table_mut(table, provider_id)?;
-        if models.contains_key(model_id) {
-            return Err(ProviderAdminError::AlreadyExists(format!(
-                "providers.{provider_id}.models.{model_id} 已存在（id 不可改名，如需换 id 请删除后新建）"
-            )));
-        }
-        models.insert(model_id, Item::Table(model_to_table(&model)));
-        self.store.write_toml(&doc)?;
-        tracing::info!(
-            provider_id = %provider_id,
-            model_id = %model_id,
-            "模型已创建（写回 global 层 fuyao.toml）"
-        );
-        Ok(())
-    }
-
-    /// 更新模型：整表替换 `[providers.<id>.models.<mid>]`
-    ///
-    /// 模型段是管理粒度的完整期望状态——载荷即替换后的全量字段（段内此前
-    /// 手写的未知字段随之消失；供应商段内其他部分不动）。校验与创建同语义。
-    pub fn update_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-        model: Model,
-    ) -> Result<(), ProviderAdminError> {
-        validate_provider_id(provider_id)?;
-        validate_model_id(model_id)?;
-        validate_model(&model)?;
-
-        let mut doc = self.store.read_toml()?;
-        let table = self.provider_table_or_not_found(&mut doc, provider_id)?;
-        let models = crate::provider_store::models_table_mut(table, provider_id)?;
-        if models.get(model_id).is_none() {
-            return Err(ProviderAdminError::NotFound(format!(
-                "providers.{provider_id}.models.{model_id} 不存在"
-            )));
-        }
-        // 整表替换：先移除旧条目（连带其子表 / 数组表）再插入新表
-        models.remove(model_id);
-        models.insert(model_id, Item::Table(model_to_table(&model)));
-        self.store.write_toml(&doc)?;
-        tracing::info!(
-            provider_id = %provider_id,
-            model_id = %model_id,
-            "模型已更新（整表替换目标段）"
-        );
-        Ok(())
-    }
-
-    /// 删除模型：移除 `[providers.<id>.models.<mid>]` 表
-    ///
-    /// models 子表删空后连带移除空 `models` 键，保持供应商段整洁。
-    pub fn delete_model(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> Result<(), ProviderAdminError> {
-        validate_provider_id(provider_id)?;
-        validate_model_id(model_id)?;
-
-        let mut doc = self.store.read_toml()?;
-        let table = self.provider_table_or_not_found(&mut doc, provider_id)?;
-        let models = crate::provider_store::models_table_mut(table, provider_id)?;
-        if models.remove(model_id).is_none() {
-            return Err(ProviderAdminError::NotFound(format!(
-                "providers.{provider_id}.models.{model_id} 不存在"
-            )));
-        }
-        // models 子表删空后连带移除空 `models` 键；provider 表经文档根重新取
-        // （上面的 `table` 可变借用已随 `models` 消耗）
-        if models.is_empty()
-            && let Some(provider_table) = doc
-                .as_table_mut()
-                .get_mut("providers")
-                .and_then(|i| i.as_table_mut())
-                .and_then(|t| t.get_mut(provider_id))
-                .and_then(|i| i.as_table_mut())
-        {
-            provider_table.remove("models");
-        }
-        self.store.write_toml(&doc)?;
-        tracing::info!(
-            provider_id = %provider_id,
-            model_id = %model_id,
-            "模型已删除"
+            "供应商已删除（toml 段级联删除全部模型；.env 归用户持有，不动）"
         );
         Ok(())
     }
@@ -544,24 +449,19 @@ impl ProviderManager {
             .ok_or_else(|| ProviderAdminError::NotFound(format!("providers.{provider_id} 不存在")))
     }
 
-    /// .env 写入的两段式——先备好新内容（含冲突检查），提交推迟到 toml 写盘成功后
+    /// .env 写入的两段式——先备好新内容（含跨行值拒绝），提交推迟到 toml 写盘成功后
     ///
-    /// 冲突在写盘前暴露：返回 `Err` 时 fuyao.toml 尚未被触碰，调用方重试或放弃
-    /// 都不会留下「toml 有指针、.env 没写」的半状态。`None` 表示不写 .env。
-    fn prepare_env_write(
-        &self,
-        env_var: &str,
-        spec: &ProviderSpec,
-    ) -> Result<Option<String>, ProviderAdminError> {
-        let Some(api_key) = &spec.api_key else {
+    /// `api_key_env_var` 与 `api_key` 同时有值才写：明文 upsert 进该变量
+    /// （同名覆盖、异名新加）。`None` 表示不写 .env。
+    fn prepare_env_write(&self, spec: &ProviderSpec) -> Result<Option<String>, ProviderAdminError> {
+        let (Some(env_var), Some(api_key)) = (&spec.api_key_env_var, &spec.api_key) else {
             return Ok(None);
         };
         let new_line = provider_store::format_env_line(env_var, api_key)?;
         let content = self.store.read_env()?;
-        let next =
-            provider_store::upsert_env_line(&content, env_var, &new_line, spec.overwrite_api_key)
-                .map_err(map_env_write_error)?;
-        Ok(Some(next))
+        Ok(Some(provider_store::upsert_env_line(
+            &content, env_var, &new_line,
+        )?))
     }
 
     /// 提交 `.env` 写入（toml 已成功落盘后调用）
@@ -570,16 +470,6 @@ impl ProviderManager {
             self.store.write_env(&next)?;
         }
         Ok(())
-    }
-}
-
-/// 把 .env 行级写入错误映射为公开错误变体
-fn map_env_write_error(e: EnvWriteError) -> ProviderAdminError {
-    match e {
-        EnvWriteError::Conflict(var) => ProviderAdminError::EnvKeyConflict(var),
-        EnvWriteError::MultiLine(var) => ProviderAdminError::Invalid(format!(
-            "环境变量 {var} 的现有值跨多行，无法单行级改写（请手工整理 .env 后重试）"
-        )),
     }
 }
 
@@ -708,6 +598,65 @@ fn validate_provider_name(name: &str) -> Result<(), ProviderAdminError> {
         return Err(ProviderAdminError::Invalid(
             "供应商 name 不能为空（显示名，如 name = \"DeepSeek\"）".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// API Key 环境变量名校验：非空，字符集 `[A-Za-z0-9_]` 且不以数字开头
+///
+/// 用户自设的变量名与供应商 id 解耦（id 变更不影响变量名）。.env / dotenvy
+/// 惯例形态之外的名字无法被 `api_key_env_vars` 指针解析链可靠命中，写入前
+/// 拦下。
+fn validate_env_var_name(env_var: &str) -> Result<(), ProviderAdminError> {
+    if env_var.is_empty() {
+        return Err(ProviderAdminError::Invalid(
+            "API Key 环境变量名不能为空（如 MY_DEEPSEEK_KEY）".to_string(),
+        ));
+    }
+    let invalid = || {
+        ProviderAdminError::Invalid(format!(
+            "API Key 环境变量名非法（{env_var}）：仅允许字母、数字、下划线，且不能以数字开头"
+        ))
+    };
+    let mut chars = env_var.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return Err(invalid()),
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+/// 写回载荷整体校验（fail-loud，此时文件未动）
+///
+/// name 非空；变量名字符集合法；明文必须伴随变量名（明文无 .env 落点即配置
+/// 错误）；每个模型 id / 必填字段合法且载荷内 id 无重复（models 整表替换以
+/// id 为键，重复条目会静默互相覆盖，写入前拦下）。
+fn validate_spec(spec: &ProviderSpec) -> Result<(), ProviderAdminError> {
+    validate_provider_name(&spec.name)?;
+    if let Some(env_var) = &spec.api_key_env_var {
+        validate_env_var_name(env_var)?;
+    }
+    if let Some(api_key) = &spec.api_key {
+        if spec.api_key_env_var.is_none() {
+            return Err(ProviderAdminError::Invalid(
+                "api_key 明文必须伴随 api_key_env_var 变量名（明文需有 .env 落点）".to_string(),
+            ));
+        }
+        validate_api_key(api_key)?;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for entry in &spec.models {
+        validate_model_id(&entry.id)?;
+        validate_model(&entry.model)?;
+        if !seen.insert(entry.id.as_str()) {
+            return Err(ProviderAdminError::Invalid(format!(
+                "模型 id 重复（{}）：载荷内每个模型 id 只能出现一次",
+                entry.id
+            )));
+        }
     }
     Ok(())
 }
@@ -960,7 +909,7 @@ mod tests {
         assert_eq!(new_model.model.limit.context, 128000);
     }
 
-    /// 写盘后列表立即可见（不经注册缓存刷新）：create_provider + create_model
+    /// 写盘后列表立即可见（不经注册缓存刷新）：create_provider（含内嵌模型）
     /// 完成即出现在列表，来源为 Global，管理字段（base_url / 指针）齐备
     #[test]
     fn list_with_source_reflects_disk_write_immediately() {
@@ -970,21 +919,22 @@ mod tests {
         // 未注册任何缓存、未写盘：空列表
         assert!(manager.list_providers_with_source().unwrap().is_empty());
 
+        let mut model = test_model("deepseek-v4-flash");
+        model.limit.context = 128000;
         manager
             .create_provider(
                 "deepseek",
                 ProviderSpec {
                     name: "DeepSeek".to_string(),
                     base_url: Some("https://api.deepseek.com".to_string()),
+                    api_key_env_var: Some("MY_DEEPSEEK_KEY".to_string()),
                     api_key: Some("sk-plain".to_string()),
-                    overwrite_api_key: false,
+                    models: vec![ProviderModelSpec {
+                        id: "deepseek-v4-flash".to_string(),
+                        model,
+                    }],
                 },
             )
-            .unwrap();
-        let mut model = test_model("deepseek-v4-flash");
-        model.limit.context = 128000;
-        manager
-            .create_model("deepseek", "deepseek-v4-flash", model)
             .unwrap();
 
         let list = manager.list_providers_with_source().unwrap();
@@ -997,7 +947,7 @@ mod tests {
             provider.base_url.as_deref(),
             Some("https://api.deepseek.com")
         );
-        assert_eq!(provider.api_key_env_vars, vec!["DEEPSEEK_API_KEY"]);
+        assert_eq!(provider.api_key_env_vars, vec!["MY_DEEPSEEK_KEY"]);
         assert_eq!(provider.models.len(), 1);
         assert_eq!(provider.models[0].id, "deepseek-v4-flash");
         assert_eq!(provider.models[0].source, ProviderSource::Global);
@@ -1093,6 +1043,69 @@ mod tests {
         assert!(validate_model(&model).is_err());
     }
 
+    // ===== 载荷校验 =====
+
+    #[test]
+    fn validate_env_var_name_accepts_env_convention() {
+        assert!(validate_env_var_name("MY_DEEPSEEK_KEY").is_ok());
+        assert!(validate_env_var_name("_internal").is_ok());
+    }
+
+    #[test]
+    fn validate_env_var_name_rejects_empty_leading_digit_and_special_chars() {
+        assert!(validate_env_var_name("").is_err());
+        assert!(validate_env_var_name("1ABC").is_err());
+        assert!(validate_env_var_name("A-B").is_err());
+        assert!(validate_env_var_name("A.B").is_err());
+        assert!(validate_env_var_name("变量").is_err());
+    }
+
+    /// 明文无变量名（明文缺 .env 落点）与载荷内重复模型 id 都在写入前拦下
+    #[test]
+    fn validate_spec_rejects_homeless_api_key_and_duplicate_model_ids() {
+        let base = |api_key_env_var: Option<&str>, id: &str| ProviderSpec {
+            name: "DeepSeek".to_string(),
+            base_url: None,
+            api_key_env_var: api_key_env_var.map(str::to_string),
+            api_key: Some("sk-plain".to_string()),
+            models: vec![ProviderModelSpec {
+                id: id.to_string(),
+                model: test_model("m"),
+            }],
+        };
+
+        let homeless = base(None, "m");
+        assert!(
+            matches!(
+                validate_spec(&homeless),
+                Err(ProviderAdminError::Invalid(_))
+            ),
+            "明文必须伴随变量名"
+        );
+
+        let duplicated = ProviderSpec {
+            api_key: None,
+            models: vec![
+                ProviderModelSpec {
+                    id: "m".to_string(),
+                    model: test_model("m"),
+                },
+                ProviderModelSpec {
+                    id: "m".to_string(),
+                    model: test_model("m"),
+                },
+            ],
+            ..base(Some("K"), "other")
+        };
+        assert!(
+            matches!(
+                validate_spec(&duplicated),
+                Err(ProviderAdminError::Invalid(_))
+            ),
+            "载荷内重复模型 id 拦下"
+        );
+    }
+
     // ===== ProviderSpec 的 Debug 屏蔽 =====
 
     #[test]
@@ -1100,8 +1113,12 @@ mod tests {
         let spec = ProviderSpec {
             name: "DeepSeek".to_string(),
             base_url: None,
+            api_key_env_var: Some("MY_DEEPSEEK_KEY".to_string()),
             api_key: Some("sk-secret".to_string()),
-            overwrite_api_key: false,
+            models: vec![ProviderModelSpec {
+                id: "deepseek-v4-flash".to_string(),
+                model: test_model("deepseek-v4-flash"),
+            }],
         };
         let debug = format!("{spec:?}");
         assert!(

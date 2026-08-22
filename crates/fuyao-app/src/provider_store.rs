@@ -8,11 +8,11 @@
 //!   一行，用户手写的其他变量与注释不动。
 //!
 //! 本模块只提供存储原语（文件读写 + 行/段级变更 + 领域对象到表的序列化），
-//! 管理策略（校验、冲突信号、指针一致性）由上层 `provider_manager` 决定。
+//! 管理策略（校验、指针一致性）由上层 `provider_manager` 决定。
 
 use std::path::{Path, PathBuf};
 
-use fuyao_api::{InputModality, Model, ModelModalities, OutputModality, Provider};
+use fuyao_api::{InputModality, Model, ModelModalities, OutputModality};
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::provider_manager::ProviderAdminError;
@@ -128,47 +128,43 @@ pub(crate) fn provider_table_mut<'a>(
     Ok(Some(table))
 }
 
-/// 取（不存在则创建）`[providers.<id>.models]` 子表
+/// models 子表整体替换：清空既有条目后按载荷全量重建
 ///
-/// 新建为隐式表：渲染为 `[providers.<id>.models.<mid>]` 层级式表头。
-/// 段存在但不是 table 返回 [`ProviderAdminError::InvalidSection`]。
-pub(crate) fn models_table_mut<'a>(
-    provider_table: &'a mut Table,
-    provider_id: &str,
-) -> Result<&'a mut Table, ProviderAdminError> {
-    if provider_table.get("models").is_none() {
-        let mut table = Table::new();
-        table.set_implicit(true);
-        provider_table.insert("models", Item::Table(table));
+/// 整体替换语义：载荷未携带的模型 id 随替换消失，载荷内的 id 即落盘键
+/// （模型 id 因此可随整体替换变更）；空载荷整体移除 `models` 键，保持段整洁。
+pub(crate) fn replace_models_table(provider_table: &mut Table, models: &[(String, Model)]) {
+    provider_table.remove("models");
+    if models.is_empty() {
+        return;
     }
-    provider_table
-        .get_mut("models")
-        .and_then(|item| item.as_table_mut())
-        .ok_or_else(|| {
-            ProviderAdminError::InvalidSection(format!(
-                "providers.{provider_id}.models 段不是 table：\
-                 必须以 [providers.{provider_id}.models.<mid>] 表形式声明模型"
-            ))
-        })
+    let mut table = Table::new();
+    table.set_implicit(true);
+    for (model_id, model) in models {
+        table.insert(model_id, Item::Table(model_to_table(model)));
+    }
+    provider_table.insert("models", Item::Table(table));
 }
 
 // ==================== 领域对象 → TOML 表 ====================
 
-/// 供应商段写入：新建完整的 `[providers.<id>]` 表体
+/// 供应商段写入：新建完整的 `[providers.<id>]` 表体（含 models 子表）
 ///
-/// api_key 明文不进 toml（密钥隔离红线）：段内只写 `api_key_env_vars` 指针，
-/// 指向 .env 中按约定生成的变量（由调用方负责写入 .env）。
-pub(crate) fn provider_to_table(spec_provider: &ProviderSpecData, env_var: &str) -> Table {
+/// api_key 明文不进 toml（密钥隔离红线）：段内只写 `api_key_env_vars` 指针
+/// （用户自设变量名，单值所见即所得），明文由调用方负责 upsert 进 .env。
+pub(crate) fn provider_to_table(spec: &ProviderSpecData) -> Table {
     let mut table = Table::new();
-    table.insert("name", value(spec_provider.name.clone()));
-    if let Some(base_url) = &spec_provider.base_url {
+    table.insert("name", value(spec.name.clone()));
+    if let Some(base_url) = &spec.base_url {
         let mut options = Table::new();
         options.insert("base_url", value(base_url.clone()));
         table.insert("options", Item::Table(options));
     }
-    let mut vars = Array::new();
-    vars.push(Value::from(env_var));
-    table.insert("api_key_env_vars", toml_edit::value(vars));
+    if let Some(env_var) = &spec.api_key_env_var {
+        let mut vars = Array::new();
+        vars.push(Value::from(env_var.clone()));
+        table.insert("api_key_env_vars", toml_edit::value(vars));
+    }
+    replace_models_table(&mut table, &spec.models);
     table
 }
 
@@ -178,6 +174,10 @@ pub(crate) struct ProviderSpecData {
     pub(crate) name: String,
     /// 自定义 base URL
     pub(crate) base_url: Option<String>,
+    /// API Key 环境变量名（None = 不落指针键）
+    pub(crate) api_key_env_var: Option<String>,
+    /// 全量模型列表（模型 id + 模型字段的二元组）
+    pub(crate) models: Vec<(String, Model)>,
 }
 
 /// 模型段写入：构造 `[providers.<id>.models.<mid>]` 表体
@@ -308,62 +308,7 @@ fn output_modality_str(m: &OutputModality) -> &str {
     }
 }
 
-/// 读回现有 Provider 配置（`api_key_env_vars` / `options`），供写回方保持指针一致
-///
-/// 从 toml_edit 表直接读取（不经过整份配置加载），仅提取写回方关心的两个键；
-/// options 兼容表头（`Item::Table`）与内联（`Item::Value` 的 InlineTable）两种
-/// 手写形态。
-pub(crate) fn read_provider_pointers(table: &Table) -> Provider {
-    let mut provider = Provider::default();
-    if let Some(arr) = table.get("api_key_env_vars").and_then(|i| i.as_array()) {
-        provider.api_key_env_vars = arr
-            .iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
-    }
-    match table.get("options") {
-        Some(Item::Table(options)) => {
-            provider.options.base_url = options
-                .get("base_url")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            provider.options.api_key = options
-                .get("api_key")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-        }
-        Some(Item::Value(value)) => {
-            if let Some(inline) = value.as_inline_table() {
-                provider.options.base_url = inline
-                    .get("base_url")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                provider.options.api_key = inline
-                    .get("api_key")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-        }
-        _ => {}
-    }
-    provider
-}
-
 // ==================== .env 单行级增量 ====================
-
-/// .env 行级写入失败形态
-#[derive(Debug)]
-pub(crate) enum EnvWriteError {
-    /// 目标变量已有不同的值且未确认覆盖（携带变量名；不携带已有值——密钥红线）
-    Conflict(String),
-    /// 目标行是跨行引号值（多行值），单行级改写会破坏文件结构
-    MultiLine(String),
-}
-
-/// 按约定生成供应商的 api_key 环境变量名：`{供应商 id 大写}_API_KEY`
-pub(crate) fn generated_env_var_name(provider_id: &str) -> String {
-    format!("{}_API_KEY", provider_id.to_ascii_uppercase())
-}
 
 /// 把 api_key 值格式化为 `.env` 单行 `VAR=值`
 ///
@@ -430,18 +375,18 @@ fn is_multiline_value(line: &str) -> bool {
     }
 }
 
-/// 单行级写入：目标变量行存在则替换整行，不存在则追加到文件末尾
+/// 单行级写入：目标变量行存在则整行覆盖，不存在则追加到文件末尾
 ///
 /// - 已有行与目标行相同（忽略行尾 `\r` 的 CRLF 差异）→ 幂等直返原内容
-/// - 已有行不同且未确认覆盖 → [`EnvWriteError::Conflict`]
-/// - 已有行是跨行引号值 → [`EnvWriteError::MultiLine`]
+/// - 已有行不同 → 直接覆盖（.env 变量值由用户持有，覆盖即更新语义）
+/// - 已有行是跨行引号值 → [`ProviderAdminError::Invalid`]（单行级改写会破坏
+///   文件结构）
 /// - 追加时保证与既有内容之间恰好一个换行分隔
 pub(crate) fn upsert_env_line(
     content: &str,
     var: &str,
     new_line: &str,
-    overwrite: bool,
-) -> Result<String, EnvWriteError> {
+) -> Result<String, ProviderAdminError> {
     let lines: Vec<&str> = content.split('\n').collect();
     let target = lines.iter().position(|l| env_line_var(l) == Some(var));
     match target {
@@ -451,11 +396,10 @@ pub(crate) fn upsert_env_line(
                 // 幂等：目标行已是期望内容，原样返回（不改写文件，也不动行尾风格）
                 return Ok(content.to_string());
             }
-            if !overwrite {
-                return Err(EnvWriteError::Conflict(var.to_string()));
-            }
             if is_multiline_value(lines[idx]) {
-                return Err(EnvWriteError::MultiLine(var.to_string()));
+                return Err(ProviderAdminError::Invalid(format!(
+                    "环境变量 {var} 的现有值跨多行，无法单行级改写（请手工整理 .env 后重试）"
+                )));
             }
             let mut lines: Vec<String> = lines.into_iter().map(String::from).collect();
             lines[idx] = new_line.to_string();
@@ -473,36 +417,10 @@ pub(crate) fn upsert_env_line(
     }
 }
 
-/// 单行级删除：移除目标变量那一行；变量不存在时原样返回
-///
-/// 目标行是跨行引号值时返回 [`EnvWriteError::MultiLine`]（删除首行会留下
-/// 残续行，破坏文件结构）。
-pub(crate) fn remove_env_line(content: &str, var: &str) -> Result<String, EnvWriteError> {
-    let lines: Vec<&str> = content.split('\n').collect();
-    let target = lines.iter().position(|l| env_line_var(l) == Some(var));
-    let Some(idx) = target else {
-        return Ok(content.to_string());
-    };
-    if is_multiline_value(lines[idx]) {
-        return Err(EnvWriteError::MultiLine(var.to_string()));
-    }
-    let mut lines: Vec<String> = lines.into_iter().map(String::from).collect();
-    lines.remove(idx);
-    Ok(lines.join("\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use fuyao_api::{ModelCost, ModelLimit};
-
-    // ===== 变量名生成 =====
-
-    #[test]
-    fn generated_env_var_name_uppercases_provider_id() {
-        assert_eq!(generated_env_var_name("deepseek"), "DEEPSEEK_API_KEY");
-        assert_eq!(generated_env_var_name("My-Vendor_9"), "MY-VENDOR_9_API_KEY");
-    }
 
     // ===== 行格式化 =====
 
@@ -578,33 +496,27 @@ mod tests {
     #[test]
     fn upsert_appends_when_var_absent() {
         let content = "# 手写注释\nOTHER_VAR=keep\n";
-        let out = upsert_env_line(content, "K", "K=v1", false).unwrap();
+        let out = upsert_env_line(content, "K", "K=v1").unwrap();
         assert_eq!(out, "# 手写注释\nOTHER_VAR=keep\nK=v1\n");
     }
 
     #[test]
     fn upsert_append_adds_separator_when_missing_trailing_newline() {
-        let out = upsert_env_line("A=1", "K", "K=v", false).unwrap();
+        let out = upsert_env_line("A=1", "K", "K=v").unwrap();
         assert_eq!(out, "A=1\nK=v\n");
     }
 
     #[test]
-    fn upsert_replace_keeps_other_lines_verbatim() {
+    fn upsert_overwrites_existing_line_keeping_others_verbatim() {
         let content = "# 注释\nA=1\nK=old\nB=2\n";
-        let out = upsert_env_line(content, "K", "K=new", true).unwrap();
+        let out = upsert_env_line(content, "K", "K=new").unwrap();
         assert_eq!(out, "# 注释\nA=1\nK=new\nB=2\n");
-    }
-
-    #[test]
-    fn upsert_conflict_when_different_and_no_overwrite() {
-        let err = upsert_env_line("K=handwritten\n", "K", "K=new", false).unwrap_err();
-        assert!(matches!(err, EnvWriteError::Conflict(var) if var == "K"));
     }
 
     #[test]
     fn upsert_idempotent_when_line_identical() {
         let content = "K=v\n";
-        let out = upsert_env_line(content, "K", "K=v", false).unwrap();
+        let out = upsert_env_line(content, "K", "K=v").unwrap();
         assert_eq!(out, content);
     }
 
@@ -612,30 +524,14 @@ mod tests {
     fn upsert_treats_crlf_existing_line_as_same_content() {
         // CRLF 文件里已有行带 \r：与 LF 新行语义相同，幂等不改写（保住 CRLF 风格）
         let content = "K=v\r\n";
-        let out = upsert_env_line(content, "K", "K=v", false).unwrap();
+        let out = upsert_env_line(content, "K", "K=v").unwrap();
         assert_eq!(out, content);
     }
 
     #[test]
     fn upsert_rejects_multiline_existing_value() {
-        let err = upsert_env_line("K='start\ncontinues'\n", "K", "K=v", true).unwrap_err();
-        assert!(matches!(err, EnvWriteError::MultiLine(_)));
-    }
-
-    // ===== 单行删除 =====
-
-    #[test]
-    fn remove_deletes_target_line_only() {
-        let content = "# 注释\nA=1\nK=drop\nB=2\n";
-        let out = remove_env_line(content, "K").unwrap();
-        assert_eq!(out, "# 注释\nA=1\nB=2\n");
-    }
-
-    #[test]
-    fn remove_absent_var_returns_unchanged() {
-        let content = "A=1\n";
-        let out = remove_env_line(content, "K").unwrap();
-        assert_eq!(out, content);
+        let err = upsert_env_line("K='start\ncontinues'\n", "K", "K=v").unwrap_err();
+        assert!(matches!(err, ProviderAdminError::Invalid(_)));
     }
 
     // ===== providers 表导航 =====
@@ -805,26 +701,68 @@ mod tests {
         assert!(table.get("reasoning_efforts").is_none());
     }
 
-    // ===== 指针读取 =====
+    // ===== models 子表整体替换 =====
 
     #[test]
-    fn read_provider_pointers_extracts_env_vars_and_options() {
-        let mut table = Table::new();
-        let mut vars = Array::new();
-        vars.push(Value::from("A_API_KEY"));
-        vars.push(Value::from("B_API_KEY"));
-        table.insert("api_key_env_vars", toml_edit::value(vars));
-        let mut options = Table::new();
-        options.insert("base_url", value("https://example.com"));
-        options.insert("api_key", value("plaintext"));
-        table.insert("options", Item::Table(options));
+    fn replace_models_table_rebuilds_keys_from_payload() {
+        let mut provider = Table::new();
+        // 预置旧 models（含一个载荷未携带的条目）
+        let mut old_models = Table::new();
+        old_models.insert("old-a", Item::Table(model_to_table(&sample_model())));
+        provider.insert("models", Item::Table(old_models));
 
-        let provider = read_provider_pointers(&table);
-        assert_eq!(provider.api_key_env_vars, vec!["A_API_KEY", "B_API_KEY"]);
-        assert_eq!(
-            provider.options.base_url.as_deref(),
-            Some("https://example.com")
+        replace_models_table(
+            &mut provider,
+            &[
+                ("renamed-b".to_string(), sample_model()),
+                ("c".to_string(), sample_model()),
+            ],
         );
-        assert_eq!(provider.options.api_key.as_deref(), Some("plaintext"));
+
+        let models = provider.get("models").unwrap().as_table().unwrap();
+        assert!(models.get("old-a").is_none(), "载荷未携带的 id 随替换消失");
+        assert!(
+            models.contains_key("renamed-b"),
+            "载荷 id 即落盘键（id 可变更）"
+        );
+        assert!(models.contains_key("c"));
+    }
+
+    #[test]
+    fn replace_models_table_with_empty_payload_removes_key() {
+        let mut provider = Table::new();
+        let mut old_models = Table::new();
+        old_models.insert("m", Item::Table(model_to_table(&sample_model())));
+        provider.insert("models", Item::Table(old_models));
+
+        replace_models_table(&mut provider, &[]);
+
+        assert!(provider.get("models").is_none(), "空载荷整体移除 models 键");
+    }
+
+    #[test]
+    fn replace_models_table_renders_quoted_dotted_id() {
+        let mut provider = Table::new();
+        replace_models_table(
+            &mut provider,
+            &[("qwen3.6-plus".to_string(), sample_model())],
+        );
+
+        // 渲染为合法 TOML 且点号 id 用引号键，可被重新解析
+        let mut doc = DocumentMut::new();
+        doc.insert(
+            "providers",
+            Item::Table({
+                let mut providers = Table::new();
+                providers.insert("p", Item::Table(provider));
+                providers
+            }),
+        );
+        let rendered = doc.to_string();
+        assert!(
+            rendered.contains("\"qwen3.6-plus\""),
+            "点号 id 应引号键：{rendered}"
+        );
+        rendered.parse::<DocumentMut>().unwrap();
     }
 }

@@ -25,7 +25,7 @@ use common::make_store;
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::{EventBase, InputEvent, OutputEvent};
 use fuyao_api::{AgentConfig, AgentPaths, EngineParams, Model, ModelConfig, SessionParams};
-use fuyao_app::{ProviderManager, ProviderSpec};
+use fuyao_app::{ProviderManager, ProviderModelSpec, ProviderSpec};
 use fuyao_core::{Engine, PluginHost};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -243,7 +243,7 @@ async fn create_then_register_is_immediately_callable() {
     write_provider_config(home.path(), "alpha", &base_url, "alpha-m");
     let engine = assemble_engine(&paths).await;
 
-    // —— 存活引擎期间：管理面写盘新供应商 beta（模型一并创建）——
+    // —— 存活引擎期间：管理面写盘新供应商 beta（模型一并内嵌写入）——
     let manager = ProviderManager::new(paths.clone());
     manager
         .create_provider(
@@ -251,15 +251,16 @@ async fn create_then_register_is_immediately_callable() {
             ProviderSpec {
                 name: "Beta".to_string(),
                 base_url: Some(base_url.clone()),
-                // 明文进 .env 按管理约定；构造实例走 api_key_env_vars 指针解析链
+                api_key_env_var: Some("BETA_API_KEY".to_string()),
+                // 明文进 .env 指定变量；构造实例走 api_key_env_vars 指针解析链
                 api_key: Some("sk-beta".to_string()),
-                overwrite_api_key: false,
+                models: vec![ProviderModelSpec {
+                    id: "beta-m".to_string(),
+                    model: runtime_model("beta-m"),
+                }],
             },
         )
         .expect("创建 beta 失败");
-    manager
-        .create_model("beta", "beta-m", runtime_model("beta-m"))
-        .expect("创建 beta 模型失败");
 
     // 运行时注册（内存缓存 + 实例表）：此刻起存活 engine 对 beta 可调用
     engine

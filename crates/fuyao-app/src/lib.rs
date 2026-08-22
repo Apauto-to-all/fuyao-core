@@ -32,7 +32,7 @@ pub use app::App;
 pub use discovery::{Discovery, list_agent_ids};
 pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
-pub use provider_manager::{ProviderAdminError, ProviderManager, ProviderSpec};
+pub use provider_manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 pub use session_manager::SessionManager;
 // 透出 fuyao-api 的列举选项类型，让二次开发只依赖 fuyao-app 即可消费 Discovery 结果
 pub use fuyao_api::{AgentIdOption, AgentIdSource, DefinitionOption, ModelOption};
