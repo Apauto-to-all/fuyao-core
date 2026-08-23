@@ -108,6 +108,7 @@ async fn image_input_described_by_real_llm() {
             images: vec![image],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
+            client_message_id: None,
         },
     });
     app.send(&session_id, event).await.expect("发送消息失败");

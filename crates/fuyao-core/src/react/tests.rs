@@ -286,6 +286,7 @@ fn make_inbound(content: &str) -> OutputUserMessage {
             images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
+            client_message_id: None,
         },
     }
 }
@@ -299,6 +300,7 @@ fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> OutputUserMes
             images: vec![],
             mode,
             source: UserMessageSource::User,
+            client_message_id: None,
         },
     }
 }
@@ -2636,6 +2638,7 @@ async fn inject_messages_preserves_plugin_source_in_event() {
             source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
                 name: "loop_guard".into(),
             }),
+            client_message_id: None,
         },
     };
     crate::history::inject_user_messages(&ctx, vec![inbound]).await;
@@ -2670,6 +2673,7 @@ fn make_inbound_with_image_data(content: &str, data: String) -> OutputUserMessag
             }],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
+            client_message_id: None,
         },
     }
 }

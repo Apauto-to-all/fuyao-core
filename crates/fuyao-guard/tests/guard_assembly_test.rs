@@ -48,6 +48,7 @@ fn make_user_event_from_user() -> OutputEvent {
             images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
+            client_message_id: None,
         },
     })
 }
@@ -219,6 +220,8 @@ async fn plugin_injected_message_only_clears_pending() {
             source: UserMessageSource::Plugin(fuyao_api::message::input::PluginSource {
                 name: "loop_guard".to_string(),
             }),
+
+            client_message_id: None,
         },
     });
     hooks.hook_output_observe(Arc::new(plugin_msg)).await;

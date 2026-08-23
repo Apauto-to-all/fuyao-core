@@ -290,6 +290,7 @@ async fn stop_session_returns_after_turn_finalization_persisted() {
                     images: vec![],
                     mode: fuyao_api::UserMessageMode::Guide,
                     source: fuyao_api::message::input::UserMessageSource::User,
+                    client_message_id: None,
                 },
             }),
         )
@@ -318,4 +319,147 @@ async fn stop_session_returns_after_turn_finalization_persisted() {
 
     // 收尾：拆除 session task
     let _ = engine.end_session(&id, "测试结束").await;
+}
+
+// ===== remove_queued_message：双队列按客户端标识删除 =====
+
+/// 构造带客户端消息标识的 output 侧用户消息（直插队列用）
+fn queued_msg(
+    content: &str,
+    client_message_id: Option<&str>,
+) -> fuyao_api::message::output::UserMessage {
+    fuyao_api::message::output::UserMessage {
+        base: fuyao_api::message::EventBase::default(),
+        payload: fuyao_api::message::output::UserPayload {
+            content: content.to_string(),
+            images: vec![],
+            mode: fuyao_api::UserMessageMode::Guide,
+            source: fuyao_api::message::input::UserMessageSource::User,
+            client_message_id: client_message_id.map(str::to_string),
+        },
+    }
+}
+
+/// 取挂载 session 的双队列共享句柄（直接注入队列条目，纯测删除语义）
+async fn session_queues(engine: &Engine, id: &SessionId) -> (SharedQueue, SharedQueue) {
+    let sessions = engine.sessions.lock().await;
+    let handle = sessions.get(id).expect("session 应在调度表");
+    (Arc::clone(&handle.guide), Arc::clone(&handle.pending))
+}
+
+/// 两队列中的全部匹配条目一次删除：guide 与 pending 各有目标 + 干扰项，
+/// 返回值为两队列删除数之和，无标识条目（系统 / 插件注入）永不匹配
+#[tokio::test]
+async fn remove_queued_message_deletes_matches_across_both_queues() {
+    let (engine, _dir) = make_engine().await;
+    let (id, _rx) = engine.create_session(engine_test_params()).await.unwrap();
+    let (guide, pending) = session_queues(&engine, &id).await;
+
+    guide
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("保留", Some("keep-1")));
+    guide
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("guide 待删", Some("del-1")));
+    pending
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("pending 待删 a", Some("del-1")));
+    pending
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("pending 待删 b", Some("del-1")));
+    pending
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("无标识", None));
+
+    let removed = engine
+        .remove_queued_message(&id, "del-1")
+        .await
+        .expect("删除应成功");
+    assert_eq!(removed, 3, "guide 1 条 + pending 2 条匹配应全删");
+
+    // 各队列只剩干扰项，且内容不受影响
+    let guide_left: Vec<String> = guide
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.payload.content.clone())
+        .collect();
+    assert_eq!(guide_left, vec!["保留".to_string()]);
+    let pending_left: Vec<String> = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| m.payload.content.clone())
+        .collect();
+    assert_eq!(pending_left, vec!["无标识".to_string()]);
+
+    let _ = engine.end_session(&id, "测试结束").await;
+}
+
+/// 队列中无匹配标识：返回 0，队列内容原样保留
+#[tokio::test]
+async fn remove_queued_message_returns_zero_when_no_match() {
+    let (engine, _dir) = make_engine().await;
+    let (id, _rx) = engine.create_session(engine_test_params()).await.unwrap();
+    let (guide, pending) = session_queues(&engine, &id).await;
+
+    guide
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("在队列", Some("other-1")));
+    pending
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("无标识", None));
+
+    let removed = engine
+        .remove_queued_message(&id, "absent-1")
+        .await
+        .expect("无匹配也应成功返回");
+    assert_eq!(removed, 0);
+    assert_eq!(guide.lock().unwrap().len(), 1);
+    assert_eq!(pending.lock().unwrap().len(), 1);
+
+    let _ = engine.end_session(&id, "测试结束").await;
+}
+
+/// 已删除过的标识再次删除：幂等返回 0
+#[tokio::test]
+async fn remove_queued_message_repeated_removal_returns_zero() {
+    let (engine, _dir) = make_engine().await;
+    let (id, _rx) = engine.create_session(engine_test_params()).await.unwrap();
+    let (guide, _pending) = session_queues(&engine, &id).await;
+
+    guide
+        .lock()
+        .unwrap()
+        .push_back(queued_msg("待删", Some("once-1")));
+    assert_eq!(
+        engine.remove_queued_message(&id, "once-1").await.unwrap(),
+        1
+    );
+    assert_eq!(
+        engine.remove_queued_message(&id, "once-1").await.unwrap(),
+        0,
+        "已删空后再次删除应返回 0"
+    );
+
+    let _ = engine.end_session(&id, "测试结束").await;
+}
+
+/// session 不在调度表：SessionNotFound（要恢复走恢复动作）
+#[tokio::test]
+async fn remove_queued_message_unknown_session_is_not_found() {
+    let (engine, _dir) = make_engine().await;
+
+    let err = engine
+        .remove_queued_message(&"不存在".to_string(), "any-1")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::SessionNotFound(_)));
 }

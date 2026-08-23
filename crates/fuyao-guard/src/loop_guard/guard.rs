@@ -603,6 +603,8 @@ mod tests {
                 source: UserMessageSource::Plugin(PluginSource {
                     name: "loop_guard".into(),
                 }),
+
+                client_message_id: None,
             },
         })))
         .await;
@@ -665,6 +667,8 @@ mod tests {
                 source: UserMessageSource::Plugin(PluginSource {
                     name: "loop_guard".into(),
                 }),
+
+                client_message_id: None,
             },
         })))
         .await;
@@ -710,6 +714,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         })))
         .await;

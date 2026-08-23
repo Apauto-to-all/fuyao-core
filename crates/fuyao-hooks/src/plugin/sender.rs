@@ -84,6 +84,8 @@ impl SessionSender {
                 source: UserMessageSource::Plugin(PluginSource {
                     name: self.name.clone(),
                 }),
+
+                client_message_id: None,
             },
         });
         if let Err(e) = result {

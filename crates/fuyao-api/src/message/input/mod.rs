@@ -50,6 +50,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         });
         match &event {
@@ -101,6 +102,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         });
         let json = serde_json::to_string(&event).expect("序列化失败");

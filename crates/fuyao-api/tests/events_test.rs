@@ -71,6 +71,7 @@ fn input_event_samples() -> Vec<InputEvent> {
                 images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         }),
         InputEvent::Interrupt(InterruptMessage {
@@ -121,6 +122,7 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 images: vec![],
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         }),
         OutputEvent::ToolCall(ToolCallMessage {
@@ -275,6 +277,7 @@ fn user_message_source_serde_preserves_branch(
         images: vec![],
         mode: UserMessageMode::Guide,
         source,
+        client_message_id: None,
     };
     let json = serde_json::to_string(&payload).expect("序列化失败");
     let restored: UserPayload = serde_json::from_str(&json).expect("反序列化失败");
@@ -296,6 +299,7 @@ fn input_and_output_user_message_are_independent_types() {
         images: vec![],
         mode: UserMessageMode::Guide,
         source: UserMessageSource::User,
+        client_message_id: None,
     };
     let output_payload = OutputUserPayload {
         content: "output".into(),
@@ -304,6 +308,7 @@ fn input_and_output_user_message_are_independent_types() {
         source: UserMessageSource::System(SystemSource {
             reason: "测试".into(),
         }),
+        client_message_id: None,
     };
 
     // 各自独立序列化，互不影响

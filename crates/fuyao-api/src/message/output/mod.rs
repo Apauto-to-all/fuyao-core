@@ -125,6 +125,7 @@ mod tests {
                 images: vec![],
                 mode: crate::message::UserMessageMode::Guide,
                 source: crate::message::UserMessageSource::User,
+                client_message_id: None,
             },
         });
         assert!(matches!(event, OutputEvent::User(_)));

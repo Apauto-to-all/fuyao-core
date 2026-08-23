@@ -183,6 +183,21 @@ impl App {
         self.engine.send(id, event).await
     }
 
+    /// 按客户端消息标识删除双队列中未消费的消息（直接代理 [`Engine::remove_queued_message`]）
+    ///
+    /// 返回删除条数（0 = 队列中无此标识的消息）。与 [`App::send`](Self::send) 组合使用：
+    /// 上层为每条发送的用户消息自配 `client_message_id`，撤回排队消息时凭该标识定位删除。
+    /// session 不在调度表返 [`EngineError::SessionNotFound`]。
+    pub async fn remove_queued_message(
+        &self,
+        id: &SessionId,
+        client_message_id: &str,
+    ) -> Result<usize, EngineError> {
+        self.engine
+            .remove_queued_message(id, client_message_id)
+            .await
+    }
+
     /// 停止会话当前 turn（屏障语义，直接代理 [`Engine::stop_session`]）
     ///
     /// 返回即该 session 的 DB 已静默（在跑 turn 已完全终止、中断收尾落库完毕），

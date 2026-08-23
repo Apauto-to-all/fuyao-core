@@ -36,6 +36,7 @@ fn guide_user_message(content: &str) -> InputEvent {
             images: vec![],
             mode: Default::default(),
             source: Default::default(),
+            client_message_id: None,
         },
     })
 }

@@ -25,9 +25,11 @@
 //!
 //! # 存储模型固有限制
 //!
-//! `Message` 未持久化用户消息的 `mode` / `source`（DB schema 无此列），回放时统一按
-//! 普通用户消息兜底（`mode = Guide`、`source = User`）。这是「给人看的历史浏览」的
-//! 合理近似——插件 / 系统注入的 user 消息回放成普通 user，不影响可读性。
+//! `Message` 未持久化用户消息的 `mode` / `source` / `client_message_id`
+//! （DB schema 无对应列，正向投影只取 content / images），回放时统一按
+//! 普通用户消息兜底（`mode = Guide`、`source = User`、`client_message_id = None`）。
+//! 这是「给人看的历史浏览」的合理近似——插件 / 系统注入的 user 消息回放成
+//! 普通 user，不影响可读性；客户端消息标识只服务于队列管理，回放无携带必要。
 
 mod images;
 
@@ -265,9 +267,10 @@ fn message_to_event(msg: Message) -> Option<OutputEvent> {
             payload: UserPayload {
                 content: msg.content.unwrap_or_default(),
                 images: msg.images,
-                // mode / source 未持久化，按普通用户消息兜底
+                // mode / source / client_message_id 未持久化，按普通用户消息兜底
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         })),
         MessageRole::Assistant => Some(OutputEvent::Assistant(AssistantMessage {
@@ -529,6 +532,7 @@ mod tests {
                 }],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         });
         let paths = AgentPaths::default();
@@ -836,5 +840,43 @@ mod tests {
     #[test]
     fn messages_to_events_empty_input() {
         assert!(messages_to_events(vec![]).is_empty());
+    }
+
+    #[test]
+    fn user_event_client_message_id_stripped_on_persist() {
+        // 客户端消息标识只服务队列管理：正向投影只取 content / images，
+        // 落库的 Message 不携带该标识（标识值与字段名均不得出现在投影产物中）
+        let ev = OutputEvent::User(OutputUserMessage {
+            base: EventBase::default(),
+            payload: UserPayload {
+                content: "队列消息".into(),
+                images: vec![],
+                mode: UserMessageMode::Pending,
+                source: UserMessageSource::User,
+                client_message_id: Some("cmid-stripped".into()),
+            },
+        });
+        let paths = AgentPaths::default();
+        let msg = event_to_message(&ev, None, &paths).expect("应投影成功");
+        assert_eq!(msg.content.as_deref(), Some("队列消息"));
+        assert!(msg.images.is_empty());
+        let json = serde_json::to_string(&msg).expect("序列化失败");
+        assert!(!json.contains("cmid-stripped"));
+        assert!(!json.contains("client_message_id"));
+    }
+
+    #[test]
+    fn user_message_replay_carries_no_client_message_id() {
+        // 标识未持久化，历史回放投影的 user 事件恒为 None
+        let msg = make_msg(MessageRole::User, 12, &|m| {
+            m.content = Some("历史消息".into());
+        });
+        let OutputEvent::User(OutputUserMessage { payload, .. }) =
+            message_to_event(msg).expect("user 应投影")
+        else {
+            panic!("变体类型不符");
+        };
+        assert_eq!(payload.content, "历史消息");
+        assert_eq!(payload.client_message_id, None);
     }
 }

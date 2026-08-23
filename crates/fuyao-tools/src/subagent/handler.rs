@@ -117,6 +117,7 @@ pub async fn subagent_handler(
             images: vec![],
             mode: Default::default(),
             source: Default::default(),
+            client_message_id: None,
         },
     });
     if let Err(e) = ops.send(&child_id, msg).await {

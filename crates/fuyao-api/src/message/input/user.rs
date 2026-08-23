@@ -99,6 +99,10 @@ pub struct UserPayload {
     pub mode: UserMessageMode,
     /// 消息来源：用户输入、系统注入或插件注入，默认 user
     pub source: UserMessageSource,
+    /// 客户端消息标识：由发送方生成、会话内唯一，仅用于队列管理（删除定位 / 回显配对），
+    /// 不落库；系统 / 插件注入消息无此标识（None）
+    #[serde(default)]
+    pub client_message_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -125,6 +129,7 @@ mod tests {
             images: vec![],
             mode: UserMessageMode::Pending,
             source: UserMessageSource::User,
+            client_message_id: None,
         };
         assert_eq!(payload.content, "你好");
         assert_eq!(payload.mode, UserMessageMode::Pending);
@@ -140,6 +145,7 @@ mod tests {
             source: UserMessageSource::Plugin(PluginSource {
                 name: "loop_guard".into(),
             }),
+            client_message_id: None,
         };
         assert_eq!(
             payload.source,
@@ -158,6 +164,7 @@ mod tests {
             source: UserMessageSource::System(SystemSource {
                 reason: "timeout".into(),
             }),
+            client_message_id: None,
         };
         assert_eq!(
             payload.source,
@@ -176,6 +183,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         };
         assert!(msg.base.seq.is_none());
@@ -196,6 +204,7 @@ mod tests {
             images: vec![],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
+            client_message_id: None,
         };
         let cloned = payload.clone();
         assert_eq!(payload.content, cloned.content);
@@ -212,6 +221,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         };
         let json = serde_json::to_string(&msg).expect("序列化失败");
@@ -231,6 +241,7 @@ mod tests {
             images: vec![img],
             mode: UserMessageMode::Guide,
             source: UserMessageSource::User,
+            client_message_id: None,
         };
         let json = serde_json::to_string(&payload).expect("序列化失败");
         let de: UserPayload = serde_json::from_str(&json).expect("反序列化失败");
@@ -246,5 +257,25 @@ mod tests {
         let de: UserPayload = serde_json::from_str(old_json).expect("反序列化失败");
         assert_eq!(de.content, "旧消息");
         assert!(de.images.is_empty());
+    }
+
+    #[test]
+    fn user_payload_client_message_id_roundtrip_and_default() {
+        // 携带客户端消息标识时序列化往返保持原值
+        let payload = UserPayload {
+            content: "队列管理".into(),
+            images: vec![],
+            mode: UserMessageMode::Pending,
+            source: UserMessageSource::User,
+            client_message_id: Some("cmid-1".into()),
+        };
+        let json = serde_json::to_string(&payload).expect("序列化失败");
+        let de: UserPayload = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(de.client_message_id.as_deref(), Some("cmid-1"));
+
+        // 旧格式事件（无 client_message_id 字段）反序列化默认 None——事件协议零迁移
+        let old_json = r#"{"content":"旧消息","images":[],"mode":"Guide","source":"User"}"#;
+        let de: UserPayload = serde_json::from_str(old_json).expect("反序列化失败");
+        assert_eq!(de.client_message_id, None);
     }
 }

@@ -32,6 +32,11 @@ pub struct UserPayload {
     pub mode: UserMessageMode,
     /// 消息来源
     pub source: UserMessageSource,
+    /// 客户端消息标识：由发送方生成、会话内唯一，随消息在队列中流转并在回显事件中
+    /// 原样携带（供回显配对），仅用于队列管理（删除定位），不落库；
+    /// 系统 / 插件注入消息无此标识（None）
+    #[serde(default)]
+    pub client_message_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -48,6 +53,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Guide,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         };
         assert_eq!(msg.payload.content, "你好");
@@ -64,6 +70,7 @@ mod tests {
                 images: vec![],
                 mode: UserMessageMode::Pending,
                 source: UserMessageSource::User,
+                client_message_id: None,
             },
         };
         let cloned = msg.clone();
