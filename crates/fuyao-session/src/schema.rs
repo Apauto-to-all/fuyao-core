@@ -17,6 +17,9 @@
 //!
 //! 索引设计：显式索引只为有真实查询的路径而建，每个索引可对应到具体 SQL——
 //! - `idx_sessions_last_active`：list_all 的 `ORDER BY last_active_at DESC`
+//! - `idx_sessions_parent`：按父定位子会话的 `WHERE parent_session_id = ?` +
+//!   `ORDER BY started_at`（list_child_sessions），以及主列表排除子会话的
+//!   `parent_session_id IS NULL` 过滤与 child_count 计数子查询
 //! - `idx_messages_session_kind_seq`：kind 过滤类查询（消息计数 / compaction 边界定位）
 //! - `idx_todos_session`：todo 列表的 `WHERE session_id` + `ORDER BY sort_order`
 //!
@@ -25,14 +28,13 @@
 //! 不建索引，也不建与约束隐式索引列完全相同的冗余显式索引——每多一个索引，
 //! 每条 INSERT 都要多维护一份索引写入。
 //!
-//! `parent_session_id` 字段历史：
-//! - 最初为「链式分裂压缩方案」引入，后随方案废弃而删除（一并删除 `idx_sessions_parent`）
-//! - 现重新加回，语义为**通用子任务标记**（非 fork 专属）：
-//!   - `NULL` = 主 session（用户对话，`create_session` / `resume_session` 产出）
-//!   - 非 `NULL` = 子任务 session（后台任务 / 子代理），值为父 session id
-//! - 用途：前端区分主对话 vs 子任务，按父 id 分组/过滤
-//! - 与链式分裂完全无关。无论子任务是「全新创建」还是「fork 旧的」，只要它是子任务就带此字段。
-//!   当前不建派生索引——级联查找（如「列出某父 session 的所有子任务」）属未来调度层职责，到时再加。
+//! `parent_session_id` 字段语义：**通用子任务标记**（非 fork 专属）：
+//! - `NULL` = 主 session（用户对话，`create_session` / `resume_session` 产出）
+//! - 非 `NULL` = 子任务 session（后台任务 / 子代理），值为父 session id
+//!
+//! 用途：主列表只返回顶层会话（排除子任务），子任务按父 id 定位列举。
+//! 无论子任务是「全新创建」还是「fork 旧的」，只要它是子任务就带此字段。
+//! `idx_sessions_parent` 支撑全部按此列的查询路径（排除过滤 / 按父列举 / 计数子查询）。
 
 /// 当前 schema 版本（开发阶段 db 每次重建，保持 1）
 pub const SCHEMA_VERSION: i32 = 1;
@@ -88,6 +90,7 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_last_active ON sessions(last_active_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_messages_session_kind_seq ON messages(session_id, kind, seq);
 
 CREATE TABLE IF NOT EXISTS todos (

@@ -60,6 +60,13 @@ pub struct Session {
     /// 与历史「链式分裂压缩方案」的同名字段无任何关系——该方案已废弃，此处仅作通用子任务标记。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// 子会话计数：以本会话为父（`parent_session_id` 指向本会话）的子会话条数
+    ///
+    /// 派生读数，不落库——由查询 SQL 的 COUNT 子查询实时计算，无子会话时为 0。
+    /// 用途：会话列表行据此驱动「展开子会话列表」入口的显隐。子会话行恒为 0
+    /// （引擎禁止子会话内递归派生）。新建的内存会话（[`Session::new`]）尚无子会话，初值 0。
+    #[serde(default)]
+    pub child_count: i64,
     /// 工作目录绝对路径（创建会话时定死，不再变化）
     ///
     /// 来源：引擎创建会话时的 `agent_paths.workspace`。无工作目录（纯 global 层运行）时为 `None`。
@@ -105,6 +112,7 @@ impl Session {
             compression_count: 0,
             last_compacted_seq: None,
             parent_session_id: None,
+            child_count: 0,
             workspace,
         }
     }
@@ -406,6 +414,21 @@ mod tests {
         // 用户会话（非派生）：parent_session_id 应为 None
         let session = Session::new(None, None, None);
         assert!(session.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn session_new_child_count_defaults_zero() {
+        // 新建会话尚无子会话：child_count 初值为 0
+        let session = Session::new(None, None, None);
+        assert_eq!(session.child_count, 0);
+    }
+
+    #[test]
+    fn session_child_count_deserializes_to_zero_when_absent() {
+        // 缺失 child_count 的 JSON（旧载荷）反序列化时兜底为 0
+        let json = r#"{"id":"abc12345"}"#;
+        let session: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(session.child_count, 0);
     }
 
     #[test]

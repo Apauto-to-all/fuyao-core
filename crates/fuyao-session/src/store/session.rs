@@ -1,7 +1,8 @@
 //! Session CRUD + 单字段局部更新
 //!
 //! sessions 表的全部元数据操作归此:
-//! - 读 / 写生命周期:create(建行) / get / delete / list_all / count / count_with_filter
+//! - 读 / 写生命周期:create(建行) / get / delete / list_all(主会话) /
+//!   list_child_sessions(按父列举子会话) / count_with_filter
 //! - 单字段局部更新:update_system_prompt / update_title / end_session
 //!
 //! **DB 唯一数据源**:session 的计数字段(message_count / tool_call_count /
@@ -117,12 +118,14 @@ impl super::SessionStore {
     ///
     /// 消息请用 [`load_visible_messages`](super::SessionStore::load_visible_messages)
     /// 或 [`load_full_history`](super::SessionStore::load_full_history) 单独查。
+    /// 行内 `child_count` 为该会话当前子会话数（COUNT 子查询实时计算）。
     pub async fn get(&self, session_id: &str) -> Result<Option<Session>, SessionError> {
         let row = sqlx::query_as::<_, SessionRow>(
             "SELECT id, started_at, ended_at, end_reason,
                     message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                     total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at
+                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at,
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id) AS child_count
              FROM sessions WHERE id = ?1",
         )
         .bind(session_id)
@@ -156,13 +159,18 @@ impl super::SessionStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// 列出会话(不含消息,分页,按最近活动时间倒序)
+    /// 列出主会话(不含消息,分页,按最近活动时间倒序)
+    ///
+    /// 只返回顶层会话——`parent_session_id IS NULL` 的行；子会话（子代理 / 后台任务派生）
+    /// 不进主列表，经 [`list_child_sessions`](Self::list_child_sessions) 按父列举。
     ///
     /// 排序用 `last_active_at DESC`——用户刚交互的会话排最前(类即时通讯的「最近会话」)。
     /// `last_active_at` 在每次 [`update`](Self::update) 落库时由 `unixepoch()` 刷新。
     ///
     /// `workspace_filter` 传 `Some(path)` 只看该工作目录的会话;`None` 看全部(含无 workspace 的)。
     /// 过滤在 SQL 层完成(走索引),不做内存截断。
+    ///
+    /// 每行携带 `child_count`（COUNT 子查询实时计算），供列表消费方驱动子会话入口显隐。
     pub async fn list_all(
         &self,
         workspace_filter: Option<&str>,
@@ -173,9 +181,10 @@ impl super::SessionStore {
             "SELECT id, started_at, ended_at, end_reason,
                     message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
                     total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
-                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at
+                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at,
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id) AS child_count
              FROM sessions
-             WHERE (?1 IS NULL OR workspace = ?1)
+             WHERE parent_session_id IS NULL AND (?1 IS NULL OR workspace = ?1)
              ORDER BY last_active_at DESC LIMIT ?2 OFFSET ?3",
         )
         .bind(workspace_filter)
@@ -187,16 +196,42 @@ impl super::SessionStore {
         Ok(rows.into_iter().map(Session::from).collect())
     }
 
-    /// 获取会话总数(可选按工作目录过滤)
+    /// 列出某父会话下的全部子会话(全量,不分页,按创建序)
     ///
-    /// 与 [`list_all`](Self::list_all) 的 `workspace_filter` 配对,供上层计算分页总页数。
-    /// `workspace_filter` 为 `None` 时统计全部会话。
+    /// 返回 `parent_session_id = parent_id` 的全部行，按 `started_at` 升序（创建序，
+    /// 先派生的排前面）。全量返回、无分页信封——子会话数由单次任务派生的子代理数
+    /// 决定，天然有限。`parent_id` 不存在或无子会话时返回空列表（纯查询原语，不校验
+    /// 父存在性）。
+    pub async fn list_child_sessions(&self, parent_id: &str) -> Result<Vec<Session>, SessionError> {
+        let rows = sqlx::query_as::<_, SessionRow>(
+            "SELECT id, started_at, ended_at, end_reason,
+                    message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
+                    total_reasoning_tokens, total_cached_tokens, total_cost, title, system_prompt,
+                    compression_count, last_compacted_seq, parent_session_id, workspace, last_active_at,
+                    (SELECT COUNT(*) FROM sessions c WHERE c.parent_session_id = sessions.id) AS child_count
+             FROM sessions
+             WHERE parent_session_id = ?1
+             ORDER BY started_at ASC",
+        )
+        .bind(parent_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Session::from).collect())
+    }
+
+    /// 获取主会话总数(可选按工作目录过滤)
+    ///
+    /// 与 [`list_all`](Self::list_all) 的过滤语义一致：排除子会话、
+    /// `workspace_filter` 配对，供上层计算分页总页数。
+    /// `workspace_filter` 为 `None` 时统计全部主会话。
     pub async fn count_with_filter(
         &self,
         workspace_filter: Option<&str>,
     ) -> Result<i64, SessionError> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM sessions WHERE (?1 IS NULL OR workspace = ?1)",
+            "SELECT COUNT(*) FROM sessions
+             WHERE parent_session_id IS NULL AND (?1 IS NULL OR workspace = ?1)",
         )
         .bind(workspace_filter)
         .fetch_one(&self.pool)
@@ -337,6 +372,18 @@ mod tests {
         // forget 让目录留到进程结束(async 测试里 SessionStore 跨 await 持有路径,dir 必须存活)
         std::mem::forget(dir);
         SessionStore::new(db_path).await.expect("创建存储失败")
+    }
+
+    /// 构造并落库一个挂在指定父下的子会话
+    ///
+    /// `started_at` 可控（连同 `last_active_at` 一并设定），供按创建序排列的断言用。
+    async fn seed_child(store: &SessionStore, parent_id: &str, started_at: f64) -> Session {
+        let mut child = Session::new(None, None, None);
+        child.parent_session_id = Some(parent_id.to_string());
+        child.started_at = started_at;
+        child.last_active_at = started_at;
+        store.create(&child).await.expect("落库子会话失败");
+        child
     }
 
     // ===== 基础 CRUD 测试 =====
@@ -689,6 +736,132 @@ mod tests {
             Some(parent.id.as_str())
         );
         assert_eq!(reloaded.message_count, 5);
+    }
+
+    // ===== 主列表排除子会话 + 按父列举 + child_count 计数 =====
+
+    #[tokio::test]
+    async fn store_list_all_excludes_child_sessions() {
+        // 主列表只返回顶层会话：子会话不占列表行，也不占分页名额
+        let store = temp_store().await;
+        let parent = Session::new(None, Some("父会话".to_string()), None);
+        store.create(&parent).await.unwrap();
+        seed_child(&store, &parent.id, 100.0).await;
+        seed_child(&store, &parent.id, 200.0).await;
+
+        let list = store.list_all(None, 10, 0).await.unwrap();
+        assert_eq!(list.len(), 1, "两个子会话不应出现在主列表");
+        assert_eq!(list[0].id, parent.id);
+        assert!(list[0].parent_session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn store_count_with_filter_excludes_child_sessions() {
+        // 计数与 list_all 同语义（只计主会话），保证分页 total 与列表条数一致
+        let store = temp_store().await;
+        let parent_a = Session::new(None, None, None);
+        let parent_b = Session::new(None, None, None);
+        store.create(&parent_a).await.unwrap();
+        store.create(&parent_b).await.unwrap();
+        seed_child(&store, &parent_a.id, 100.0).await;
+        seed_child(&store, &parent_a.id, 200.0).await;
+        seed_child(&store, &parent_b.id, 300.0).await;
+
+        assert_eq!(store.count_with_filter(None).await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn store_child_count_counts_children_per_row() {
+        // COUNT 子查询按行计数：带子的主会话报实际条数，无子的报 0
+        let store = temp_store().await;
+        let with_children = Session::new(None, Some("带子".to_string()), None);
+        let childless = Session::new(None, Some("无子".to_string()), None);
+        store.create(&with_children).await.unwrap();
+        store.create(&childless).await.unwrap();
+        seed_child(&store, &with_children.id, 100.0).await;
+        seed_child(&store, &with_children.id, 200.0).await;
+
+        let list = store.list_all(None, 10, 0).await.unwrap();
+        let row_with = list
+            .iter()
+            .find(|s| s.title.as_deref() == Some("带子"))
+            .expect("应找到带子的主会话");
+        let row_childless = list
+            .iter()
+            .find(|s| s.title.as_deref() == Some("无子"))
+            .expect("应找到无子的主会话");
+        assert_eq!(row_with.child_count, 2, "两个子会话应计为 2");
+        assert_eq!(row_childless.child_count, 0, "无子会话应计为 0");
+
+        // 单行直读同样携带计数（get 与 list_all 同一列清单）
+        let single = store.get(&with_children.id).await.unwrap().unwrap();
+        assert_eq!(single.child_count, 2);
+
+        // 子会话自身恒为 0（引擎禁止子会话内递归派生）
+        let children = store.list_child_sessions(&with_children.id).await.unwrap();
+        assert!(children.iter().all(|c| c.child_count == 0));
+    }
+
+    #[tokio::test]
+    async fn store_list_child_sessions_orders_by_started_at_asc() {
+        // 按父列举：全量返回该父的子会话，按创建序（started_at 升序）排列
+        let store = temp_store().await;
+        let parent = Session::new(None, None, None);
+        store.create(&parent).await.unwrap();
+        // 落库顺序故意打乱（先 300 再 100 后 200），断言输出按时间升序
+        let third = seed_child(&store, &parent.id, 300.0).await;
+        let first = seed_child(&store, &parent.id, 100.0).await;
+        let second = seed_child(&store, &parent.id, 200.0).await;
+
+        let children = store.list_child_sessions(&parent.id).await.unwrap();
+        assert_eq!(children.len(), 3, "该父的全部子会话全量返回");
+        let ids: Vec<&str> = children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![first.id.as_str(), second.id.as_str(), third.id.as_str()]
+        );
+        assert!(
+            children
+                .iter()
+                .all(|c| c.parent_session_id.as_deref() == Some(parent.id.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn store_list_child_sessions_scoped_to_parent_and_empty_cases() {
+        // 只列目标父的子会话（他父的子不混入）；无子父与不存在的父均返回空列表
+        let store = temp_store().await;
+        let parent_a = Session::new(None, None, None);
+        let parent_b = Session::new(None, None, None);
+        store.create(&parent_a).await.unwrap();
+        store.create(&parent_b).await.unwrap();
+        seed_child(&store, &parent_a.id, 100.0).await;
+        seed_child(&store, &parent_b.id, 200.0).await;
+
+        let children_a = store.list_child_sessions(&parent_a.id).await.unwrap();
+        assert_eq!(children_a.len(), 1);
+        assert_eq!(
+            children_a[0].parent_session_id.as_deref(),
+            Some(parent_a.id.as_str())
+        );
+
+        // 无子父 → 空；不存在的父 → 空（纯查询原语，不校验父存在性）
+        let parent_c = Session::new(None, None, None);
+        store.create(&parent_c).await.unwrap();
+        assert!(
+            store
+                .list_child_sessions(&parent_c.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_child_sessions("nonexistent")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ===== 单字段更新:update_system_prompt =====

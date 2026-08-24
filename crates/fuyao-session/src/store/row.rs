@@ -22,6 +22,8 @@ pub(super) struct SessionRow {
     pub(super) compression_count: i32,
     pub(super) last_compacted_seq: Option<i64>,
     pub(super) parent_session_id: Option<String>,
+    /// 子会话计数（查询 SQL 的 COUNT 子查询产出列，非表内物理列）
+    pub(super) child_count: i64,
     pub(super) workspace: Option<String>,
     pub(super) last_active_at: f64,
 }
@@ -45,6 +47,7 @@ impl From<SessionRow> for Session {
             compression_count: r.compression_count,
             last_compacted_seq: r.last_compacted_seq,
             parent_session_id: r.parent_session_id,
+            child_count: r.child_count,
             workspace: r.workspace,
             last_active_at: r.last_active_at,
         }

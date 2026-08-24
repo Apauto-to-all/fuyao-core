@@ -49,9 +49,12 @@ impl SessionManager {
 
     // ── 会话查询 ───────────────────────────────────────────────
 
-    /// 列举历史会话（分页，按最近活动时间倒序）
+    /// 列举历史会话（分页，按最近活动时间倒序，只含主会话）
     ///
     /// 返回的会话按 `last_active_at` 倒序——用户刚交互的会话排最前。
+    /// 只返回顶层会话（`parent_session_id` 为空）；子会话经
+    /// [`list_child_sessions`](Self::list_child_sessions) 按父列举。`total` 与
+    /// `items` 同语义（只计主会话）。
     ///
     /// # 参数
     /// - `workspace_filter`：传 `Some(path)` 只列该工作目录的会话；`None` 列全部（含无 workspace 的）
@@ -73,6 +76,23 @@ impl SessionManager {
             limit,
             offset,
         })
+    }
+
+    /// 列举主会话下的全部子会话（全量、不分页、按创建序）
+    ///
+    /// 透传 [`SessionStore::list_child_sessions`](fuyao_session::SessionStore::list_child_sessions)：
+    /// 返回该父会话派生的全部子会话（子代理 / 后台任务），按 `started_at` 升序（先派生的
+    /// 排前面）。全量返回、无分页信封——子会话数由单次任务派生的子代理数决定，天然有限。
+    ///
+    /// 行的 `parent_session_id` 恒指向 `parent_id`；父不存在或无子会话时返回空列表。
+    ///
+    /// # 参数
+    /// - `parent_id`：父会话（主会话）id
+    pub async fn list_child_sessions(
+        &self,
+        parent_id: &str,
+    ) -> Result<Vec<fuyao_api::Session>, fuyao_session::SessionError> {
+        self.store.list_child_sessions(parent_id).await
     }
 
     /// 获取单个会话的最新元数据（纯元数据，不含消息）
@@ -277,6 +297,22 @@ mod tests {
         session.id
     }
 
+    /// 创建一个挂在指定父会话下的子会话并落库
+    ///
+    /// `started_at` 可控（连同 `last_active_at` 一并设定），供按创建序排列的断言用。
+    async fn seed_child_session(
+        manager: &SessionManager,
+        parent_id: &str,
+        started_at: f64,
+    ) -> String {
+        let mut session = Session::new(None, None, None);
+        session.parent_session_id = Some(parent_id.to_string());
+        session.started_at = started_at;
+        session.last_active_at = started_at;
+        manager.store.create_with_retry(&mut session).await.unwrap();
+        session.id
+    }
+
     /// 给 session 追加一条 user 消息并落库
     async fn seed_user_message(manager: &SessionManager, session_id: &str, content: &str) {
         let mut msg = Message::user(content.to_string());
@@ -352,6 +388,103 @@ mod tests {
         let p1_ids: Vec<&str> = p1.items.iter().map(|s| s.id.as_str()).collect();
         let p2_ids: Vec<&str> = p2.items.iter().map(|s| s.id.as_str()).collect();
         assert!(p1_ids.iter().all(|id| !p2_ids.contains(id)));
+    }
+
+    // ===== 主列表排除子会话 + 按父列举 + child_count =====
+
+    #[tokio::test]
+    async fn list_sessions_excludes_child_sessions() {
+        // 主列表只含顶层会话：子会话不占列表行，也不占分页 total
+        let manager = temp_manager().await;
+        let main_a = seed_session(&manager, None).await;
+        let main_b = seed_session(&manager, None).await;
+        seed_child_session(&manager, &main_a, 100.0).await;
+        seed_child_session(&manager, &main_a, 200.0).await;
+        seed_child_session(&manager, &main_b, 300.0).await;
+
+        let page = manager.list_sessions(None, 100, 0).await.unwrap();
+        assert_eq!(page.items.len(), 2, "三个子会话不应出现在主列表");
+        assert!(
+            page.items.iter().all(|s| s.parent_session_id.is_none()),
+            "主列表行的 parent_session_id 应全为空"
+        );
+        let ids: Vec<&str> = page.items.iter().map(|s| s.id.as_str()).collect();
+        assert!(ids.contains(&main_a.as_str()));
+        assert!(ids.contains(&main_b.as_str()));
+        assert_eq!(page.total, 2, "total 只计主会话");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_child_count_matches_actual_children() {
+        // 主列表行携带的 child_count 与该主会话实际子会话数一致，无子为 0
+        let manager = temp_manager().await;
+        let with_children = seed_session(&manager, None).await;
+        let childless = seed_session(&manager, None).await;
+        seed_child_session(&manager, &with_children, 100.0).await;
+        seed_child_session(&manager, &with_children, 200.0).await;
+
+        let page = manager.list_sessions(None, 100, 0).await.unwrap();
+        let count_of = |id: &str| {
+            page.items
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("主列表应含 {id}"))
+                .child_count
+        };
+        assert_eq!(count_of(&with_children), 2, "两个子会话应计为 2");
+        assert_eq!(count_of(&childless), 0, "无子会话应计为 0");
+    }
+
+    #[tokio::test]
+    async fn list_child_sessions_returns_all_in_creation_order() {
+        // 按父列举：全量返回该父的子会话，按创建序（started_at 升序）排列
+        let manager = temp_manager().await;
+        let parent = seed_session(&manager, None).await;
+        // 派生顺序故意打乱（先 300 再 100 后 200），断言输出按创建时间升序
+        let third = seed_child_session(&manager, &parent, 300.0).await;
+        let first = seed_child_session(&manager, &parent, 100.0).await;
+        let second = seed_child_session(&manager, &parent, 200.0).await;
+
+        let children = manager.list_child_sessions(&parent).await.unwrap();
+        assert_eq!(children.len(), 3, "该父的全部子会话全量返回，无分页信封");
+        let ids: Vec<&str> = children.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![first.as_str(), second.as_str(), third.as_str()],
+            "按创建序（started_at 升序）排列"
+        );
+        assert!(
+            children
+                .iter()
+                .all(|s| s.parent_session_id.as_deref() == Some(parent.as_str()))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_child_sessions_scoped_to_parent_and_empty_cases() {
+        // 只列目标父的子会话（他父的子不混入）；无子父返回空列表
+        let manager = temp_manager().await;
+        let parent_a = seed_session(&manager, None).await;
+        let parent_b = seed_session(&manager, None).await;
+        seed_child_session(&manager, &parent_a, 100.0).await;
+        seed_child_session(&manager, &parent_b, 200.0).await;
+
+        let children_a = manager.list_child_sessions(&parent_a).await.unwrap();
+        assert_eq!(children_a.len(), 1, "只含 parent_a 的子会话");
+        assert_eq!(
+            children_a[0].parent_session_id.as_deref(),
+            Some(parent_a.as_str())
+        );
+
+        // 无子的父 → 空列表
+        let parent_c = seed_session(&manager, None).await;
+        assert!(
+            manager
+                .list_child_sessions(&parent_c)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // ===== get_session：单会话主键直读 =====
