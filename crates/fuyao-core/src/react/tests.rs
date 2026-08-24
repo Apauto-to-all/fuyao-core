@@ -3030,11 +3030,12 @@ async fn title_skipped_for_non_first_session() {
     );
 }
 
-/// 子 session（is_child=true 且默认 skip_child=true）豁免标题生成
+/// 子 session（is_child=true）与主 session 同权生成标题：首轮注入触发生成，
+/// 落库并发 Title 事件
 #[tokio::test]
-async fn title_skipped_for_child_session() {
+async fn title_generated_for_child_session() {
+    // 标题生成走非流式 chat：TitleProvider 返回固定标题「测试标题」
     let provider: Arc<dyn Provider> = Arc::new(TitleProvider);
-    // harness 只为借它的 session 落库流程；豁免判定在 provider 使用前短路，注册表内容无关紧要
     let h = make_harness(
         Arc::clone(&provider),
         Arc::new(ToolRegistry::builder().build()),
@@ -3063,11 +3064,22 @@ async fn title_skipped_for_child_session() {
     super::title::maybe_spawn_title(&ctx, Some("子会话首问")).await;
     assert!(
         ctx.title_gate.load(std::sync::atomic::Ordering::Relaxed),
-        "豁免判定也应消耗判定门"
+        "子 session 首次判定应消耗判定门"
     );
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(
-        !matches!(rx_event.try_recv(), Ok(OutputEvent::Title(_))),
-        "子 session 默认豁免，不应触发标题生成"
+
+    // 子 session 与主 session 同一条生成路径：等 Title 事件（fire-and-forget task 落库 + 发事件）
+    let title = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(ev) = rx_event.recv().await {
+            if let OutputEvent::Title(m) = ev {
+                return Some(m.payload.title);
+            }
+        }
+        None
+    })
+    .await;
+    assert_eq!(
+        title.expect("2 秒内应收到 Title 事件").as_deref(),
+        Some("测试标题"),
+        "子 session 不应被豁免，应生成标题并发 Title 事件"
     );
 }

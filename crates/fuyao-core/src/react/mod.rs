@@ -116,7 +116,7 @@ pub(crate) struct SessionCtx {
     ///
     /// 创建时定死、整 session 不变（来自 DB session 行的 `parent_session_id`）。
     /// 用途：`resolve_model` 据此过滤子 session 不可见的工具（递归防护）、
-    /// 标题生成与压缩的子 session 豁免判定。
+    /// 压缩的子 session 豁免判定、压缩重建 system_prompt 时按子/主推断 PromptUsage。
     ///
     /// 取代旧的"内存 `session.parent_session_id` 现读"——DB 唯一数据源后，
     /// session 不再常驻内存，此标记提升为 ctx 的不可变字段。
@@ -124,7 +124,7 @@ pub(crate) struct SessionCtx {
     /// 标题生成判定门（每 session 至多开一次）
     ///
     /// 首批 user 消息注入时由 title 模块原子消耗（`swap` 换防），此后所有轮次
-    /// 零成本跳过标题判定——含配置关闭 / 子会话豁免 / 非首轮的情形
+    /// 零成本跳过标题判定——含配置关闭 / 非首轮的情形
     /// （标题配置为进程级静态，首次判定即终局）。恒 false 起步，builder 不暴露 setter。
     pub title_gate: std::sync::atomic::AtomicBool,
 }

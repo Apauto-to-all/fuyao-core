@@ -69,11 +69,6 @@ impl Default for SessionStorageConfig {
 pub struct TitleConfig {
     /// 是否启用自动生成标题
     pub enabled: bool,
-    /// 是否跳过子 session（有 parent_session_id）的标题生成
-    ///
-    /// 子任务 session 用 parent_session_id 表达归属，重命名反而扰乱父/子分组
-    /// 与前端过滤。默认 true：子 session 不自动生成标题。
-    pub skip_child: bool,
     /// 输入截断长度（字符数），用户消息与 AI 回答各截取前 N 字符喂给 LLM
     pub snippet_max_chars: usize,
     /// 标题最大长度（字符数），超长截断并加省略号
@@ -84,7 +79,6 @@ impl Default for TitleConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            skip_child: true,
             snippet_max_chars: 500,
             max_len: 80,
         }
@@ -127,7 +121,6 @@ mod tests {
     fn title_config_defaults() {
         let c = TitleConfig::default();
         assert!(c.enabled);
-        assert!(c.skip_child);
         assert_eq!(c.snippet_max_chars, 500);
         assert_eq!(c.max_len, 80);
     }

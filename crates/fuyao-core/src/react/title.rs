@@ -19,11 +19,9 @@ use std::sync::atomic::Ordering;
 ///
 /// 触发条件（按序短路，全部满足才生成）：
 /// - 本 session 首次经过本函数：[`SessionCtx::title_gate`] 原子换防，之后所有轮次
-///   零成本返回（含配置关闭 / 子会话豁免 / 非首轮的情形——标题配置为进程级静态，
+///   零成本返回（含配置关闭 / 非首轮的情形——标题配置为进程级静态，
 ///   首次判定即终局，无需每轮重评）
 /// - `[session.title] enabled = true`
-/// - 非子 session 或 `[session.title] skip_child = false`：子任务 session 用
-///   `parent_session_id` 表达归属，重命名反而扰乱父/子分组与前端过滤
 /// - DB 中 `role=user` 的普通消息数严格等于 1（首轮判定：计数法比
 ///   `title=="新会话"` 更稳——用户可能改过 title；COUNT 查询不加载消息体）
 /// - 能取到首条 user content（调用方从刚注入的批传入，不回读 DB）
@@ -42,12 +40,6 @@ pub(super) async fn maybe_spawn_title(ctx: &SessionCtx, first_user_content: Opti
 
     let title_cfg = &fuyao_api::get_config().session.title;
     if !title_cfg.enabled {
-        return;
-    }
-
-    // 子 session 跳过（可配置）：parent_session_id 已是归属标记，
-    // 默认 skip_child=true 避免重命名扰乱父/子分组
-    if ctx.is_child && title_cfg.skip_child {
         return;
     }
 
