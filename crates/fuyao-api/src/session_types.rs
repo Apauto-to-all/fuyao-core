@@ -425,8 +425,21 @@ mod tests {
 
     #[test]
     fn session_child_count_deserializes_to_zero_when_absent() {
-        // 缺失 child_count 的 JSON（旧载荷）反序列化时兜底为 0
-        let json = r#"{"id":"abc12345"}"#;
+        // 缺失 child_count 的 JSON（旧载荷）反序列化时兜底为 0；
+        // 载荷须带全其余无默认值的必填字段，缺失时报缺字段而非 child_count 兜底
+        let json = r#"{
+            "id": "abc12345",
+            "message_count": 0,
+            "tool_call_count": 0,
+            "total_prompt_tokens": 0,
+            "total_completion_tokens": 0,
+            "total_reasoning_tokens": 0,
+            "total_cached_tokens": 0,
+            "total_cost": 0.0,
+            "started_at": 1000.0,
+            "compression_count": 0,
+            "last_active_at": 1000.0
+        }"#;
         let session: Session = serde_json::from_str(json).unwrap();
         assert_eq!(session.child_count, 0);
     }
