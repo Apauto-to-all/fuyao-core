@@ -5,18 +5,25 @@
 //! 2. `create_child_session` → `(child_id, rx)`
 //! 3. 发 `ChildSession(Started)` 事件通知前端（携带 child_id 供渲染区开辟）
 //! 4. `send(child_id, UserMessage(prompt))`
-//! 5. 消费 rx：取 `Assistant(finish_reason=stop)` 的 content；中间事件经
-//!    `ctx.capabilities.event_forwarder` 转发到父 session 出站通道（前端实时看子代理进度）
+//! 5. 消费 rx：全部事件经 `ctx.capabilities.event_forwarder` 转发到父 session
+//!    出站通道（前端实时看子代理进度）；`Assistant(finish_reason=stop)` 的
+//!    content 截留为工具返回值，事件本身照常转发
 //! 6. `end_session(child_id)`（一次性子 session，跑完即退）
-//! 7. 发 `ChildSession(Ended)` 事件通知前端关闭渲染区
-//! 8. 返 content 作为工具结果回喂父 ReAct
+//! 7. 排空通道滞留事件继续转发（子 task 收尾产物：Title / 中断终态等）
+//! 8. 发 `ChildSession(Ended)` 事件通知前端关闭渲染区
+//! 9. 返 content 作为工具结果回喂父 ReAct
 //!
-//! 中间事件透传：子 session 的 Chunk / ToolCall / ToolResult / 含 tool_calls 的 Assistant
-//! 经父 session 的 per-session 出站通道进 fan_out（事件 session_id 标的是 child，
-//! 前端按 child_id 过滤渲染到子代理区域）。事件已落 DB，转发失败仅 WARN 不阻断。
+//! 事件全量透传：子 session 的全部事件（Chunk / ToolCall / ToolResult / Assistant /
+//! Title 等，含 finish_reason=stop 的终态）经父 session 的 per-session 出站通道进
+//! fan_out（事件 session_id 标的是 child，前端按 child_id 过滤渲染到子代理区域）。
+//! 终态 Assistant 必须转发：前端子会话运行状态机只认终态事件（非 tool_calls 的
+//! Assistant / Interrupt / Error）回 idle，截留不发会让子会话永久显示运行中。
+//! 事件已落 DB，转发失败仅 WARN 不阻断。
 
 use super::types::{SubagentArgs, validate_subagent_type};
 use std::time::Duration;
+
+use tokio::sync::mpsc;
 
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{UserMessage, UserPayload};
@@ -127,7 +134,8 @@ pub async fn subagent_handler(
         return ToolOutput::error(format!("子代理任务发送失败：{e}"));
     }
 
-    // 7. 消费子事件流：取 finish_reason=stop 的最终回复；中间事件经 event_forwarder 转发
+    // 7. 消费子事件流：全部事件转发进父 session 出站通道；finish_reason=stop 的
+    //    终态 Assistant 同时截留 content 作工具返回值
     let mut final_content = String::new();
     let mut got_final = false;
     let deadline = tokio::time::Instant::now() + SUBAGENT_TIMEOUT;
@@ -139,6 +147,7 @@ pub async fn subagent_handler(
             _ = cancel.cancelled() => {
                 tracing::info!(child_id = %child_id, "子代理被父取消");
                 let _ = ops.end_session(&child_id, "被父取消").await;
+                drain_child_events(&ctx, &child_id, &mut child_rx);
                 emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
                 return ToolOutput::text("⚠️ 子代理被父取消");
             }
@@ -150,6 +159,7 @@ pub async fn subagent_handler(
                     "子代理执行超时"
                 );
                 let _ = ops.end_session(&child_id, "超时").await;
+                drain_child_events(&ctx, &child_id, &mut child_rx);
                 emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
                 return ToolOutput::error(format!(
                     "子代理执行超时（{}s）",
@@ -163,33 +173,32 @@ pub async fn subagent_handler(
                     tracing::warn!(child_id = %child_id, "子 session 退出，rx 返 None");
                     break;
                 };
-                // 只关心 finish_reason=stop 的最终 Assistant——它是工具返回值
-                if let OutputEvent::Assistant(m) = &ev
-                    && m.payload.finish_reason.as_deref() == Some("stop")
-                {
-                    final_content = m.payload.content.clone().unwrap_or_default();
-                    got_final = true;
+                // 终态 Assistant（finish_reason=stop）：content 截留为工具返回值
+                let is_final = match &ev {
+                    OutputEvent::Assistant(m)
+                        if m.payload.finish_reason.as_deref() == Some("stop") =>
+                    {
+                        final_content = m.payload.content.clone().unwrap_or_default();
+                        got_final = true;
+                        true
+                    }
+                    _ => false,
+                };
+                // 终态与其余事件（Chunk / ToolCall / ToolResult / 含 tool_calls 的
+                // Assistant / Title 等）一律转发——终态 Assistant 是前端子会话运行
+                // 状态回 idle 的唯一正常信号
+                forward_child_event(&ctx, &child_id, ev);
+                if is_final {
                     break;
                 }
-                // 其他事件（Chunk / ToolCall / ToolResult / 含 tool_calls 的 Assistant）：
-                // 经父 session 出站通道转发到 fan_out，前端按 child_id 实时渲染子代理进度。
-                // 事件 session_id 已是 child，不能被父 emitter 覆盖，所以直送 raw sender。
-                if let Some(tx) = &ctx.capabilities.event_forwarder
-                    && tx.send(ev).is_err()
-                {
-                    tracing::warn!(
-                        child_id = %child_id,
-                        "event_forwarder 已关闭，子代理中间事件丢弃"
-                    );
-                    // 不 break——继续消费 rx，最终回复可能仍在路上
-                }
-                // 无 event_forwarder：静默丢弃（DB 已落库，前端可按 child_id 查历史）
             }
         }
     }
 
-    // 8. end_session（一次性子 session）
+    // 8. end_session（一次性子 session）——task 退出后通道里滞留的收尾产物
+    //    （Title 等）非阻塞排空转发，之后丢弃接收端
     let _ = ops.end_session(&child_id, "子代理完成").await;
+    drain_child_events(&ctx, &child_id, &mut child_rx);
     emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
     tracing::info!(child_id = %child_id, got_final, "子代理结束");
 
@@ -241,9 +250,194 @@ fn emit_child_session_event(
     }
 }
 
+/// 转发一条子事件到父 session 出站通道
+///
+/// 事件 session_id 已是 child，不能被父 emitter 覆盖，所以直送 raw sender。
+/// 无 event_forwarder（未注入）时静默丢弃（事件已落 DB，前端可按 child_id 查
+/// 历史）；转发失败（通道关闭）仅 WARN，不阻碍后续事件消费。
+fn forward_child_event(ctx: &ToolCallContext, child_id: &str, ev: OutputEvent) {
+    if let Some(tx) = &ctx.capabilities.event_forwarder
+        && tx.send(ev).is_err()
+    {
+        tracing::warn!(child_id, "event_forwarder 已关闭，子代理事件丢弃");
+    }
+}
+
+/// 非阻塞排空子事件通道的滞留事件并逐条转发
+///
+/// `end_session` 返回时子 task 已退出，其收尾产物（中断式终态、Title 等）仍滞留
+/// 通道缓冲——逐条转发后再丢弃接收端，保证转发的子事件流有始有终。用 try_recv
+/// 非阻塞排空：标题生成等旁路 task 仍持 sender 克隆，通道不会关闭，await 式
+/// 排空会挂住。
+fn drain_child_events(
+    ctx: &ToolCallContext,
+    child_id: &str,
+    rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+) {
+    while let Ok(ev) = rx.try_recv() {
+        forward_child_event(ctx, child_id, ev);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex, Weak};
+
+    use fuyao_api::message::output::{
+        AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, InterruptMessage,
+        InterruptPayload, TitleMessage, TitlePayload,
+    };
+    use fuyao_api::{InterruptSource, SubagentOps};
+
+    // ── 测试辅助 ─────────────────────────────────────────────
+
+    /// 伪造 SubagentOps：`create_child_session` 交出预灌好事件的 rx，send / end 恒成功
+    #[allow(clippy::type_complexity)]
+    struct FakeSubagentOps {
+        /// 预构造的子事件通道接收端（create_child_session 交出）
+        child_rx: Mutex<Option<mpsc::UnboundedReceiver<OutputEvent>>>,
+    }
+
+    impl SubagentOps for FakeSubagentOps {
+        fn create_child_session<'a>(
+            &'a self,
+            _parent_session_id: &'a str,
+            _source: ChildSessionSource,
+            _child_agent_config: AgentConfig,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(String, mpsc::UnboundedReceiver<OutputEvent>), String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let rx = self.child_rx.lock().unwrap().take();
+            Box::pin(async move {
+                rx.map(|rx| ("child-1".to_string(), rx))
+                    .ok_or_else(|| "测试 rx 未预置".to_string())
+            })
+        }
+
+        fn send<'a>(
+            &'a self,
+            _id: &'a str,
+            _event: InputEvent,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn end_session<'a>(
+            &'a self,
+            _id: &'a str,
+            _end_reason: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// 构造带伪造 SubagentOps 与 event_forwarder 的工具上下文
+    ///
+    /// 返回的 `Arc` 是弱引用的强句柄持有方（生产环境由引擎承担）——测试须持有到
+    /// handler 调用结束，否则 Weak upgrade 失败走「引擎已关闭」分支。
+    fn fake_ops_ctx(
+        child_rx: mpsc::UnboundedReceiver<OutputEvent>,
+        fwd_tx: mpsc::UnboundedSender<OutputEvent>,
+    ) -> (Arc<dyn SubagentOps>, ToolCallContext) {
+        let ops: Arc<dyn SubagentOps> = Arc::new(FakeSubagentOps {
+            child_rx: Mutex::new(Some(child_rx)),
+        });
+        let weak: Weak<dyn SubagentOps> = Arc::downgrade(&ops);
+        (
+            ops,
+            ToolCallContext {
+                session_id: Some("parent-1".into()),
+                capabilities: fuyao_api::ToolCapabilities {
+                    subagent_ops: Some(weak),
+                    event_forwarder: Some(fwd_tx),
+                    todo_store: None,
+                },
+                ..ToolCallContext::default()
+            },
+        )
+    }
+
+    /// 逐条收空转发通道，把事件折叠为种类标签序列
+    fn collect_forwarded_kinds(rx: &mut mpsc::UnboundedReceiver<OutputEvent>) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(match ev {
+                OutputEvent::Chunk(_) => "chunk",
+                OutputEvent::Assistant(_) => "assistant",
+                OutputEvent::Title(_) => "title",
+                OutputEvent::Interrupt(_) => "interrupt",
+                OutputEvent::ChildSession(m) => match m.payload.state {
+                    ChildSessionState::Started => "child-started",
+                    ChildSessionState::Ended => "child-ended",
+                },
+                _ => "other",
+            });
+        }
+        kinds
+    }
+
+    /// 中间流式片段事件
+    fn chunk_event(content: &str) -> OutputEvent {
+        OutputEvent::Chunk(ChunkMessage {
+            base: EventBase::default(),
+            payload: ChunkPayload {
+                content: Some(content.to_string()),
+                reasoning: None,
+            },
+        })
+    }
+
+    /// 终态助手事件（finish_reason=stop）
+    fn final_assistant_event(content: &str) -> OutputEvent {
+        OutputEvent::Assistant(AssistantMessage {
+            base: EventBase::default(),
+            payload: AssistantPayload {
+                content: Some(content.to_string()),
+                reasoning: None,
+                tool_calls: None,
+                finish_reason: Some("stop".to_string()),
+                completion_tokens: 0,
+                prompt_tokens: 0,
+                total_tokens: 0,
+                reasoning_tokens: 0,
+                cached_tokens: 0,
+            },
+        })
+    }
+
+    /// 标题更新事件（fire-and-forget 旁路产物，常滞留在通道缓冲）
+    fn title_event(title: &str) -> OutputEvent {
+        OutputEvent::Title(TitleMessage {
+            base: EventBase::default(),
+            payload: TitlePayload {
+                title: title.to_string(),
+            },
+        })
+    }
+
+    /// 中断终态事件（子 session 收尾落库前发出）
+    fn interrupt_event() -> OutputEvent {
+        OutputEvent::Interrupt(InterruptMessage {
+            base: EventBase::default(),
+            payload: InterruptPayload::new("被父取消", InterruptSource::User),
+        })
+    }
+
+    /// 合法子代理调用参数
+    fn valid_args() -> serde_json::Value {
+        serde_json::json!({
+            "subagent_type": "explore",
+            "description": "测试",
+            "prompt": "做某事"
+        })
+    }
 
     #[tokio::test]
     async fn returns_error_when_subagent_type_missing() {
@@ -318,5 +512,58 @@ mod tests {
             result.contains("explore") && result.contains("executor"),
             "错误信息应含可用列表，实际：{result}"
         );
+    }
+
+    #[tokio::test]
+    async fn forwards_final_assistant_and_drains_residual_events() {
+        // 预灌子事件流：中间 Chunk → 终态 Assistant → 滞留通道的 Title
+        // （unbounded 通道缓冲，handler 后续逐条消费）
+        let (child_tx, child_rx) = mpsc::unbounded_channel();
+        child_tx.send(chunk_event("部分输出")).unwrap();
+        child_tx.send(final_assistant_event("探索完成")).unwrap();
+        child_tx.send(title_event("探索任务")).unwrap();
+        drop(child_tx);
+
+        let (fwd_tx, mut fwd_rx) = mpsc::unbounded_channel();
+        let (_ops_guard, ctx) = fake_ops_ctx(child_rx, fwd_tx);
+
+        let out = subagent_handler(valid_args(), ctx, CancellationToken::new()).await;
+
+        // 工具返回值是终态 Assistant 的 content 原文
+        assert_eq!(out.to_wire(), "探索完成");
+        // 转发流有始有终：Started 夹住生命周期，中间事件、终态 Assistant、
+        // 滞留 Title 依次到达，Ended 收尾
+        let kinds = collect_forwarded_kinds(&mut fwd_rx);
+        assert_eq!(
+            kinds,
+            vec![
+                "child-started",
+                "chunk",
+                "assistant",
+                "title",
+                "child-ended"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_path_drains_residual_interrupt() {
+        // 滞留通道的中断终态（end_session 后仍在缓冲）
+        let (child_tx, child_rx) = mpsc::unbounded_channel();
+        child_tx.send(interrupt_event()).unwrap();
+        drop(child_tx);
+
+        let (fwd_tx, mut fwd_rx) = mpsc::unbounded_channel();
+        let (_ops_guard, ctx) = fake_ops_ctx(child_rx, fwd_tx);
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let out = subagent_handler(valid_args(), ctx, cancel).await;
+
+        assert_eq!(out.to_wire(), "⚠️ 子代理被父取消");
+        // 滞留的 Interrupt 终态经排空转发（前端子会话运行态据此回 idle）
+        let kinds = collect_forwarded_kinds(&mut fwd_rx);
+        assert_eq!(kinds, vec!["child-started", "interrupt", "child-ended"]);
     }
 }
