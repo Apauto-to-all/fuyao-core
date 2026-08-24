@@ -1,11 +1,11 @@
 //! todos 表 CRUD
 //!
 //! 任务列表（todo）的全部操作归此：读取（按 sort_order 排序）、整体覆盖写入、
-//! 按 session_id 删除全部（会话删除时级联清理）。
+//! 按会话组删除全部（会话删除时级联清理）。
 //!
 //! todos 表按 session_id 软关联会话——`session_id` 仅作字符串过滤键，不加外键约束，
 //! 数据隔离靠查询过滤。会话删除时由 [`super::SessionStore::delete`] 在同一事务内
-//! 显式删 todos 行，保证无残留。
+//! 显式删组内（本会话 + 其全部子会话）的 todos 行，保证无残留。
 
 use crate::error::SessionError;
 use fuyao_api::{TodoItem, TodoStoreOps};
@@ -75,18 +75,22 @@ impl super::SessionStore {
         self.read_todos(session_id).await
     }
 
-    /// 删除指定 session 的全部任务（会话删除级联清理用）
+    /// 删除指定会话组的全部任务（会话删除级联清理用）
     ///
+    /// 清理范围为「根会话 + 其全部子会话」的会话组——组内每个会话的 todos 一并删除。
     /// 不对外暴露为查询能力，仅供 [`delete`](super::SessionStore::delete) 在事务内调用，
     /// 保证删会话时任务列表无残留。
     pub(super) async fn delete_todos_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,
     ) -> Result<(), SessionError> {
-        sqlx::query("DELETE FROM todos WHERE session_id = ?1")
-            .bind(session_id)
-            .execute(&mut **tx)
-            .await?;
+        sqlx::query(
+            "DELETE FROM todos WHERE session_id IN
+             (SELECT id FROM sessions WHERE id = ?1 OR parent_session_id = ?1)",
+        )
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await?;
         Ok(())
     }
 }

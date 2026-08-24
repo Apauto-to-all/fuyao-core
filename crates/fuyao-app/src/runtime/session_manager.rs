@@ -137,14 +137,14 @@ impl SessionManager {
 
     // ── 会话删除 ───────────────────────────────────────────────
 
-    /// 删除会话（cascade 删消息 + 任务列表 + 会话行）
+    /// 删除会话（cascade 删该会话及其全部子会话，含各自的消息 + 任务列表）
     ///
     /// 透传 [`SessionStore::delete`](fuyao_session::SessionStore::delete)：单事务内删
     /// todos + messages + sessions，三者要么全删要么全留。
     ///
     /// # 返回
     /// - `Ok(true)`：会话存在，删除成功
-    /// - `Ok(false)`：会话不存在（无 session 行被删，但该 id 的残留 todos / messages 仍被清理）
+    /// - `Ok(false)`：会话不存在（无 session 行被删，但该 id 组内的子会话与残留 todos / messages 仍被清理）
     pub async fn delete_session(
         &self,
         session_id: &str,
@@ -764,6 +764,122 @@ mod tests {
         assert!(
             manager.store.read_todos(&sid).await.unwrap().is_empty(),
             "删会话后任务列表应清空"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_cascades_children_with_messages_and_todos() {
+        // 删除主会话按会话组整体清理：子会话行、各子会话的消息与 todos 全部无残留
+        let manager = temp_manager().await;
+        let parent = seed_session(&manager, None).await;
+        let child_a = seed_child_session(&manager, &parent, 100.0).await;
+        let child_b = seed_child_session(&manager, &parent, 200.0).await;
+
+        // 主会话与两个子会话各有消息 + 任务
+        seed_user_message(&manager, &parent, "主会话消息").await;
+        for sid in [&child_a, &child_b] {
+            seed_user_message(&manager, sid, "子会话消息").await;
+            manager
+                .store
+                .write_todos(
+                    sid,
+                    vec![fuyao_api::TodoItem {
+                        id: "1".to_string(),
+                        content: "子会话任务".to_string(),
+                        status: "pending".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            manager.list_child_sessions(&parent).await.unwrap().len(),
+            2,
+            "删除前按父列举有 2 个子会话"
+        );
+
+        assert!(manager.delete_session(&parent).await.unwrap());
+
+        // 子会话行无残留
+        assert!(
+            manager.get_session(&child_a).await.unwrap().is_none(),
+            "子会话行无残留"
+        );
+        assert!(
+            manager.get_session(&child_b).await.unwrap().is_none(),
+            "子会话行无残留"
+        );
+        // 按父列举该主会话返回空
+        assert!(
+            manager
+                .list_child_sessions(&parent)
+                .await
+                .unwrap()
+                .is_empty(),
+            "删除后按父列举返回空"
+        );
+        // 各子会话的消息与 todos 全部无残留
+        assert!(
+            manager
+                .list_messages(&child_a, None, Some(10))
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "子会话消息无残留"
+        );
+        assert!(
+            manager
+                .list_messages(&child_b, None, Some(10))
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "子会话消息无残留"
+        );
+        assert!(
+            manager.store.read_todos(&child_a).await.unwrap().is_empty(),
+            "子会话任务无残留"
+        );
+        assert!(
+            manager.store.read_todos(&child_b).await.unwrap().is_empty(),
+            "子会话任务无残留"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_session_scopes_cascade_to_own_children() {
+        // 组删除不越界：他父的子会话及其消息原样保留
+        let manager = temp_manager().await;
+        let victim = seed_session(&manager, None).await;
+        let bystander = seed_session(&manager, None).await;
+        seed_child_session(&manager, &victim, 100.0).await;
+        let other_child = seed_child_session(&manager, &bystander, 200.0).await;
+        seed_user_message(&manager, &other_child, "他组消息").await;
+
+        assert!(manager.delete_session(&victim).await.unwrap());
+
+        // 被删主会话按父列举为空；他父的子会话原样保留
+        assert!(
+            manager
+                .list_child_sessions(&victim)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            manager.list_child_sessions(&bystander).await.unwrap().len() == 1,
+            "他父的子会话不受波及"
+        );
+        assert_eq!(
+            manager
+                .list_messages(&other_child, None, Some(10))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1,
+            "他父子会话的消息原样保留"
         );
     }
 

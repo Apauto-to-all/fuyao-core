@@ -135,28 +135,41 @@ impl super::SessionStore {
         Ok(row.map(Session::from))
     }
 
-    /// 删除会话(cascade 删该会话的全部消息 + 任务列表 + session 行)
+    /// 删除会话（cascade 删该会话及其全部子会话 + 各自的消息 + 任务列表）
     ///
-    /// 单事务内删 todos + messages + sessions，三者要么全删要么全留——避免出现
-    /// 「消息删了、session 行还在」或「session 删了、任务列表孤儿」的不一致窗口。
-    /// 返回 `true` = 删到了 session 行；`false` = session 不存在（此时 todos /
-    /// messages 即便有残留也会被一并清掉）。
+    /// 删除范围是「本会话 + 其全部子会话」的会话组：单事务内删 todos + messages +
+    /// sessions，组内每个会话的数据要么全删要么全留——避免出现「消息删了、session
+    /// 行还在」或「session 删了、任务列表孤儿」的不一致窗口，也不留孤儿子会话。
+    /// 返回 `true` = 删到了主会话行；`false` = 主会话不存在（此时组内的子会话与
+    /// todos / messages 即便有残留也会被一并清掉）。
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
         let mut tx = self.pool.begin().await?;
 
-        // 先清任务列表 + 消息（删 session 行前清，避免 session 行不存在时仍残留）
+        // 主会话行是否存在的判定独立于 DELETE 的 rows_affected——组删除会把
+        // 子会话行也计入受影响行数，无法单独反映主行是否删到，故以显式 EXISTS 为准
+        let main_row_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)")
+                .bind(session_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        // 先清任务列表 + 消息，再删 session 行：组内会话的 id 集合经子查询取自
+        // sessions 表，行仍在时子查询才取得到；session 行不存在时组内残留同样被清
         Self::delete_todos_in_tx(&mut tx, session_id).await?;
-        sqlx::query("DELETE FROM messages WHERE session_id = ?1")
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await?;
-        let result = sqlx::query("DELETE FROM sessions WHERE id = ?1")
+        sqlx::query(
+            "DELETE FROM messages WHERE session_id IN
+             (SELECT id FROM sessions WHERE id = ?1 OR parent_session_id = ?1)",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM sessions WHERE id = ?1 OR parent_session_id = ?1")
             .bind(session_id)
             .execute(&mut *tx)
             .await?;
 
         tx.commit().await?;
-        Ok(result.rows_affected() > 0)
+        Ok(main_row_exists)
     }
 
     /// 列出主会话(不含消息,分页,按最近活动时间倒序)
@@ -456,6 +469,170 @@ mod tests {
         );
         // messages 表该 session 的行也清空（count 全量查）
         assert_eq!(store.count_with_filter(None).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn store_delete_cascades_children_sessions_messages_and_todos() {
+        // delete 按会话组整体清理：主会话行 + 全部子会话行 + 组内每个会话的消息与
+        // todos 同事务一并删除，不留孤儿子会话
+        let store = temp_store().await;
+        let parent = Session::new(None, None, None);
+        store.create(&parent).await.unwrap();
+        let child_a = seed_child(&store, &parent.id, 100.0).await;
+        let child_b = seed_child(&store, &parent.id, 200.0).await;
+
+        // 组内三个会话各有消息 + 任务
+        for sid in [&parent.id, &child_a.id, &child_b.id] {
+            let mut msg = fuyao_api::Message::user("对话".to_string());
+            store.insert_message(sid, &mut msg).await.unwrap();
+            store
+                .write_todos(
+                    sid,
+                    vec![fuyao_api::TodoItem {
+                        id: "1".to_string(),
+                        content: "任务".to_string(),
+                        status: "pending".to_string(),
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+
+        // 隔离锚点：他父的子会话不属于本组，删除不得波及
+        let other_parent = Session::new(None, None, None);
+        store.create(&other_parent).await.unwrap();
+        let other_child = seed_child(&store, &other_parent.id, 300.0).await;
+        let mut msg = fuyao_api::Message::user("他组对话".to_string());
+        store
+            .insert_message(&other_child.id, &mut msg)
+            .await
+            .unwrap();
+        store
+            .write_todos(
+                &other_child.id,
+                vec![fuyao_api::TodoItem {
+                    id: "1".to_string(),
+                    content: "他组任务".to_string(),
+                    status: "pending".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let deleted = store.delete(&parent.id).await.unwrap();
+        assert!(deleted);
+
+        // 主会话与全部子会话行无残留
+        assert!(store.get(&parent.id).await.unwrap().is_none());
+        assert!(
+            store.get(&child_a.id).await.unwrap().is_none(),
+            "子会话行应随组删除，无孤儿"
+        );
+        assert!(
+            store.get(&child_b.id).await.unwrap().is_none(),
+            "子会话行应随组删除，无孤儿"
+        );
+        assert!(
+            store
+                .list_child_sessions(&parent.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "删除后按父列举返回空"
+        );
+        // 组内每个会话的消息与 todos 无残留
+        assert!(
+            store
+                .load_full_history(&parent.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "主会话消息无残留"
+        );
+        assert!(
+            store
+                .load_full_history(&child_a.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "子会话消息无残留"
+        );
+        assert!(
+            store
+                .load_full_history(&child_b.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "子会话消息无残留"
+        );
+        assert!(
+            store.read_todos(&parent.id).await.unwrap().is_empty(),
+            "主会话任务无残留"
+        );
+        assert!(
+            store.read_todos(&child_a.id).await.unwrap().is_empty(),
+            "子会话任务无残留"
+        );
+        assert!(
+            store.read_todos(&child_b.id).await.unwrap().is_empty(),
+            "子会话任务无残留"
+        );
+
+        // 他父的子会话原样保留（组删除不越界）
+        assert!(
+            store.get(&other_child.id).await.unwrap().is_some(),
+            "他父的子会话不应被波及"
+        );
+        assert_eq!(
+            store
+                .load_full_history(&other_child.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "他父子会话的消息原样保留"
+        );
+        assert_eq!(
+            store.read_todos(&other_child.id).await.unwrap().len(),
+            1,
+            "他父子会话的任务原样保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_delete_missing_parent_returns_false_but_cleans_children() {
+        // 主会话行不存在时返回 false，但指向该 id 的子会话行及其数据仍按组清理——
+        // 返回值只反映主行是否删到，组清理无条件执行
+        let store = temp_store().await;
+        let child = seed_child(&store, "no-such-parent", 100.0).await;
+        let mut msg = fuyao_api::Message::user("孤儿对话".to_string());
+        store.insert_message(&child.id, &mut msg).await.unwrap();
+        store
+            .write_todos(
+                &child.id,
+                vec![fuyao_api::TodoItem {
+                    id: "1".to_string(),
+                    content: "孤儿任务".to_string(),
+                    status: "pending".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let deleted = store.delete("no-such-parent").await.unwrap();
+        assert!(!deleted, "主会话行不存在应返回 false");
+        assert!(
+            store.get(&child.id).await.unwrap().is_none(),
+            "指向该 id 的子会话行仍被组清理删除"
+        );
+        assert!(
+            store.load_full_history(&child.id).await.unwrap().is_empty(),
+            "孤儿子会话的消息无残留"
+        );
+        assert!(
+            store.read_todos(&child.id).await.unwrap().is_empty(),
+            "孤儿子会话的任务无残留"
+        );
     }
 
     #[tokio::test]
