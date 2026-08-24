@@ -123,30 +123,35 @@ pub fn check_command_safety(command: &str) -> SecurityCheckResult {
 
 // =========== 工作目录校验 ===========
 
-/// 允许出现在路径中的字符（白名单）
-static WORKDIR_SAFE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9/\\:_\-.~ +@=,]+$").unwrap());
+/// 不允许出现在工作目录路径中的字符（黑名单）
+///
+/// 工作目录通过 `Command::current_dir()` 传递给 OS，不经过 shell 解析，
+/// 因此 Unicode 字符（如中文目录名）和大部分 shell 元字符在路径中合法。
+/// 此处只拦截 OS 层面会导致路径截断或异常的控制字符。
+static WORKDIR_BLOCKED_CHARS: &[char] = &[
+    '\n', // 换行（路径截断）
+    '\r', // 回车（路径截断）
+    '\0', // null 字节（字符串终结符）
+];
 
 /// 校验工作目录路径安全性
 ///
-/// 使用白名单机制，只允许合法的路径字符。
+/// 使用黑名单机制，只拦截 OS 层面会导致路径截断的控制字符（\0 \n \r）。
+/// Unicode 字符（如中文目录名）和 shell 元字符（; | & $ `等）在路径中合法，
+/// 因为工作目录通过 `Command::current_dir()` 传递，不经过 shell 解析。
 /// 返回 `None` 表示安全，`Some(reason)` 表示错误原因。
 pub fn validate_workdir(workdir: &str) -> Option<String> {
     if workdir.is_empty() {
         return None;
     }
 
-    if !WORKDIR_SAFE_RE.is_match(workdir) {
-        // 找到不允许的字符
-        for ch in workdir.chars() {
-            let s = ch.to_string();
-            if !WORKDIR_SAFE_RE.is_match(&s) {
-                return Some(format!(
-                    "工作目录包含不允许的字符 {ch:?}。请使用不含 shell 元字符的简单文件路径。"
-                ));
-            }
+    // 检查是否包含控制字符
+    for ch in workdir.chars() {
+        if WORKDIR_BLOCKED_CHARS.contains(&ch) {
+            return Some(format!(
+                "工作目录包含非法控制字符 {ch:?}，请使用不含控制字符的路径。"
+            ));
         }
-        return Some("工作目录包含不允许的字符。".to_string());
     }
 
     None
@@ -265,9 +270,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_workdir_chinese_path() {
+        // 中文目录名是合法的 Unicode 路径，不应被拦截
+        assert!(validate_workdir("/home/用户/项目目录").is_none());
+        assert!(validate_workdir(r"C:\用户\测试目录\项目").is_none());
+        assert!(validate_workdir("/home/鱼饵/workspace").is_none());
+    }
+
+    #[test]
+    fn validate_workdir_unicode_path() {
+        // 其他 Unicode 字符（日文、韩文等）也应通过
+        assert!(validate_workdir("/home/ユーザー/プロジェクト").is_none());
+        assert!(validate_workdir("/home/프로젝트").is_none());
+    }
+
+    #[test]
     fn validate_workdir_shell_metachar() {
-        let result = validate_workdir("/tmp; rm -rf /");
-        assert!(result.is_some());
+        // shell 元字符在路径中合法（不经过 shell 解析），不应被拦截
+        assert!(validate_workdir("/tmp; rm -rf /").is_none());
+        assert!(validate_workdir("/tmp & echo hi").is_none());
+        assert!(validate_workdir("/tmp | cat").is_none());
+        assert!(validate_workdir("/tmp$(whoami)").is_none());
+        assert!(validate_workdir("/tmp`whoami`").is_none());
+        assert!(validate_workdir("/tmp*").is_none());
+        assert!(validate_workdir("/tmp?foo").is_none());
+        assert!(validate_workdir("/tmp!bar").is_none());
+        assert!(validate_workdir("/tmp#baz").is_none());
+    }
+
+    #[test]
+    fn validate_workdir_control_chars() {
+        // 控制字符应被拦截
+        assert!(validate_workdir("/tmp\nfoo").is_some());
+        assert!(validate_workdir("/tmp\rfoo").is_some());
+        // null 字节在 Rust 字符串中虽可构造，但理应拦截
+        assert!(validate_workdir("/tmp\0foo").is_some());
     }
 
     #[test]
