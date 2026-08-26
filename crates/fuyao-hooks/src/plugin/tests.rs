@@ -3,7 +3,7 @@
 //! 覆盖：
 //! - PluginHost（create_instances / dispose_all / validate_unique_names / list / panic 防护）
 //! - PluginInstance trait register 行为（含 sender 接收）
-//! - SessionSender 两通道分流 + 身份绑定
+//! - SessionSender 三通道分流 + 身份绑定
 //! - simple_plugin 快捷构造（钩子真实生效 / name / 每 session 独立调用闭包）
 
 use super::factory::Plugin;
@@ -121,7 +121,8 @@ fn instance_register_called_when_invoked() {
     let mut hooks = HooksRegistry::new();
     let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let sender = SessionSender::new("only", tx_user, tx_interrupt);
+    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
+    let sender = SessionSender::new("only", "test-session", tx_user, tx_interrupt, tx_event);
     for (_, instance) in &instances {
         instance.register(&mut hooks, &sender);
     }
@@ -371,7 +372,14 @@ fn make_sender() -> (
 ) {
     let (tx_user, rx_user) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let sender = SessionSender::new("test_plugin", tx_user, tx_interrupt);
+    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
+    let sender = SessionSender::new(
+        "test_plugin",
+        "test-session",
+        tx_user,
+        tx_interrupt,
+        tx_event,
+    );
     (sender, rx_user, rx_interrupt)
 }
 
@@ -463,7 +471,8 @@ fn make_chunk() -> OutputEvent {
 fn make_sender_named(name: &str) -> SessionSender {
     let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-    SessionSender::new(name, tx_user, tx_interrupt)
+    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
+    SessionSender::new(name, "test-session", tx_user, tx_interrupt, tx_event)
 }
 
 /// simple_plugin：name 正确，注册的观察钩子真实生效

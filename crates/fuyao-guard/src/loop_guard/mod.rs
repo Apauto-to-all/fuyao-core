@@ -119,7 +119,15 @@ mod tests {
         let mut hooks = HooksRegistry::new();
         let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
         let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-        let sender = SessionSender::new("loop_guard", tx_user, tx_interrupt);
+        let (tx_event, _rx_event) =
+            tokio::sync::mpsc::unbounded_channel::<fuyao_api::message::OutputEvent>();
+        let sender = SessionSender::new(
+            "loop_guard",
+            "test-session",
+            tx_user,
+            tx_interrupt,
+            tx_event,
+        );
         // register 不 panic 即说明两个钩子注册成功 + sender 保存成功
         instance.register(&mut hooks, &sender);
     }

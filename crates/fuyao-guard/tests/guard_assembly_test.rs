@@ -32,7 +32,14 @@ fn assembled_guard() -> SharedHooks {
     // 构造 SessionSender（dummy 通道，测试不验证投递侧）
     let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
     let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
-    let sender = SessionSender::new("loop_guard", tx_user, tx_interrupt);
+    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
+    let sender = SessionSender::new(
+        "loop_guard",
+        "test-session",
+        tx_user,
+        tx_interrupt,
+        tx_event,
+    );
     instance.register(&mut registry, &sender);
 
     registry.finalize();
@@ -67,7 +74,14 @@ fn plugin_registers_hooks() {
     let instance = plugin.create_instance();
     let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
     let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
-    let sender = SessionSender::new("loop_guard", tx_user, tx_interrupt);
+    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
+    let sender = SessionSender::new(
+        "loop_guard",
+        "test-session",
+        tx_user,
+        tx_interrupt,
+        tx_event,
+    );
     instance.register(&mut registry, &sender);
     // register 完成（不 panic）即说明钩子注册 + sender 保存成功
 }

@@ -14,11 +14,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use fuyao_api::message::EventBase;
 use fuyao_api::message::output::{
     ChunkMessage, ChunkPayload, InterruptMessage as OutputInterruptMessage, ToolCallMessage,
     ToolCallPayload, ToolResultMessage, ToolResultPayload, UserMessage as OutputUserMessage,
 };
+use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::{HooksRegistry, NamedPluginInstance, Plugin, PluginInstance, SessionSender};
 
 // ============================================================================
@@ -229,9 +229,17 @@ pub fn assemble(
     tx_interrupt: tokio::sync::mpsc::Sender<OutputInterruptMessage>,
 ) -> fuyao_hooks::SharedHooks {
     let mut registry = HooksRegistry::new();
+    // notice 出站通道：装配测试不验证直送侧，接收端丢弃
+    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
     for (name, instance) in &instances {
         // 每个实例拿到绑定自己插件名的 sender（注入消息 source 可追溯）
-        let sender = SessionSender::new(name.clone(), tx_user.clone(), tx_interrupt.clone());
+        let sender = SessionSender::new(
+            name.clone(),
+            "test-session",
+            tx_user.clone(),
+            tx_interrupt.clone(),
+            tx_event.clone(),
+        );
         // register panic 防护（同步）——复刻 fuyao-core 的 catch_unwind，单插件崩溃不阻塞
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             instance.register(&mut registry, &sender)

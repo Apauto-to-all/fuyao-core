@@ -474,6 +474,7 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Assistant(m) => m.base.session_id.as_deref(),
         OutputEvent::Interrupt(m) => m.base.session_id.as_deref(),
         OutputEvent::Error(m) => m.base.session_id.as_deref(),
+        OutputEvent::PluginNotice(m) => m.base.session_id.as_deref(),
         OutputEvent::Compression(m) => m.base.session_id.as_deref(),
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),

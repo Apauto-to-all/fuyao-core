@@ -274,7 +274,7 @@ mod tests {
         state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 构造 SessionSender + 两条通道接收端（user / interrupt）
+    /// 构造 SessionSender + 两条通道接收端（user / interrupt；notice 出站接收端丢弃）
     ///
     /// 测试辅助：插件名统一为 `loop_guard`，通道容量 16。
     /// 测试按需解构对应 rx 验证消息流向。
@@ -285,7 +285,14 @@ mod tests {
     ) {
         let (tx_interrupt, rx_interrupt) = mpsc::channel(16);
         let (tx_user, rx_user) = mpsc::channel(16);
-        let sender = SessionSender::new("loop_guard", tx_user, tx_interrupt);
+        let (tx_event, _rx_event) = mpsc::unbounded_channel::<fuyao_api::message::OutputEvent>();
+        let sender = SessionSender::new(
+            "loop_guard",
+            "test-session",
+            tx_user,
+            tx_interrupt,
+            tx_event,
+        );
         (sender, rx_interrupt, rx_user)
     }
 

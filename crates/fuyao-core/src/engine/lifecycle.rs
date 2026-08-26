@@ -415,8 +415,12 @@ impl Engine {
 
         // 装配该 session 的 hooks（per-session：create_instances + register + finalize）
         // 实例集合随 hooks 一起产出，存进 SessionHandle 供 session 结束时逆序 dispose
-        let (hooks, plugin_instances) =
-            self.assemble_session_hooks(&session_id, tx_plugin_user.clone(), tx_interrupt.clone());
+        let (hooks, plugin_instances) = self.assemble_session_hooks(
+            &session_id,
+            tx_plugin_user.clone(),
+            tx_interrupt.clone(),
+            tx_event.clone(),
+        );
 
         // 装配 SessionCtx（会话级共享依赖的 owned 视图）+ SessionRx（入站通道集合）。
         // SessionCtx 统一经 builder 构造（与测试共用唯一构造点）：必填字段位置参数钉死，
@@ -483,6 +487,7 @@ impl Engine {
         session_id: &SessionId,
         tx_plugin_user: mpsc::Sender<OutputUserMessage>,
         tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
+        tx_event: mpsc::UnboundedSender<OutputEvent>,
     ) -> (SharedHooks, Vec<NamedPluginInstance>) {
         let mut registry = HooksRegistry::new();
 
@@ -503,8 +508,13 @@ impl Engine {
         //    每个实例拿到绑定自己插件名的 sender（注入消息 source 可追溯）
         //    单个 instance.register panic 不阻塞其他实例注册
         for (name, instance) in &instances {
-            let sender =
-                SessionSender::new(name.clone(), tx_plugin_user.clone(), tx_interrupt.clone());
+            let sender = SessionSender::new(
+                name.clone(),
+                session_id.clone(),
+                tx_plugin_user.clone(),
+                tx_interrupt.clone(),
+                tx_event.clone(),
+            );
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 instance.register(&mut registry, &sender)
             }));
