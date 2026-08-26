@@ -82,7 +82,7 @@ impl Engine {
                     // input 侧 ControlMessage 字段照搬转化为 output 侧 ControlMessage
                     // （command / mode / client_message_id），包成 Control 条目走与用户消息
                     // 相同的入站通道——同一通道承载保证两类消息的总序。
-                    // 命令本体（如手动压缩跳过阈值 / 反抖动，reason=manual）由消费点的
+                    // 命令本体（如手动压缩跳过阈值，reason=manual）由消费点的
                     // handle_control 执行，client_message_id 供排队中撤销配对。
                     let outbound = fuyao_api::message::output::ControlMessage {
                         base: ctrl_msg.base,

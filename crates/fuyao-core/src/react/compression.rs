@@ -130,7 +130,7 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
 /// 手动触发上下文压缩（控制通道 Compress 命令的处理）
 ///
 /// 与自动压缩（[`run_pre_turn_compression`]）共用 [`run_compression`] 执行流程，区别有二：
-/// ① 跳过阈值检测与反抖动（用户意图优先，不判「该不该压」）；
+/// ① 跳过阈值检测（用户意图优先，不判「该不该压」）；
 /// ② 不适用子会话豁免——用户显式要对子会话压缩是用户的选择，引擎照做，
 ///    子代理失真风险由用户自担（自动压缩替用户挡不划算的压缩，手动不挡）。
 /// 触发原因标记为 manual。
@@ -162,13 +162,13 @@ pub(super) async fn run_manual_compression(ctx: &SessionCtx) {
 /// 执行一次上下文压缩（「怎么压」的执行体）
 ///
 /// 自动 / 手动两条触发路径共用本函数：
-/// - 自动（[`run_pre_turn_compression`]）：先过阈值门 + 反抖动，命中才调（reason = auto）
+/// - 自动（[`run_pre_turn_compression`]）：先过阈值门，命中才调（reason = auto）
 /// - 手动（[`run_manual_compression`]）：跳过阈值门直接调（reason = manual，用户意图优先）
 ///
 /// 流程：发 Started → 调摘要 LLM（流式 Delta 并发转发）→ apply 落库 → 发 Ended。
 /// 失败处理（失败保持边界 + 错误分级）：
 /// - 摘要为空 / 无可压缩内容：log warn 跳过
-/// - LLM 调用失败：log warn 跳过（不进 cooldown，下次还会触发判定）
+/// - LLM 调用失败：log warn 跳过（下次照常触发判定）
 /// - 落库失败：log warn 跳过
 ///
 /// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。

@@ -11,7 +11,7 @@
 /// （serde 序列化随消息过 IPC），也可由内核组件直接构造。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ControlCommand {
-    /// 手动触发上下文压缩（跳过阈值 / 反抖动，触发原因标记为 manual）
+    /// 手动触发上下文压缩（跳过阈值，触发原因标记为 manual）
     Compress,
 }
 
