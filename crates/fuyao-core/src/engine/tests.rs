@@ -323,7 +323,7 @@ async fn stop_session_returns_after_turn_finalization_persisted() {
 
 // ===== remove_queued_message：双队列按客户端标识删除 =====
 
-/// 构造带客户端消息标识的 output 侧用户消息（直插队列用）
+/// 构造带客户端消息标识的 User 队列条目（直插队列用）
 fn queued_msg(
     content: &str,
     client_message_id: Option<&str>,
@@ -340,11 +340,36 @@ fn queued_msg(
     }
 }
 
+/// 构造带客户端命令标识的 Control 队列条目（直插队列用）
+fn queued_cmd(client_message_id: Option<&str>) -> QueueEntry {
+    QueueEntry::Control(fuyao_api::message::output::ControlMessage {
+        base: fuyao_api::message::EventBase::default(),
+        payload: fuyao_api::message::output::ControlPayload {
+            command: fuyao_api::ControlCommand::Compress,
+            mode: fuyao_api::UserMessageMode::Guide,
+            client_message_id: client_message_id.map(str::to_string),
+        },
+    })
+}
+
 /// 取挂载 session 的双队列共享句柄（直接注入队列条目，纯测删除语义）
 async fn session_queues(engine: &Engine, id: &SessionId) -> (SharedQueue, SharedQueue) {
     let sessions = engine.sessions.lock().await;
     let handle = sessions.get(id).expect("session 应在调度表");
     (Arc::clone(&handle.guide), Arc::clone(&handle.pending))
+}
+
+/// 队列中 User 条目的 content 快照（断言剩余内容用）
+fn user_contents(queue: &SharedQueue) -> Vec<String> {
+    queue
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            QueueEntry::User(m) => Some(m.payload.content.clone()),
+            QueueEntry::Control(_) => None,
+        })
+        .collect()
 }
 
 /// 两队列中的全部匹配条目一次删除：guide 与 pending 各有目标 + 干扰项，
@@ -358,23 +383,29 @@ async fn remove_queued_message_deletes_matches_across_both_queues() {
     guide
         .lock()
         .unwrap()
-        .push_back(queued_msg("保留", Some("keep-1")));
+        .push_back(QueueEntry::User(queued_msg("保留", Some("keep-1"))));
     guide
         .lock()
         .unwrap()
-        .push_back(queued_msg("guide 待删", Some("del-1")));
+        .push_back(QueueEntry::User(queued_msg("guide 待删", Some("del-1"))));
     pending
         .lock()
         .unwrap()
-        .push_back(queued_msg("pending 待删 a", Some("del-1")));
+        .push_back(QueueEntry::User(queued_msg(
+            "pending 待删 a",
+            Some("del-1"),
+        )));
     pending
         .lock()
         .unwrap()
-        .push_back(queued_msg("pending 待删 b", Some("del-1")));
+        .push_back(QueueEntry::User(queued_msg(
+            "pending 待删 b",
+            Some("del-1"),
+        )));
     pending
         .lock()
         .unwrap()
-        .push_back(queued_msg("无标识", None));
+        .push_back(QueueEntry::User(queued_msg("无标识", None)));
 
     let removed = engine
         .remove_queued_message(&id, "del-1")
@@ -383,20 +414,43 @@ async fn remove_queued_message_deletes_matches_across_both_queues() {
     assert_eq!(removed, 3, "guide 1 条 + pending 2 条匹配应全删");
 
     // 各队列只剩干扰项，且内容不受影响
-    let guide_left: Vec<String> = guide
+    assert_eq!(user_contents(&guide), vec!["保留".to_string()]);
+    assert_eq!(user_contents(&pending), vec!["无标识".to_string()]);
+
+    let _ = engine.end_session(&id, "测试结束").await;
+}
+
+/// 排队中未生效的控制命令可撤销：Control 条目按自身 client_message_id 匹配删除，
+/// 不误删无标识命令
+#[tokio::test]
+async fn remove_queued_message_deletes_queued_control_command() {
+    let (engine, _dir) = make_engine().await;
+    let (id, _rx) = engine.create_session(engine_test_params()).await.unwrap();
+    let (guide, _pending) = session_queues(&engine, &id).await;
+
+    guide
         .lock()
         .unwrap()
-        .iter()
-        .map(|m| m.payload.content.clone())
-        .collect();
-    assert_eq!(guide_left, vec!["保留".to_string()]);
-    let pending_left: Vec<String> = pending
+        .push_back(queued_cmd(Some("cmd-del-1")));
+    guide.lock().unwrap().push_back(queued_cmd(None));
+    guide
         .lock()
         .unwrap()
-        .iter()
-        .map(|m| m.payload.content.clone())
-        .collect();
-    assert_eq!(pending_left, vec!["无标识".to_string()]);
+        .push_back(QueueEntry::User(queued_msg("消息", Some("keep-2"))));
+
+    let removed = engine
+        .remove_queued_message(&id, "cmd-del-1")
+        .await
+        .expect("删除应成功");
+    assert_eq!(removed, 1, "恰删带标识的控制命令条目");
+
+    // 剩余：无标识命令 + 无关 User 消息
+    assert_eq!(
+        guide.lock().unwrap().len(),
+        2,
+        "无标识命令与无关消息不应被误删"
+    );
+    assert_eq!(user_contents(&guide), vec!["消息".to_string()]);
 
     let _ = engine.end_session(&id, "测试结束").await;
 }
@@ -411,11 +465,11 @@ async fn remove_queued_message_returns_zero_when_no_match() {
     guide
         .lock()
         .unwrap()
-        .push_back(queued_msg("在队列", Some("other-1")));
+        .push_back(QueueEntry::User(queued_msg("在队列", Some("other-1"))));
     pending
         .lock()
         .unwrap()
-        .push_back(queued_msg("无标识", None));
+        .push_back(QueueEntry::User(queued_msg("无标识", None)));
 
     let removed = engine
         .remove_queued_message(&id, "absent-1")
@@ -438,7 +492,7 @@ async fn remove_queued_message_repeated_removal_returns_zero() {
     guide
         .lock()
         .unwrap()
-        .push_back(queued_msg("待删", Some("once-1")));
+        .push_back(QueueEntry::User(queued_msg("待删", Some("once-1"))));
     assert_eq!(
         engine.remove_queued_message(&id, "once-1").await.unwrap(),
         1

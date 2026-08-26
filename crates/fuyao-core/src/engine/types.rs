@@ -2,10 +2,11 @@
 //!
 //! 集中放引擎模块间共享的类型别名、状态类型。
 
+use fuyao_api::SessionParams;
 use fuyao_api::message::output::{
-    InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
+    ControlMessage as OutputControlMessage, InterruptMessage as OutputInterruptMessage,
+    UserMessage as OutputUserMessage,
 };
-use fuyao_api::{ControlCommand, SessionParams};
 use fuyao_hooks::NamedPluginInstance;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -22,12 +23,21 @@ use tokio_util::sync::CancellationToken;
 /// 后续若类型安全需求增强，可提升为 newtype。
 pub type SessionId = String;
 
-/// 共享队列（guide / pending 对等，同类型，可互倒）
+/// 队列条目：guide / pending 双队列的载荷
 ///
-/// 队列载荷直接复用 output 侧 `OutputUserMessage`——内核统一处理输出侧消息，
-/// 入站载荷与队列载荷类型完全一致，
+/// 用户消息与控制命令消息共用双队列，同一枚举承载两种条目。
+/// 载荷直接复用 output 侧消息类型——内核统一处理输出侧消息，
+/// 入站通道与队列载荷类型完全一致，
 /// 复用同一类型避免无意义的拆解/重组（也消除字段丢失风险）。
-pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<OutputUserMessage>>>;
+pub(crate) enum QueueEntry {
+    /// 用户消息条目（消费时经统一历史管道注入）
+    User(OutputUserMessage),
+    /// 控制命令条目（消费时就地执行命令本体）
+    Control(OutputControlMessage),
+}
+
+/// 共享队列（guide / pending 对等，同类型，可互倒）
+pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<QueueEntry>>>;
 
 /// 会话执行流的 turn 相位（Engine 与 session task 共享的运行状态）
 ///
@@ -78,29 +88,26 @@ impl Drop for TurnPhaseGuard {
 /// 双队列 + 入站通道 + 中断通道 + SessionParams 共享句柄 + 关闭信号 + 插件实例分离：
 /// - `guide`：引导队列，直接消费，驱动 ReAct 循环
 /// - `pending`：排队队列，AI 不再调工具（最终回复）后才解禁转入 guide
-/// - `tx_inbound`：入站通道（User 消息送进 session task 过管道）
+/// - `tx_inbound`：入站通道（User 与 Control 消息统一经此送进 session task，保证总序）
 /// - `tx_interrupt`：中断通道，select! 中断点监听（与队列正交）
-/// - `tx_control`：控制通道，承载命令主循环做事的信号（手动压缩等），turn 边界消费
 /// - `turn_phase_rx`：turn 相位接收端（stop_session 屏障等待用）
 /// - `session_params`：对话级参数共享句柄，Engine 写（update_session_params）、task 现读现用
 /// - `task`：session 独立执行流任务句柄（shutdown 时 await 等退出 / 超时 abort 兜底）
 /// - `shutdown_token`：该 session 的关闭信号（Engine::shutdown 时 cancel）
 /// - `plugin_instances`：该 session 的插件实例集合（session 结束时逆序 dispose）
+///
+/// 插件注入通道的发送端不进本句柄——它只存在于各插件的 SessionSender clone 里，
+/// 无插件时通道关闭、session task 的 select! 臂自动禁用。
 #[allow(dead_code)]
 pub(crate) struct SessionHandle {
     /// 引导队列（直接消费）
     pub guide: SharedQueue,
     /// 排队队列（最终回复后转入 guide）
     pub pending: SharedQueue,
-    /// 入站通道发送端（User 消息，output 侧 OutputUserMessage）
-    pub tx_inbound: Sender<OutputUserMessage>,
+    /// 入站通道发送端（User 与 Control 条目统一承载，output 侧消息包裹 QueueEntry）
+    pub tx_inbound: Sender<QueueEntry>,
     /// 中断通道发送端（output 侧 InterruptMessage，入口转化后承载）
     pub tx_interrupt: Sender<OutputInterruptMessage>,
-    /// 控制通道发送端（承载 ControlCommand，主循环 turn 边界消费）
-    ///
-    /// 承载「命令主循环做事」的信号（手动压缩等）。主循环在 turn 边界消费，
-    /// 不入 ReAct 队列、不抢占在途 turn。新增 B 类功能加 ControlCommand 变体，不开新通道。
-    pub tx_control: Sender<ControlCommand>,
     /// turn 相位接收端（与 SessionCtx.turn_phase 的 sender 同源）
     ///
     /// task 侧进 turn 区间置 Running / 退出回 Idle；stop_session 借此实现

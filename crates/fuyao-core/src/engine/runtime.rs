@@ -1,9 +1,9 @@
 //! 会话运行时操作（入站分发 / 参数更新 / 队列删除）
 //!
 //! 本模块集中 [`Engine`] 的「运行」相关动作：
-//! - [`Engine::send`]：入站事件单一入口（User / Interrupt 分流）
+//! - [`Engine::send`]：入站事件单一入口（User / Control / Interrupt 分流）
 //! - [`Engine::update_session_params`]：运行时调整 session 参数
-//! - [`Engine::remove_queued_message`]：按客户端消息标识删除双队列中未消费的消息
+//! - [`Engine::remove_queued_message`]：按客户端消息标识删除双队列中未消费的条目
 //!
 //! 出站事件不再走 Engine——每 session 持自己的 per-session 通道，rx 由创建方法
 //! 返调用方独占消费。
@@ -17,18 +17,10 @@ use super::*;
 /// 若此时仍持引擎级 sessions 锁，会把 send / create / shutdown 全部排队，
 /// 一个 session 的背压拖死所有 session（跨 session 队头阻塞）。
 enum OutboundAction {
-    /// User 消息 → 入站通道
-    Inbound(
-        mpsc::Sender<fuyao_api::message::output::UserMessage>,
-        fuyao_api::message::output::UserMessage,
-    ),
+    /// User / Control 消息条目 → 入站通道
+    Inbound(mpsc::Sender<QueueEntry>, QueueEntry),
     /// 中断信号 → 中断通道
     Interrupt(mpsc::Sender<OutputInterruptMessage>, OutputInterruptMessage),
-    /// 控制命令（手动压缩 / 回退）→ 控制通道
-    Control(
-        mpsc::Sender<fuyao_api::ControlCommand>,
-        fuyao_api::ControlCommand,
-    ),
 }
 
 /// 通道投递（send 的统一语义包装）
@@ -44,9 +36,10 @@ impl Engine {
     ///
     /// 所有对话级输入事件从一个口进，靠 session id 区分对话，按事件类型分流：
     /// - `User`：入队，触发 ReAct 循环。模型配置从 session 的 `SessionParams` 现读（见 [`update_session_params`](Self::update_session_params)）
+    /// - `Control`：控制命令消息，与用户消息同走入站通道（保证总序），进双队列后
+    ///   在消费时机执行；mode 决定生效时机（Guide = 下一消费时机 / Pending = 最终回复后），
+    ///   结果经 per-session 出口以对应 OutputEvent 流出（如 Compression）
     /// - `Interrupt`：发出中断信号，打断对应对话的当前执行
-    /// - `Compress`：控制类命令，转 ControlCommand 投控制通道，task 在 turn 边界自执行；
-    ///   结果经 per-session 出口以对应 OutputEvent 流出（Compression）
     ///
     /// 入队即返回，不阻塞——不等大模型想完。
     /// 后续产出从该 session 的 per-session rx 流出（由 create_session 等返回）。
@@ -69,11 +62,11 @@ impl Engine {
             match event {
                 InputEvent::User(user_msg) => {
                     // 立即把 input 侧 UserMessage 字段照搬转化为 output 侧 UserMessage
-                    // （base + payload 完整保留，含 source），直接送进 session task。
+                    // （base + payload 完整保留，含 source），包成 User 条目送进 session task。
                     // 模型/思考等运行时配置挂在 session 级（SessionParams.model_config），
                     // 消费点（跑 turn、压缩）现读现用，不随消息携带。
-                    // 后续 handle_inbound_user 纯入队，inject_messages 消费时统一过管道。
-                    let outbound = fuyao_api::message::output::UserMessage {
+                    // 后续 handle_inbound_item 纯入队，inject_user_messages 消费时统一过管道。
+                    let outbound = OutputUserMessage {
                         base: user_msg.base,
                         payload: fuyao_api::message::output::UserPayload {
                             content: user_msg.payload.content,
@@ -83,7 +76,26 @@ impl Engine {
                             client_message_id: user_msg.payload.client_message_id,
                         },
                     };
-                    OutboundAction::Inbound(handle.tx_inbound.clone(), outbound)
+                    OutboundAction::Inbound(handle.tx_inbound.clone(), QueueEntry::User(outbound))
+                }
+                InputEvent::Control(ctrl_msg) => {
+                    // input 侧 ControlMessage 字段照搬转化为 output 侧 ControlMessage
+                    // （command / mode / client_message_id），包成 Control 条目走与用户消息
+                    // 相同的入站通道——同一通道承载保证两类消息的总序。
+                    // 命令本体（如手动压缩跳过阈值 / 反抖动，reason=manual）由消费点的
+                    // handle_control 执行，client_message_id 供排队中撤销配对。
+                    let outbound = fuyao_api::message::output::ControlMessage {
+                        base: ctrl_msg.base,
+                        payload: fuyao_api::message::output::ControlPayload {
+                            command: ctrl_msg.payload.command,
+                            mode: ctrl_msg.payload.mode,
+                            client_message_id: ctrl_msg.payload.client_message_id,
+                        },
+                    };
+                    OutboundAction::Inbound(
+                        handle.tx_inbound.clone(),
+                        QueueEntry::Control(outbound),
+                    )
                 }
                 InputEvent::Interrupt(interrupt_msg) => {
                     // 入口转化：input 侧 InterruptMessage → output 侧 InterruptMessage。
@@ -95,23 +107,14 @@ impl Engine {
                     );
                     OutboundAction::Interrupt(handle.tx_interrupt.clone(), outbound)
                 }
-                InputEvent::Compress(_) => {
-                    // 控制通道：手动压缩请求转化为 ControlCommand::Compress，送主循环 turn 边界消费
-                    //（跳过阈值 / 反抖动，复用自动压缩执行流程，reason=manual）
-                    OutboundAction::Control(
-                        handle.tx_control.clone(),
-                        fuyao_api::ControlCommand::Compress,
-                    )
-                }
             }
         };
 
-        // 锁外投递：三种通道的 send 语义一致（满则等待，断则 Shutdown），
+        // 锁外投递：两类通道的 send 语义一致（满则等待，断则 Shutdown），
         // 仅载荷类型不同，统一走泛型 deliver
         match action {
-            OutboundAction::Inbound(tx, msg) => deliver(tx, msg).await?,
+            OutboundAction::Inbound(tx, entry) => deliver(tx, entry).await?,
             OutboundAction::Interrupt(tx, msg) => deliver(tx, msg).await?,
-            OutboundAction::Control(tx, cmd) => deliver(tx, cmd).await?,
         }
 
         Ok(())
@@ -155,11 +158,13 @@ impl Engine {
         Ok(())
     }
 
-    /// 按客户端消息标识删除双队列中未消费的消息
+    /// 按客户端消息标识删除双队列中未消费的条目
     ///
-    /// 依次在 pending、guide 两队列中移除所有 `client_message_id` 匹配的条目，
-    /// 返回删除条数（0 = 两队列中均无此标识的消息）。只删**未消费**的消息：
-    /// 已被 turn 消费（drain 出队、走历史管道）的消息不在此方法管辖内。
+    /// 依次在 pending、guide 两队列中移除所有 `client_message_id` 匹配的条目
+    /// （User 与 Control 条目按各自 `payload.client_message_id` 匹配——排队中
+    /// 尚未生效的命令同样可撤销），返回删除条数（0 = 两队列中均无此标识的条目）。
+    /// 只删**未消费**的条目：已被 turn 消费（drain 出队、注入历史或执行命令）的
+    /// 条目不在此方法管辖内。
     ///
     /// 旁路管理方法：不经过 session 通道、不触发任何钩子或事件——删除是纯内存
     /// 队列操作，session task 与调用方对同一队列各持 `Arc`，短临界区天然互斥。
@@ -206,12 +211,19 @@ impl Engine {
 
 /// 按客户端消息标识从单个队列移除匹配条目，返回移除条数
 ///
+/// User 与 Control 两类条目都按各自 `payload.client_message_id` 匹配。
 /// 锁内只做 retain（纯内存、无 await）；锁中毒时取回内部数据继续操作——
 /// 队列数据本身完好，中毒不代表队列不可用。无标识（None）的条目
 /// （系统 / 插件注入消息）永不匹配任何客户端标识。
 fn retain_out_matching(queue: &SharedQueue, client_message_id: &str) -> usize {
     let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
     let before = q.len();
-    q.retain(|m| m.payload.client_message_id.as_deref() != Some(client_message_id));
+    q.retain(|entry| {
+        let id = match entry {
+            QueueEntry::User(m) => m.payload.client_message_id.as_deref(),
+            QueueEntry::Control(m) => m.payload.client_message_id.as_deref(),
+        };
+        id != Some(client_message_id)
+    });
     before - q.len()
 }

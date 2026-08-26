@@ -3,18 +3,20 @@
 //! 一个 turn = 处理一批已注入的 user messages，驱动"想 → 调工具 → 再想"循环，
 //! 直到 AI 不再调工具（最终回复）且 guide/pending 都空才结束。
 //!
-//! 两个消费时机：
+//! 两个消费时机（批次处理统一走 `consume_batch`：连续 User 段注入、Control 执行）：
 //! - **一批工具全部执行完成后、发回 AI 前**：只看 guide（还在调工具，pending 不动）。
-//!   guide 全取注入 → continue；guide 空 → continue（只带工具结果）。
+//!   guide 全取处理 → continue；guide 空 → continue（只带工具结果）。
 //! - **AI 不调用工具（最终回复，一轮 ReAct 结束）**：固定顺序
-//!   ① pending 全部倒进 guide ② guide 全部消费注入 messages；
-//!   消费到消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环），
-//!   双队列都空才结束 turn。
+//!   ① pending 全部倒进 guide ② guide 全部取出处理；
+//!   注入过 User 消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环），
+//!   双队列都空才结束 turn。批内 Control 条目就地执行——执行后按批次是否
+//!   注入过消息自然走向（有则继续 ReAct，无则 turn 结束）。
 //!
-//! turn 运行期间的入站消息：两段 select! 均监听 `rx_inbound`（idle 段在 run_session
-//! 外层），收到即经 `handle_inbound_user` 纯入队——不打断流式 / 工具执行，入队后
-//! 由上述两个消费时机接管。入站通道若只在 idle 消费，turn 运行期间的消息到不了
-//! 队列，两个消费时机在生产链路上永远空转（消费被推迟到 turn 结束后）。
+//! turn 运行期间的入站条目：两段 select! 均监听 `rx_inbound`（User / Control 条目，
+//! 经 `handle_inbound_item` 纯入队）与 `rx_plugin`（插件注入的纯 User 消息，同纯入队）
+//! ——不打断流式 / 工具执行，入队后由上述两个消费时机接管。入站通道若只在 idle 消费，
+//! turn 运行期间的消息到不了队列，两个消费时机在生产链路上永远空转
+//! （消费被推迟到 turn 结束后）。
 //!
 //! 中断：两段 select!——流式期间、工具执行期间。idle 段在 run_session 外层。
 //! 中断分支用 `Some(...)` 模式：中断通道关闭（所有 tx drop）时分支禁用而非当作事件，
@@ -33,14 +35,14 @@ use super::builders::{
     ResolvedModel, assistant_payload, build_chat_request, resolve_model, tool_call_data_to_event,
     tool_call_event_to_data,
 };
-use super::handle_control;
-use super::handle_inbound_user;
+use super::consume_batch;
+use super::handle_inbound_item;
+use crate::engine::types::QueueEntry;
 use crate::interrupt::{self, SharedTurnState, TurnState};
 use crate::react::queue;
 use crate::stream::StreamResult;
 use crate::tool_exec;
 use fuyao_api::ModelConfig;
-use fuyao_api::TurnDirective;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{
@@ -60,11 +62,11 @@ use tokio::sync::mpsc::Receiver;
 ///
 /// - `Completed`（双队列跑空、AI 给最终回复）：[`may_consume`](Self::may_consume) 为真，
 ///   主循环继续 consume（本就空）或落 select! 等待
-/// - 非 `Completed`（命令停 / 中断 / 失败）：`may_consume` 为假 → 主循环跳过 consume，
+/// - 非 `Completed`（中断 / 失败）：`may_consume` 为假 → 主循环跳过 consume，
 ///   guide/pending 剩余**原样保留**（引擎不清队列），落 select! 等待
-/// - **恢复迁移**：idle select! 的 inbound 分支收到新用户消息时调
-///   [`resume_on_new_intent`](Self::resume_on_new_intent) 重置为 `Completed`——新消息 =
-///   新意图，回顶部 consume 把「旧剩余 + 新消息」一起跑（忠实消费）
+/// - **恢复迁移**：idle select! 的 inbound / plugin_user 分支收到新条目时调
+///   [`resume_on_new_intent`](Self::resume_on_new_intent) 重置为 `Completed`——新条目 =
+///   新意图，回顶部 consume 把「旧剩余 + 新条目」一起跑（忠实消费）
 /// - **空闲解禁**：task 空闲（无活跃 turn）时 pending 的「等链结束」解禁条件已满足，
 ///   主循环顶部先倒 pending 再消费（否则只发 pending 会死信）——这是主循环侧的固定
 ///   动作，不属于本类型，但依赖 `may_consume` 为真才执行
@@ -74,9 +76,7 @@ use tokio::sync::mpsc::Receiver;
 pub(crate) enum TurnOutcome {
     /// 正常完成：双队列跑空，AI 给了最终回复
     Completed,
-    /// 被 StopTurn 命令打断（回退 / 手动压缩）。DB 已被命令改写，turn 持有状态失效
-    HaltedByCommand,
-    /// 被用户中断打断
+    /// 被用户中断打断（含 shutdown 共用的收尾路径）
     Interrupted,
     /// 配置错误 / LLM 失败（不可恢复）
     Failed,
@@ -85,39 +85,38 @@ pub(crate) enum TurnOutcome {
 impl TurnOutcome {
     /// 消费许可：仅 `Completed` 允许主循环消费 guide/pending
     ///
-    /// 非 `Completed` 的退出（命令停 / 中断 / 失败）都意味着「队列剩余不该继续跑」，
+    /// 非 `Completed` 的退出（中断 / 失败）都意味着「队列剩余不该继续跑」，
     /// 返回假让主循环跳过 consume、保留剩余等待恢复。
     pub(crate) fn may_consume(&self) -> bool {
         matches!(self, Self::Completed)
     }
 
-    /// 新用户消息入队：恢复消费许可
+    /// 新条目入队：恢复消费许可
     ///
-    /// 新消息 = 新意图，重置为 `Completed`，主循环回顶部把「旧剩余 + 新消息」
-    /// 一起消费（忠实消费，引擎不清队列）。由 idle select! 的 inbound 分支调用。
+    /// 新条目（用户消息 / 控制命令 / 插件注入）= 新意图，重置为 `Completed`，
+    /// 主循环回顶部把「旧剩余 + 新条目」一起消费（忠实消费，引擎不清队列）。
+    /// 由 idle select! 的 inbound / plugin_user 分支调用。
     pub(crate) fn resume_on_new_intent(&mut self) {
         *self = Self::Completed;
     }
 }
 
-/// 运行一轮 ReAct（user messages 已由 run_session 主循环经 inject_messages 注入 DB）
+/// 运行一轮 ReAct（user messages 已由 run_session 主循环经批次处理注入 DB）
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
-/// `rx_inbound` 为入站通道接收端：流式与工具执行两段 select! 监听它，收到 User 消息
-/// 即经 `handle_inbound_user` 纯入队（不打断 turn），由消费时机接管——保证 turn 运行
-/// 期间到达的消息能赶上前面的消费点，而不是滞留通道等到 turn 结束。
+/// `rx_inbound` 为入站通道接收端（User / Control 条目）：流式与工具执行两段 select!
+/// 监听它，收到条目即经 `handle_inbound_item` 纯入队（不打断 turn），由消费时机接管
+/// ——保证 turn 运行期间到达的条目能赶上前面的消费点，而不是滞留通道等到 turn 结束。
+/// `rx_plugin` 为插件注入通道接收端（纯 User 消息），两段 select! 同样监听并纯入队。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
-/// `rx_control` 为控制通道接收端，ReAct loop 顶部间隙检查点消费它——取到任意 StopTurn
-/// 命令（手动压缩 / 回退）则立即 return，打断 ReAct 链让命令快速生效（命令自身的 DB
-/// 写已在 handle_control 内完成，无需额外落库）。
 ///
 /// 返回 [`TurnOutcome`]：主循环据此决定是否继续消费队列。非 `Completed` 的退出都意味着
 /// 「队列剩余不该继续跑」，主循环应跳过 consume 落 select! 等用户新消息恢复。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
-    rx_inbound: &mut Receiver<OutputUserMessage>,
+    rx_inbound: &mut Receiver<QueueEntry>,
+    rx_plugin: &mut Receiver<OutputUserMessage>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
-    rx_control: &mut Receiver<fuyao_api::ControlCommand>,
     model_config: ModelConfig,
 ) -> TurnOutcome {
     // 解析本轮 model_id + 从 registry 查 Provider 实例
@@ -168,29 +167,6 @@ pub(crate) async fn run_turn(
     let options = resolved.options.clone();
 
     loop {
-        // === 控制通道间隙检查点 ===
-        // 每轮 ReAct 开始前非阻塞排空控制通道。时机安全：上一轮工具结果已落库、
-        // 下一轮 LLM 还没调用——DB 稳定态。命令改 DB 后，紧接着的 build_chat_request
-        // 读到最新状态（回退重算的 count / 压缩新边界）。
-        //
-        // 忠实执行：while try_recv 逐条 FIFO 排空，不做同批去重 / 合并（引擎是忠实执行器）。
-        // 取到命令先问它的 turn_directive（命令自带，固有属性），任一条 StopTurn 即标记停止。
-        // 全排空后若有任意 StopTurn → 立即 return（命令的 DB 写已在 handle_control 内完成），
-        // 打断 ReAct 链交还控制权；通道空 / 全是 Continue → 继续 ReAct。
-        //
-        // stop_turn 标志的必要性：while try_recv 可能一次取到多条命令，必须遍历完才能判断
-        // 「有没有出现过 StopTurn」，不用标志循环结束后无法回溯。
-        let mut stop_turn = false;
-        while let Ok(cmd) = rx_control.try_recv() {
-            if matches!(cmd.turn_directive(), TurnDirective::StopTurn) {
-                stop_turn = true;
-            }
-            handle_control(ctx, cmd).await;
-        }
-        if stop_turn {
-            return TurnOutcome::HaltedByCommand;
-        }
-
         // 本轮 LLM 调用的共享状态（中断分支读部分结果用）。
         // 每次 loop 顶部新建；retry.rs 在重试时清空复用，保证不携带上一次的部分结果。
         let state: SharedTurnState = Arc::new(std::sync::Mutex::new(TurnState::new()));
@@ -204,7 +180,7 @@ pub(crate) async fn run_turn(
         // shutdown：retry.rs 退避 sleep 期间收到 shutdown 信号会冒泡 Cancelled，
         //          本 select! 的 shutdown 分支也并发监听 token，谁先到谁接管。
         //
-        // 入站分支：流式期间到达的 User 消息即时入队（纯入队，不打断流式）。
+        // 入站 / 插件分支：流式期间到达的条目即时入队（纯入队，不打断流式）。
         // biased 顺序放在 retry_fut 之前——流已就绪时先入队再取流结果，保证
         // 「流式期间到达的消息」能被本轮 turn 后续的消费点（①/②）看到，
         // 而不是滞留通道变成 turn 结束后的独立新 turn。入队后 continue 重新
@@ -222,10 +198,14 @@ pub(crate) async fn run_turn(
                         interrupt::finish_streaming(ctx, &state, &interrupt::shutdown_payload()).await;
                         return TurnOutcome::Interrupted;
                     }
-                    // 入站消息：纯入队后继续等流式。Some 模式：通道关闭（所有 tx drop）
-                    // 时分支禁用，关闭不是事件、不参与调度
-                    Some(inbound) = rx_inbound.recv() => {
-                        handle_inbound_user(ctx, inbound).await;
+                    // 入站条目（User / Control）：纯入队后继续等流式。Some 模式：通道关闭
+                    //（所有 tx drop）时分支禁用，关闭不是事件、不参与调度
+                    Some(entry) = rx_inbound.recv() => {
+                        handle_inbound_item(ctx, entry).await;
+                    }
+                    // 插件注入的纯 User 消息：同纯入队语义（Some 模式，关闭 = 分支禁用）
+                    Some(user_msg) = rx_plugin.recv() => {
+                        handle_inbound_item(ctx, QueueEntry::User(user_msg)).await;
                     }
                     result = &mut retry_fut => break result,
                     // 中断通道独立：此处只会收到 Interrupt。
@@ -242,8 +222,8 @@ pub(crate) async fn run_turn(
         match stream_result {
             Ok(result) => {
                 if result.tool_calls.is_empty() {
-                    // 无工具调用：最终回复。消费时机②：pending 倒 guide 后全取注入，
-                    // 消费到消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环）；
+                    // 无工具调用：最终回复。消费时机②：pending 倒 guide 后全取处理，
+                    // 注入过消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环）；
                     // 双队列都空 → turn 正常结束
                     if !handle_final_reply(ctx, &result, &model_config).await {
                         return TurnOutcome::Completed;
@@ -251,9 +231,15 @@ pub(crate) async fn run_turn(
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
                     // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
-                    let halted =
-                        handle_tool_calls(ctx, rx_inbound, rx_interrupt, &result, &model_config)
-                            .await;
+                    let halted = handle_tool_calls(
+                        ctx,
+                        rx_inbound,
+                        rx_plugin,
+                        rx_interrupt,
+                        &result,
+                        &model_config,
+                    )
+                    .await;
                     if halted {
                         return TurnOutcome::Interrupted;
                     }
@@ -293,11 +279,12 @@ async fn emit_unrecoverable_error(ctx: &SessionCtx, message: &str) {
 /// 处理最终回复（AI 不调用工具，一轮 ReAct 结束）
 ///
 /// 固定顺序：① pending 全部倒进 guide（追加在 guide 现有内容之后）② guide 全部
-/// 消费注入 messages。
+/// 取出经 [`consume_batch`] 处理（连续 User 段注入历史、Control 就地执行）。
 ///
 /// 返回值表达 turn 是否还有后续：
-/// - `false`：guide 和 pending 都空，turn 正常结束（消息已在统一历史入口事务内即时落库）
-/// - `true`：消费到消息并已注入——调用方应回 ReAct 顶部再调一轮 LLM，
+/// - `false`：guide 和 pending 都空（未注入任何 User），turn 正常结束
+///   （消息已在统一历史入口事务内即时落库）
+/// - `true`：注入过消息——调用方应回 ReAct 顶部再调一轮 LLM，
 ///   让 AI 真正回应这批消息（触发下一轮 ReAct 循环），而不是注入后无人应答
 async fn handle_final_reply(
     ctx: &SessionCtx,
@@ -315,16 +302,10 @@ async fn handle_final_reply(
     crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
     // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
-    // 消费时机②：① pending 全倒 guide ② guide 全取注入
+    // 消费时机②：① pending 全倒 guide ② guide 全取批次处理
     queue::drain_pending_to_guide(&ctx.guide, &ctx.pending);
-    let msgs = queue::consume_all_guide(&ctx.guide);
-    if msgs.is_empty() {
-        false
-    } else {
-        // 有消息：全部注入（每条经统一历史入口拦截→落 DB→发送→观察）
-        crate::history::inject_user_messages(ctx, msgs).await;
-        true
-    }
+    let entries = queue::consume_all_guide(&ctx.guide);
+    consume_batch(ctx, entries).await
 }
 
 /// 处理工具调用：逐个拦截工具调用 → 计费入口同步 AssistantMessage → 执行整批工具 → 消费时机①
@@ -342,10 +323,12 @@ async fn handle_final_reply(
 /// 工具执行通过 channel 通知完成，turn.rs 边收边走统一历史入口（拦截 → 落 DB → 发事件）。
 /// 中断时 channel 里剩余结果也清空落库，保证不丢。
 ///
-/// `rx_inbound`：工具执行段 select! 监听入站通道，收到 User 消息即时纯入队（见循环内注释）。
+/// `rx_inbound`：工具执行段 select! 监听入站通道，收到条目即时纯入队（见循环内注释）。
+/// `rx_plugin`：同段监听插件注入通道，纯 User 消息同纯入队。
 async fn handle_tool_calls(
     ctx: &SessionCtx,
-    rx_inbound: &mut Receiver<OutputUserMessage>,
+    rx_inbound: &mut Receiver<QueueEntry>,
+    rx_plugin: &mut Receiver<OutputUserMessage>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
@@ -384,11 +367,10 @@ async fn handle_tool_calls(
     // 拦截 Block：消息不进历史、不计费——插件的责任
 
     // 若全部工具调用被拦截（effective 为空）或 AssistantMessage 被 Block，无需执行
+    // 工具批——直接走消费时机①（guide 批次处理）后回 ReAct 顶部
     if effective_result.tool_calls.is_empty() {
-        let msgs = queue::consume_all_guide(&ctx.guide);
-        if !msgs.is_empty() {
-            crate::history::inject_user_messages(ctx, msgs).await;
-        }
+        let entries = queue::consume_all_guide(&ctx.guide);
+        consume_batch(ctx, entries).await;
         return false;
     }
 
@@ -466,12 +448,16 @@ async fn handle_tool_calls(
                 // 完成一个：立即走统一历史入口（拦截 → 落 DB → 发送事件）并记入已答集
                 record_tool_result(ctx, &mut answered, r).await;
             }
-            // 入站消息：纯入队，不打断工具批。biased 放在 exec_fut 之前——整批工具
-            // 完成与入站消息同时就绪时先入队再收批，保证紧随工具完成的消费时机①
+            // 入站条目：纯入队，不打断工具批。biased 放在 exec_fut 之前——整批工具
+            // 完成与入站条目同时就绪时先入队再收批，保证紧随工具完成的消费时机①
             // 能看到这条消息（同 turn 消费，而非推迟到 turn 结束后的独立新 turn）。
             // Some 模式：通道关闭（所有 tx drop）时分支禁用
-            Some(inbound) = rx_inbound.recv() => {
-                handle_inbound_user(ctx, inbound).await;
+            Some(entry) = rx_inbound.recv() => {
+                handle_inbound_item(ctx, entry).await;
+            }
+            // 插件注入的纯 User 消息：同纯入队语义（Some 模式，关闭 = 分支禁用）
+            Some(user_msg) = rx_plugin.recv() => {
+                handle_inbound_item(ctx, QueueEntry::User(user_msg)).await;
             }
             _ = &mut exec_fut => {
                 // execute_tools 完成：清空 channel 里剩余的（防丢，理论已空）
@@ -482,11 +468,10 @@ async fn handle_tool_calls(
     }
 
     // 步骤4：消费时机①——一批工具全部完成后、发回 AI 前，只看 guide（pending 不动）
-    let msgs = queue::consume_all_guide(&ctx.guide);
-    if !msgs.is_empty() {
-        crate::history::inject_user_messages(ctx, msgs).await;
-    }
-    // 回 run_turn 顶部：带 guide 消息（若有）+ 工具结果再调 LLM
+    // 批次处理（User 段注入 + Control 执行）；返回值此处不参与决策——工具结果已就绪，
+    // 恒回 ReAct 顶部带 guide 消息（若有）+ 工具结果再调 LLM
+    let entries = queue::consume_all_guide(&ctx.guide);
+    consume_batch(ctx, entries).await;
     false
 }
 
