@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use fuyao_api::UserMessageMode;
 use fuyao_api::message::output::{
     ChunkMessage, ChunkPayload, InterruptMessage as OutputInterruptMessage, ToolCallMessage,
     ToolCallPayload, ToolResultMessage, ToolResultPayload, UserMessage as OutputUserMessage,
@@ -154,7 +155,7 @@ impl PluginInstance for FakeInstance {
                 }
                 HookAction::SendUserOnRegister { log_tag, content } => {
                     self.log.lock().unwrap().push(log_tag.clone());
-                    sender.send_user(content.clone());
+                    sender.send_user(content.clone(), UserMessageMode::Guide);
                 }
             }
         }

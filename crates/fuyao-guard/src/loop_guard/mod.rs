@@ -2,8 +2,8 @@
 //!
 //! 通过 observe/intercept 钩子检测 AI 输出重复和工具循环。
 //! 当检测到循环时，根据严重程度采取不同措施（警告、注入结果或终止）。
-//! 发消息能力经 register 的 sender 参数直接获得（interrupt 中断 / user 注入引导），
-//! 通知类信息走 tracing 日志。
+//! 发消息能力经 register 的 sender 参数直接获得（interrupt 中断 / user 注入引导 /
+//! notice 消费者通知），检测与干预动作同步记 tracing 日志。
 //!
 //! 两层模型：
 //! - [`LoopGuardPlugin`]（工厂）：引擎级，持 `LoopGuardConfig`；每 session 调用
@@ -29,7 +29,8 @@ use guard::{LoopGuardState, make_output_intercept, make_output_observe};
 /// 循环检测插件（工厂模板，引擎级）
 ///
 /// 通过 output_observe（检测累积）+ output_intercept（注入警告/替换内容）
-/// 两个钩子实现循环检测；interrupt / user 注入经 register 拿到的 SessionSender 发出。
+/// 两个钩子实现循环检测；interrupt / user 注入 / notice 消费者通知
+/// 经 register 拿到的 SessionSender 发出。
 ///
 /// 引擎级只持有配置；每 session 启动时 [`create_instance`](Plugin::create_instance)
 /// 新建独立 `LoopGuardState`，多 session 并发互不串台。
@@ -79,7 +80,7 @@ impl Plugin for LoopGuardPlugin {
 /// 持该 session 独立的 `LoopGuardState`，register 时注册两个钩子并保存 sender：
 /// - `output_observe`：累积检测（chunk 文本 + tool_call 历史 + 用户消息重置时机）
 /// - `output_intercept`：注入警告或替换工具结果内容
-/// - sender：interrupt 中断 / user 引导注入的发消息能力
+/// - sender：interrupt 中断 / user 引导注入 / notice 消费者通知的发消息能力
 struct LoopGuardInstance {
     state: Arc<Mutex<LoopGuardState>>,
 }

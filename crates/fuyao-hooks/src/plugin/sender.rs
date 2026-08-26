@@ -73,13 +73,6 @@ impl SessionSender {
         &self.name
     }
 
-    /// 发送 User 消息（默认 Guide 模式，触发 ReAct 循环）
-    ///
-    /// 等价于 [`send_user_with_mode`](Self::send_user_with_mode)`(content, UserMessageMode::Guide)`。
-    pub fn send_user(&self, content: impl Into<String>) {
-        self.send_user_with_mode(content, UserMessageMode::Guide);
-    }
-
     /// 发送 User 消息（指定模式）
     ///
     /// `mode` 决定消息入哪个队列：
@@ -87,7 +80,7 @@ impl SessionSender {
     /// - `Pending`：进入排队队列，AI 不再调工具（最终回复）后才投递
     ///
     /// source 字段自动标记为 `Plugin`，携带本插件的名称——保证来源可追溯。
-    pub fn send_user_with_mode(&self, content: impl Into<String>, mode: UserMessageMode) {
+    pub fn send_user(&self, content: impl Into<String>, mode: UserMessageMode) {
         let result = self.tx_user.try_send(OutputUserMessage {
             base: EventBase::default(),
             payload: OutputUserPayload {
@@ -129,14 +122,7 @@ impl SessionSender {
         }
     }
 
-    /// 发送插件通知（默认 Info 级别）
-    ///
-    /// 等价于 [`send_notice_with_level`](Self::send_notice_with_level)`(content, NoticeLevel::Info)`。
-    pub fn send_notice(&self, content: impl Into<String>) {
-        self.send_notice_with_level(content, NoticeLevel::Info);
-    }
-
-    /// 发送插件通知（指定级别）
+    /// 发送插件通知
     ///
     /// 通知直达 per-session 出站通道，**不经 dispatch 管道**——三重刻意设计：
     /// - 不经 intercept：通知不可被其他插件 Block（拦截权用于内容管制，
@@ -148,7 +134,7 @@ impl SessionSender {
     /// source 自动填本插件名（可追溯）；session_id 由本方法盖标签
     /// （与 Emitter::emit 的「session id 全程标签」原则同一约定）。
     /// 出站通道无界，send 永不阻塞——钩子体内调用安全；通道关闭仅记 warn。
-    pub fn send_notice_with_level(&self, content: impl Into<String>, level: NoticeLevel) {
+    pub fn send_notice(&self, content: impl Into<String>, level: NoticeLevel) {
         let mut event = OutputEvent::PluginNotice(OutputPluginNoticeMessage::new(
             self.name.clone(),
             level,
@@ -181,11 +167,11 @@ mod tests {
         (sender, rx_event)
     }
 
-    /// send_notice：事件到达出站通道，session_id 已盖标签，source 填插件名，默认 Info
+    /// send_notice：事件到达出站通道，session_id 已盖标签，source 填插件名，级别透传
     #[tokio::test]
     async fn send_notice_stamps_session_id_and_source() {
         let (sender, mut rx_event) = make_sender();
-        sender.send_notice("检测到循环");
+        sender.send_notice("检测到循环", NoticeLevel::Info);
         let event = rx_event.recv().await.expect("应收到通知事件");
         let OutputEvent::PluginNotice(m) = event else {
             panic!("应是 PluginNotice 事件");
@@ -196,11 +182,11 @@ mod tests {
         assert_eq!(m.payload.content, "检测到循环");
     }
 
-    /// send_notice_with_level：级别透传
+    /// send_notice：Error 级别透传
     #[tokio::test]
-    async fn send_notice_with_level_passes_level() {
+    async fn send_notice_passes_level() {
         let (sender, mut rx_event) = make_sender();
-        sender.send_notice_with_level("已终止", NoticeLevel::Error);
+        sender.send_notice("已终止", NoticeLevel::Error);
         let OutputEvent::PluginNotice(m) = rx_event.recv().await.expect("应收到通知事件")
         else {
             panic!("应是 PluginNotice 事件");

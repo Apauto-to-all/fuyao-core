@@ -2,20 +2,22 @@
 //!
 //! 组合 ToolLoopGuard 和 TextLoopGuard，提供统一的钩子接口。
 //! 工具循环检测优先级高于文本循环检测。
-//! 发消息能力经 register 拿到的 SessionSender 实现（interrupt 中断 / user 注入引导），
-//! 通知类信息走 tracing 日志，不持有引擎内部 channel。
+//! 发消息能力经 register 拿到的 SessionSender 实现（interrupt 中断 / user 注入引导 /
+//! notice 消费者通知），检测与干预动作同步记 tracing 日志。
 //!
 //! 锁纪律：state 用 `std::sync::Mutex`——handler 体内无 await（发送全为非阻塞
 //! try_send），锁不跨 await 点，同步锁即够且 register（同步上下文）可直接存 sender。
 
 use std::sync::Arc;
 
+use fuyao_api::UserMessageMode;
 use fuyao_api::UserMessageSource;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::output::{ChunkMessage, ToolCallMessage, ToolResultMessage};
+use fuyao_api::message::output::{ChunkMessage, NoticeLevel, ToolCallMessage, ToolResultMessage};
 use fuyao_hooks::SessionSender;
 use std::sync::Mutex;
 
+use super::escalation::DetectKind;
 use super::text_guard::TextLoopGuard;
 use super::tool_guard::ToolLoopGuard;
 use super::types::LoopSeverity;
@@ -35,7 +37,7 @@ pub(crate) struct LoopGuardState {
     pending_severity: Option<LoopSeverity>,
     /// 中断次数计数器
     interrupt_count: usize,
-    /// session 级发送器（register 时注入，封装 interrupt / user 两类消息分流）
+    /// session 级发送器（register 时注入，封装 interrupt / user / notice 三类消息分流）
     sender: Option<SessionSender>,
 }
 
@@ -74,7 +76,18 @@ impl LoopGuardState {
     /// 经 SessionSender 的 User 通道投递（Guide 模式，触发 ReAct 调整 AI 策略）。
     fn send_inject_message(&self, content: String) {
         if let Some(ref s) = self.sender {
-            s.send_user(content);
+            s.send_user(content, UserMessageMode::Guide);
+        }
+    }
+
+    /// 发送循环检测通知（面向消费者）
+    ///
+    /// 经 SessionSender 的 Notice 通道直送消费者（CLI/TUI），告知守卫的发现与
+    /// 已采取的动作。级别映射：Warn/Inject 档发 Warn，Interrupt/Abort 档发 Error。
+    /// 纯旁路信号，不影响 AI 侧任何动作。
+    fn send_loop_notice(&self, level: NoticeLevel, content: String) {
+        if let Some(ref s) = self.sender {
+            s.send_notice(content, level);
         }
     }
 
@@ -103,13 +116,18 @@ impl LoopGuardState {
 
     /// 应用高严重程度（Interrupt/Abort）的统一副作用
     ///
-    /// - Abort：记 WARN、缓存 inject、发中断信号
+    /// - Abort：记 WARN、缓存 inject、发中断信号、向消费者发 Error 通知
     /// - Interrupt：记 INFO、递增 interrupt_count、缓存 inject、
-    ///   发中断信号、发引导注入消息
+    ///   发中断信号、发引导注入消息、向消费者发 Error 通知
     ///
     /// 返回 true 表示已处理（调用方据此跳过低 severity 的分支）。
     /// 两条检测路径（chunk / tool_call）的高 severity 行为完全一致，集中于此消除重复。
-    fn apply_severe(&mut self, severity: LoopSeverity, message: &str) -> bool {
+    /// `kind` 决定通知文案中的重复行为描述（工具 / 文本）。
+    fn apply_severe(&mut self, severity: LoopSeverity, kind: DetectKind, message: &str) -> bool {
+        let behavior = match kind {
+            DetectKind::Tool => "重复执行工具",
+            DetectKind::Text => "重复输出内容",
+        };
         match severity {
             LoopSeverity::Abort => {
                 tracing::warn!(
@@ -119,6 +137,13 @@ impl LoopGuardState {
                 );
                 self.pending_inject = message.to_string();
                 self.send_interrupt(message.to_string());
+                self.send_loop_notice(
+                    NoticeLevel::Error,
+                    format!(
+                        "循环检测：连续 {} 次干预仍{behavior}，已终止执行。请调整任务后重新开始",
+                        self.interrupt_count
+                    ),
+                );
                 true
             }
             LoopSeverity::Interrupt => {
@@ -131,6 +156,13 @@ impl LoopGuardState {
                 self.pending_inject = message.to_string();
                 self.send_interrupt(message.to_string());
                 self.send_inject_message(message.to_string());
+                self.send_loop_notice(
+                    NoticeLevel::Error,
+                    format!(
+                        "循环检测：AI {behavior}，已中断执行并注入引导消息（第 {} 次干预）",
+                        self.interrupt_count
+                    ),
+                );
                 true
             }
             _ => false,
@@ -138,6 +170,9 @@ impl LoopGuardState {
     }
 
     /// 处理流式内容块（文本循环检测）
+    ///
+    /// 检测触发即发消费者通知：高 severity 由 apply_severe 发 Error；
+    /// Warn 档此路径无注入动作（仅记日志），通知是消费者唯一的可见信号。
     pub fn handle_chunk(&mut self, chunk: &ChunkMessage) {
         let result = self.text_guard.handle_chunk(
             chunk.payload.content.as_deref(),
@@ -148,13 +183,21 @@ impl LoopGuardState {
         if let Some(r) = result {
             self.pending_severity = Some(r.severity);
             // 高 severity 由 apply_severe 统一处理；Warn 仅记日志（chunk 路径不缓存 pending_warn）
-            if !self.apply_severe(r.severity, &r.message) {
+            if !self.apply_severe(r.severity, DetectKind::Text, &r.message) {
                 tracing::warn!(severity = "warn", message = %r.message, "循环检测警告 (chunk)");
+                self.send_loop_notice(
+                    NoticeLevel::Warn,
+                    format!("循环检测：输出疑似重复（{}），若持续将升级干预", r.message),
+                );
             }
         }
     }
 
     /// 处理工具调用事件（工具循环检测，优先级高于文本）
+    ///
+    /// 检测触发即发消费者通知：高 severity 由 apply_severe 发 Error；
+    /// Inject/Warn 档在完成 pending 缓存后发 Warn 通知（消费者经工具结果
+    /// 间接可见注入内容，通知额外说明守卫已介入）。
     pub fn handle_tool_call(&mut self, tc: &ToolCallMessage) {
         let result = self.tool_guard.handle_tool_call(
             &tc.payload.tool_name,
@@ -164,17 +207,31 @@ impl LoopGuardState {
 
         if let Some(r) = result {
             self.pending_severity = Some(r.severity);
-            if self.apply_severe(r.severity, &r.message) {
+            if self.apply_severe(r.severity, DetectKind::Tool, &r.message) {
                 return;
             }
             // 低 severity：Inject 替换结果内容，Warn 追加警告
             match r.severity {
                 LoopSeverity::Inject => {
                     tracing::warn!(severity = "inject", message = %r.message, "循环检测注入 (tool)");
+                    self.send_loop_notice(
+                        NoticeLevel::Warn,
+                        format!(
+                            "循环检测：工具循环升级（{}），已替换工具结果打断循环",
+                            r.message
+                        ),
+                    );
                     self.pending_inject = r.message;
                 }
                 _ => {
                     tracing::warn!(severity = "warn", message = %r.message, "循环检测警告 (tool)");
+                    self.send_loop_notice(
+                        NoticeLevel::Warn,
+                        format!(
+                            "循环检测：疑似工具循环（{}），已在工具结果中附加警告",
+                            r.message
+                        ),
+                    );
                     self.pending_warn = r.message;
                 }
             }
@@ -259,7 +316,6 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::UserMessageMode;
     use fuyao_api::message::EventBase;
     use fuyao_api::message::input::PluginSource;
     use fuyao_api::message::output::{
@@ -274,7 +330,7 @@ mod tests {
         state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 构造 SessionSender + 两条通道接收端（user / interrupt；notice 出站接收端丢弃）
+    /// 构造 SessionSender + 三条通道接收端（user / interrupt / notice 出站）
     ///
     /// 测试辅助：插件名统一为 `loop_guard`，通道容量 16。
     /// 测试按需解构对应 rx 验证消息流向。
@@ -282,10 +338,11 @@ mod tests {
         SessionSender,
         mpsc::Receiver<OutputInterruptMessage>,
         mpsc::Receiver<OutputUserMessage>,
+        mpsc::UnboundedReceiver<OutputEvent>,
     ) {
         let (tx_interrupt, rx_interrupt) = mpsc::channel(16);
         let (tx_user, rx_user) = mpsc::channel(16);
-        let (tx_event, _rx_event) = mpsc::unbounded_channel::<fuyao_api::message::OutputEvent>();
+        let (tx_event, rx_event) = mpsc::unbounded_channel::<OutputEvent>();
         let sender = SessionSender::new(
             "loop_guard",
             "test-session",
@@ -293,7 +350,17 @@ mod tests {
             tx_interrupt,
             tx_event,
         );
-        (sender, rx_interrupt, rx_user)
+        (sender, rx_interrupt, rx_user, rx_event)
+    }
+
+    /// 从出站通道取一条通知事件（同步 try_recv，发送全为非阻塞无需 await）
+    fn expect_notice(
+        rx: &mut mpsc::UnboundedReceiver<OutputEvent>,
+    ) -> fuyao_api::message::output::PluginNoticeMessage {
+        match rx.try_recv() {
+            Ok(OutputEvent::PluginNotice(m)) => m,
+            other => panic!("应是 PluginNotice 事件，实际 {other:?}"),
+        }
     }
 
     fn make_chunk(content: Option<&str>, reasoning: Option<&str>) -> ChunkMessage {
@@ -495,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn send_interrupt_sends_input_event() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, mut rx_interrupt, _rx_user) = make_sender();
+        let (sender, mut rx_interrupt, _rx_user, _rx_event) = make_sender();
         state.set_sender(sender);
         state.send_interrupt("循环检测".to_string());
         let msg = rx_interrupt.recv().await.unwrap();
@@ -509,7 +576,7 @@ mod tests {
     #[tokio::test]
     async fn send_inject_message_sends_user_event() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, _rx_interrupt, mut rx_user) = make_sender();
+        let (sender, _rx_interrupt, mut rx_user, _rx_event) = make_sender();
         state.set_sender(sender);
         state.send_inject_message("请调整策略".to_string());
         let msg = rx_user.recv().await.unwrap();
@@ -520,6 +587,88 @@ mod tests {
         }
     }
 
+    /// apply_severe 高档通知：Interrupt → Error（第 n 次干预），Abort → Error（连续 n 次干预）
+    #[test]
+    fn apply_severe_sends_error_notices() {
+        let mut state = LoopGuardState::new(LoopGuardConfig::default());
+        let (sender, _rx_interrupt, _rx_user, mut rx_event) = make_sender();
+        state.set_sender(sender);
+
+        // Interrupt（工具）：第 1 次干预
+        state.apply_severe(LoopSeverity::Interrupt, DetectKind::Tool, "引导消息");
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Error);
+        assert_eq!(m.payload.source.name, "loop_guard");
+        assert!(m.payload.content.contains("重复执行工具"));
+        assert!(m.payload.content.contains("第 1 次干预"));
+
+        // Interrupt（文本）：第 2 次干预
+        state.apply_severe(LoopSeverity::Interrupt, DetectKind::Text, "引导消息");
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Error);
+        assert!(m.payload.content.contains("重复输出内容"));
+        assert!(m.payload.content.contains("第 2 次干预"));
+
+        // Abort：连续 2 次干预仍重复，已终止执行
+        state.apply_severe(LoopSeverity::Abort, DetectKind::Tool, "终止消息");
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Error);
+        assert!(m.payload.content.contains("连续 2 次干预"));
+        assert!(m.payload.content.contains("已终止执行"));
+    }
+
+    /// 工具升级链通知：Warn → Warn（含检测详情），Inject → Warn，Interrupt → Error
+    #[test]
+    fn tool_escalation_notifies_per_level() {
+        let mut state = LoopGuardState::new(LoopGuardConfig {
+            tool_repeat_threshold: 4,
+            ..Default::default()
+        });
+        let (sender, _rx_interrupt, _rx_user, mut rx_event) = make_sender();
+        state.set_sender(sender);
+
+        // 前 3 次不触发：无通知
+        for _ in 0..3 {
+            state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
+        }
+        assert!(rx_event.try_recv().is_err(), "未触发检测不应有通知");
+
+        // 第 4 次：Warn 通知（含检测详情）
+        state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Warn);
+        assert!(m.payload.content.contains("连续 4 次相同操作 bash"));
+
+        // 第 5 次：Inject 通知
+        state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Warn);
+        assert!(m.payload.content.contains("替换工具结果"));
+
+        // 第 6 次：Interrupt 通知
+        state.handle_tool_call(&make_tool_call("bash", r#"{"command":"ls"}"#));
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Error);
+        assert!(m.payload.content.contains("已中断执行"));
+    }
+
+    /// 文本 Warn 通知：检测详情随通知发出（此路径无注入动作，通知是唯一可见信号）
+    #[test]
+    fn chunk_warn_sends_notice() {
+        let mut state = LoopGuardState::new(LoopGuardConfig {
+            streaming_check_interval: 10,
+            ..Default::default()
+        });
+        let (sender, _rx_interrupt, _rx_user, mut rx_event) = make_sender();
+        state.set_sender(sender);
+
+        let text = "这是一段重复的内容".repeat(4);
+        state.handle_chunk(&make_chunk(Some(&text), None));
+        let m = expect_notice(&mut rx_event);
+        assert_eq!(m.payload.level, NoticeLevel::Warn);
+        assert!(m.payload.content.contains("输出疑似重复"));
+    }
+
     /// 完整升级链路集成测试：Warn → Inject → Interrupt ×3 → Abort
     #[test]
     fn full_escalation_chain() {
@@ -527,7 +676,7 @@ mod tests {
             tool_repeat_threshold: 4,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_user) = make_sender();
+        let (sender, _rx_interrupt, _rx_user, _rx_event) = make_sender();
         state.set_sender(sender);
 
         // 1-3 次相同调用：不触发
@@ -638,7 +787,7 @@ mod tests {
         })));
         {
             let mut guard = lock(&state);
-            let (sender, _rx_interrupt, _rx_user) = make_sender();
+            let (sender, _rx_interrupt, _rx_user, _rx_event) = make_sender();
             guard.set_sender(sender);
         }
 

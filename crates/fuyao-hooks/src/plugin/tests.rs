@@ -383,21 +383,21 @@ fn make_sender() -> (
     (sender, rx_user, rx_interrupt)
 }
 
-/// send_user 默认 Guide 模式
+/// send_user 指定 Guide 模式
 #[tokio::test]
-async fn sender_send_user_uses_guide_mode_by_default() {
+async fn sender_send_user_guide_mode() {
     let (sender, mut rx_user, _rx_int) = make_sender();
-    sender.send_user("hello");
+    sender.send_user("hello", UserMessageMode::Guide);
     let received = rx_user.recv().await.expect("应收到 User 消息");
     assert_eq!(received.payload.content, "hello");
     assert_eq!(received.payload.mode, UserMessageMode::Guide);
 }
 
-/// send_user_with_mode 指定 Pending 模式
+/// send_user 指定 Pending 模式
 #[tokio::test]
-async fn sender_send_user_with_mode_pending() {
+async fn sender_send_user_pending_mode() {
     let (sender, mut rx_user, _rx_int) = make_sender();
-    sender.send_user_with_mode("排队", UserMessageMode::Pending);
+    sender.send_user("排队", UserMessageMode::Pending);
     let received = rx_user.recv().await.expect("应收到 User 消息");
     assert_eq!(received.payload.content, "排队");
     assert_eq!(received.payload.mode, UserMessageMode::Pending);
@@ -407,7 +407,7 @@ async fn sender_send_user_with_mode_pending() {
 #[tokio::test]
 async fn sender_send_user_fills_plugin_source() {
     let (sender, mut rx_user, _rx_int) = make_sender();
-    sender.send_user("来源校验");
+    sender.send_user("来源校验", UserMessageMode::Guide);
     let received = rx_user.recv().await.expect("应收到 User 消息");
     match received.payload.source {
         fuyao_api::UserMessageSource::Plugin(src) => assert_eq!(src.name, "test_plugin"),
@@ -429,7 +429,7 @@ async fn sender_send_interrupt_routes_to_interrupt_channel() {
 #[tokio::test]
 async fn sender_two_channels_are_independent() {
     let (sender, mut rx_user, mut rx_int) = make_sender();
-    sender.send_user("只发 User");
+    sender.send_user("只发 User", UserMessageMode::Guide);
     // Interrupt 通道应无消息
     assert!(rx_int.try_recv().is_err(), "Interrupt 通道不应有消息");
     // User 通道有消息
