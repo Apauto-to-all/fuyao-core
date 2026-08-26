@@ -5,6 +5,12 @@
 //! 两类钩子统一按优先级排序执行（priority 降序、同优先级按注册序，
 //! [`HooksRegistry::finalize`] 装配期一次排定）。
 //!
+//! 故障防护覆盖（三类钩子故障形态各归其位，均为保留项）：
+//! - 钩子 panic：`catch_unwind` 兜底，两类钩子都有
+//! - observe 钩子挂起（future 永不完成）：超时兜底——本注册表内**唯一**保底机制
+//! - intercept 钩子死循环（同步代码）：同步代码不可抢占，无运行时保底可做，
+//!   属同步拦截的固有约束，靠插件作者自律
+//!
 //! 生命周期约定：注册只发生在 session 装配期（`register_*` 需 `&mut self`），
 //! 装配方在注册完成后调一次 [`HooksRegistry::finalize`] 排序冻结，之后注册表
 //! 以 `Arc` 只读共享（见 [`crate::SharedHooks`]），运行期无锁、不可再改。
@@ -84,6 +90,14 @@ impl HooksRegistry {
     /// - `hook_timeout` > 0：用 `tokio::time::timeout` 包裹，超时返回 None
     ///
     /// 调用方负责先做 `catch_unwind`（panic 防护），本方法只管超时。
+    ///
+    /// 超时是 observe 钩子「挂起」故障的唯一保底，不可删减：
+    /// - observe 串行 await 在 dispatch 内联路径上（ReAct 主循环与历史入口均
+    ///   内联等待 deliver），一个永不完成的 future 会冻结整个 session 的
+    ///   事件管道，且无日志、无诊断——无界静默假死
+    /// - 插件面向二次开发者，钩子代码不受引擎作者控制，引擎必须兜底
+    /// - 超时把无界冻结降为有界损失：丢弃该 future（副作用停在中间态）并告警，
+    ///   管道继续推进；中间态风险小于整个 session 假死
     async fn run_hook_with_timeout<T>(&self, fut: impl Future<Output = T>) -> Option<T> {
         if self.hook_timeout.is_zero() {
             Some(fut.await)

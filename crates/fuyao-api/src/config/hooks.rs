@@ -11,6 +11,11 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct HooksConfig {
     /// 单个 hook 执行超时（秒），默认 5；0 表示不超时
+    ///
+    /// 该超时是 observe 钩子「挂起」（future 永不完成）的唯一保底：observe
+    /// 串行 await 在引擎内联路径上，钩子挂起会冻结整个 session 的事件管道
+    /// 且无诊断信息。置 0 即放弃该保底，仅当确认所有 observe 钩子都
+    /// 不可能挂起时才可接受。
     pub timeout_secs: u64,
 }
 

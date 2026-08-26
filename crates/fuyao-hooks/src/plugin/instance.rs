@@ -23,6 +23,9 @@ use crate::plugin::SessionSender;
 /// - 字段：完全自由（持 per-session state、共享 Arc、配置、无字段都合法）
 /// - 注册几个 hook：完全自由（0 个、1 个、2 个都合法）
 /// - 是否要发消息：完全自由（忽略 sender 就只能观察/拦截）
+///
+/// 公开扩展契约：外部插件按此实现；dispose 为需要显式清理（刷盘、关闭
+/// 非 Drop 友好连接等）的插件预留，无此需求的插件用默认空实现。
 pub trait PluginInstance: Send + Sync {
     /// 注册阶段：把 hook 闭包注册到 registry，并接收该 session 的消息发送器
     ///

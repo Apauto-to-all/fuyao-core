@@ -24,6 +24,13 @@ use crate::plugin::PluginInstance;
 /// - Plugin（工厂）：生命周期 = Engine，数量 = 每插件 1 份，持配置
 /// - PluginInstance（实例）：生命周期 = Session，数量 = 每 session 每插件 1 份，持 state
 ///
+/// 两层 trait 形态的选型依据（公开扩展 API，不按内置插件使用程度评判）：
+/// - trait 自文档 + IDE 可发现：外部插件作者无需读引擎源码即知该实现什么
+/// - trait 可演进：新增能力以默认方法扩展（dispose 即此形态），注册闭包式
+///   签名一经发布便无法再扩展
+/// - 引擎级（配置 / 共享依赖，每插件一份）与 session 级（独立状态，每 session
+///   一份）是两个真实作用域边界，两层各持其所
+///
 /// 实现示例见模块文档。
 pub trait Plugin: Send + Sync {
     /// 插件唯一标识（调试、日志、配置开关匹配、实例 sender 身份绑定用）
