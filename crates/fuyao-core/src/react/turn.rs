@@ -12,11 +12,10 @@
 //!   双队列都空才结束 turn。批内 Control 条目就地执行——执行后按批次是否
 //!   注入过消息自然走向（有则继续 ReAct，无则 turn 结束）。
 //!
-//! turn 运行期间的入站条目：两段 select! 均监听 `rx_inbound`（User / Control 条目，
-//! 经 `handle_inbound_item` 纯入队）与 `rx_plugin`（插件注入的纯 User 消息，同纯入队）
-//! ——不打断流式 / 工具执行，入队后由上述两个消费时机接管。入站通道若只在 idle 消费，
-//! turn 运行期间的消息到不了队列，两个消费时机在生产链路上永远空转
-//! （消费被推迟到 turn 结束后）。
+//! turn 运行期间的入站条目：两段 select! 监听 `rx_inbound`（外部 User / Control 条目
+//! 与插件注入的 User 条目，经 `handle_inbound_item` 纯入队）——不打断流式 / 工具执行，
+//! 入队后由上述两个消费时机接管。入站通道若只在 idle 消费，turn 运行期间的消息
+//! 到不了队列，两个消费时机在生产链路上永远空转（消费被推迟到 turn 结束后）。
 //!
 //! 中断：两段 select!——流式期间、工具执行期间。idle 段在 run_session 外层。
 //! 中断分支用 `Some(...)` 模式：中断通道关闭（所有 tx drop）时分支禁用而非当作事件，
@@ -37,7 +36,6 @@ use super::builders::{
 };
 use super::consume_batch;
 use super::handle_inbound_item;
-use crate::engine::types::QueueEntry;
 use crate::interrupt::{self, SharedTurnState, TurnState};
 use crate::react::queue;
 use crate::stream::StreamResult;
@@ -45,9 +43,8 @@ use crate::tool_exec;
 use fuyao_api::ModelConfig;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
-use fuyao_api::message::output::{
-    AssistantMessage, InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
-};
+use fuyao_api::message::QueueEntry;
+use fuyao_api::message::output::{AssistantMessage, InterruptMessage as OutputInterruptMessage};
 use fuyao_provider::Provider;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -64,7 +61,7 @@ use tokio::sync::mpsc::Receiver;
 ///   主循环继续 consume（本就空）或落 select! 等待
 /// - 非 `Completed`（中断 / 失败）：`may_consume` 为假 → 主循环跳过 consume，
 ///   guide/pending 剩余**原样保留**（引擎不清队列），落 select! 等待
-/// - **恢复迁移**：idle select! 的 inbound / plugin_user 分支收到新条目时调
+/// - **恢复迁移**：idle select! 的 inbound 分支收到新条目时调
 ///   [`resume_on_new_intent`](Self::resume_on_new_intent) 重置为 `Completed`——新条目 =
 ///   新意图，回顶部 consume 把「旧剩余 + 新条目」一起跑（忠实消费）
 /// - **空闲解禁**：task 空闲（无活跃 turn）时 pending 的「等链结束」解禁条件已满足，
@@ -95,7 +92,7 @@ impl TurnOutcome {
     ///
     /// 新条目（用户消息 / 控制命令 / 插件注入）= 新意图，重置为 `Completed`，
     /// 主循环回顶部把「旧剩余 + 新条目」一起消费（忠实消费，引擎不清队列）。
-    /// 由 idle select! 的 inbound / plugin_user 分支调用。
+    /// 由 idle select! 的 inbound 分支调用。
     pub(crate) fn resume_on_new_intent(&mut self) {
         *self = Self::Completed;
     }
@@ -104,10 +101,10 @@ impl TurnOutcome {
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环经批次处理注入 DB）
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
-/// `rx_inbound` 为入站通道接收端（User / Control 条目）：流式与工具执行两段 select!
-/// 监听它，收到条目即经 `handle_inbound_item` 纯入队（不打断 turn），由消费时机接管
-/// ——保证 turn 运行期间到达的条目能赶上前面的消费点，而不是滞留通道等到 turn 结束。
-/// `rx_plugin` 为插件注入通道接收端（纯 User 消息），两段 select! 同样监听并纯入队。
+/// `rx_inbound` 为入站通道接收端（外部 User / Control 条目与插件注入的 User 条目）：
+/// 流式与工具执行两段 select! 监听它，收到条目即经 `handle_inbound_item` 纯入队
+/// （不打断 turn），由消费时机接管——保证 turn 运行期间到达的条目能赶上前面的
+/// 消费点，而不是滞留通道等到 turn 结束。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
 ///
 /// 返回 [`TurnOutcome`]：主循环据此决定是否继续消费队列。非 `Completed` 的退出都意味着
@@ -115,7 +112,6 @@ impl TurnOutcome {
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     rx_inbound: &mut Receiver<QueueEntry>,
-    rx_plugin: &mut Receiver<OutputUserMessage>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     model_config: ModelConfig,
 ) -> TurnOutcome {
@@ -198,14 +194,10 @@ pub(crate) async fn run_turn(
                         interrupt::finish_streaming(ctx, &state, &interrupt::shutdown_payload()).await;
                         return TurnOutcome::Interrupted;
                     }
-                    // 入站条目（User / Control）：纯入队后继续等流式。Some 模式：通道关闭
-                    //（所有 tx drop）时分支禁用，关闭不是事件、不参与调度
+                    // 入站条目（外部 User / Control 或插件注入的 User）：纯入队后继续
+                    // 等流式。Some 模式：通道关闭（所有 tx drop）时分支禁用，关闭不是事件、不参与调度
                     Some(entry) = rx_inbound.recv() => {
                         handle_inbound_item(ctx, entry).await;
-                    }
-                    // 插件注入的纯 User 消息：同纯入队语义（Some 模式，关闭 = 分支禁用）
-                    Some(user_msg) = rx_plugin.recv() => {
-                        handle_inbound_item(ctx, QueueEntry::User(user_msg)).await;
                     }
                     result = &mut retry_fut => break result,
                     // 中断通道独立：此处只会收到 Interrupt。
@@ -231,15 +223,9 @@ pub(crate) async fn run_turn(
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
                     // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
-                    let halted = handle_tool_calls(
-                        ctx,
-                        rx_inbound,
-                        rx_plugin,
-                        rx_interrupt,
-                        &result,
-                        &model_config,
-                    )
-                    .await;
+                    let halted =
+                        handle_tool_calls(ctx, rx_inbound, rx_interrupt, &result, &model_config)
+                            .await;
                     if halted {
                         return TurnOutcome::Interrupted;
                     }
@@ -323,12 +309,11 @@ async fn handle_final_reply(
 /// 工具执行通过 channel 通知完成，turn.rs 边收边走统一历史入口（拦截 → 落 DB → 发事件）。
 /// 中断时 channel 里剩余结果也清空落库，保证不丢。
 ///
-/// `rx_inbound`：工具执行段 select! 监听入站通道，收到条目即时纯入队（见循环内注释）。
-/// `rx_plugin`：同段监听插件注入通道，纯 User 消息同纯入队。
+/// `rx_inbound`：工具执行段 select! 监听入站通道，收到条目（外部 User / Control
+/// 或插件注入的 User）即时纯入队（见循环内注释）。
 async fn handle_tool_calls(
     ctx: &SessionCtx,
     rx_inbound: &mut Receiver<QueueEntry>,
-    rx_plugin: &mut Receiver<OutputUserMessage>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
@@ -454,10 +439,6 @@ async fn handle_tool_calls(
             // Some 模式：通道关闭（所有 tx drop）时分支禁用
             Some(entry) = rx_inbound.recv() => {
                 handle_inbound_item(ctx, entry).await;
-            }
-            // 插件注入的纯 User 消息：同纯入队语义（Some 模式，关闭 = 分支禁用）
-            Some(user_msg) = rx_plugin.recv() => {
-                handle_inbound_item(ctx, QueueEntry::User(user_msg)).await;
             }
             _ = &mut exec_fut => {
                 // execute_tools 完成：清空 channel 里剩余的（防丢，理论已空）

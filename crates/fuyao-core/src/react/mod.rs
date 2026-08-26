@@ -20,14 +20,14 @@
 //!   再 guide 全消费；注入过消息则回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环），
 //!   双队列都空才结束 turn
 //!
-//! 三条 session 级入站通道：
-//! - 入站通道（inbound）：User 与 Control 条目统一承载（保证两类消息的总序）
-//! - 插件注入通道（plugin_user）：插件经 SessionSender 注入的纯 User 消息
-//!   （独立通道让 fuyao-hooks 无需感知队列条目类型）
+//! 两条 session 级入站通道：
+//! - 入站通道（inbound）：User 与 Control 条目统一承载（保证总序）——外部入站
+//!   （Engine::send）与插件注入（SessionSender）共用同一条通道，插件注入的
+//!   User 消息就是 `QueueEntry::User` 条目
 //! - 中断通道（interrupt）：与队列正交，select! 中断点只监听它——不会误取 User
 //!
-//! 入队时机（turn 内两段 select! 的 inbound / plugin_user 臂 + idle select! 同名臂，
-//! 全走 [`handle_inbound_item`] 纯入队）：turn 运行期间到达的条目即时入队，
+//! 入队时机（turn 内两段 select! 的 inbound 臂 + idle select! 同名臂，全走
+//! [`handle_inbound_item`] 纯入队）：turn 运行期间到达的条目（含插件注入）即时入队，
 //! 保证上面的消费时机在真实链路上能看到它们，而不是滞留通道推迟到 turn
 //! 结束后才各开独立 turn。
 //!
@@ -43,13 +43,13 @@ mod title;
 pub(crate) mod turn;
 
 use crate::emit::Emitter;
-use crate::engine::types::QueueEntry;
 use crate::engine::types::SharedQueue;
 use crate::engine::types::TurnPhase;
 use crate::engine::types::TurnPhaseGuard;
 use crate::interrupt::notify_idle;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
+use fuyao_api::message::QueueEntry;
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::{AgentDefinition, CompressionConfig, ControlCommand, SessionParams};
@@ -276,24 +276,22 @@ impl SessionCtx {
 
 /// session 执行流的入站通道集合
 ///
-/// 聚合喂给 session task 的三条接收端，由 Engine 的 assemble_session 一次性构造、
-/// 整个 task 期间由 run_session 独占消费：inbound / plugin_user / interrupt 在主循环
+/// 聚合喂给 session task 的两条接收端，由 Engine 的 assemble_session 一次性构造、
+/// 整个 task 期间由 run_session 独占消费：inbound / interrupt 在主循环
 /// select! 与 run_turn 间 `&mut` 借用。
 ///
 /// 与 [`SessionCtx`]（共享依赖视图）正交：ctx 是所有 turn 复用的只读依赖，rx 是本 task
 /// 独占消费的入站通道——两者一并构成 [`run_session`] 的全部入参。
 pub(crate) struct SessionRx {
-    /// 入站条目（User / Control，按自带 mode 分流入 guide / pending 队列）
+    /// 入站条目（外部 User / Control 与插件注入的 User，按自带 mode 分流入 guide / pending 队列）
     pub inbound: Receiver<QueueEntry>,
-    /// 插件注入的纯 User 消息（SessionSender 的通道，收到即纯入队）
-    pub plugin_user: Receiver<OutputUserMessage>,
     /// 中断信号（idle 段与流式 / 工具执行段的中断点）
     pub interrupt: Receiver<OutputInterruptMessage>,
 }
 
 /// session 的独立执行流
 ///
-/// 消费 guide 队列驱动 ReAct 循环；guide 空时 select! 等待入站 / 插件条目（纯入队）
+/// 消费 guide 队列驱动 ReAct 循环；guide 空时 select! 等待入站条目（纯入队）
 /// 或 rx_interrupt（idle 中断）。
 ///
 /// User 消息的处理统一推迟到消费时刻：Engine::send 把条目送入站通道 → select! 收到 →
@@ -314,11 +312,10 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
         "session 执行流启动"
     );
 
-    // 拆出入站三通道：inbound / plugin_user / interrupt 在主循环 select! 与 run_turn 间
-    // &mut 借用。三个绑定均 mut——recv/try_recv 需 &mut self。
+    // 拆出入站两通道：inbound / interrupt 在主循环 select! 与 run_turn 间
+    // &mut 借用。两个绑定均 mut——recv/try_recv 需 &mut self。
     let SessionRx {
         inbound: mut rx_inbound,
-        plugin_user: mut rx_plugin,
         interrupt: mut rx_interrupt,
     } = rx;
 
@@ -392,14 +389,9 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                     // turn 运行期间到达的入站条目由 run_turn 内两段 select! 即时入队
                     //（见 turn.rs），不滞留通道；outcome 决定下一轮 loop 顶部的消费许可：
                     // 非 Completed 则跳过 consume 等恢复。
-                    outcome = turn::run_turn(
-                        &ctx,
-                        &mut rx_inbound,
-                        &mut rx_plugin,
-                        &mut rx_interrupt,
-                        model_config,
-                    )
-                    .await;
+                    outcome =
+                        turn::run_turn(&ctx, &mut rx_inbound, &mut rx_interrupt, model_config)
+                            .await;
                 }
                 // 批次未注入任何 User（只含命令）：不跑 turn，回 select! 等待新条目
             }
@@ -409,7 +401,7 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
         // ① guide 空（Completed 且无条目）② run_turn 非 Completed return（队列剩余被保留）
         // ③ 消费被跳过（outcome 非 Completed）。
         // 停止消费：非 Completed 时 guide 剩余不跑，落这里等。
-        // 恢复消费：inbound / plugin_user 收到新条目 → 恢复许可 → 回顶部 consume，
+        // 恢复消费：inbound 收到新条目 → 恢复许可 → 回顶部 consume，
         // 旧剩余 + 新条目一起跑（忠实消费，不清队列）。
         tokio::select! {
             biased;
@@ -422,16 +414,11 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
                 break;
             }
             Some(entry) = rx_inbound.recv() => {
-                // 入站条目（User / Control）按自带 mode 纯入队。
+                // 入站条目（外部 User / Control 或插件注入的 User）按自带 mode 纯入队。
                 // 恢复消费许可：任何新条目（含命令）= 新意图，回顶部 consume
                 //（否则中断后 idle 发的命令会死信）
                 outcome.resume_on_new_intent();
                 handle_inbound_item(&ctx, entry).await;
-            }
-            Some(user_msg) = rx_plugin.recv() => {
-                // 插件注入的纯 User 消息入队，语义与入站臂一致（新意图恢复消费）
-                outcome.resume_on_new_intent();
-                handle_inbound_item(&ctx, QueueEntry::User(user_msg)).await;
             }
             Some(interrupt_msg) = rx_interrupt.recv() => {
                 // idle 中断：无活跃 turn，只发通知事件（收尾协议归 interrupt 模块）
@@ -488,9 +475,9 @@ async fn consume_batch(ctx: &SessionCtx, entries: Vec<QueueEntry>) -> bool {
 /// 这样保证 user 消息的拦截/落库/发送三个时机**对齐**（都在消费时刻），
 /// 与 assistant / tool_result 的处理路径完全对称。
 ///
-/// 四处调用（同一 task 串行消费，天然互斥）：
-/// - 主循环 idle select! 的 inbound / plugin_user 分支（task 空闲时入队，附带恢复消费许可）
-/// - turn.rs 流式期间 / 工具执行期间两段 select! 的 inbound / plugin_user 分支
+/// 三处调用（同一 task 串行消费，天然互斥）：
+/// - 主循环 idle select! 的 inbound 分支（task 空闲时入队，附带恢复消费许可）
+/// - turn.rs 流式期间 / 工具执行期间两段 select! 的 inbound 分支
 ///   （turn 运行期间即时入队，不打断 turn，由 turn 内消费时机接管）
 async fn handle_inbound_item(ctx: &SessionCtx, entry: QueueEntry) {
     let mode = match &entry {

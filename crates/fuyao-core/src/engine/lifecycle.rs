@@ -360,7 +360,7 @@ impl Engine {
 
     /// 装配 session（create_session / resume_session 公共方法）
     ///
-    /// 建该 session 专属的双队列、三条入站通道（inbound / plugin_user / interrupt）
+    /// 建该 session 专属的双队列、两条入站通道（inbound / interrupt）
     /// 与 per-session 出站通道，装配该 session 的 hooks（per-session 独立实例），
     /// spawn 执行流 task，返回 `(SessionHandle, rx_event)`——rx_event 是该 session
     /// 的独立出站通道接收端，由调用方（装配层 / detached 调用方）独占消费。
@@ -391,12 +391,11 @@ impl Engine {
         }
 
         // session 级入站通道（载荷统一为 output 侧类型——入口转化后内核只认 output 侧）：
-        // - 入站通道：User 与 Control 消息统一承载（QueueEntry），保证两类消息的总序
-        // - 插件注入通道：纯 User 消息（SessionSender 的公开类型不含 QueueEntry，
-        //   独立通道让 fuyao-hooks 无需感知队列条目类型）
+        // - 入站通道：User 与 Control 条目统一承载（QueueEntry），保证总序——
+        //   外部入站（Engine::send）与插件注入（SessionSender）共用同一条通道，
+        //   发送顺序即排队顺序
         // - 中断通道：与队列正交的中断信号
-        let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
-        let (tx_plugin_user, rx_plugin_user) = mpsc::channel::<OutputUserMessage>(16);
+        let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(32);
         let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
 
         // 该 session 的 per-session 出站通道（无界——事件入 channel 前已落库，
@@ -417,7 +416,7 @@ impl Engine {
         // 实例集合随 hooks 一起产出，存进 SessionHandle 供 session 结束时逆序 dispose
         let (hooks, plugin_instances) = self.assemble_session_hooks(
             &session_id,
-            tx_plugin_user.clone(),
+            tx_inbound.clone(),
             tx_interrupt.clone(),
             tx_event.clone(),
         );
@@ -445,7 +444,6 @@ impl Engine {
         .build();
         let rx = react::SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin_user,
             interrupt: rx_interrupt,
         };
         let task = tokio::spawn(react::run_session(ctx, rx));
@@ -485,7 +483,7 @@ impl Engine {
     fn assemble_session_hooks(
         &self,
         session_id: &SessionId,
-        tx_plugin_user: mpsc::Sender<OutputUserMessage>,
+        tx_inbound: mpsc::Sender<QueueEntry>,
         tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
         tx_event: mpsc::UnboundedSender<OutputEvent>,
     ) -> (SharedHooks, Vec<NamedPluginInstance>) {
@@ -511,7 +509,7 @@ impl Engine {
             let sender = SessionSender::new(
                 name.clone(),
                 session_id.clone(),
-                tx_plugin_user.clone(),
+                tx_inbound.clone(),
                 tx_interrupt.clone(),
                 tx_event.clone(),
             );

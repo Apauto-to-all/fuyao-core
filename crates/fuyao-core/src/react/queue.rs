@@ -11,7 +11,8 @@
 //!
 //! User 消息的拦截/发送/观察**全在消费时刻**统一发生（入队纯排队，无 side effect）。
 
-use crate::engine::types::{QueueEntry, SharedQueue};
+use crate::engine::types::SharedQueue;
+use fuyao_api::message::QueueEntry;
 
 /// 一次性取出 guide 全部条目（非阻塞，drain 清空队列）
 pub(crate) fn consume_all_guide(guide: &SharedQueue) -> Vec<QueueEntry> {

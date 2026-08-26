@@ -352,12 +352,9 @@ struct TestHarness {
     session_id: String,
     /// 入站通道接收端：run_turn 流式 / 工具执行两段 select! 消费它（User / Control 条目）
     rx_inbound: mpsc::Receiver<QueueEntry>,
-    /// 入站通道发送端：测试向 turn 运行期间注入条目用（与生产 Engine::send 同路径）
+    /// 入站通道发送端：测试向 turn 运行期间注入条目用（与生产 Engine::send 同路径，
+    /// 插件注入的 User 条目也走此通道）
     tx_inbound: mpsc::Sender<QueueEntry>,
-    /// 插件注入通道接收端：run_turn 两段 select! 消费它（纯 User 消息）
-    rx_plugin: mpsc::Receiver<OutputUserMessage>,
-    /// 插件注入通道发送端：测试模拟插件注入用
-    tx_plugin: mpsc::Sender<OutputUserMessage>,
     rx_interrupt: Receiver<OutputInterruptMessage>,
     tx_interrupt: mpsc::Sender<OutputInterruptMessage>,
     rx_event: mpsc::UnboundedReceiver<OutputEvent>,
@@ -422,12 +419,10 @@ async fn make_harness_full(
     store.create(&session).await.unwrap();
     drop(session);
     let (tx_event, rx_event) = mpsc::unbounded_channel();
-    // 入站通道（User / Control 条目统一承载）：与生产同容量（16），
-    // 测试经 tx_inbound 模拟 Engine::send 的投递路径
-    let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
+    // 统一入站通道（外部 User / Control 条目与插件注入的 User 条目承载）：
+    // 与生产同路径，测试经 tx_inbound 模拟 Engine::send / SessionSender 的投递
+    let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(32);
     let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
-    // 插件注入通道（纯 User 消息）：与生产同容量（16），测试经 tx_plugin 模拟插件注入
-    let (tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     // 包成 ProviderRegistry：测试里所有 model_id 都用 "test/..."，统一走 test provider。
     // turn.rs 从 ctx.providers.get(provider_id) 取实例，必须找到才能继续。
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -447,8 +442,6 @@ async fn make_harness_full(
         session_id: TEST_SESSION_ID.to_string(),
         rx_inbound,
         tx_inbound,
-        rx_plugin,
-        tx_plugin,
         rx_interrupt,
         tx_interrupt,
         rx_event,
@@ -514,7 +507,6 @@ async fn single_turn_no_tools() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -548,7 +540,6 @@ async fn react_loop_with_tool() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -578,7 +569,6 @@ async fn tool_result_in_messages() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -605,7 +595,6 @@ async fn llm_error_emits_error_event() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -639,7 +628,6 @@ async fn guide_all_consumed_on_tool_complete() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -695,7 +683,6 @@ async fn pending_before_guide_on_final_reply() {
     let outcome = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -740,7 +727,6 @@ async fn both_empty_turn_ends() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -787,7 +773,6 @@ async fn guide_via_channel_consumed_after_tool_batch() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -843,9 +828,9 @@ async fn guide_via_channel_consumed_after_tool_batch() {
     assert!(h.ctx.guide.lock().unwrap().is_empty(), "guide 应被消费空");
 }
 
-/// 插件消息经插件注入通道在工具执行期间到达：工具执行段 select! 的 plugin_user
-/// 分支即时入队（纯 User 消息），在消费时机①被消费注入——与入站通道同语义，
-/// 不打断工具批、不滞留到 turn 结束后。
+/// 插件消息经统一入站通道在工具执行期间到达：工具执行段 select! 的 inbound
+/// 分支即时入队（QueueEntry::User 条目），在消费时机①被消费注入——与外部入站
+/// 同语义，不打断工具批、不滞留到 turn 结束后。
 #[tokio::test]
 async fn plugin_msg_via_channel_consumed_after_tool_batch() {
     // 阻塞工具：sleep 200ms 后完成（Pending 窗口，等测试在窗口内注入插件消息）
@@ -870,11 +855,10 @@ async fn plugin_msg_via_channel_consumed_after_tool_batch() {
     let mut h = make_harness(provider, Arc::new(tools)).await;
     preload_user(&h, "原始问题").await;
 
-    let tx_plugin = h.tx_plugin.clone();
+    let tx_inbound = h.tx_inbound.clone();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -885,9 +869,9 @@ async fn plugin_msg_via_channel_consumed_after_tool_batch() {
             tokio::task::yield_now().await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        // 工具执行期间注入插件消息（plugin_user 分支即时入队，不打断工具批）
-        tx_plugin
-            .send(make_user_message("插件期间补充"))
+        // 工具执行期间注入插件消息（inbound 分支即时入队，不打断工具批）
+        tx_inbound
+            .send(QueueEntry::User(make_user_message("插件期间补充")))
             .await
             .unwrap();
     };
@@ -949,7 +933,6 @@ async fn guide_via_channel_batched_in_one_turn() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -1014,7 +997,6 @@ async fn inbound_during_streaming_consumed_at_final_reply() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -1096,7 +1078,6 @@ async fn interrupt_after_inbound_preserves_guide_queue() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -1186,7 +1167,6 @@ async fn pending_via_channel_consumed_at_final_reply_not_tool_batch() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -1268,7 +1248,6 @@ async fn closed_interrupt_channel_does_not_disturb_turn() {
     let outcome = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -1313,10 +1292,9 @@ async fn pending_consumed_when_task_idle() {
     let pending = empty_queue();
     // 入站通道（User / Control 条目经此送进 session task 纯入队）
     let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
-    // 中断 / 插件注入通道：tx 直接 drop 即关闭——select! 的 Some 模式下关闭 = 分支禁用，
+    // 中断通道：tx 直接 drop 即关闭——select! 的 Some 模式下关闭 = 分支禁用，
     // 无需保活（通道关闭语义的活验证：session 只靠 inbound / shutdown 驱动）
     let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     // 启动 session 执行流（两队列都空，task 进入 select! 等待）
@@ -1339,7 +1317,6 @@ async fn pending_consumed_when_task_idle() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
@@ -1379,8 +1356,9 @@ async fn pending_consumed_when_task_idle() {
     assert!(guide.lock().unwrap().is_empty(), "guide 应保持空");
 }
 
-/// task 空闲时插件经注入通道发一条 User 消息：plugin_user 分支入队并恢复消费许可，
-/// 触发新 turn 跑完——插件通道与入站通道在 idle 段语义一致
+/// task 空闲时插件经统一入站通道发一条 User 条目（SessionSender 同款路径）：
+/// inbound 分支入队并恢复消费许可，触发新 turn 跑完——插件注入与外部入站
+/// 在 idle 段语义一致
 #[tokio::test]
 async fn plugin_user_message_triggers_turn_when_idle() {
     let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
@@ -1394,10 +1372,8 @@ async fn plugin_user_message_triggers_turn_when_idle() {
 
     let guide = empty_queue();
     let pending = empty_queue();
-    // 入站通道：tx 直接 drop 即关闭（关闭 = 分支禁用），session 只靠插件通道驱动
-    let (_tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
+    let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
     let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -1419,14 +1395,13 @@ async fn plugin_user_message_triggers_turn_when_idle() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
 
-    // 模拟插件注入：经插件通道发一条 Guide 模式 User 消息
-    tx_plugin
-        .send(make_user_message("插件注入消息"))
+    // 模拟插件注入：经统一入站通道发一条 Guide 模式 User 条目
+    tx_inbound
+        .send(QueueEntry::User(make_user_message("插件注入消息")))
         .await
         .unwrap();
 
@@ -1476,7 +1451,6 @@ async fn turn_restart_on_new_inbound_after_drained() {
     let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
     // 中断 / 插件注入通道：tx 直接 drop 即关闭（关闭 = 分支禁用，无需保活）
     let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -1498,7 +1472,6 @@ async fn turn_restart_on_new_inbound_after_drained() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
@@ -1560,7 +1533,6 @@ async fn rapid_fire_messages_answered_in_single_turn() {
     let pending = empty_queue();
     let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
     let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -1582,7 +1554,6 @@ async fn rapid_fire_messages_answered_in_single_turn() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
@@ -1649,7 +1620,6 @@ async fn interrupted_turn_preserves_guide_until_new_inbound() {
     let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
     // 中断通道：本测试要发中断，tx 保留发送用（不再是为保活）
     let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -1669,7 +1639,6 @@ async fn interrupted_turn_preserves_guide_until_new_inbound() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
@@ -1805,7 +1774,6 @@ async fn interrupt_during_streaming() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -1897,7 +1865,6 @@ async fn interrupt_during_streaming_reasoning_only() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -1980,7 +1947,6 @@ async fn interrupt_during_tool_execution() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -2088,7 +2054,6 @@ async fn interrupt_during_tool_execution_only_completes_unfinished() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -2179,7 +2144,6 @@ async fn shutdown_during_streaming() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -2270,7 +2234,6 @@ async fn shutdown_during_tool_execution() {
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     );
@@ -2339,7 +2302,6 @@ async fn messages_persisted_to_db() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -2415,7 +2377,6 @@ async fn usage_flows_to_final_assistant_message() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -2509,14 +2470,7 @@ async fn cost_accumulated_per_assistant_message() {
     let mut params = test_params();
     params.model_id = "test/cost-model".to_string();
 
-    turn::run_turn(
-        &h.ctx,
-        &mut h.rx_inbound,
-        &mut h.rx_plugin,
-        &mut h.rx_interrupt,
-        params,
-    )
-    .await;
+    turn::run_turn(&h.ctx, &mut h.rx_inbound, &mut h.rx_interrupt, params).await;
 
     // 清理全局缓存（避免污染后续测试）
     fuyao_provider::clear_cache(&agent_paths);
@@ -2645,7 +2599,6 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -2703,7 +2656,6 @@ async fn intercept_block_skips_final_assistant_in_history() {
     turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -3036,7 +2988,6 @@ async fn control_only_batch_executes_command_without_running_turn() {
 
     let (_tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
     let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -3059,7 +3010,6 @@ async fn control_only_batch_executes_command_without_running_turn() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
@@ -3156,7 +3106,6 @@ async fn interleaved_batch_processes_users_and_command_in_order() {
 
     let (_tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
     let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
-    let (_tx_plugin, rx_plugin) = mpsc::channel::<OutputUserMessage>(16);
     let (tx_event, mut rx_event) = mpsc::unbounded_channel();
 
     let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -3179,7 +3128,6 @@ async fn interleaved_batch_processes_users_and_command_in_order() {
         ctx,
         SessionRx {
             inbound: rx_inbound,
-            plugin_user: rx_plugin,
             interrupt: rx_interrupt,
         },
     ));
@@ -3284,7 +3232,6 @@ async fn run_turn_returns_completed_on_final_reply() {
     let outcome = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )
@@ -3311,7 +3258,6 @@ async fn run_turn_returns_failed_on_llm_error() {
     let outcome = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
-        &mut h.rx_plugin,
         &mut h.rx_interrupt,
         test_params(),
     )

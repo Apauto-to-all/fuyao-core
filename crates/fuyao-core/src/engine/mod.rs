@@ -21,10 +21,11 @@ mod teardown;
 #[cfg(test)]
 mod tests;
 
-use crate::engine::types::{QueueEntry, SessionHandle, SharedQueue, TurnPhase};
+use crate::engine::types::{SessionHandle, SharedQueue, TurnPhase};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
+use fuyao_api::message::QueueEntry;
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
 };

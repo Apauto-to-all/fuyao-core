@@ -25,8 +25,8 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 | 术语 | 代码标识 | 含义 |
 | --- | --- | --- |
-| 会话 | `Session` / `SessionHandle` | 一次对话实体；Handle 是引擎调度表条目（双队列 + 三通道 + 参数句柄） |
-| session 通道 | inbound / plugin_user / interrupt | 入站通道（用户 + 控制命令消息统一 `QueueEntry` 条目，保证总序）/ 插件注入通道（`SessionSender` 的纯 User 消息，独立通道让 fuyao-hooks 无需感知队列条目类型）/ 中断通道（与队列正交） |
+| 会话 | `Session` / `SessionHandle` | 一次对话实体；Handle 是引擎调度表条目（双队列 + 两通道 + 参数句柄） |
+| session 通道 | inbound / interrupt | 统一入站通道（外部用户 + 控制命令与插件注入的 User 条目统一 `QueueEntry` 承载，保证总序；`QueueEntry` 定义在 fuyao-api）/ 中断通道（与队列正交） |
 | 存储层 | `SessionStore` | SQLite（WAL）唯一入口；sessions / messages / todos 三表 |
 | 落库序号 | `seq` | 事务内分配，事件级落库后回填到 `EventBase` |
 | 可见窗口 | `load_visible_messages` | 给 LLM 的压缩感知窗口（最新 compaction 摘要 + 其后新消息），与「给人看的」查询路径正交 |
@@ -108,7 +108,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 ## 一条消息的旅程
 
-1. `App::send(session_id, InputEvent::User)` → `Engine::send` 转化为 output 侧消息，包 `QueueEntry` 投入站通道（`InputEvent::Control` 同路，与用户消息同通道保总序；插件注入走独立的 plugin_user 通道）
+1. `App::send(session_id, InputEvent::User)` → `Engine::send` 转化为 output 侧消息，包 `QueueEntry` 投统一入站通道（`InputEvent::Control` 同路；插件注入的 User 消息经 `SessionSender` 也投同一通道——发送顺序即排队顺序）
 2. session task 按条目自带 mode 入 guide / pending 双队列
 3. 消费时机取出 → 批次处理：连续 User 段经 dispatch 管道（intercept 拦截 → 投影落库（seq 回填）→ 发送 → observe 观察），Control 条目就地执行命令
 4. pre-turn 压缩检查（上一轮真实 usage 对阈值门），命中则流式摘要 + 落 compaction 边界

@@ -24,10 +24,10 @@ use fuyao_hooks::{Plugin, PluginHost};
 fn single_plugin_assemble(cfg: FakePluginConfig) -> (fuyao_hooks::SharedHooks, common::ExecLog) {
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let plugin = FakePlugin::new(cfg, log.clone());
-    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
     let hooks = assemble(
         vec![("single".to_string(), plugin.create_instance())],
-        tx_user,
+        tx_inbound,
         tx_interrupt,
     );
     (hooks, log)
@@ -64,8 +64,8 @@ async fn full_assembly_registers_and_invokes_observe() {
 #[tokio::test]
 async fn empty_registry_handles_events_without_panic() {
     // 空 registry（无插件装配）也应能正常处理 observe/intercept 事件，不 panic
-    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
-    let hooks = assemble(vec![], tx_user, tx_interrupt);
+    let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(vec![], tx_inbound, tx_interrupt);
 
     hooks
         .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk("x"))))
@@ -112,8 +112,8 @@ async fn multiple_plugins_register_and_observe_in_registration_order() {
     // create_instances 顺序 = add 顺序（(名, 实例) 配对）
     let instances = host.create_instances().expect("无重名应成功");
     assert_eq!(instances.len(), 2);
-    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
-    let hooks = assemble(instances, tx_user, tx_interrupt);
+    let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(instances, tx_inbound, tx_interrupt);
 
     hooks
         .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
@@ -176,8 +176,8 @@ async fn create_instance_panic_skipped_others_proceed() {
     // boom 被跳过：只拿到 healthy + trailing 两个实例
     assert_eq!(instances.len(), 2, "崩溃插件应被跳过");
 
-    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
-    let hooks = assemble(instances, tx_user, tx_interrupt);
+    let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(instances, tx_inbound, tx_interrupt);
     hooks
         .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
         .await;
@@ -225,8 +225,8 @@ async fn register_panic_isolated_others_proceed() {
     )));
 
     let instances = host.create_instances().expect("应成功");
-    let (tx_user, _rx_user, tx_interrupt, _rx_interrupt) = make_channels();
-    let hooks = assemble(instances, tx_user, tx_interrupt);
+    let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
+    let hooks = assemble(instances, tx_inbound, tx_interrupt);
     hooks
         .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
         .await;
@@ -249,7 +249,7 @@ async fn register_panic_isolated_others_proceed() {
 #[tokio::test]
 async fn register_sender_delivers_user_message_to_channel() {
     // 插件在 register 时拿到 sender 立即 send_user，
-    // 消息应真的落到 rx_user 通道（跨 PluginHost→register→sender 的完整路径）
+    // 消息应真的落入站通道（跨 PluginHost→register→sender 的完整路径）
     let log: common::ExecLog = Arc::new(Mutex::new(Vec::new()));
     let plugin = FakePlugin::new(
         FakePluginConfig {
@@ -263,15 +263,18 @@ async fn register_sender_delivers_user_message_to_channel() {
         },
         log.clone(),
     );
-    let (tx_user, mut rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let (tx_inbound, mut rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
     let _hooks = assemble(
         vec![("sender_plugin".to_string(), plugin.create_instance())],
-        tx_user,
+        tx_inbound,
         tx_interrupt,
     );
 
     // register 已在 assemble 内完成；验证消息已投递
-    let received = rx_user.recv().await.expect("应收到插件投递的 User 消息");
+    let received = rx_inbound.recv().await.expect("应收到插件投递的 User 消息");
+    let fuyao_api::message::QueueEntry::User(received) = received else {
+        panic!("应为 User 条目");
+    };
     assert_eq!(received.payload.content, "主动投递的消息");
     // sender 绑定插件名：source 应为 Plugin 且携带该插件名
     match received.payload.source {
@@ -313,15 +316,18 @@ async fn observe_intercept_and_sender_coexist_on_single_plugin() {
         },
         log.clone(),
     );
-    let (tx_user, mut rx_user, tx_interrupt, _rx_interrupt) = make_channels();
+    let (tx_inbound, mut rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
     let hooks = assemble(
         vec![("combo".to_string(), plugin.create_instance())],
-        tx_user,
+        tx_inbound,
         tx_interrupt,
     );
 
     // register 时已投递 combo_msg
-    let received = rx_user.recv().await.expect("register 应已投递");
+    let received = rx_inbound.recv().await.expect("register 应已投递");
+    let fuyao_api::message::QueueEntry::User(received) = received else {
+        panic!("应为 User 条目");
+    };
     assert_eq!(received.payload.content, "combo_msg");
 
     // 喂一个事件：observe + intercept 都应记录

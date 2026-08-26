@@ -15,9 +15,10 @@
 use std::sync::{Arc, Mutex};
 
 use fuyao_api::UserMessageMode;
+use fuyao_api::message::QueueEntry;
 use fuyao_api::message::output::{
     ChunkMessage, ChunkPayload, InterruptMessage as OutputInterruptMessage, ToolCallMessage,
-    ToolCallPayload, ToolResultMessage, ToolResultPayload, UserMessage as OutputUserMessage,
+    ToolCallPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_hooks::{HooksRegistry, NamedPluginInstance, Plugin, PluginInstance, SessionSender};
@@ -65,18 +66,18 @@ pub fn make_tool_result(name: &str, content: &str) -> ToolResultMessage {
 // 通道夹具
 // ============================================================================
 
-/// 构造 session 的两条通道（User / Interrupt），返回 (tx 对, rx 对)
+/// 构造 session 的两条通道（统一入站 / Interrupt），返回 (tx 对, rx 对)
 ///
 /// 字段注入绕开全局状态：通道由测试构造，零环境变量依赖。
 pub fn make_channels() -> (
-    tokio::sync::mpsc::Sender<OutputUserMessage>,
-    tokio::sync::mpsc::Receiver<OutputUserMessage>,
+    tokio::sync::mpsc::Sender<QueueEntry>,
+    tokio::sync::mpsc::Receiver<QueueEntry>,
     tokio::sync::mpsc::Sender<OutputInterruptMessage>,
     tokio::sync::mpsc::Receiver<OutputInterruptMessage>,
 ) {
-    let (tx_user, rx_user) = tokio::sync::mpsc::channel(16);
+    let (tx_inbound, rx_inbound) = tokio::sync::mpsc::channel(16);
     let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);
-    (tx_user, rx_user, tx_interrupt, rx_interrupt)
+    (tx_inbound, rx_inbound, tx_interrupt, rx_interrupt)
 }
 
 // ============================================================================
@@ -226,7 +227,7 @@ impl Plugin for FakePlugin {
 /// 日志由调用方构造并注入 FakePlugin，装配后调用方持同一引用断言顺序。
 pub fn assemble(
     instances: Vec<NamedPluginInstance>,
-    tx_user: tokio::sync::mpsc::Sender<OutputUserMessage>,
+    tx_inbound: tokio::sync::mpsc::Sender<QueueEntry>,
     tx_interrupt: tokio::sync::mpsc::Sender<OutputInterruptMessage>,
 ) -> fuyao_hooks::SharedHooks {
     let mut registry = HooksRegistry::new();
@@ -237,7 +238,7 @@ pub fn assemble(
         let sender = SessionSender::new(
             name.clone(),
             "test-session",
-            tx_user.clone(),
+            tx_inbound.clone(),
             tx_interrupt.clone(),
             tx_event.clone(),
         );

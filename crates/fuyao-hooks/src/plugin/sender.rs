@@ -6,7 +6,8 @@
 //! 保存到自己的 state 里随时调用。
 //!
 //! 三类消息的分流：
-//! - `User` → session 入站通道（送进 session task 过完整管道：拦截→处理→发送→观察）
+//! - `User` → session 统一入站通道（与外部用户消息同通道同类型，发送顺序即排队顺序；
+//!   消费时机过完整管道：拦截→处理→发送→观察）
 //! - `Interrupt` → session 中断通道（select! 中断点监听，打断当前 ReAct）
 //! - `Notice` → per-session 出站通道直送（不经 ReAct 循环、不经拦截/观察面、不落库）
 //!
@@ -16,6 +17,7 @@
 use fuyao_api::InterruptSource;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
+use fuyao_api::message::QueueEntry;
 use fuyao_api::message::input::{PluginSource, UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_api::message::output::NoticeLevel;
@@ -42,8 +44,8 @@ pub struct SessionSender {
     name: String,
     /// 绑定的 session id（Notice 事件直送出站通道时自盖标签）
     session_id: String,
-    /// User 消息发送端（送进 session 入站通道）
-    tx_user: Sender<OutputUserMessage>,
+    /// 统一入站通道发送端（User 条目排队，与外部入站同通道）
+    tx_inbound: Sender<QueueEntry>,
     /// Interrupt 消息发送端（送进 session 中断通道）
     tx_interrupt: Sender<OutputInterruptMessage>,
     /// Notice 事件发送端（per-session 出站通道，直达消费者）
@@ -55,14 +57,14 @@ impl SessionSender {
     pub fn new(
         name: impl Into<String>,
         session_id: impl Into<String>,
-        tx_user: Sender<OutputUserMessage>,
+        tx_inbound: Sender<QueueEntry>,
         tx_interrupt: Sender<OutputInterruptMessage>,
         tx_event: UnboundedSender<OutputEvent>,
     ) -> Self {
         Self {
             name: name.into(),
             session_id: session_id.into(),
-            tx_user,
+            tx_inbound,
             tx_interrupt,
             tx_event,
         }
@@ -81,23 +83,25 @@ impl SessionSender {
     ///
     /// source 字段自动标记为 `Plugin`，携带本插件的名称——保证来源可追溯。
     pub fn send_user(&self, content: impl Into<String>, mode: UserMessageMode) {
-        let result = self.tx_user.try_send(OutputUserMessage {
-            base: EventBase::default(),
-            payload: OutputUserPayload {
-                content: content.into(),
-                images: vec![],
-                mode,
-                source: UserMessageSource::Plugin(PluginSource {
-                    name: self.name.clone(),
-                }),
+        let result = self
+            .tx_inbound
+            .try_send(QueueEntry::User(OutputUserMessage {
+                base: EventBase::default(),
+                payload: OutputUserPayload {
+                    content: content.into(),
+                    images: vec![],
+                    mode,
+                    source: UserMessageSource::Plugin(PluginSource {
+                        name: self.name.clone(),
+                    }),
 
-                client_message_id: None,
-            },
-        });
+                    client_message_id: None,
+                },
+            }));
         if let Err(e) = result {
             tracing::warn!(
                 plugin = %self.name,
-                channel = "user",
+                channel = "inbound",
                 cause = %e,
                 "插件发送 User 消息失败"
             );

@@ -317,6 +317,7 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 mod tests {
     use super::*;
     use fuyao_api::message::EventBase;
+    use fuyao_api::message::QueueEntry;
     use fuyao_api::message::input::PluginSource;
     use fuyao_api::message::output::{
         ChunkPayload, InterruptMessage as OutputInterruptMessage, ToolCallPayload,
@@ -330,27 +331,27 @@ mod tests {
         state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 构造 SessionSender + 三条通道接收端（user / interrupt / notice 出站）
+    /// 构造 SessionSender + 三条通道接收端（入站 / interrupt / notice 出站）
     ///
     /// 测试辅助：插件名统一为 `loop_guard`，通道容量 16。
     /// 测试按需解构对应 rx 验证消息流向。
     fn make_sender() -> (
         SessionSender,
         mpsc::Receiver<OutputInterruptMessage>,
-        mpsc::Receiver<OutputUserMessage>,
+        mpsc::Receiver<QueueEntry>,
         mpsc::UnboundedReceiver<OutputEvent>,
     ) {
         let (tx_interrupt, rx_interrupt) = mpsc::channel(16);
-        let (tx_user, rx_user) = mpsc::channel(16);
+        let (tx_inbound, rx_inbound) = mpsc::channel(16);
         let (tx_event, rx_event) = mpsc::unbounded_channel::<OutputEvent>();
         let sender = SessionSender::new(
             "loop_guard",
             "test-session",
-            tx_user,
+            tx_inbound,
             tx_interrupt,
             tx_event,
         );
-        (sender, rx_interrupt, rx_user, rx_event)
+        (sender, rx_interrupt, rx_inbound, rx_event)
     }
 
     /// 从出站通道取一条通知事件（同步 try_recv，发送全为非阻塞无需 await）
@@ -562,7 +563,7 @@ mod tests {
     #[tokio::test]
     async fn send_interrupt_sends_input_event() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, mut rx_interrupt, _rx_user, _rx_event) = make_sender();
+        let (sender, mut rx_interrupt, _rx_inbound, _rx_event) = make_sender();
         state.set_sender(sender);
         state.send_interrupt("循环检测".to_string());
         let msg = rx_interrupt.recv().await.unwrap();
@@ -576,10 +577,13 @@ mod tests {
     #[tokio::test]
     async fn send_inject_message_sends_user_event() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, _rx_interrupt, mut rx_user, _rx_event) = make_sender();
+        let (sender, _rx_interrupt, mut rx_inbound, _rx_event) = make_sender();
         state.set_sender(sender);
         state.send_inject_message("请调整策略".to_string());
-        let msg = rx_user.recv().await.unwrap();
+        let msg = rx_inbound.recv().await.unwrap();
+        let QueueEntry::User(msg) = msg else {
+            panic!("应为 User 条目");
+        };
         assert_eq!(msg.payload.content, "请调整策略");
         match msg.payload.source {
             fuyao_api::UserMessageSource::Plugin(src) => assert_eq!(src.name, "loop_guard"),
@@ -591,7 +595,7 @@ mod tests {
     #[test]
     fn apply_severe_sends_error_notices() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, _rx_interrupt, _rx_user, mut rx_event) = make_sender();
+        let (sender, _rx_interrupt, _rx_inbound, mut rx_event) = make_sender();
         state.set_sender(sender);
 
         // Interrupt（工具）：第 1 次干预
@@ -624,7 +628,7 @@ mod tests {
             tool_repeat_threshold: 4,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_user, mut rx_event) = make_sender();
+        let (sender, _rx_interrupt, _rx_inbound, mut rx_event) = make_sender();
         state.set_sender(sender);
 
         // 前 3 次不触发：无通知
@@ -659,7 +663,7 @@ mod tests {
             streaming_check_interval: 10,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_user, mut rx_event) = make_sender();
+        let (sender, _rx_interrupt, _rx_inbound, mut rx_event) = make_sender();
         state.set_sender(sender);
 
         let text = "这是一段重复的内容".repeat(4);
@@ -676,7 +680,7 @@ mod tests {
             tool_repeat_threshold: 4,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_user, _rx_event) = make_sender();
+        let (sender, _rx_interrupt, _rx_inbound, _rx_event) = make_sender();
         state.set_sender(sender);
 
         // 1-3 次相同调用：不触发
@@ -787,7 +791,7 @@ mod tests {
         })));
         {
             let mut guard = lock(&state);
-            let (sender, _rx_interrupt, _rx_user, _rx_event) = make_sender();
+            let (sender, _rx_interrupt, _rx_inbound, _rx_event) = make_sender();
             guard.set_sender(sender);
         }
 

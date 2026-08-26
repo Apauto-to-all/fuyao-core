@@ -7,6 +7,7 @@ pub mod control;
 pub mod event_base;
 pub mod input;
 pub mod output;
+pub mod queue;
 
 pub use control::ControlCommand;
 pub use event_base::EventBase;
@@ -15,5 +16,6 @@ pub use input::{InterruptSource, PluginSource, SystemSource, UserMessageMode, Us
 // 事件 enum 导出
 pub use input::InputEvent;
 pub use output::OutputEvent;
+pub use queue::QueueEntry;
 // 注：envelope / payload 不在此导出，外部通过 input::UserMessage / output::UserMessage 等路径访问
 // （输入输出 envelope/payload 同名，靠模块路径区分，避免根导出撞名）
