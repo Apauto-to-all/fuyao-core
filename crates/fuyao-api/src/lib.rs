@@ -12,7 +12,6 @@
 
 mod agent;
 mod config;
-mod control;
 mod error;
 mod mcp_types;
 pub mod message;
@@ -37,12 +36,11 @@ pub use config::{
     is_config_set, load_config, load_env, load_env_missing, load_merged_config, set_config,
     unknown_tool_names,
 };
-pub use control::{ControlCommand, TurnDirective};
 pub use error::ApiError;
 pub use mcp_types::MCPServerConfig;
 pub use message::{
-    EventBase, InputEvent, InterruptSource, OutputEvent, PluginSource, SystemSource,
-    UserMessageMode, UserMessageSource,
+    ControlCommand, EventBase, InputEvent, InterruptSource, OutputEvent, PluginSource,
+    SystemSource, UserMessageMode, UserMessageSource,
 };
 pub use pagination::{EventPage, MessagePage, SessionPage};
 pub use paths::{

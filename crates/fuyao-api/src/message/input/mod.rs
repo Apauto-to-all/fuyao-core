@@ -5,17 +5,17 @@
 //!
 //! - `User`: 用户消息（envelope {base, payload}）
 //! - `Interrupt`: 中断信号（envelope {base, payload}）
-//! - `Compress`: 手动压缩请求（envelope {base}，无业务载荷）
+//! - `Control`: 控制命令消息（envelope {base, payload}，命令本体在 payload.command）
 
 // 子模块：每种事件类型独立文件管理
-mod compress_request;
+mod control;
 mod interrupt;
-mod user;
+mod user_message;
 
 // envelope / payload 在 input 层导出（外部通过 input::UserMessage 等路径访问）
-pub use compress_request::CompressRequest;
+pub use control::{ControlMessage, ControlPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload, InterruptSource};
-pub use user::{
+pub use user_message::{
     PluginSource, SystemSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
 };
 
@@ -29,17 +29,19 @@ pub enum InputEvent {
     User(UserMessage),
     /// 中断：用户取消或中断当前操作
     Interrupt(InterruptMessage),
-    /// 手动压缩请求：用户 / 上层应用主动请求一次上下文压缩
+    /// 控制命令消息：命令主循环在队列消费时机执行（如手动压缩）
     ///
-    /// 经引擎入口送入控制通道，在 turn 边界触发压缩（跳过阈值与反抖动，
-    /// 复用自动压缩执行流程，触发原因标记为 manual）。
-    Compress(CompressRequest),
+    /// 与用户消息同型排队：入口转化为 output 侧消息后进入 guide / pending
+    /// 双队列，mode 决定生效时机。新增控制类功能 = 给
+    /// [`ControlCommand`](crate::message::control::ControlCommand) 加变体，不加新输入事件。
+    Control(ControlMessage),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::message::EventBase;
+    use crate::message::control::ControlCommand;
 
     #[test]
     fn user_event_contains_content_and_mode() {
@@ -83,13 +85,21 @@ mod tests {
     }
 
     #[test]
-    fn compress_event_carries_base() {
-        let event = InputEvent::Compress(CompressRequest {
+    fn control_event_carries_command_and_mode() {
+        let event = InputEvent::Control(ControlMessage {
             base: EventBase::default(),
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Guide,
+                client_message_id: None,
+            },
         });
         match &event {
-            InputEvent::Compress(req) => assert!(req.base.seq.is_none()),
-            _ => panic!("应为 Compress 变体"),
+            InputEvent::Control(msg) => {
+                assert_eq!(msg.payload.command, ControlCommand::Compress);
+                assert_eq!(msg.payload.mode, UserMessageMode::Guide);
+            }
+            _ => panic!("应为 Control 变体"),
         }
     }
 
@@ -114,15 +124,24 @@ mod tests {
     }
 
     #[test]
-    fn compress_event_serde_roundtrip() {
-        let event = InputEvent::Compress(CompressRequest {
+    fn control_event_serde_roundtrip() {
+        let event = InputEvent::Control(ControlMessage {
             base: EventBase::default(),
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Pending,
+                client_message_id: Some("cmd-1".to_string()),
+            },
         });
         let json = serde_json::to_string(&event).expect("序列化失败");
         let de: InputEvent = serde_json::from_str(&json).expect("反序列化失败");
         match de {
-            InputEvent::Compress(req) => assert!(req.base.seq.is_none()),
-            _ => panic!("反序列化后应为 Compress 变体"),
+            InputEvent::Control(msg) => {
+                assert_eq!(msg.payload.command, ControlCommand::Compress);
+                assert_eq!(msg.payload.mode, UserMessageMode::Pending);
+                assert_eq!(msg.payload.client_message_id.as_deref(), Some("cmd-1"));
+            }
+            _ => panic!("反序列化后应为 Control 变体"),
         }
     }
 }

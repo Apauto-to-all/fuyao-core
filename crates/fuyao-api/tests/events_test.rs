@@ -5,8 +5,9 @@
 //! 全部为纯值类型，零 IO，零全局状态。
 
 use fuyao_api::message::input::{
-    CompressRequest, InputEvent, InterruptMessage, InterruptPayload, InterruptSource, PluginSource,
-    SystemSource, UserMessage, UserMessageMode, UserMessageSource, UserPayload,
+    ControlMessage, ControlPayload, InputEvent, InterruptMessage, InterruptPayload,
+    InterruptSource, PluginSource, SystemSource, UserMessage, UserMessageMode, UserMessageSource,
+    UserPayload,
 };
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, CompressionDeltaPayload,
@@ -81,8 +82,13 @@ fn input_event_samples() -> Vec<InputEvent> {
                 source: InterruptSource::User,
             },
         }),
-        InputEvent::Compress(CompressRequest {
+        InputEvent::Control(ControlMessage {
             base: EventBase::default(),
+            payload: ControlPayload {
+                command: fuyao_api::ControlCommand::Compress,
+                mode: UserMessageMode::Guide,
+                client_message_id: None,
+            },
         }),
     ]
 }
@@ -97,7 +103,7 @@ fn input_event_serde_preserves_variant(#[values(0, 1, 2)] idx: usize) {
     match (&original, &restored) {
         (InputEvent::User(_), InputEvent::User(_)) => {}
         (InputEvent::Interrupt(_), InputEvent::Interrupt(_)) => {}
-        (InputEvent::Compress(_), InputEvent::Compress(_)) => {}
+        (InputEvent::Control(_), InputEvent::Control(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
 }

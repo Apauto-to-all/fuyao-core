@@ -3,10 +3,12 @@
 //! 定义输入事件类型（UI → Engine）。
 //! 定义输出事件类型（Engine → UI）。
 
+pub mod control;
 pub mod event_base;
 pub mod input;
 pub mod output;
 
+pub use control::ControlCommand;
 pub use event_base::EventBase;
 // 共享枚举/结构（无方向语义，输入输出共享）导出到 message 根
 pub use input::{InterruptSource, PluginSource, SystemSource, UserMessageMode, UserMessageSource};
