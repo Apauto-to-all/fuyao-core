@@ -5,6 +5,7 @@
 //! 基于 reqwest 自建 HTTP 客户端，不依赖 async-openai。
 
 pub mod admin;
+pub mod anthropic;
 mod error;
 mod factory;
 mod openai;
