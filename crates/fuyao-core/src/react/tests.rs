@@ -2950,9 +2950,8 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
         "压缩摘要",
     )]));
     let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
-    // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门——harness 未注册模型，
-    // context_length 解析为 None 仅影响 CompressionStarted 事件里的展示值，
-    // 不影响压缩能否执行。
+    // 预置多条可见消息（压缩对象）。手动压缩跳过阈值门——harness 未注册模型
+    // （context_length 为 None）只影响自动压缩的阈值判定，不影响手动压缩执行。
     preload_user(&h, "第一段对话内容").await;
     preload_user(&h, "第二段对话内容").await;
     preload_user(&h, "第三段对话内容").await;

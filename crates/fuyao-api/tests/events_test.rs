@@ -186,8 +186,6 @@ fn output_event_samples() -> Vec<OutputEvent> {
             base: EventBase::default(),
             payload: CompressionPayload::Started(CompressionStartedPayload {
                 reason: CompressionReason::Auto,
-                prompt_tokens: 10_000,
-                context_length: 128_000,
             }),
         }),
         OutputEvent::Compression(CompressionMessage {

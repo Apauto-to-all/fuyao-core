@@ -117,15 +117,7 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
         return;
     }
 
-    run_compression(
-        ctx,
-        CompressionReason::Auto,
-        usage.prompt_tokens,
-        &model,
-        &provider,
-        None,
-    )
-    .await;
+    run_compression(ctx, CompressionReason::Auto, &model, &provider, None).await;
 }
 
 /// 手动触发上下文压缩（控制通道 Compress 命令的处理）
@@ -144,24 +136,7 @@ pub(super) async fn run_manual_compression(ctx: &SessionCtx, note: Option<&str>)
         None => return,
     };
 
-    // prompt_tokens：取上一轮真实 usage（首轮前无 usage 则 0——仅用于 Started 事件展示）
-    let prompt_tokens = ctx
-        .last_usage
-        .lock()
-        .await
-        .as_ref()
-        .map(|u| u.prompt_tokens)
-        .unwrap_or(0);
-
-    run_compression(
-        ctx,
-        CompressionReason::Manual,
-        prompt_tokens,
-        &model,
-        &provider,
-        note,
-    )
-    .await;
+    run_compression(ctx, CompressionReason::Manual, &model, &provider, note).await;
 }
 
 /// 执行一次上下文压缩（「怎么压」的执行体）
@@ -185,20 +160,13 @@ pub(super) async fn run_manual_compression(ctx: &SessionCtx, note: Option<&str>)
 async fn run_compression(
     ctx: &SessionCtx,
     reason: CompressionReason,
-    prompt_tokens: u32,
     model: &builders::ResolvedModel,
     provider: &std::sync::Arc<dyn fuyao_provider::Provider>,
     note: Option<&str>,
 ) {
-    // 上下文长度未知（模型未注册）时按 0：仅影响 Started 事件展示值，
-    // 摘要 LLM 调用会因模型不存在在 provider 处失败，不在压缩侧兜底
-    let context_length = model.context_length.unwrap_or(0);
-
     tracing::info!(
         session_id = ctx.emitter.session_id(),
         reason = ?reason,
-        prompt_tokens = prompt_tokens,
-        context_length = context_length,
         model_id = %model.model_id,
         "触发上下文压缩"
     );
@@ -209,11 +177,7 @@ async fn run_compression(
         &ctx.hooks,
         OutputEvent::Compression(CompressionMessage {
             base: EventBase::default(),
-            payload: CompressionPayload::Started(CompressionStartedPayload {
-                reason,
-                prompt_tokens,
-                context_length,
-            }),
+            payload: CompressionPayload::Started(CompressionStartedPayload { reason }),
         }),
     )
     .await;

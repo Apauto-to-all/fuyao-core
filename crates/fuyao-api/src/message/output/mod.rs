@@ -208,8 +208,6 @@ mod tests {
             base: EventBase::default(),
             payload: CompressionPayload::Started(CompressionStartedPayload {
                 reason: CompressionReason::Auto,
-                prompt_tokens: 10_000,
-                context_length: 128_000,
             }),
         });
         assert!(matches!(event, OutputEvent::Compression(_)));

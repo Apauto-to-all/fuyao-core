@@ -2,7 +2,7 @@
 //!
 //! 压缩发生时按三阶段推送：Started（开始）→ Delta（摘要流式增量）→ Ended（完成）。
 //! 前端据此完整追踪压缩生命周期——显示"压缩中..."状态、实时渲染正在生成的摘要、
-//! 压缩完成展示统计。
+//! 压缩完成展示摘要。
 //!
 //! 与主对话流的 Chunk 事件语义不同：Chunk 是 AI 回复的增量，Compression Delta 是
 //! 压缩 LLM 摘要的增量，前端渲染位置/样式不同。
@@ -52,10 +52,6 @@ pub enum CompressionPayload {
 pub struct CompressionStartedPayload {
     /// 触发原因（auto / manual / overflow）
     pub reason: CompressionReason,
-    /// 触发时的 prompt_tokens（来自上一轮真实 usage）
-    pub prompt_tokens: u32,
-    /// 模型上下文长度（用于触发判定的 context_length）
-    pub context_length: u32,
 }
 
 /// Delta 阶段载荷（字段对齐 ChunkPayload，区分思考和正文）
@@ -88,12 +84,8 @@ mod tests {
     fn started_payload_carries_trigger_info() {
         let payload = CompressionStartedPayload {
             reason: CompressionReason::Auto,
-            prompt_tokens: 10_000,
-            context_length: 128_000,
         };
         assert_eq!(payload.reason, CompressionReason::Auto);
-        assert_eq!(payload.prompt_tokens, 10_000);
-        assert_eq!(payload.context_length, 128_000);
     }
 
     #[test]
@@ -144,8 +136,6 @@ mod tests {
             base: EventBase::default(),
             payload: CompressionPayload::Started(CompressionStartedPayload {
                 reason: CompressionReason::Auto,
-                prompt_tokens: 5_000,
-                context_length: 64_000,
             }),
         };
         assert!(msg.base.timestamp > 0.0);
@@ -183,8 +173,6 @@ mod tests {
             base: EventBase::default(),
             payload: CompressionPayload::Started(CompressionStartedPayload {
                 reason: CompressionReason::Auto,
-                prompt_tokens: 1_000,
-                context_length: 32_000,
             }),
         };
         let json = serde_json::to_string(&original).expect("序列化失败");
