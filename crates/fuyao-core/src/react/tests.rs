@@ -2990,6 +2990,144 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     assert_eq!(ended.content, "压缩摘要");
 }
 
+/// 压缩 LLM 调用失败：Started 之后必须以 Failed 收尾（终态保证）
+///
+/// 失败场景下前端已因 Started 进入"压缩中"状态——若无终态事件，状态永久挂起。
+/// 验证：Started → Failed（reason 一致、cause 携带错误文本），无 Ended，
+/// 且 DB 无 compaction 边界消息（失败保持边界：压缩状态不变）。
+#[tokio::test]
+async fn manual_compression_llm_failure_emits_failed_event() {
+    use fuyao_api::message::output::{CompressionPayload, CompressionReason};
+
+    // 摘要 LLM 直接返回速率限制错误（复现真实失败：LLM 调用失败: 速率限制）
+    let provider = Arc::new(MockProvider::new(vec![vec![Err(
+        fuyao_provider::StreamError::RateLimit {
+            retry_after_ms: None,
+            retry_after_secs: None,
+        },
+    )]]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    preload_user(&h, "第一段对话内容").await;
+    preload_user(&h, "第二段对话内容").await;
+
+    super::compression::run_manual_compression(&h.ctx, None).await;
+
+    let events = collect_events(&mut h.rx_event).await;
+
+    // Failed：reason=manual + cause 含错误文本
+    let failed = events.iter().find_map(|e| match e {
+        OutputEvent::Compression(m) => match &m.payload {
+            CompressionPayload::Failed(p) => Some(p),
+            _ => None,
+        },
+        _ => None,
+    });
+    let failed = failed.expect("压缩失败应发 Compression Failed 事件");
+    assert_eq!(failed.reason, CompressionReason::Manual);
+    assert!(
+        failed.cause.contains("速率限制"),
+        "cause 应携带错误文本，实际: {}",
+        failed.cause
+    );
+
+    // 终态唯一：失败路径不得再发 Ended
+    let has_ended = events.iter().any(|e| {
+        matches!(
+            e,
+            OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Ended(_))
+        )
+    });
+    assert!(!has_ended, "失败后不应发 Compression Ended 事件");
+
+    // Started 先于 Failed 存在（前端曾进入"压缩中"状态）
+    let pos_started = events.iter().position(|e| {
+        matches!(
+            e,
+            OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Started(_))
+        )
+    });
+    let pos_failed = events.iter().position(|e| {
+        matches!(
+            e,
+            OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Failed(_))
+        )
+    });
+    let (Some(pos_started), Some(pos_failed)) = (pos_started, pos_failed) else {
+        panic!("压缩事件序列应同时含 Started 与 Failed");
+    };
+    assert!(pos_started < pos_failed, "Started 应先于 Failed");
+
+    // 失败保持边界：不落 compaction 边界消息
+    let has_compaction = h
+        .ctx
+        .store
+        .load_full_history(&h.session_id)
+        .await
+        .expect("加载全量历史失败")
+        .iter()
+        .any(|m| m.kind == fuyao_api::MessageKind::Compaction);
+    assert!(!has_compaction, "失败的压缩不应落库 compaction 边界");
+}
+
+/// 手动压缩模型解析失败（Provider 未注册）：Started 之前失败也必须发 Failed
+///
+/// 手动压缩是用户显式动作（前端已收 Control 回显、等待结果）——resolve 失败
+/// 虽未发过 Started，同样需要 Failed 事件反馈，否则前端零反馈。
+#[tokio::test]
+async fn manual_compression_resolve_failure_emits_failed_event() {
+    use fuyao_api::message::output::CompressionPayload;
+
+    // 空 ProviderRegistry：model_id 前缀 test 解析成功但实例查不到
+    let store = temp_store().await;
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
+    session.id = TEST_SESSION_ID.to_string();
+    store.create(&session).await.unwrap();
+    drop(session);
+    let (tx_event, rx_event) = mpsc::unbounded_channel();
+    let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(32);
+    let (tx_interrupt, rx_interrupt) = mpsc::channel(8);
+    let ctx = test_ctx_builder(
+        store.clone(),
+        Arc::new(fuyao_provider::ProviderRegistry::default()),
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .build();
+    let mut h = TestHarness {
+        ctx,
+        session_id: TEST_SESSION_ID.to_string(),
+        rx_inbound,
+        tx_inbound,
+        rx_interrupt,
+        tx_interrupt,
+        rx_event,
+    };
+    preload_user(&h, "第一段对话内容").await;
+    preload_user(&h, "第二段对话内容").await;
+
+    super::compression::run_manual_compression(&h.ctx, None).await;
+
+    let events = collect_events(&mut h.rx_event).await;
+
+    // 仅一条压缩事件：Failed（cause 说明 Provider 未注册），无 Started / Ended
+    let failed = events.iter().find_map(|e| match e {
+        OutputEvent::Compression(m) => match &m.payload {
+            CompressionPayload::Failed(p) => Some(p),
+            _ => None,
+        },
+        _ => None,
+    });
+    let failed = failed.expect("resolve 失败应发 Compression Failed 事件");
+    assert!(
+        failed.cause.contains("Provider 实例未注册"),
+        "cause 应说明 Provider 未注册，实际: {}",
+        failed.cause
+    );
+    assert_eq!(events.len(), 1, "resolve 失败路径只应发一条 Failed 事件");
+}
+
 /// 压缩落库后 Ended 事件的 base.seq 携带边界消息 seq：
 /// 实时事件与历史回放的 Compression 事件同构，按 seq 定位的截断逻辑对两条路径统一成立
 #[tokio::test]

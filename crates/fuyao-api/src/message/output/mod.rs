@@ -41,8 +41,8 @@ pub use child_session::{
 };
 pub use chunk::{ChunkMessage, ChunkPayload};
 pub use compression::{
-    CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
-    CompressionReason, CompressionStartedPayload,
+    CompressionDeltaPayload, CompressionEndedPayload, CompressionFailedPayload, CompressionMessage,
+    CompressionPayload, CompressionReason, CompressionStartedPayload,
 };
 pub use control::{ControlMessage, ControlPayload};
 pub use error::{ErrorMessage, ErrorPayload};

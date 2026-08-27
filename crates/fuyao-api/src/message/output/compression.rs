@@ -1,8 +1,10 @@
 //! 上下文压缩事件
 //!
-//! 压缩发生时按三阶段推送：Started（开始）→ Delta（摘要流式增量）→ Ended（完成）。
-//! 前端据此完整追踪压缩生命周期——显示"压缩中..."状态、实时渲染正在生成的摘要、
-//! 压缩完成展示摘要。
+//! 压缩发生时按阶段推送：Started（开始）→ Delta（摘要流式增量）→ Ended（完成）
+//! 或 Failed（失败）。前端据此完整追踪压缩生命周期——显示"压缩中..."状态、
+//! 实时渲染正在生成的摘要、压缩完成展示摘要、失败时解除"压缩中"状态并提示原因。
+//!
+//! 终态保证：Started 发出后必有 Ended / Failed 之一，前端不会挂起在"压缩中"状态。
 //!
 //! 与主对话流的 Chunk 事件语义不同：Chunk 是 AI 回复的增量，Compression Delta 是
 //! 压缩 LLM 摘要的增量，前端渲染位置/样式不同。
@@ -45,6 +47,9 @@ pub enum CompressionPayload {
     Delta(CompressionDeltaPayload),
     /// 压缩完成（apply 落库成功后发出，前端移除"压缩中"状态、展示统计）
     Ended(CompressionEndedPayload),
+    /// 压缩失败（Started 之后任一步失败时发出，前端解除"压缩中"状态并提示原因）；
+    /// live-only 事件——失败的压缩不落库，历史回放中不出现
+    Failed(CompressionFailedPayload),
 }
 
 /// Started 阶段载荷
@@ -74,6 +79,15 @@ pub struct CompressionEndedPayload {
     pub content: String,
     /// 新 compaction 边界消息的 seq（前端定位压缩在对话流中的位置）
     pub new_seq: i64,
+}
+
+/// Failed 阶段载荷
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompressionFailedPayload {
+    /// 触发原因（与 Started 一致）
+    pub reason: CompressionReason,
+    /// 失败原因（人类可读描述，用于前端展示；已脱敏的错误链文本）
+    pub cause: String,
 }
 
 #[cfg(test)]
@@ -131,6 +145,16 @@ mod tests {
     }
 
     #[test]
+    fn failed_payload_carries_cause() {
+        let payload = CompressionFailedPayload {
+            reason: CompressionReason::Manual,
+            cause: "LLM 调用失败: 速率限制".into(),
+        };
+        assert_eq!(payload.reason, CompressionReason::Manual);
+        assert_eq!(payload.cause, "LLM 调用失败: 速率限制");
+    }
+
+    #[test]
     fn message_started_envelope_constructs() {
         let msg = CompressionMessage {
             base: EventBase::default(),
@@ -165,6 +189,42 @@ mod tests {
             }),
         };
         assert!(matches!(msg.payload, CompressionPayload::Ended(_)));
+    }
+
+    #[test]
+    fn message_failed_envelope_constructs() {
+        let msg = CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Failed(CompressionFailedPayload {
+                reason: CompressionReason::Manual,
+                cause: "LLM 调用失败: 速率限制".into(),
+            }),
+        };
+        assert!(matches!(msg.payload, CompressionPayload::Failed(_)));
+    }
+
+    #[test]
+    fn payload_serde_failed_roundtrip() {
+        let original = CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Failed(CompressionFailedPayload {
+                reason: CompressionReason::Auto,
+                cause: "摘要生成失败".into(),
+            }),
+        };
+        let json = serde_json::to_string(&original).expect("序列化失败");
+        assert!(
+            json.contains(r#""mode":"failed""#),
+            "JSON 应含 mode=failed 标签，实际: {json}"
+        );
+        let restored: CompressionMessage = serde_json::from_str(&json).expect("反序列化失败");
+        match restored.payload {
+            CompressionPayload::Failed(p) => {
+                assert_eq!(p.reason, CompressionReason::Auto);
+                assert_eq!(p.cause, "摘要生成失败");
+            }
+            other => panic!("应反序列化为 Failed 变体，实际: {other:?}"),
+        }
     }
 
     #[test]

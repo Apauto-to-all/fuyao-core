@@ -11,9 +11,9 @@ use fuyao_api::message::input::{
 };
 use fuyao_api::message::output::{
     AssistantMessage, AssistantPayload, ChunkMessage, ChunkPayload, CompressionDeltaPayload,
-    CompressionEndedPayload, CompressionMessage, CompressionPayload, CompressionReason,
-    CompressionStartedPayload, ErrorMessage, ErrorPayload, OutputEvent, ToolCallMessage,
-    ToolCallPayload, ToolResultMessage, ToolResultPayload,
+    CompressionEndedPayload, CompressionFailedPayload, CompressionMessage, CompressionPayload,
+    CompressionReason, CompressionStartedPayload, ErrorMessage, ErrorPayload, OutputEvent,
+    ToolCallMessage, ToolCallPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::output::{
     ControlMessage as OutputControlMessage, ControlPayload as OutputControlPayload,
@@ -181,7 +181,7 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 recoverable: true,
             },
         }),
-        // 压缩事件三阶段（Started / Delta / Ended）样本
+        // 压缩事件四阶段（Started / Delta / Ended / Failed）样本
         OutputEvent::Compression(CompressionMessage {
             base: EventBase::default(),
             payload: CompressionPayload::Started(CompressionStartedPayload {
@@ -203,6 +203,13 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 new_seq: 42,
             }),
         }),
+        OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Failed(CompressionFailedPayload {
+                reason: CompressionReason::Manual,
+                cause: "LLM 调用失败: 速率限制".into(),
+            }),
+        }),
         // 控制命令回显样本（消费时刻先发出本事件、后执行命令本体）
         OutputEvent::Control(OutputControlMessage {
             base: EventBase::default(),
@@ -217,12 +224,14 @@ fn output_event_samples() -> Vec<OutputEvent> {
 }
 
 #[rstest]
-fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] idx: usize) {
+fn output_event_serde_preserves_variant(
+    #[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)] idx: usize,
+) {
     let original = output_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: OutputEvent = serde_json::from_str(&json).expect("反序列化失败");
 
-    // 11 样本穷尽匹配（8 基础变体 + 3 压缩 mode），保证 serde 不丢标签
+    // 12 样本穷尽匹配（8 基础变体 + 4 压缩 mode），保证 serde 不丢标签
     match (&original, &restored) {
         (OutputEvent::Chunk(_), OutputEvent::Chunk(_)) => {}
         (OutputEvent::User(_), OutputEvent::User(_)) => {}

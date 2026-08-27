@@ -4,7 +4,8 @@
 //! 释放 token 预算。两层职责：
 //! - 触发层（[`run_pre_turn_compression`] / [`run_manual_compression`]）：判定「该不该压」
 //!   ——前者走阈值门 + 子会话豁免，后者跳过判定直接压（用户意图优先）。
-//! - 执行层（[`run_compression`]）：负责「怎么压」——发 Started → 流式摘要 → 落库 → 发 Ended。
+//! - 执行层（[`run_compression`]）：负责「怎么压」——发 Started → 流式摘要 → 落库 → 发
+//!   Ended，任一步失败发 Failed（Started 后必有终态，前端不挂起）。
 
 use super::SessionCtx;
 use super::builders;
@@ -12,8 +13,8 @@ use crate::dispatch;
 use fuyao_api::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::output::{
-    CompressionDeltaPayload, CompressionEndedPayload, CompressionMessage, CompressionPayload,
-    CompressionReason, CompressionStartedPayload,
+    CompressionDeltaPayload, CompressionEndedPayload, CompressionFailedPayload, CompressionMessage,
+    CompressionPayload, CompressionReason, CompressionStartedPayload,
 };
 
 /// 压缩执行依赖的解析结果（model_id / 思考配置 / provider / 上下文长度）
@@ -38,14 +39,20 @@ fn compression_exempt(ctx: &SessionCtx) -> bool {
 /// `run_turn` 同一份逻辑，避免散算漂移）；provider 实例是压缩路径专属步骤——
 /// [`builders::resolve_model`] 故意不查 registry（保持纯构造边界），故在此单独取。
 ///
+/// 失败返回人类可读原因（Err String）：自动触发路径仅记日志跳过，手动触发路径
+/// 额外据其发 Compression Failed 事件（用户显式动作必须有反馈）。
+///
 /// 注：写回逻辑（turn.rs）已在首轮后把 model_id + thinking 物化进 session_params，
 /// 正常运行期这里读到的都是 Some。None→default 分支仅首轮前 / 未物化时兜底。
 async fn resolve_compression_model(
     ctx: &SessionCtx,
-) -> Option<(
-    builders::ResolvedModel,
-    std::sync::Arc<dyn fuyao_provider::Provider>,
-)> {
+) -> Result<
+    (
+        builders::ResolvedModel,
+        std::sync::Arc<dyn fuyao_provider::Provider>,
+    ),
+    String,
+> {
     let model_config = ctx.session_params.lock().await.model_config.clone();
     let resolved = builders::resolve_model(
         &model_config,
@@ -54,26 +61,14 @@ async fn resolve_compression_model(
         &ctx.definition.tools,
         &ctx.agent_paths,
     )
-    .map_err(|msg| {
-        tracing::warn!(
-            session_id = ctx.emitter.session_id(),
-            cause = %msg,
-            "压缩跳过：模型解析失败（model_id 无效或为空）"
-        );
-        msg
-    })
-    .ok()?;
+    .map_err(|msg| format!("模型解析失败（model_id 无效或为空）：{msg}"))?;
 
-    let provider = ctx.providers.get(&resolved.provider_id).or_else(|| {
-        tracing::warn!(
-            session_id = ctx.emitter.session_id(),
-            provider_id = %resolved.provider_id,
-            "压缩跳过：Provider 实例未注册"
-        );
-        None
-    })?;
+    let provider = ctx
+        .providers
+        .get(&resolved.provider_id)
+        .ok_or_else(|| format!("Provider 实例未注册：{}", resolved.provider_id))?;
 
-    Some((resolved, provider))
+    Ok((resolved, provider))
 }
 
 /// Pre-turn 自动上下文压缩检查（「该不该压」的阈值门）
@@ -92,8 +87,16 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
     };
 
     let (model, provider) = match resolve_compression_model(ctx).await {
-        Some(v) => v,
-        None => return,
+        Ok(v) => v,
+        // 自动压缩是引擎后台行为，用户无预期：resolve 失败仅记日志跳过，不发事件
+        Err(cause) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %cause,
+                "自动压缩跳过：模型信息解析失败"
+            );
+            return;
+        }
     };
 
     // 模型未注册 → 注册表查不到 limit.context，无从判定阈值——不编造数字，
@@ -132,11 +135,51 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
 /// 自动触发路径没有用户附言，恒为 None——附言仅手动路径携带。
 pub(super) async fn run_manual_compression(ctx: &SessionCtx, note: Option<&str>) {
     let (model, provider) = match resolve_compression_model(ctx).await {
-        Some(v) => v,
-        None => return,
+        Ok(v) => v,
+        // 手动压缩是用户显式动作（前端已收 Control 回显、等待结果）：
+        // resolve 失败必须发 Failed 事件，否则前端零反馈
+        Err(cause) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %cause,
+                "手动压缩失败：模型信息解析失败"
+            );
+            dispatch::dispatch(
+                &ctx.emitter,
+                &ctx.hooks,
+                OutputEvent::Compression(CompressionMessage {
+                    base: EventBase::default(),
+                    payload: CompressionPayload::Failed(CompressionFailedPayload {
+                        reason: CompressionReason::Manual,
+                        cause: cause.clone(),
+                    }),
+                }),
+            )
+            .await;
+            return;
+        }
     };
 
     run_compression(ctx, CompressionReason::Manual, &model, &provider, note).await;
+}
+
+/// 发 Compression Failed 事件（终态通知）
+///
+/// Started 发出后前端进入"压缩中"状态，任一步失败都必须以 Failed 收尾，
+/// 否则前端状态永久挂起。失败压缩不落库，本事件 live-only、不出现在历史回放。
+async fn emit_failed(ctx: &SessionCtx, reason: CompressionReason, cause: &str) {
+    dispatch::dispatch(
+        &ctx.emitter,
+        &ctx.hooks,
+        OutputEvent::Compression(CompressionMessage {
+            base: EventBase::default(),
+            payload: CompressionPayload::Failed(CompressionFailedPayload {
+                reason,
+                cause: cause.to_string(),
+            }),
+        }),
+    )
+    .await;
 }
 
 /// 执行一次上下文压缩（「怎么压」的执行体）
@@ -151,10 +194,9 @@ pub(super) async fn run_manual_compression(ctx: &SessionCtx, note: Option<&str>)
 /// 是否提供不影响压缩流程本身。
 ///
 /// 流程：发 Started → 调摘要 LLM（流式 Delta 并发转发）→ apply 落库 → 发 Ended。
-/// 失败处理（失败保持边界 + 错误分级）：
-/// - 摘要为空 / 无可压缩内容：log warn 跳过
-/// - LLM 调用失败：log warn 跳过（下次照常触发判定）
-/// - 落库失败：log warn 跳过
+/// 失败处理（失败保持边界 + 终态通知）：Started 之后的任一步失败（加载消息 /
+/// 摘要生成 / 落库）先 log warn 再发 Failed 事件——压缩状态不变（失败保持边界），
+/// 前端收到终态解除"压缩中"状态；下次照常触发判定。
 ///
 /// 同步执行：task 内串行，期间不接收新消息（天然互斥，不需要锁/队列/通道）。
 async fn run_compression(
@@ -191,11 +233,13 @@ async fn run_compression(
     {
         Ok(m) => m,
         Err(e) => {
+            let cause = format!("压缩前加载可见消息失败：{e}");
             tracing::warn!(
                 session_id = ctx.emitter.session_id(),
-                cause = %e,
-                "压缩前加载可见消息失败，跳过本次压缩"
+                cause = %cause,
+                "跳过本次压缩"
             );
+            emit_failed(ctx, reason, &cause).await;
             return;
         }
     };
@@ -277,11 +321,13 @@ async fn run_compression(
             match s {
                 Ok(s) => s,
                 Err(e) => {
+                    let cause = format!("摘要生成失败：{e}");
                     tracing::warn!(
                         session_id = ctx.emitter.session_id(),
-                        cause = %e,
-                        "摘要生成失败，跳过本次压缩"
+                        cause = %cause,
+                        "跳过本次压缩"
                     );
+                    emit_failed(ctx, reason, &cause).await;
                     return;
                 }
             }
@@ -357,11 +403,13 @@ async fn run_compression(
             .await;
         }
         Err(e) => {
+            let cause = format!("压缩落地失败：{e}");
             tracing::warn!(
                 session_id = ctx.emitter.session_id(),
-                cause = %e,
-                "压缩落地失败，跳过本次压缩"
+                cause = %cause,
+                "跳过本次压缩"
             );
+            emit_failed(ctx, reason, &cause).await;
         }
     }
 }
