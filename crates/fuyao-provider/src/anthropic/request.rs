@@ -121,6 +121,19 @@ struct WireTool {
     cache_control: Option<CacheControl>,
 }
 
+/// thinking 开关 wire 形态（enabled / disabled 字面量，不带 budget_tokens）
+#[derive(Debug, Serialize)]
+struct WireThinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+/// 思考强度 wire 形态（仅 effort 参数）
+#[derive(Debug, Serialize)]
+struct WireOutputConfig {
+    effort: String,
+}
+
 /// stream 字段的 skip 判定（false 时不序列化）
 fn is_false(value: &bool) -> bool {
     !value
@@ -128,8 +141,7 @@ fn is_false(value: &bool) -> bool {
 
 /// /v1/messages 请求体顶层形态
 ///
-/// 该协议不存在的概念（thinking / reasoning_effort / tool_choice）不设字段，
-/// 「不发送」由结构体缺位直接保证。
+/// 该协议不存在的概念（tool_choice）不设字段，「不发送」由结构体缺位直接保证。
 #[derive(Debug, Serialize)]
 struct MessagesRequestBody {
     model: String,
@@ -142,6 +154,12 @@ struct MessagesRequestBody {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<WireTool>>,
+    /// 思考开关：Enabled / Disabled 都发对应字面量
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<WireThinking>,
+    /// 思考强度：与 thinking 开关正交，配置了就发
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<WireOutputConfig>,
 }
 
 /// 校验并过滤图片：MIME 白名单 + 协议字节上限，不合规的丢弃并告警
@@ -438,10 +456,21 @@ pub fn build_request_body(
                 .collect()
         });
 
-    // 该协议暂不支持思考开关：Enabled 打 WARN 后忽略，Disabled 静默忽略
-    if matches!(options.thinking_type, Some(ThinkingType::Enabled)) {
-        tracing::warn!(model = %model, "Anthropic 协议暂不支持思考开关，已忽略 thinking 配置");
-    }
+    // 思考字段正交注入：thinking_type 与 reasoning_effort 是两个独立字段，
+    // 各自为 Some 时各自发送，互不压制——禁止因 thinking_type=Disabled 压掉
+    // output_config，也不因有强度配置强制开思考，两者由服务器各自解释
+    let thinking = options.thinking_type.as_ref().map(|t| WireThinking {
+        kind: match t {
+            ThinkingType::Enabled => "enabled",
+            ThinkingType::Disabled => "disabled",
+        },
+    });
+    let output_config = options
+        .reasoning_effort
+        .as_ref()
+        .map(|effort| WireOutputConfig {
+            effort: effort.clone(),
+        });
 
     let body = MessagesRequestBody {
         model: model.to_string(),
@@ -450,6 +479,8 @@ pub fn build_request_body(
         system,
         stream,
         tools,
+        thinking,
+        output_config,
     };
     serde_json::to_value(body).expect("请求体序列化不会失败")
 }
@@ -545,10 +576,13 @@ mod tests {
         assert_eq!(body["model"], "claude-sonnet-4");
         // max_tokens 必填且恒发 16384
         assert_eq!(body["max_tokens"], 16384);
-        // 非流式不发 stream 字段；tool_choice / reasoning_effort 该协议均不发送
+        // 非流式不发 stream 字段；tool_choice / reasoning_effort 该协议均不发送；
+        // 未配置思考时 thinking / output_config 均缺位
         assert!(body.get("stream").is_none());
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
 
         let body = build_request_body(
             ChatRequest::default(),
@@ -927,33 +961,52 @@ mod tests {
         );
     }
 
+    /// 思考开关三态与强度两态的正交注入：各自为 Some 时各自发送，互不压制
     #[test]
-    fn thinking_enabled_warns_and_omits_field() {
+    fn thinking_toggle_and_effort_orthogonal_injection() {
+        // Enabled + high 强度：两字段各自发送且互不压制
         let options = StreamOptions {
             thinking_type: Some(ThinkingType::Enabled),
             reasoning_effort: Some("high".to_string()),
             ..Default::default()
         };
         let body = build_request_body(ChatRequest::default(), "claude-sonnet-4", &options, false);
+        // 精确等值锁定：enabled 字面量且无 budget_tokens
+        assert_eq!(body["thinking"], serde_json::json!({"type": "enabled"}));
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "high"}));
 
-        assert!(
-            body.get("thinking").is_none(),
-            "Enabled 忽略，不发 thinking 字段"
-        );
-        assert!(
-            body.get("reasoning_effort").is_none(),
-            "该协议无思考强度概念"
-        );
-
+        // Disabled 同样发字面量；未配置强度不发 output_config
         let options = StreamOptions {
             thinking_type: Some(ThinkingType::Disabled),
-            reasoning_effort: Some("high".to_string()),
+            reasoning_effort: None,
             ..Default::default()
         };
         let body = build_request_body(ChatRequest::default(), "claude-sonnet-4", &options, false);
+        assert_eq!(body["thinking"], serde_json::json!({"type": "disabled"}));
+        assert!(
+            body.get("output_config").is_none(),
+            "无强度配置不发 output_config"
+        );
 
-        assert!(body.get("thinking").is_none(), "Disabled 同样不发字段");
-        assert!(body.get("reasoning_effort").is_none());
+        // 未配置开关只发强度：开关不压制强度、强度不压制开关
+        let options = StreamOptions {
+            thinking_type: None,
+            reasoning_effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        let body = build_request_body(ChatRequest::default(), "claude-sonnet-4", &options, false);
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["output_config"], serde_json::json!({"effort": "low"}));
+
+        // 双 None：两字段都不发
+        let body = build_request_body(
+            ChatRequest::default(),
+            "claude-sonnet-4",
+            &StreamOptions::default(),
+            false,
+        );
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]

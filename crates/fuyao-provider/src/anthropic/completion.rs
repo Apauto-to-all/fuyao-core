@@ -2,8 +2,8 @@
 //!
 //! `/v1/messages` 非流式响应 JSON 文本 → 统一 [`ChatResponse`]。入方向宽松
 //! 反序列化：全 Option 单结构体吸收字段缺失 / null，content 数组按 block 的
-//! `type` 字符串分发（text 拼接为内容、tool_use 收集为工具调用），未知
-//! block 类型（thinking 等）静默跳过。
+//! `type` 字符串分发（text 拼接为内容、thinking 拼接为思考、tool_use 收集为
+//! 工具调用），未知 block 类型静默跳过。
 
 use fuyao_api::ToolCallData;
 use serde::Deserialize;
@@ -23,14 +23,17 @@ struct MessageResponse {
     stop_reason: Option<String>,
 }
 
-/// content block 宽松结构：text / tool_use / thinking 等共用一个结构，
-/// `type` 字段决定分发去向，未列出的字段（thinking / signature 等）忽略
+/// content block 宽松结构：text / thinking / tool_use 等共用一个结构，
+/// `type` 字段决定分发去向，未列出的字段（signature 等）忽略
 #[derive(Debug, Deserialize)]
 struct MessageContentBlock {
     #[serde(rename = "type")]
     block_type: Option<String>,
     #[serde(default)]
     text: Option<String>,
+    /// 思考块文本
+    #[serde(default)]
+    thinking: Option<String>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -67,6 +70,7 @@ pub fn parse_completion(body: &str) -> Result<ChatResponse, StreamError> {
     };
 
     let mut text = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls: Vec<ToolCallData> = Vec::new();
     for block in blocks {
         match block.block_type.as_deref() {
@@ -74,6 +78,12 @@ pub fn parse_completion(body: &str) -> Result<ChatResponse, StreamError> {
             Some("text") => {
                 if let Some(t) = block.text {
                     text.push_str(&t);
+                }
+            }
+            // thinking 块文本拼接为思考内容（空文本无贡献，signature 丢弃）
+            Some("thinking") => {
+                if let Some(t) = block.thinking {
+                    reasoning.push_str(&t);
                 }
             }
             // tool_use 块收集为类型化工具调用：input（JSON object）序列化回字符串，
@@ -89,7 +99,7 @@ pub fn parse_completion(body: &str) -> Result<ChatResponse, StreamError> {
                     _ => "{}".to_string(),
                 },
             }),
-            // thinking 等其余类型不参与内容与工具调用
+            // 其余类型不参与内容与工具调用
             _ => {}
         }
     }
@@ -127,7 +137,7 @@ pub fn parse_completion(body: &str) -> Result<ChatResponse, StreamError> {
 
     Ok(ChatResponse {
         content: (!text.is_empty()).then_some(text),
-        reasoning: None,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         usage,
         finish_reason,
@@ -161,7 +171,7 @@ mod tests {
         assert_eq!(resp.usage.total_tokens, 15);
     }
 
-    /// 文本 + 多工具调用：thinking 块跳过、input 序列化回字符串、id 缺失生成兜底标识
+    /// 文本 + 多工具调用：thinking 块进 reasoning、input 序列化回字符串、id 缺失生成兜底标识
     #[test]
     fn text_and_multiple_tool_calls() {
         let resp = parse_completion(
@@ -178,6 +188,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resp.content.as_deref(), Some("先查天气"));
+        assert_eq!(resp.reasoning.as_deref(), Some("内心独白"));
         let calls = resp.tool_calls.expect("应有两个工具调用");
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "toolu_01");
@@ -189,6 +200,30 @@ mod tests {
         assert_eq!(calls[1].name, "read_file");
         assert_eq!(calls[1].arguments, r#"{"path":"a.rs"}"#);
         assert_eq!(resp.finish_reason, FinishReason::ToolCalls);
+    }
+
+    /// thinking 块文本拼接进 reasoning（多块拼接、signature 丢弃、空文本不贡献），
+    /// 与 text / tool_use 混排时各归其位
+    #[test]
+    fn thinking_blocks_concatenate_into_reasoning() {
+        let resp = parse_completion(
+            r#"{
+                "content": [
+                    {"type": "thinking", "thinking": "先想第一步。", "signature": "sig_a=="},
+                    {"type": "thinking", "thinking": "", "signature": "sig_b=="},
+                    {"type": "thinking", "thinking": "再想第二步。"},
+                    {"type": "text", "text": "结论"},
+                    {"type": "tool_use", "id": "toolu_01", "name": "bash", "input": {"cmd": "ls"}}
+                ],
+                "stop_reason": "tool_use"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(resp.reasoning.as_deref(), Some("先想第一步。再想第二步。"));
+        assert_eq!(resp.content.as_deref(), Some("结论"));
+        let calls = resp.tool_calls.expect("应有一个工具调用");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, r#"{"cmd":"ls"}"#);
     }
 
     /// usage 三桶归一：prompt_tokens 三桶 saturating 求和，缓存桶各自留痕

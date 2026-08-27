@@ -118,8 +118,9 @@ impl AnthropicStreamDecoder {
         }]
     }
 
-    /// content_block_delta：text_delta 转文本增量；input_json_delta 按映射
-    /// 转对应工具序号的参数分片增量；thinking_delta 与未知类型静默忽略
+    /// content_block_delta：text_delta 转文本增量；thinking_delta 转思考增量；
+    /// input_json_delta 按映射转对应工具序号的参数分片增量；
+    /// signature_delta 与未知类型静默忽略（signature 无落点）
     fn content_block_delta(&self, event: &serde_json::Value) -> Vec<StreamEvent> {
         let delta = &event["delta"];
         let delta_type = delta
@@ -129,6 +130,12 @@ impl AnthropicStreamDecoder {
         match delta_type {
             "text_delta" => match delta.get("text").and_then(|t| t.as_str()) {
                 Some(text) if !text.is_empty() => vec![StreamEvent::TextDelta {
+                    content: text.to_string(),
+                }],
+                _ => Vec::new(),
+            },
+            "thinking_delta" => match delta.get("thinking").and_then(|t| t.as_str()) {
+                Some(text) if !text.is_empty() => vec![StreamEvent::ReasoningDelta {
                     content: text.to_string(),
                 }],
                 _ => Vec::new(),
@@ -151,7 +158,7 @@ impl AnthropicStreamDecoder {
                     None => Vec::new(),
                 }
             }
-            // thinking_delta / signature_delta / 未知类型静默忽略
+            // signature_delta / 未知类型静默忽略
             _ => Vec::new(),
         }
     }
@@ -325,33 +332,59 @@ mod tests {
         ])
         .unwrap();
 
-        // thinking_delta / signature_delta 静默忽略，无任何产出
-        assert_eq!(events.len(), 6, "事件序列：{events:?}");
+        // thinking_delta 转思考增量，signature_delta 静默忽略
+        assert_eq!(events.len(), 7, "事件序列：{events:?}");
         assert!(
-            matches!(&events[0], StreamEvent::ToolCallChunk { index, id, name, args_delta }
+            matches!(&events[0], StreamEvent::ReasoningDelta { content } if content == "内心独白")
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::ToolCallChunk { index, id, name, args_delta }
                 if *index == 0
                 && id.as_deref() == Some("toolu_a")
                 && name.as_deref() == Some("read_file")
                 && args_delta.is_none())
         );
         assert!(
-            matches!(&events[1], StreamEvent::ToolCallChunk { index, args_delta, .. }
+            matches!(&events[2], StreamEvent::ToolCallChunk { index, args_delta, .. }
                 if *index == 0 && args_delta.as_deref() == Some("{\"path\":"))
         );
         assert!(
-            matches!(&events[2], StreamEvent::TextDelta { content } if content == "两个工具之间")
+            matches!(&events[3], StreamEvent::TextDelta { content } if content == "两个工具之间")
         );
         assert!(
-            matches!(&events[3], StreamEvent::ToolCallChunk { index, id, name, .. }
+            matches!(&events[4], StreamEvent::ToolCallChunk { index, id, name, .. }
                 if *index == 1
                 && id.as_deref() == Some("toolu_b")
                 && name.as_deref() == Some("bash"))
         );
         assert!(
-            matches!(&events[4], StreamEvent::ToolCallChunk { index, args_delta, .. }
+            matches!(&events[5], StreamEvent::ToolCallChunk { index, args_delta, .. }
                 if *index == 1 && args_delta.as_deref() == Some("{\"cmd\":\"ls\"}"))
         );
-        assert!(matches!(&events[5], StreamEvent::Done { .. }));
+        assert!(matches!(&events[6], StreamEvent::Done { .. }));
+    }
+
+    /// thinking_delta 逐段转 ReasoningDelta；signature_delta 混入不报错不产事件
+    #[test]
+    fn thinking_delta_maps_to_reasoning_deltas() {
+        let events = feed_all(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"第一段"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig=="}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"第二段"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ])
+        .unwrap();
+
+        // 两个非空思考段各产一个 ReasoningDelta，signature_delta 与空文本无产出
+        assert_eq!(events.len(), 2, "事件序列：{events:?}");
+        assert!(
+            matches!(&events[0], StreamEvent::ReasoningDelta { content } if content == "第一段")
+        );
+        assert!(
+            matches!(&events[1], StreamEvent::ReasoningDelta { content } if content == "第二段")
+        );
     }
 
     /// 纯缓存命中场景：input_tokens 仅为断点后残余，三桶求和归一
