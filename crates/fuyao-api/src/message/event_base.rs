@@ -14,8 +14,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 从入口到出口一路跟随，消费者据此分流。
 ///
 /// `seq` 是会话内单调递增的消息序号，由 store 层在落库时分配（见
-/// [`crate::Message::seq`]）。只有进历史的事件（User/Assistant/ToolResult）有 seq；
-/// 不落库的纯实时事件（Chunk/Error/Compression/Interrupt 通知等）为 `None`。实时事件
+/// [`crate::Message::seq`]）。进历史的事件（User/Assistant/ToolResult）与压缩
+/// 落库成功后的 Compression Ended 携带 seq；纯实时事件（Chunk/Error、
+/// Compression 的 Started/Delta、Interrupt 通知等）为 `None`。实时事件
 /// 的 seq 与历史回放读回的 seq 同构——前端游标分页据此连续定位，无需区分实时/历史。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EventBase {

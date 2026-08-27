@@ -337,11 +337,16 @@ async fn run_compression(
             }
 
             // 发 Compression Ended 事件：apply 落库成功后，让前端移除"压缩中"状态、展示摘要
+            // base.seq 填入落库返回的新消息 seq——实时事件与历史回放的 Compression
+            // 事件同构，按 seq 定位的截断逻辑对两条路径统一成立
             dispatch::dispatch(
                 &ctx.emitter,
                 &ctx.hooks,
                 OutputEvent::Compression(CompressionMessage {
-                    base: EventBase::default(),
+                    base: EventBase {
+                        seq: Some(new_seq),
+                        ..EventBase::default()
+                    },
                     payload: CompressionPayload::Ended(CompressionEndedPayload {
                         reason,
                         content: summary.content.clone(),

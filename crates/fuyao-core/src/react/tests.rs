@@ -2990,6 +2990,53 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     assert_eq!(ended.content, "压缩摘要");
 }
 
+/// 压缩落库后 Ended 事件的 base.seq 携带边界消息 seq：
+/// 实时事件与历史回放的 Compression 事件同构，按 seq 定位的截断逻辑对两条路径统一成立
+#[tokio::test]
+async fn compression_ended_event_carries_boundary_seq() {
+    use fuyao_api::message::output::CompressionPayload;
+
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "压缩摘要",
+    )]));
+    let mut h = make_harness(provider, Arc::new(ToolRegistry::builder().build())).await;
+    // 预置多条可见消息：压缩对象过少时摘要生成会按「无可压缩内容」跳过
+    preload_user(&h, "第一段对话内容").await;
+    preload_user(&h, "第二段对话内容").await;
+    preload_user(&h, "第三段对话内容").await;
+    preload_user(&h, "第四段对话内容").await;
+
+    super::compression::run_manual_compression(&h.ctx, None).await;
+
+    let events = collect_events(&mut h.rx_event).await;
+    let (base_seq, new_seq) = events
+        .iter()
+        .find_map(|e| match e {
+            OutputEvent::Compression(m) => match &m.payload {
+                CompressionPayload::Ended(p) => Some((m.base.seq, p.new_seq)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("应有 Compression Ended 事件");
+
+    // base.seq 与载荷 new_seq 一致
+    assert_eq!(base_seq, Some(new_seq));
+
+    // 与落库 compaction 边界消息的真实 seq 一致（DB 是唯一数据源）
+    let boundary_seq = h
+        .ctx
+        .store
+        .load_full_history(&h.session_id)
+        .await
+        .expect("加载全量历史失败")
+        .into_iter()
+        .find(|m| m.kind == fuyao_api::MessageKind::Compaction)
+        .expect("应存在 compaction 边界消息")
+        .seq;
+    assert_eq!(base_seq, Some(boundary_seq));
+}
+
 /// 压缩摘要调用必须把裸模型名（不带 provider_id 前缀）传给 provider
 ///
 /// provider.stream_chat 的 model 参数原样进请求体 `model` 字段；带前缀的完整

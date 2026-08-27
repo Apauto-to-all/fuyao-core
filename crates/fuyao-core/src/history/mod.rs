@@ -40,10 +40,11 @@ use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::output::{
-    AssistantMessage, AssistantPayload, ToolCallPayload, ToolResultMessage, ToolResultPayload,
+    AssistantMessage, AssistantPayload, CompressionEndedPayload, CompressionMessage,
+    CompressionPayload, CompressionReason, ToolCallPayload, ToolResultMessage, ToolResultPayload,
     UserPayload,
 };
-use fuyao_api::{AgentPaths, Message, MessageRole, ToolCallData};
+use fuyao_api::{AgentPaths, Message, MessageKind, MessageRole, ToolCallData};
 
 // ===== 正向：事件 → Message → 落库 =====
 
@@ -245,7 +246,9 @@ fn append_placeholder(content: &str, placeholder: &str) -> String {
 
 /// 单条历史 Message → OutputEvent
 ///
-/// 按 [`MessageRole`] 分流到 User / Assistant / ToolResult；`system` 无对应事件变体,
+/// 先按 [`MessageKind`] 分流：compaction 边界消息投影为 [`OutputEvent::Compression`]
+/// 的 Ended 载荷——压缩身份随事件保留，历史回放与实时压缩流同型；其余消息按
+/// [`MessageRole`] 分流到 User / Assistant / ToolResult；`system` 无对应事件变体,
 /// 返回 `None`（系统提示是构造而非对话内容，不进历史回放流）。
 ///
 /// `base` 复刻原消息的 timestamp / session_id，并把 seq 直接填入——历史回放与实时事件
@@ -261,6 +264,18 @@ fn message_to_event(msg: Message) -> Option<OutputEvent> {
         timestamp: msg.timestamp,
         session_id: Some(msg.session_id),
     };
+    // compaction 边界消息的 role 为 assistant，但它承载的是压缩产物而非对话回复——
+    // kind 分流必须先于 role 分流，否则压缩身份被 assistant 分支吞掉
+    if msg.kind == MessageKind::Compaction {
+        return Some(OutputEvent::Compression(CompressionMessage {
+            base,
+            payload: CompressionPayload::Ended(CompressionEndedPayload {
+                reason: parse_compaction_reason(msg.tool_name.as_deref()),
+                content: msg.content.unwrap_or_default(),
+                new_seq: msg.seq,
+            }),
+        }));
+    }
     match msg.role {
         MessageRole::User => Some(OutputEvent::User(OutputUserMessage {
             base,
@@ -299,6 +314,17 @@ fn message_to_event(msg: Message) -> Option<OutputEvent> {
         // 系统消息是 prompt 构造，非对话内容，不进历史回放流
         MessageRole::System => None,
     }
+}
+
+/// compaction 消息审计列（tool_name）字符串 → 压缩触发原因
+///
+/// 审计列存 reason 的 serde 表示（"auto" / "manual" / "overflow"），此处按同一
+/// serde 表示反序列化还原——表示格式由 serde 派生单点定义。缺失（列 NULL）或
+/// 非法值（外部脏数据）兜底 auto，单条脏数据不阻断整段历史回放。
+fn parse_compaction_reason(tool_name: Option<&str>) -> CompressionReason {
+    tool_name
+        .and_then(|s| serde_json::from_str(&format!("\"{s}\"")).ok())
+        .unwrap_or(CompressionReason::Auto)
 }
 
 /// typed tool_calls → 扁平 ToolCallPayload 列表
@@ -594,6 +620,74 @@ mod tests {
     }
 
     // ── 反向映射：message_to_event（历史回放） ─────────────────
+
+    #[test]
+    fn compaction_message_projects_to_compression_ended() {
+        // 落库形态：role=assistant + kind=compaction + content=摘要 +
+        // 审计列（tool_name）存 reason 的 serde 表示
+        let msg = make_msg(MessageRole::Assistant, 7, &|m| {
+            m.kind = MessageKind::Compaction;
+            m.content = Some("## 摘要\n- 要点".into());
+            m.tool_name = Some("manual".into());
+        });
+
+        let OutputEvent::Compression(CompressionMessage { base, payload }) =
+            message_to_event(msg).expect("compaction 应投影成 Compression 事件")
+        else {
+            panic!("变体类型不符");
+        };
+        let CompressionPayload::Ended(p) = &payload else {
+            panic!("载荷应为 Ended 阶段，实际：{payload:?}")
+        };
+        // 字段映射：content=摘要正文、reason 自审计列还原、new_seq=消息自身 seq
+        assert_eq!(p.content, "## 摘要\n- 要点");
+        assert_eq!(p.reason, CompressionReason::Manual);
+        assert_eq!(p.new_seq, 7);
+        // base.seq 同为消息 seq：历史回放的 Compression 事件与实时 Ended 同构
+        assert_eq!(base.seq, Some(7));
+        // base 复刻原消息时间戳与会话标识
+        assert!((base.timestamp - 7.0).abs() < f64::EPSILON);
+        assert_eq!(base.session_id.as_deref(), Some("sess-1"));
+    }
+
+    #[test]
+    fn compaction_message_missing_reason_falls_back_to_auto() {
+        // 审计列缺失（NULL 脏数据）：reason 兜底 auto，事件照常产出不阻断回放
+        let msg = make_msg(MessageRole::Assistant, 3, &|m| {
+            m.kind = MessageKind::Compaction;
+            m.content = Some("摘要".into());
+        });
+
+        let OutputEvent::Compression(CompressionMessage { payload, .. }) =
+            message_to_event(msg).expect("compaction 应投影")
+        else {
+            panic!("变体类型不符");
+        };
+        let CompressionPayload::Ended(p) = &payload else {
+            panic!("载荷应为 Ended 阶段，实际：{payload:?}")
+        };
+        assert_eq!(p.reason, CompressionReason::Auto);
+    }
+
+    #[test]
+    fn compaction_message_invalid_reason_falls_back_to_auto() {
+        // 审计列存非法值（外部脏数据）：reason 兜底 auto，事件照常产出不阻断回放
+        let msg = make_msg(MessageRole::Assistant, 4, &|m| {
+            m.kind = MessageKind::Compaction;
+            m.content = Some("摘要".into());
+            m.tool_name = Some("not-a-reason".into());
+        });
+
+        let OutputEvent::Compression(CompressionMessage { payload, .. }) =
+            message_to_event(msg).expect("compaction 应投影")
+        else {
+            panic!("变体类型不符");
+        };
+        let CompressionPayload::Ended(p) = &payload else {
+            panic!("载荷应为 Ended 阶段，实际：{payload:?}")
+        };
+        assert_eq!(p.reason, CompressionReason::Auto);
+    }
 
     #[test]
     fn user_message_projects_with_default_mode_source() {
