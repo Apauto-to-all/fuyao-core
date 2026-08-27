@@ -15,9 +15,10 @@
 //! - `title`: 会话标题更新（首轮对话后异步生成）
 //! - `retry`: LLM 重试事件（重试前发，前端据此渲染「N 秒后重试」提示）
 //! - `child_session`: 子任务 session 生命周期（子代理 / 后台任务派生时发出）
+//! - `control`: 控制命令消息（消费时刻回显：引擎先发出本事件、后执行命令本体）
 //!
-//! 另有 `ControlMessage`（控制命令消息）：内核流转的队列条目载荷，
-//! 不是 `OutputEvent` 变体——命令不回显，其执行产物走上方对应事件。
+//! `ControlMessage` 同时也是 guide / pending 双队列的条目载荷：队列中的条目
+//! 在消费时机以 `control` 事件回显，此后命令本体才被执行。
 
 mod assistant;
 mod child_session;
@@ -63,6 +64,8 @@ pub enum OutputEvent {
     Chunk(ChunkMessage),
     /// 用户消息（引擎处理用户输入后发出，CLI 据此渲染）
     User(UserMessage),
+    /// 控制命令消息
+    Control(ControlMessage),
     /// 工具调用
     ToolCall(ToolCallMessage),
     /// 工具结果
@@ -95,6 +98,7 @@ impl OutputEvent {
         match self {
             OutputEvent::Chunk(m) => &mut m.base,
             OutputEvent::User(m) => &mut m.base,
+            OutputEvent::Control(m) => &mut m.base,
             OutputEvent::ToolCall(m) => &mut m.base,
             OutputEvent::ToolResult(m) => &mut m.base,
             OutputEvent::Assistant(m) => &mut m.base,

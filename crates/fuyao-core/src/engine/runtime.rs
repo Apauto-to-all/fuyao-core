@@ -83,7 +83,8 @@ impl Engine {
                     // （command / mode / client_message_id），包成 Control 条目走与用户消息
                     // 相同的入站通道——同一通道承载保证两类消息的总序。
                     // 命令本体（如手动压缩跳过阈值，reason=manual）由消费点的
-                    // handle_control 执行，client_message_id 供排队中撤销配对。
+                    // handle_control 先回显后执行，client_message_id 供排队中
+                    // 撤销与消费回显配对。
                     let outbound = fuyao_api::message::output::ControlMessage {
                         base: ctrl_msg.base,
                         payload: fuyao_api::message::output::ControlPayload {
@@ -170,7 +171,7 @@ impl Engine {
     /// 队列操作，session task 与调用方对同一队列各持 `Arc`，短临界区天然互斥。
     ///
     /// `client_message_id` 由发送方生成、会话内唯一，引擎信任不校验；标识仅存活
-    /// 于队列流转与回显配对，消费进历史时即剥离（不落库）。
+    /// 于队列流转与消费回显（供前端配对），一律不落库。
     ///
     /// session id 不在调度表 → 同步返回 `Err(SessionNotFound)`（要恢复走恢复动作）。
     pub async fn remove_queued_message(

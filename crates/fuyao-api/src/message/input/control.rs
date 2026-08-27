@@ -36,7 +36,7 @@ pub struct ControlPayload {
     /// 生效时机（Guide：下一消费时机；Pending：最终回复后）
     pub mode: UserMessageMode,
     /// 客户端命令标识：由发送方生成、会话内唯一，仅用于队列管理
-    /// （撤销排队中尚未生效的命令），消费进历史时即剥离（不落库）
+    /// （撤销排队中尚未生效的命令 / 消费回显配对）；随消费回显原样携带，不落库
     #[serde(default)]
     pub client_message_id: Option<String>,
 }

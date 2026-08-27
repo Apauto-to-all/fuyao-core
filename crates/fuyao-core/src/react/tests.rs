@@ -472,6 +472,7 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),
         OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
+        OutputEvent::Control(m) => m.base.session_id.as_deref(),
     }
 }
 
@@ -3064,6 +3065,135 @@ async fn control_only_batch_executes_command_without_running_turn() {
     );
     // guide 已被消费清空
     assert!(guide.lock().unwrap().is_empty(), "guide 应被批次消费清空");
+}
+
+/// 消费时刻回显先于执行：命令条目被消费时先把 `OutputEvent::Control` 发给外部，
+/// 随后才出现命令的执行产物（Compression 事件）
+///
+/// 验证三件事：
+/// ① 回显是本批次对外发出的**首个**事件（前端据此得知该命令已被消费并即将生效）；
+/// ② 回显携带原 client_message_id / command / mode（供前端配对排队项），
+///    且带 session 标签；
+/// ③ 回显先于 Compression Started——「先告知外部、后执行命令本体」的顺序契约。
+#[tokio::test]
+async fn control_consumption_echoes_command_event_before_execution() {
+    use fuyao_api::message::output::CompressionPayload;
+
+    // 压缩会调一次摘要 LLM（MockProvider 的唯一响应）
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "压缩摘要",
+    )]));
+
+    let store = temp_store().await;
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
+    session.id = "test_session".to_string();
+    store.create(&session).await.unwrap();
+
+    let guide = empty_queue();
+    let pending = empty_queue();
+    // guide 预排一条带客户端标识的 Compress 命令条目
+    guide
+        .lock()
+        .unwrap()
+        .push_back(QueueEntry::Control(OutputControlMessage {
+            base: EventBase::default(),
+            payload: OutputControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Guide,
+                client_message_id: Some("cmd-order".to_string()),
+            },
+        }));
+    // 预置多条可见消息（压缩对象）
+    for content in ["第一段对话内容", "第二段对话内容", "第三段对话内容"] {
+        let mut m = fuyao_api::Message::user(content.to_string());
+        store.insert_message(&session.id, &mut m).await.unwrap();
+    }
+
+    let (_tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
+    let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
+
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test",
+        provider.clone(),
+    ));
+    let ctx = test_ctx_builder(
+        Arc::clone(&store),
+        providers,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, "test_session".to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .guide(Arc::clone(&guide))
+    .pending(Arc::clone(&pending))
+    .shutdown_token(tokio_util::sync::CancellationToken::new())
+    .build();
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+        },
+    ));
+
+    // 收集到 Compression Ended 为止的全部事件（命令完整跑完），2 秒超时防止挂死
+    let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut collected = Vec::new();
+        while let Some(ev) = rx_event.recv().await {
+            let is_ended = matches!(
+                &ev,
+                OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Ended(_))
+            );
+            collected.push(ev);
+            if is_ended {
+                break;
+            }
+        }
+        collected
+    })
+    .await
+    .expect("2 秒内应消费完命令并发出 Ended 事件");
+    task.abort();
+
+    // ① 首个事件即回显：前端最先看到的是「命令开始生效」，而非其执行产物
+    match events.first() {
+        Some(OutputEvent::Control(m)) => {
+            // ② 回显忠实携带原条目字段 + session 标签
+            assert_eq!(m.payload.command, ControlCommand::Compress);
+            assert_eq!(m.payload.mode, UserMessageMode::Guide);
+            assert_eq!(m.payload.client_message_id.as_deref(), Some("cmd-order"));
+            assert_eq!(
+                m.base.session_id.as_deref(),
+                Some("test_session"),
+                "回显应带 emitter 盖的 session 标签"
+            );
+        }
+        other => panic!("首个事件应为 Control 回显，实际：{other:?}"),
+    }
+
+    // ③ 回显严格先于 Compression Started（命令本体的首个执行产物）
+    let pos_echo = 0;
+    let pos_started = events
+        .iter()
+        .position(|e| {
+            matches!(
+                e,
+                OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Started(_))
+            )
+        })
+        .expect("应有 Compression Started 事件");
+    assert!(
+        pos_echo < pos_started,
+        "回显应先于命令执行产物发出（echo@{pos_echo}，Started@{pos_started}）"
+    );
+
+    // 压缩确实被执行（非仅回显）
+    assert_eq!(
+        provider.call_count.load(Ordering::SeqCst),
+        1,
+        "摘要 LLM 应被调用一次"
+    );
 }
 
 /// 批内交错：guide 预排 [User A, Control(Compress), User B]，批次 FIFO 忠实全处理

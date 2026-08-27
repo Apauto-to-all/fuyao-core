@@ -2,8 +2,9 @@
 //!
 //! 引擎内核流转的控制命令消息：入口（`Engine::send`）把 input 侧
 //! `ControlMessage` 转化为本类型，此后入站通道、guide / pending 双队列、
-//! 消费执行全程只认 output 侧。本类型不是 `OutputEvent` 变体——命令不作为
-//! 输出事件回显，其执行产物（如 Compression 事件）照常走输出事件流。
+//! 消费全程只认 output 侧。消费时刻经 [`crate::message::OutputEvent`] 的
+//! `Control` 变体回显对外——前端据此得知该命令已被消费并即将生效；
+//! 命令的执行产物（如 Compression 事件）照常走输出事件流。
 //!
 //! 注：与 `input::ControlMessage` 字段完全一致，但故意独立定义、不共享类型，
 //! 与 UserMessage 的输入输出双侧惯例一致。
@@ -30,7 +31,8 @@ pub struct ControlPayload {
     pub command: ControlCommand,
     /// 生效时机（Guide：下一消费时机；Pending：最终回复后）
     pub mode: UserMessageMode,
-    /// 客户端命令标识：仅用于队列管理（撤销排队中尚未生效的命令），不落库
+    /// 客户端命令标识：由发送方生成、会话内唯一，仅用于队列管理
+    /// （撤销排队中尚未生效的命令 / 消费回显配对），不落库
     #[serde(default)]
     pub client_message_id: Option<String>,
 }

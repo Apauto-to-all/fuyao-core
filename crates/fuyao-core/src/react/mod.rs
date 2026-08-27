@@ -9,7 +9,7 @@
 //! 双队列（guide / pending）承载两类条目（[`QueueEntry`]）——用户消息与控制命令
 //! 消息同型排队，条目自带 mode 决定入哪个队列：
 //! - guide：直接消费的队列，触发消费时机时一次性全部取出——连续 User 段批量
-//!   注入历史（每条变一条 user message 落 DB），Control 条目就地执行命令
+//!   注入历史（每条变一条 user message 落 DB），Control 条目先对外回显后执行命令
 //! - pending：排队队列，AI 不再调工具（最终回复）后才一次性全部倒进 guide
 //!
 //! 三个消费时机（逻辑统一走 [`consume_batch`]，详见 [`turn::run_turn`]）：
@@ -42,6 +42,7 @@ mod tests;
 mod title;
 pub(crate) mod turn;
 
+use crate::dispatch;
 use crate::emit::Emitter;
 use crate::engine::types::SharedQueue;
 use crate::engine::types::TurnPhase;
@@ -49,7 +50,9 @@ use crate::engine::types::TurnPhaseGuard;
 use crate::interrupt::notify_idle;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::UserMessageMode;
+use fuyao_api::message::OutputEvent;
 use fuyao_api::message::QueueEntry;
+use fuyao_api::message::output::ControlMessage as OutputControlMessage;
 use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::{AgentDefinition, CompressionConfig, ControlCommand, SessionParams};
@@ -432,8 +435,8 @@ pub(crate) async fn run_session(ctx: SessionCtx, rx: SessionRx) {
 ///
 /// 连续 User 段收集后批量经统一历史入口注入（`crate::history::inject_user_messages`：
 /// 拦截 → 落 DB → 发送事件 → 观察，与 assistant / tool_result 走完全相同的管道）；
-/// Control 条目就地执行命令本体。段与命令的相对顺序忠实保持——命令看到的是
-/// 它之前到达的全部用户消息。
+/// Control 条目先对外回显（`OutputEvent::Control`）再就地执行命令本体。
+/// 段与命令的相对顺序忠实保持——命令看到的是它之前到达的全部用户消息。
 ///
 /// 返回本批是否注入过 User 消息：
 /// - 主循环顶：true 才跑 turn（只含命令的批次不调 LLM）
@@ -453,7 +456,7 @@ async fn consume_batch(ctx: &SessionCtx, entries: Vec<QueueEntry>) -> bool {
                     crate::history::inject_user_messages(ctx, std::mem::take(&mut user_run)).await;
                     injected = true;
                 }
-                handle_control(ctx, cmd.payload.command).await;
+                handle_control(ctx, cmd).await;
             }
         }
     }
@@ -494,15 +497,23 @@ async fn handle_inbound_item(ctx: &SessionCtx, entry: QueueEntry) {
         .push_back(entry);
 }
 
-/// 处理一条控制命令（消费点执行）
+/// 处理一条控制命令（消费点：先回显后执行）
 ///
 /// 控制命令载荷在此分发：每个 [`ControlCommand`] 变体对应一个执行体。
-/// 命令不做特殊处理——执行产物（如 Compression 事件）照常过 dispatch 管道，
-/// 可被拦截钩子修改或阻止。
+/// 消费时刻先经统一管道（拦截 → 发送 → 观察）把命令消息以
+/// [`OutputEvent::Control`] 回显给外部——前端据此得知该命令已被消费并
+/// 即将生效，回显完成后才执行命令本体。client_message_id 随回显原样携带
+/// （供前端配对排队项）。命令本体忠实执行、不受回显侧拦截影响——拦截钩子
+/// 改写 / 丢弃的只是本次回显的对外可见性；执行产物（如 Compression 事件）
+/// 照常过 dispatch 管道，可被拦截钩子修改或阻止。
 ///
 /// 调用方为 [`consume_batch`]（主循环顶与 turn 内时机①②的批次处理共用）。
-async fn handle_control(ctx: &SessionCtx, cmd: ControlCommand) {
-    match cmd {
+async fn handle_control(ctx: &SessionCtx, msg: OutputControlMessage) {
+    // 回显前先取命令本体快照：回显经统一管道时拦截钩子可原地改写消息，
+    // 实际执行的命令以队列原条目为准
+    let command = msg.payload.command.clone();
+    dispatch::dispatch(&ctx.emitter, &ctx.hooks, OutputEvent::Control(msg)).await;
+    match command {
         ControlCommand::Compress => compression::run_manual_compression(ctx).await,
     }
 }

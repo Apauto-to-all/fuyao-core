@@ -16,7 +16,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | dispatch 管道 | `dispatch` | 统一输出处理链：`intercept`（同步原地修改 / 阻止）→ `deliver`（发送 + 观察） |
 | 输出事件 | `OutputEvent` | Engine → UI 的唯一对外事件，11 个变体（`Chunk` / `User` / `ToolCall` / `ToolResult` / `Assistant` / `Interrupt` / `Error` / `Compression` / `Title` / `Retry` / `ChildSession`） |
 | 输入事件 | `InputEvent` | UI → Engine 的入口事件（`User` / `Interrupt` / `Control`），入口即转 `OutputEvent`，内核不区分方向 |
-| 控制命令 | `ControlCommand` / `ControlMessage` | 命令主循环做事的消息（如手动压缩）：与用户消息同型排队、同序消费，命令本体在消费点执行，执行产物照常走输出事件流 |
+| 控制命令 | `ControlCommand` / `ControlMessage` | 命令主循环做事的消息（如手动压缩）：与用户消息同型排队、同序消费，消费点先以 `OutputEvent::Control` 回显对外、后执行命令本体，执行产物照常走输出事件流 |
 | 事件信封 | `EventBase` | 每条事件带 `seq`（落库回填序号）/ `timestamp` / `session_id`（全程标签） |
 | 中断协议 | `interrupt` 模块 | 三段 select! 收尾：`finish_streaming` / `finish_tool_batch` / `notify_idle`，先发 Interrupt 通知再补增量结果落库 |
 | 停止屏障 | `stop_session` | 返回即该 session DB 已静默（等 TurnPhase 回 Idle），是「先停后改库」组合操作的前半步 |
@@ -104,13 +104,13 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 5. **引擎是忠实执行器**——忠实触发外部一切命令，不做去重 / 合并 / 冷却等意图解释，那属于上层职责
 6. **新生命周期信号首选加事件变体**——而非给现有 payload 挂额外字段（消息驱动架构）
 7. **依赖严格单向**——11 个 crate 分五类（基座 → 内核 → 协作者 → 能力 → 装配），禁止反向依赖
-8. **所有消息都可以被拦截**——控制命令不做特殊处理，命令执行产物照常过 dispatch 管道（可被拦截钩子修改或阻止）；引擎不为命令开拦截豁免、也不新增拦截扩展，后续有必要再附加
+8. **所有消息都可以被拦截**——命令消费的对外回显与执行产物照常过 dispatch 管道（可被拦截钩子修改或阻止）；回显被丢弃只影响对外可见性，命令本体忠实执行不受影响；引擎不为命令开拦截豁免、也不新增拦截扩展，后续有必要再附加
 
 ## 一条消息的旅程
 
 1. `App::send(session_id, InputEvent::User)` → `Engine::send` 转化为 output 侧消息，包 `QueueEntry` 投统一入站通道（`InputEvent::Control` 同路；插件注入的 User 消息经 `SessionSender` 也投同一通道——发送顺序即排队顺序）
 2. session task 按条目自带 mode 入 guide / pending 双队列
-3. 消费时机取出 → 批次处理：连续 User 段经 dispatch 管道（intercept 拦截 → 投影落库（seq 回填）→ 发送 → observe 观察），Control 条目就地执行命令
+3. 消费时机取出 → 批次处理：连续 User 段经 dispatch 管道（intercept 拦截 → 投影落库（seq 回填）→ 发送 → observe 观察），Control 条目先以 `OutputEvent::Control` 回显对外、后就地执行命令本体
 4. pre-turn 压缩检查（上一轮真实 usage 对阈值门），命中则流式摘要 + 落 compaction 边界
 5. `run_turn`：现查可见窗口组装请求 → `resolve_model` 路由 Provider → 流式 `StreamEvent` 聚合成 `Chunk` 事件出站
 6. 流结束按 usage 计费落 assistant 消息；有 tool_calls 则编排执行（并行 / 串行），ToolResult 逐条出站，工具批完成后回 ReAct 顶部

@@ -16,6 +16,7 @@ use fuyao_api::message::output::{
     ToolCallPayload, ToolResultMessage, ToolResultPayload,
 };
 use fuyao_api::message::output::{
+    ControlMessage as OutputControlMessage, ControlPayload as OutputControlPayload,
     InterruptMessage as OutputInterruptMessage, InterruptPayload as OutputInterruptPayload,
     UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
 };
@@ -109,7 +110,7 @@ fn input_event_serde_preserves_variant(#[values(0, 1, 2)] idx: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// OutputEvent：7 基础变体穷尽性与 serde 往返
+// OutputEvent：8 基础变体穷尽性与 serde 往返
 // ---------------------------------------------------------------------------
 
 fn output_event_samples() -> Vec<OutputEvent> {
@@ -203,16 +204,25 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 new_seq: 42,
             }),
         }),
+        // 控制命令回显样本（消费时刻先发出本事件、后执行命令本体）
+        OutputEvent::Control(OutputControlMessage {
+            base: EventBase::default(),
+            payload: OutputControlPayload {
+                command: fuyao_api::ControlCommand::Compress,
+                mode: UserMessageMode::Pending,
+                client_message_id: Some("cmd-echo".into()),
+            },
+        }),
     ]
 }
 
 #[rstest]
-fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)] idx: usize) {
+fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] idx: usize) {
     let original = output_event_samples()[idx].clone();
     let json = serde_json::to_string(&original).expect("序列化失败");
     let restored: OutputEvent = serde_json::from_str(&json).expect("反序列化失败");
 
-    // 10 样本穷尽匹配（7 基础变体 + 3 压缩 mode），保证 serde 不丢标签
+    // 11 样本穷尽匹配（8 基础变体 + 3 压缩 mode），保证 serde 不丢标签
     match (&original, &restored) {
         (OutputEvent::Chunk(_), OutputEvent::Chunk(_)) => {}
         (OutputEvent::User(_), OutputEvent::User(_)) => {}
@@ -222,6 +232,7 @@ fn output_event_serde_preserves_variant(#[values(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)] 
         (OutputEvent::Interrupt(_), OutputEvent::Interrupt(_)) => {}
         (OutputEvent::Error(_), OutputEvent::Error(_)) => {}
         (OutputEvent::Compression(_), OutputEvent::Compression(_)) => {}
+        (OutputEvent::Control(_), OutputEvent::Control(_)) => {}
         _ => panic!("serde 往返后变体不匹配"),
     }
 }
