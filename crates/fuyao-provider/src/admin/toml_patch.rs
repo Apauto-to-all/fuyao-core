@@ -34,11 +34,12 @@ pub fn insert_provider(
 
 /// 更新：目标段管理字段 patch + `models` 子表整表替换
 ///
-/// name 覆盖为载荷值；base_url Some 覆盖 / None 清除；`api_key_env_vars` 指针
-/// 所见即所得（Some 落单值 / None 移除键）；`spec.api_key` 有值时连带移除段内
-/// 残留的 `options.api_key` 明文（明文密钥不进 toml）；models 按载荷整表替换
-/// （未携带的模型消失，载荷 id 即落盘键）。段内其他键（用户手写的未知字段）
-/// 不动。目标不存在返回 [`ProviderAdminError::NotFound`]。
+/// name / `api_protocol` 覆盖为载荷值（协议必有字段，恒写完整值）；base_url
+/// Some 覆盖 / None 清除；`api_key_env_vars` 指针所见即所得（Some 落单值 /
+/// None 移除键）；`spec.api_key` 有值时连带移除段内残留的 `options.api_key`
+/// 明文（明文密钥不进 toml）；models 按载荷整表替换（未携带的模型消失，
+/// 载荷 id 即落盘键）。段内其他键（用户手写的未知字段）不动。目标不存在返回
+/// [`ProviderAdminError::NotFound`]。
 pub fn patch_provider(
     doc: &mut DocumentMut,
     provider_id: &str,
@@ -50,6 +51,9 @@ pub fn patch_provider(
 
     // name：覆盖为载荷值
     table.insert("name", value(spec.name.clone()));
+
+    // api_protocol：覆盖为载荷值（必填无缺省，完整期望状态恒携带）
+    table.insert("api_protocol", value(spec.api_protocol.as_config_str()));
 
     // base_url：Some 覆盖 / None 清除（options 兼容表头与内联两种手写形态，
     // 空则整体移除）
@@ -231,6 +235,7 @@ mod tests {
     fn sample_spec() -> ProviderSpec {
         ProviderSpec {
             name: "DeepSeek".to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             base_url: Some("https://api.deepseek.com".to_string()),
             api_key_env_var: Some("MY_DEEPSEEK_KEY".to_string()),
             api_key: None,
@@ -248,6 +253,7 @@ mod tests {
         let mut doc: DocumentMut = "[providers.p]\nname = \"old\"\n".parse().unwrap();
         let data = ProviderSpecData {
             name: "P".to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             base_url: None,
             api_key_env_var: None,
             models: Vec::new(),
@@ -264,6 +270,7 @@ mod tests {
         let spec = sample_spec();
         let data = ProviderSpecData {
             name: spec.name.clone(),
+            api_protocol: spec.api_protocol,
             base_url: spec.base_url.clone(),
             api_key_env_var: spec.api_key_env_var.clone(),
             models: vec![("deepseek-v4-flash".to_string(), sample_model())],
@@ -273,6 +280,10 @@ mod tests {
         assert!(rendered.contains("[providers.deepseek]"), "{rendered}");
         assert!(rendered.contains("MY_DEEPSEEK_KEY"), "{rendered}");
         assert!(rendered.contains("base_url"), "{rendered}");
+        assert!(
+            rendered.contains("api_protocol = \"openai-completions\""),
+            "协议必写：{rendered}"
+        );
         rendered.parse::<DocumentMut>().unwrap();
     }
 
@@ -306,6 +317,11 @@ mod tests {
             .unwrap();
         assert_eq!(table.get("name").unwrap().as_str(), Some("DeepSeek"));
         assert_eq!(
+            table.get("api_protocol").unwrap().as_str(),
+            Some("openai-completions"),
+            "协议随载荷覆盖"
+        );
+        assert_eq!(
             table.get("unknown_key").unwrap().as_str(),
             Some("keep"),
             "段内用户手写的未知字段不动"
@@ -335,6 +351,7 @@ mod tests {
             .unwrap();
         let spec = ProviderSpec {
             name: "P".to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             base_url: None,
             api_key_env_var: None,
             api_key: None,

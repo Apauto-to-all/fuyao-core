@@ -17,6 +17,8 @@ use super::spec::ProviderSpecData;
 pub(crate) fn provider_to_table(spec: &ProviderSpecData) -> Table {
     let mut table = Table::new();
     table.insert("name", value(spec.name.clone()));
+    // 协议必填无缺省：恒写完整值（读回路径按必填校验，缺失即配置错误）
+    table.insert("api_protocol", value(spec.api_protocol.as_config_str()));
     if let Some(base_url) = &spec.base_url {
         let mut options = Table::new();
         options.insert("base_url", value(base_url.clone()));
@@ -375,6 +377,7 @@ mod tests {
     fn provider_to_table_contains_no_api_key_plaintext() {
         let data = ProviderSpecData {
             name: "P".to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             base_url: None,
             api_key_env_var: Some("K".to_string()),
             models: Vec::new(),
@@ -383,5 +386,13 @@ mod tests {
         // 密钥隔离红线：toml 段内只有指针键，无明文字段
         assert!(table.get("api_key").is_none());
         assert!(table.get("api_key_env_vars").is_some());
+        // 协议必写（配置拼写与读回解析的识别集一致）
+        assert_eq!(
+            table
+                .get("api_protocol")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str()),
+            Some("openai-completions")
+        );
     }
 }

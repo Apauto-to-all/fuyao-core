@@ -21,8 +21,8 @@ impl Engine {
     /// 1. `.env` 增量补载（只补进程环境缺失的变量）——管理面写回的密钥变量
     ///    发生在启动期加载之后，不补载则指针解析落空；
     /// 2. 落盘存在的每个供应商：配置注册进进程级缓存（Provider + 其全部
-    ///    Model，幂等覆盖）+ 构造 `OpenAIProvider` 实例插入本 engine 的
-    ///    [`ProviderRegistry`]（同名覆盖 = 刷新）；
+    ///    Model，幂等覆盖）+ 按配置的 `api_protocol` 经构造工厂分派实例、
+    ///    插入本 engine 的 [`ProviderRegistry`]（同名覆盖 = 刷新）；
     /// 3. 注册表与落盘不再对应的清理：落盘已不存在的供应商、落盘存在但实例
     ///    构造失败的供应商，实例从注册表移除，前者的缓存条目（含旗下全部
     ///    Model）一并清除。
@@ -81,20 +81,21 @@ impl Engine {
                 continue;
             }
 
-            let instance = match fuyao_provider::OpenAIProvider::new(provider_id, agent_paths) {
-                Some(instance) => instance,
-                None => {
+            let instance = match fuyao_provider::build_provider(provider_id, provider, agent_paths)
+            {
+                Ok(instance) => instance,
+                Err(cause) => {
                     tracing::warn!(
                         provider_id = %provider_id,
-                        "供应商实例构造跳过：HTTP 客户端构建异常"
+                        cause = %cause,
+                        "供应商实例构造跳过"
                     );
                     skipped.push(provider_id.to_lowercase());
                     self.providers.unregister(provider_id);
                     continue;
                 }
             };
-            self.providers
-                .register(provider_id, std::sync::Arc::new(instance));
+            self.providers.register(provider_id, instance);
         }
 
         // 4. 注册表中有、落盘没有的：实例与缓存条目清除（注册表键为小写形态，
@@ -154,6 +155,7 @@ mod tests {
         let content = format!(
             "[providers.{provider_id}]\n\
              name = \"Test\"\n\
+             api_protocol = \"openai-completions\"\n\
              options = {{ api_key = \"sk-test\" }}\n\
              [providers.{provider_id}.models.\"{model_id}\"]\n\
              name = \"{model_id}\"\n\
@@ -271,8 +273,10 @@ mod tests {
         // 落盘改写：key 换成未设置的指针变量（.env 未写、环境变量未设）
         std::fs::write(
             home.path().join("fuyao.toml"),
-            "[providers.gamma]\nname = \"G\"\napi_key_env_vars = [\"GAMMA_API_KEY\"]\n\
+            "[providers.gamma]\nname = \"G\"\napi_protocol = \"openai-completions\"\n\
+             api_key_env_vars = [\"GAMMA_API_KEY\"]\n\
              [providers.delta]\nname = \"D\"\n\
+             api_protocol = \"openai-completions\"\n\
              options = { api_key = \"sk-ok\" }\n\
              [providers.delta.models.\"m2\"]\nname = \"m2\"\nlimit = { context = 64000 }\n",
         )
@@ -304,6 +308,39 @@ mod tests {
         let err = engine.reload_providers().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("三层配置加载失败"), "错误指向配置加载：{msg}");
+
+        fuyao_provider::clear_cache(&paths);
+    }
+
+    /// 配置了未实现协议（如 anthropic-messages）：加载可过、配置进缓存，但实例
+    /// 构造在工厂分派处明确报「尚未实现」跳过——其余供应商照常刷新
+    #[tokio::test]
+    async fn reload_skips_unimplemented_protocol() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = unique_paths("reload_unimplemented", home.path());
+        // alpha 为可用供应商（openai-completions + 明文 key）；beta 配置合法但
+        // 协议未实现
+        std::fs::write(
+            home.path().join("fuyao.toml"),
+            "[providers.alpha]\nname = \"A\"\napi_protocol = \"openai-completions\"\n\
+             options = { api_key = \"sk-ok\" }\n\
+             [providers.alpha.models.\"m1\"]\nname = \"m1\"\nlimit = { context = 64000 }\n\
+             [providers.beta]\nname = \"B\"\napi_protocol = \"anthropic-messages\"\n\
+             options = { api_key = \"sk-ok\" }\n\
+             [providers.beta.models.\"m2\"]\nname = \"m2\"\nlimit = { context = 64000 }\n",
+        )
+        .unwrap();
+        let engine = bare_engine(paths.clone()).await;
+
+        let skipped = engine.reload_providers().expect("刷新应成功");
+
+        assert_eq!(skipped, vec!["beta".to_string()], "仅未实现协议进跳过名单");
+        assert!(!engine.providers.contains("beta"), "未实现协议不注册实例");
+        assert!(
+            fuyao_provider::get_provider("beta", &paths).is_some(),
+            "落盘存在的配置仍进缓存（实例与配置解耦）"
+        );
+        assert!(engine.providers.contains("alpha"), "其余供应商照常刷新");
 
         fuyao_provider::clear_cache(&paths);
     }

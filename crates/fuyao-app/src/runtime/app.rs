@@ -409,6 +409,7 @@ mod tests {
         let content = format!(
             "[providers.{provider_id}]\n\
              name = \"Test\"\n\
+             api_protocol = \"openai-completions\"\n\
              options = {{ api_key = \"sk-test\" }}\n\
              [providers.{provider_id}.models.\"m1\"]\n\
              name = \"m1\"\n\

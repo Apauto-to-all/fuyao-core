@@ -195,6 +195,7 @@ mod tests {
     fn create_test_provider(name: &str) -> Provider {
         Provider {
             name: name.to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             models: HashMap::new(),
             options: ProviderOptions::default(),
             api_key_env_vars: Vec::new(),

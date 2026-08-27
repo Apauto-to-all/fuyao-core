@@ -316,6 +316,7 @@ terminal_default_timeout_secs = 240
             r#"
 [providers.aliyun]
 name = "阿里云百炼"
+api_protocol = "openai-completions"
 [providers.aliyun.models."qwen3.6-plus"]
 name = "qwen3.6-plus"
 limit = { context = 131072 }
@@ -342,6 +343,7 @@ input = 2
             r#"
 [providers.aliyun]
 name = "阿里云百炼"
+api_protocol = "openai-completions"
 [providers.aliyun.models."qwen3.6-plus"]
 name = "qwen3.6-plus"
 "#,
@@ -370,6 +372,7 @@ name = "qwen3.6-plus"
             r#"
 [providers.aliyun]
 name = "阿里云百炼"
+api_protocol = "openai-completions"
 "#,
         );
 
@@ -394,6 +397,7 @@ name = "阿里云百炼"
             r#"
 [providers.deepseek]
 name = "DeepSeek"
+api_protocol = "openai-completions"
 "#,
         );
 
@@ -415,6 +419,7 @@ name = "DeepSeek"
             r#"
 [providers.deepseek]
 name = "DeepSeek"
+api_protocol = "openai-completions"
 [providers.deepseek.models.deepseek-v4-flash]
 name = "deepseek-v4-flash"
 limit = { context = 128000 }

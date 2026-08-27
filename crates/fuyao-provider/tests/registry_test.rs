@@ -33,6 +33,7 @@ fn unique_paths(test_name: &str) -> AgentPaths {
 fn sample_provider(name: &str) -> ProviderConfig {
     ProviderConfig {
         name: name.to_string(),
+        api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
         models: HashMap::new(),
         options: ProviderOptions::default(),
         api_key_env_vars: Vec::new(),

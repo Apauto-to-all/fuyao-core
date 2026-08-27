@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use fuyao_api::Model;
+use fuyao_api::{ApiProtocol, Model};
 
 use super::error::ProviderAdminError;
 
@@ -32,9 +32,14 @@ pub struct ProviderModelSpec {
 ///
 /// `base_url` / `name` 为完整期望状态：update 时 `base_url = None` 表示清除
 /// 该项（调用方提交表单的完整状态，而非增量）。
+///
+/// `api_protocol` 为必有字段（非 Option）：协议必填无缺省，清除即配置非法，
+/// create / update 载荷恒携带完整值。
 pub struct ProviderSpec {
     /// 供应商显示名（必填）
     pub name: String,
+    /// API 协议（wire 方言三选一，必有字段，恒随载荷落盘）
+    pub api_protocol: ApiProtocol,
     /// 自定义 base URL（None = 不配置 / 清除）
     pub base_url: Option<String>,
     /// API Key 环境变量名（None = 不配置指针；明文提供时必填）
@@ -50,6 +55,7 @@ impl ProviderSpec {
     pub fn into_data(self) -> ProviderSpecData {
         ProviderSpecData {
             name: self.name,
+            api_protocol: self.api_protocol,
             base_url: self.base_url,
             api_key_env_var: self.api_key_env_var,
             models: self
@@ -66,6 +72,7 @@ impl fmt::Debug for ProviderSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderSpec")
             .field("name", &self.name)
+            .field("api_protocol", &self.api_protocol)
             .field("base_url", &self.base_url)
             .field("api_key_env_var", &self.api_key_env_var)
             .field(
@@ -85,6 +92,8 @@ impl fmt::Debug for ProviderSpec {
 pub struct ProviderSpecData {
     /// 供应商显示名
     pub name: String,
+    /// API 协议（wire 方言三选一，落盘必写）
+    pub api_protocol: ApiProtocol,
     /// 自定义 base URL
     pub base_url: Option<String>,
     /// API Key 环境变量名（None = 不落指针键）
@@ -312,6 +321,7 @@ mod tests {
     fn validate_spec_rejects_homeless_api_key_and_duplicate_model_ids() {
         let base = |api_key_env_var: Option<&str>, id: &str| ProviderSpec {
             name: "DeepSeek".to_string(),
+            api_protocol: ApiProtocol::OpenaiCompletions,
             base_url: None,
             api_key_env_var: api_key_env_var.map(str::to_string),
             api_key: Some("sk-plain".to_string()),
@@ -359,6 +369,7 @@ mod tests {
     fn provider_spec_debug_masks_api_key() {
         let spec = ProviderSpec {
             name: "DeepSeek".to_string(),
+            api_protocol: ApiProtocol::OpenaiCompletions,
             base_url: None,
             api_key_env_var: Some("MY_DEEPSEEK_KEY".to_string()),
             api_key: Some("sk-secret".to_string()),

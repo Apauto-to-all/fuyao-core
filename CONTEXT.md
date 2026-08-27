@@ -56,6 +56,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 术语 | 代码标识 | 含义 |
 | --- | --- | --- |
 | 供应商 | `Provider` trait | LLM 统一抽象：`stream_chat`（返 `StreamEvent` 流）+ `chat`（非流式） |
+| API 协议 | `ApiProtocol` | 供应商的 wire 协议方言：`openai-completions` / `openai-responses` / `anthropic-messages` 三枚举，供应商段必填（无缺省，缺失即配置错误）；注册表按它分派构造哪种协议实现（见 ADR-0002） |
 | 供应商注册表 | `ProviderRegistry` | 引擎级路由；`model_id` 形如 `provider_id/model_id`，按前缀拆解路由；运行时可 `register` / `unregister` 即时生效 |
 | admin 域 | `admin` 模块 | 供应商管理底座：`ProviderSpec` 完整期望状态写回 global 层（`fuyao.toml` + `.env` 两落点） |
 | 密钥隔离 | `env_file` | 明文密钥只进 `.env`，toml 只写 `api_key_env_var` 指针；`.env` 只增改不删除；供应商 id 不可变（换 id 走建新 + 删旧） |

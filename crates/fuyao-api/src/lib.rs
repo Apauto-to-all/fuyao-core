@@ -49,8 +49,8 @@ pub use paths::{
 };
 pub use prompt_types::{AgentDefinition, AgentMode};
 pub use provider::{
-    InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
-    Provider, ProviderOptions, ThinkingType,
+    ApiProtocol, InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality,
+    PriceTier, Provider, ProviderOptions, ThinkingType,
 };
 pub use selection::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,

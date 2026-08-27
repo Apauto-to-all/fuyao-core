@@ -224,6 +224,7 @@ fn write_provider_config(
     let content = format!(
         "[providers.{provider_id}]\n\
          name = \"测试-{provider_id}\"\n\
+         api_protocol = \"openai-completions\"\n\
          options = {{ api_key = \"sk-test\", base_url = \"{base_url}\" }}\n\
          [providers.{provider_id}.models.\"{model_id}\"]\n\
          name = \"{model_id}\"\n\
@@ -254,6 +255,7 @@ async fn create_then_reload_is_immediately_callable() {
             "beta",
             ProviderSpec {
                 name: "Beta".to_string(),
+                api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
                 base_url: Some(base_url.clone()),
                 api_key_env_var: Some("BETA_API_KEY".to_string()),
                 // 明文进 .env 指定变量；构造实例走 api_key_env_vars 指针解析链
@@ -317,6 +319,7 @@ async fn reload_skips_missing_key_provider_and_keeps_others() {
             "beta",
             ProviderSpec {
                 name: "Beta".to_string(),
+                api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
                 base_url: Some(base_url.clone()),
                 api_key_env_var: Some("BETA_KEY".to_string()),
                 api_key: None,

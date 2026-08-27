@@ -89,6 +89,7 @@ mod tests {
     ) -> Provider {
         Provider {
             name: name.to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             models: std::collections::HashMap::new(),
             options: ProviderOptions { api_key, base_url },
             api_key_env_vars: Vec::new(),
@@ -98,6 +99,7 @@ mod tests {
     fn create_test_provider_with_env_vars(name: &str, env_vars: Vec<String>) -> Provider {
         Provider {
             name: name.to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             models: std::collections::HashMap::new(),
             options: ProviderOptions::default(),
             api_key_env_vars: env_vars,
@@ -165,6 +167,7 @@ mod tests {
 
         let provider = Provider {
             name: "test".to_string(),
+            api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
             models: std::collections::HashMap::new(),
             options: ProviderOptions {
                 api_key: Some("options-key".to_string()),

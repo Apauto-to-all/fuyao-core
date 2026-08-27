@@ -34,10 +34,11 @@ fn sample_model() -> Model {
     }
 }
 
-/// 构造供应商写回载荷（不含密钥与模型）
+/// 构造供应商写回载荷（不含密钥与模型；协议取 openai-completions）
 fn spec(name: &str, base_url: Option<&str>) -> ProviderSpec {
     ProviderSpec {
         name: name.to_string(),
+        api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
         base_url: base_url.map(str::to_string),
         api_key_env_var: None,
         api_key: None,
@@ -66,6 +67,7 @@ fn create_provider_then_reload_matches_spec() {
             "deepseek",
             ProviderSpec {
                 name: "DeepSeek".to_string(),
+                api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
                 base_url: Some("https://api.deepseek.com".to_string()),
                 api_key_env_var: Some("MY_DEEPSEEK_KEY".to_string()),
                 api_key: Some("sk-plain".to_string()),
@@ -170,7 +172,7 @@ fn create_provider_overwrites_existing_env_line_directly() {
 #[test]
 fn create_provider_preserves_unrelated_toml_verbatim() {
     let (paths, _home) = temp_agent_paths();
-    let handwritten = "# 我的全局配置\n[llm]\nrequest_timeout_secs = 300 # 手写注释\n\n# 手写供应商（管理 API 不触碰）\n[providers.aliyun]\nname = \"阿里云百炼\"\napi_key_env_vars = [\"DASHSCOPE_API_KEY\"]\nunknown_future_field = \"保留我\"\n";
+    let handwritten = "# 我的全局配置\n[llm]\nrequest_timeout_secs = 300 # 手写注释\n\n# 手写供应商（管理 API 不触碰）\n[providers.aliyun]\nname = \"阿里云百炼\"\napi_protocol = \"openai-completions\"\napi_key_env_vars = [\"DASHSCOPE_API_KEY\"]\nunknown_future_field = \"保留我\"\n";
     std::fs::write(paths.fuyao_home.join("fuyao.toml"), handwritten).unwrap();
     let manager = ProviderManager::new(paths.clone());
 
@@ -236,6 +238,7 @@ fn update_provider_replaces_models_and_patches_fields() {
             "deepseek",
             ProviderSpec {
                 name: "深度求索".to_string(),
+                api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
                 base_url: None,
                 api_key_env_var: None,
                 api_key: None,

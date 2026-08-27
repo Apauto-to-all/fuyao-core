@@ -7,7 +7,7 @@
 //! - 供应商定义只存在于全局层 `fuyao.toml`（单一事实源），管理列表
 //!   （[`ProviderOption`] / [`ProviderModelOption`]）直接反映落盘内容。
 
-use crate::{AgentDefinition, Model};
+use crate::{AgentDefinition, ApiProtocol, Model};
 
 /// agent_id 来源层
 ///
@@ -63,6 +63,8 @@ pub struct ProviderOption {
     pub id: String,
     /// 供应商显示名
     pub name: String,
+    /// API 协议（wire 方言，与管理载荷 / 落盘配置同枚举）
+    pub api_protocol: ApiProtocol,
     /// 自定义 base URL（None = 未配置，走供应商默认）
     pub base_url: Option<String>,
     /// API Key 环境变量指针名列表（只给变量名，不给明文）
@@ -106,6 +108,7 @@ mod tests {
         let option = ProviderOption {
             id: "deepseek".to_string(),
             name: "深度求索".to_string(),
+            api_protocol: ApiProtocol::OpenaiCompletions,
             base_url: Some("https://api.deepseek.com".to_string()),
             api_key_env_vars: vec!["DEEPSEEK_API_KEY".to_string()],
             models: vec![ProviderModelOption {
@@ -121,6 +124,10 @@ mod tests {
         };
         let json = serde_json::to_string(&option).unwrap();
         assert!(json.contains("\"id\":\"deepseek\""), "id 应进 JSON：{json}");
+        assert!(
+            json.contains("\"api_protocol\":\"openai-completions\""),
+            "API 协议应进 JSON（kebab-case）：{json}"
+        );
         assert!(
             json.contains("\"api_key_env_vars\":[\"DEEPSEEK_API_KEY\"]"),
             "指针名应进 JSON：{json}"

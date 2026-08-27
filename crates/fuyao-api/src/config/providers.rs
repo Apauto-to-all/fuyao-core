@@ -19,19 +19,25 @@
 //! ```toml
 //! [providers.aliyun]
 //! name = "阿里云百炼"
+//! api_protocol = "openai-completions"
 //! api_key_env_vars = ["DASHSCOPE_API_KEY"]
 //! [providers.aliyun.models.qwen3.6-plus]
 //! name = "qwen3.6-plus"
 //! cost = { input = 2, output = 12, cache = 0.4 }
 //! limit = { context = 1000000, output = 65536 }
 //! ```
+//!
+//! - `api_protocol` 必填校验：每个供应商必须声明 API 协议且为三选一
+//!   （`openai-completions` / `openai-responses` / `anthropic-messages`）——缺失 /
+//!   非字符串 / 未知值直接判为配置错误（fail-loud），错误信息带 `provider_id`
+//!   定位并列出全部合法取值。
 
 use std::collections::HashMap;
 
 use crate::config::error::ConfigError;
 use crate::provider::{
-    InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality, PriceTier,
-    Provider, ProviderOptions,
+    ApiProtocol, InputModality, Model, ModelCost, ModelLimit, ModelModalities, OutputModality,
+    PriceTier, Provider, ProviderOptions,
 };
 
 /// 将 TOML 数值转换为 f64（兼容整数和浮点）
@@ -265,6 +271,9 @@ fn parse_provider_options(table: &toml::Table) -> ProviderOptions {
 ///   fail-loud），错误信息带 `{provider_id}` 定位
 /// - name：必须字段且必须为字符串——缺失 / 类型不符返回 `Err`（配置错误，
 ///   fail-loud），错误信息带 `{provider_id}` 定位
+/// - api_protocol：必须字段且为三选一枚举（`openai-completions` /
+///   `openai-responses` / `anthropic-messages`）——缺失 / 非字符串 / 未知值
+///   返回 `Err`（配置错误，fail-loud），错误信息列出全部合法取值
 /// - models：可选，遍历并解析每个 Model；模型条目残缺或 `limit.context` 非法时
 ///   返回 `Err`（配置错误，整个加载失败）
 fn parse_provider(provider_id: &str, provider_data: &toml::Value) -> Result<Provider, String> {
@@ -286,6 +295,34 @@ fn parse_provider(provider_id: &str, provider_data: &toml::Value) -> Result<Prov
         return Err(format!("{provider_id} 的 name 类型错误：必须为字符串"));
     };
     let name = name.to_string();
+
+    // api_protocol 必填且为三选一：协议决定供应商实例构造的分派目标，缺失 /
+    // 类型不符 / 未知值在加载期拦下（fail-loud），错误信息列出全部合法取值
+    let valid_values = ApiProtocol::ALL_CONFIG_STRS.join(" / ");
+    let api_protocol = match table.get("api_protocol") {
+        None => {
+            return Err(format!(
+                "{provider_id} 的 api_protocol 缺失：必须声明为三选一\
+                 （{valid_values}，如 api_protocol = \"openai-completions\"）"
+            ));
+        }
+        Some(value) => match value.as_str() {
+            None => {
+                return Err(format!(
+                    "{provider_id} 的 api_protocol 类型错误：必须为字符串（三选一 {valid_values}）"
+                ));
+            }
+            Some(s) => match ApiProtocol::from_config_str(s) {
+                Some(protocol) => protocol,
+                None => {
+                    return Err(format!(
+                        "{provider_id} 的 api_protocol 非法（{s}）：合法取值为 {valid_values}\
+                         （如 api_protocol = \"openai-completions\"）"
+                    ));
+                }
+            },
+        },
+    };
 
     // 解析 api_key_env_vars（可选）
     let api_key_env_vars = table
@@ -312,6 +349,7 @@ fn parse_provider(provider_id: &str, provider_data: &toml::Value) -> Result<Prov
 
     Ok(Provider {
         name,
+        api_protocol,
         models,
         options,
         api_key_env_vars,
@@ -380,6 +418,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
             limit = { context = 131072 }
@@ -399,6 +438,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
             limit = { context = 128000 }
@@ -422,6 +462,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
             limit = { context = 131072 }
@@ -448,6 +489,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             api_key_env_vars = ["DASHSCOPE_API_KEY"]
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
@@ -468,6 +510,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.options]
             base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
             [providers.aliyun.models."qwen3.6-plus"]
@@ -489,6 +532,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
             limit = { context = 131072 }
@@ -514,6 +558,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
             limit = { context = 131072 }
@@ -550,6 +595,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
             limit = { context = 131072 }
@@ -567,6 +613,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
             limit = { context = 128000 }
@@ -594,6 +641,7 @@ mod tests {
         let toml_str = r#"
             [providers.somevendor]
             name = "SomeVendor"
+            api_protocol = "openai-completions"
             [providers.somevendor.models.weird-model]
             name = "weird-model"
             limit = { context = 64000 }
@@ -616,6 +664,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.test-model]
             name = "test-model"
             limit = { context = 64000 }
@@ -640,6 +689,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
         "#;
@@ -663,6 +713,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
             limit = { output = 8192 }
@@ -683,6 +734,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
             limit = { context = 0 }
@@ -703,6 +755,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
             limit = { context = -1 }
@@ -720,6 +773,7 @@ mod tests {
                 r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.deepseek-v4-flash]
             name = "deepseek-v4-flash"
             limit = {{ {bad} }}
@@ -745,6 +799,7 @@ mod tests {
         let toml_str = r#"
             [providers.aliyun]
             name = "阿里云百炼"
+            api_protocol = "openai-completions"
             [providers.aliyun.models."qwen3.6-plus"]
             name = "qwen3.6-plus"
             limit = { context = 1000000, input = 900000, output = 65536 }
@@ -756,6 +811,100 @@ mod tests {
         assert_eq!(model.limit.context, 1_000_000);
         assert_eq!(model.limit.input, Some(900_000));
         assert_eq!(model.limit.output, 65536);
+    }
+
+    // ===== api_protocol 必填校验 =====
+
+    /// 三选一全部合法取值可解析进 Provider 配置
+    #[test]
+    fn parse_all_api_protocol_values() {
+        for (config_str, expected) in [
+            ("openai-completions", ApiProtocol::OpenaiCompletions),
+            ("openai-responses", ApiProtocol::OpenaiResponses),
+            ("anthropic-messages", ApiProtocol::AnthropicMessages),
+        ] {
+            let toml_str = format!(
+                r#"
+            [providers.vendor]
+            name = "V"
+            api_protocol = "{config_str}"
+            [providers.vendor.models.m]
+            name = "m"
+            limit = {{ context = 64000 }}
+        "#
+            );
+            let value: toml::Value = toml::from_str(&toml_str).unwrap();
+            let providers = load_providers(value.get("providers").unwrap()).unwrap();
+            assert_eq!(
+                providers["vendor"].api_protocol, expected,
+                "合法取值 {config_str} 应解析为对应枚举"
+            );
+        }
+    }
+
+    /// 缺失 api_protocol：加载失败，错误信息带 provider_id 定位并列出全部合法取值
+    #[test]
+    fn missing_api_protocol_fails_with_valid_values() {
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { context = 128000 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("deepseek"), "错误信息应含 provider_id：{msg}");
+        assert!(msg.contains("api_protocol"), "错误应指向字段：{msg}");
+        assert!(
+            msg.contains("openai-completions / openai-responses / anthropic-messages"),
+            "错误信息应列出全部合法取值：{msg}"
+        );
+    }
+
+    /// 未知值（如 "openai"）：错误信息含实际写出值与合法取值
+    #[test]
+    fn unknown_api_protocol_fails_with_actual_value() {
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            api_protocol = "openai"
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { context = 128000 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("非法（openai）"),
+            "错误信息应含实际写出值：{msg}"
+        );
+        assert!(
+            msg.contains("openai-completions / openai-responses / anthropic-messages"),
+            "错误信息应列出全部合法取值：{msg}"
+        );
+    }
+
+    /// 非字符串（如整数）：判为类型错误
+    #[test]
+    fn non_string_api_protocol_fails() {
+        let toml_str = r#"
+            [providers.deepseek]
+            name = "DeepSeek"
+            api_protocol = 1
+            [providers.deepseek.models.deepseek-v4-flash]
+            name = "deepseek-v4-flash"
+            limit = { context = 128000 }
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = load_providers(value.get("providers").unwrap()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("api_protocol 类型错误：必须为字符串"),
+            "非字符串应报类型错误：{err}"
+        );
     }
 
     // ===== 条目残缺必填报错（非 table / name） =====
@@ -812,6 +961,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.no-name-model]
             limit = { context = 64000 }
         "#;
@@ -832,6 +982,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models.bad-model]
             name = 123
             limit = { context = 64000 }
@@ -852,6 +1003,7 @@ mod tests {
         let toml_str = r#"
             [providers.deepseek]
             name = "DeepSeek"
+            api_protocol = "openai-completions"
             [providers.deepseek.models]
             broken = "oops"
         "#;

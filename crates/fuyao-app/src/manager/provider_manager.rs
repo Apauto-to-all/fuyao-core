@@ -81,6 +81,7 @@ impl ProviderManager {
                 ProviderOption {
                     id,
                     name: provider.name,
+                    api_protocol: provider.api_protocol,
                     base_url: provider.options.base_url,
                     api_key_env_vars: provider.api_key_env_vars,
                     models,
@@ -255,6 +256,7 @@ mod tests {
                 "deepseek",
                 ProviderSpec {
                     name: "DeepSeek".to_string(),
+                    api_protocol: fuyao_api::ApiProtocol::OpenaiCompletions,
                     base_url: Some("https://api.deepseek.com".to_string()),
                     api_key_env_var: Some("MY_DEEPSEEK_KEY".to_string()),
                     api_key: Some("sk-plain".to_string()),
@@ -272,6 +274,11 @@ mod tests {
         assert_eq!(provider.id, "deepseek");
         assert_eq!(provider.name, "DeepSeek");
         assert_eq!(
+            provider.api_protocol,
+            fuyao_api::ApiProtocol::OpenaiCompletions,
+            "列表透出 API 协议（UI 回显当前协议）"
+        );
+        assert_eq!(
             provider.base_url.as_deref(),
             Some("https://api.deepseek.com")
         );
@@ -287,10 +294,10 @@ mod tests {
         // 故意按字母逆序写盘
         std::fs::write(
             home.path().join("fuyao.toml"),
-            "[providers.zhipu]\nname = \"Z\"\n\
+            "[providers.zhipu]\nname = \"Z\"\napi_protocol = \"openai-completions\"\n\
              [providers.zhipu.models.\"glm-5.2\"]\nname = \"g52\"\nlimit = { context = 64000 }\n\
              [providers.zhipu.models.\"glm-4.7\"]\nname = \"g47\"\nlimit = { context = 64000 }\n\
-             [providers.sensenova]\nname = \"S\"\n\
+             [providers.sensenova]\nname = \"S\"\napi_protocol = \"openai-completions\"\n\
              [providers.sensenova.models.\"sense-6.5\"]\nname = \"s65\"\nlimit = { context = 64000 }\n",
         )
         .unwrap();

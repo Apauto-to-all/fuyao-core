@@ -6,6 +6,7 @@
 
 pub mod admin;
 mod error;
+mod factory;
 mod openai;
 mod provider;
 mod registry;
@@ -14,6 +15,7 @@ mod stream_decoder;
 
 pub use admin::{ProviderAdminError, ProviderModelSpec, ProviderSpec};
 pub use error::ProviderError;
+pub use factory::{BuildProviderError, build_provider};
 pub use openai::OpenAIProvider;
 pub use provider::{
     BoxStream, ChatMessage, ChatRequest, ChatResponse, FinishReason, Provider, StreamError,

@@ -27,7 +27,7 @@ pub use cache::{
     register_model, register_provider, unregister_model, unregister_provider,
 };
 
-use crate::openai::OpenAIProvider;
+use crate::factory::build_provider;
 use crate::provider::Provider as ProviderTrait;
 use fuyao_api::AgentPaths;
 use std::collections::HashMap;
@@ -68,8 +68,9 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     /// 从全局配置注册表批量构造 Provider 实例
     ///
-    /// 遍历 [`list_providers`](cache::list_providers) 的每个 provider_id，调
-    /// [`OpenAIProvider::new`] 建实例。单个失败（API Key 未配等）仅记 WARN 跳过，
+    /// 遍历 [`list_providers`](cache::list_providers) 的每个条目，经
+    /// [`build_provider`](crate::factory::build_provider) 按配置的 `api_protocol`
+    /// 分派构造实例。单个失败（API Key 未配、协议未实现等）仅记 WARN 跳过，
     /// 其余成功的照常注册——支持渐进配置（部分 provider 配错也能启动引擎）。
     ///
     /// 调用方应在返回后检查 [`is_empty`](Self::is_empty)：空表示所有 provider
@@ -79,15 +80,16 @@ impl ProviderRegistry {
     pub fn from_registered(agent_paths: &AgentPaths) -> Self {
         let mut instances: HashMap<String, Arc<dyn ProviderTrait>> = HashMap::new();
         let providers = cache::list_providers(agent_paths);
-        for provider_id in providers.keys() {
-            match OpenAIProvider::new(provider_id, agent_paths) {
-                Some(p) => {
-                    instances.insert(provider_id.to_lowercase(), Arc::new(p));
+        for (provider_id, provider) in &providers {
+            match build_provider(provider_id, provider, agent_paths) {
+                Ok(instance) => {
+                    instances.insert(provider_id.to_lowercase(), instance);
                 }
-                None => {
+                Err(cause) => {
                     tracing::warn!(
-                        provider = %provider_id,
-                        "Provider 实例创建失败（通常是 API Key 未配置），该 provider 将不可用"
+                        provider_id = %provider_id,
+                        cause = %cause,
+                        "Provider 实例创建失败，该 provider 将不可用"
                     );
                 }
             }
