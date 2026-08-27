@@ -348,6 +348,7 @@ fn queued_cmd(client_message_id: Option<&str>) -> QueueEntry {
             command: fuyao_api::ControlCommand::Compress,
             mode: fuyao_api::UserMessageMode::Guide,
             client_message_id: client_message_id.map(str::to_string),
+            note: None,
         },
     })
 }

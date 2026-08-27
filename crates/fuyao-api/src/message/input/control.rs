@@ -27,8 +27,9 @@ pub struct ControlMessage {
 
 /// 控制命令载荷
 ///
-/// 命令本体 + 生效时机 + 客户端标识。触发参数（如压缩的模型、上下文长度）
-/// 由引擎在执行时按 session 配置现解析，不随消息携带。
+/// 命令本体 + 生效时机 + 客户端标识 + 可选附言。触发参数（如压缩的模型、上下文长度）
+/// 由引擎在执行时按 session 配置现解析，不随消息携带；附言是发送方的意图内容，
+/// 是否消费由各命令自决（多数命令视作一段提示词交给 AI 自行理解）。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ControlPayload {
     /// 要执行的命令
@@ -39,6 +40,12 @@ pub struct ControlPayload {
     /// （撤销排队中尚未生效的命令 / 消费回显配对）；随消费回显原样携带，不落库
     #[serde(default)]
     pub client_message_id: Option<String>,
+    /// 控制命令附言：发送方随命令附带的可选自由文本（如手动压缩时指定摘要
+    /// 的侧重要求）。随消费回显原样携带，不落库；新增命令禁止默认把附言设为
+    /// 必填——确需必填且缺失即无法实现功能时，由该命令的消费点执行体校验并
+    /// 发错误事件，引擎入口不做必填校验
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[cfg(test)]
@@ -46,21 +53,53 @@ mod tests {
     use super::*;
     use crate::message::EventBase;
 
-    /// 控制消息携带命令本体与生效时机
+    /// 控制消息携带命令本体、生效时机、附言
     #[test]
-    fn control_message_holds_command_and_mode() {
+    fn control_message_holds_command_mode_and_note() {
         let msg = ControlMessage {
             base: EventBase::default(),
             payload: ControlPayload {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Pending,
                 client_message_id: Some("cmd-1".to_string()),
+                note: Some("重点保留文件路径".to_string()),
             },
         };
         assert!(msg.base.seq.is_none());
         assert_eq!(msg.payload.command, ControlCommand::Compress);
         assert_eq!(msg.payload.mode, UserMessageMode::Pending);
         assert_eq!(msg.payload.client_message_id.as_deref(), Some("cmd-1"));
+        assert_eq!(msg.payload.note.as_deref(), Some("重点保留文件路径"));
+    }
+
+    /// 控制消息附言 serde 往返：携带与缺省两形态（缺省反序列化为 None）
+    #[test]
+    fn control_message_note_serde_roundtrip() {
+        let carried = ControlMessage {
+            base: EventBase::default(),
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Guide,
+                client_message_id: None,
+                note: Some("侧重错误堆栈".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&carried).expect("序列化失败");
+        let de: ControlMessage = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(de.payload.note.as_deref(), Some("侧重错误堆栈"));
+
+        let absent = ControlMessage {
+            base: EventBase::default(),
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Guide,
+                client_message_id: None,
+                note: None,
+            },
+        };
+        let json = serde_json::to_string(&absent).expect("序列化失败");
+        let de: ControlMessage = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(de.payload.note, None, "未携带附言应反序列化为 None");
     }
 
     /// 控制消息 serde 往返（过 IPC）
@@ -72,6 +111,7 @@ mod tests {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Guide,
                 client_message_id: None,
+                note: None,
             },
         };
         let json = serde_json::to_string(&msg).expect("序列化失败");

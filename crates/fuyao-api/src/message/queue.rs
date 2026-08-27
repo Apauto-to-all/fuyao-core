@@ -51,6 +51,7 @@ mod tests {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Pending,
                 client_message_id: None,
+                note: None,
             },
         });
         match entry {

@@ -89,6 +89,7 @@ fn input_event_samples() -> Vec<InputEvent> {
                 command: fuyao_api::ControlCommand::Compress,
                 mode: UserMessageMode::Guide,
                 client_message_id: None,
+                note: None,
             },
         }),
     ]
@@ -211,6 +212,7 @@ fn output_event_samples() -> Vec<OutputEvent> {
                 command: fuyao_api::ControlCommand::Compress,
                 mode: UserMessageMode::Pending,
                 client_message_id: Some("cmd-echo".into()),
+                note: Some("侧重阻塞项".into()),
             },
         }),
     ]

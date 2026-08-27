@@ -123,6 +123,7 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
         usage.prompt_tokens,
         &model,
         &provider,
+        None,
     )
     .await;
 }
@@ -134,7 +135,10 @@ pub(super) async fn run_pre_turn_compression(ctx: &SessionCtx) {
 /// ② 不适用子会话豁免——用户显式要对子会话压缩是用户的选择，引擎照做，
 ///    子代理失真风险由用户自担（自动压缩替用户挡不划算的压缩，手动不挡）。
 /// 触发原因标记为 manual。
-pub(super) async fn run_manual_compression(ctx: &SessionCtx) {
+///
+/// `note` 为控制命令附言（发送方对摘要的侧重要求），原样传给摘要生成；
+/// 自动触发路径没有用户附言，恒为 None——附言仅手动路径携带。
+pub(super) async fn run_manual_compression(ctx: &SessionCtx, note: Option<&str>) {
     let (model, provider) = match resolve_compression_model(ctx).await {
         Some(v) => v,
         None => return,
@@ -155,6 +159,7 @@ pub(super) async fn run_manual_compression(ctx: &SessionCtx) {
         prompt_tokens,
         &model,
         &provider,
+        note,
     )
     .await;
 }
@@ -162,8 +167,13 @@ pub(super) async fn run_manual_compression(ctx: &SessionCtx) {
 /// 执行一次上下文压缩（「怎么压」的执行体）
 ///
 /// 自动 / 手动两条触发路径共用本函数：
-/// - 自动（[`run_pre_turn_compression`]）：先过阈值门，命中才调（reason = auto）
-/// - 手动（[`run_manual_compression`]）：跳过阈值门直接调（reason = manual，用户意图优先）
+/// - 自动（[`run_pre_turn_compression`]）：先过阈值门，命中才调（reason = auto），
+///   无附言（None）
+/// - 手动（[`run_manual_compression`]）：跳过阈值门直接调（reason = manual，用户意图优先），
+///   可携带控制命令附言
+///
+/// `note` 为控制命令附言（发送方对摘要的侧重要求），原样传给摘要生成——
+/// 是否提供不影响压缩流程本身。
 ///
 /// 流程：发 Started → 调摘要 LLM（流式 Delta 并发转发）→ apply 落库 → 发 Ended。
 /// 失败处理（失败保持边界 + 错误分级）：
@@ -178,6 +188,7 @@ async fn run_compression(
     prompt_tokens: u32,
     model: &builders::ResolvedModel,
     provider: &std::sync::Arc<dyn fuyao_provider::Provider>,
+    note: Option<&str>,
 ) {
     // 上下文长度未知（模型未注册）时按 0：仅影响 Started 事件展示值，
     // 摘要 LLM 调用会因模型不存在在 provider 处失败，不在压缩侧兜底
@@ -295,6 +306,7 @@ async fn run_compression(
             &visible_messages,
             provider,
             &model.model_id,
+            note,
             compression_options,
             &mut on_delta,
         ) => {

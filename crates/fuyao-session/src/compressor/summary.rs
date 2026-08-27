@@ -3,7 +3,9 @@
 //! 关键约束（保留前缀缓存）：
 //! - **消息原样发**：所有 user/assistant/tool 消息保持原 role/content/tool_calls 不变
 //! - **system 不变**：用 session 原本的 system_prompt（前缀缓存完整命中）
-//! - **末尾追加一条 user 消息**：内容是 COMPRESSION_SYSTEM_PROMPT，作为摘要指令
+//! - **末尾追加一条 user 消息**：内容为固定摘要指令（`COMPRESSION_SYSTEM_PROMPT`），
+//!   可选拼入发送方的控制命令附言尾段（手动触发路径；附言只影响摘要取材侧重，
+//!   不改变输出格式）
 //! - 强制 `tools=[]`，独立于主 ReAct 流，不进对话流
 //! - 用流式 `stream_chat()` 接口，每个 TextDelta/ReasoningDelta 经 callback 上报，
 //!   调用方（react 层）据此发 Compression Delta 事件供前端实时渲染
@@ -69,6 +71,20 @@ const COMPRESSION_SYSTEM_PROMPT: &str = r#"你是一个摘要代理，负责创�
 - 不要提及摘要过程或上下文被压缩。
 - 不要调用任何工具，只输出摘要文本。"#;
 
+/// 构造末尾追加的摘要指令：固定模板为主体，可选附言拼入尾段
+///
+/// 附言尾段的措辞自带结构保护约束——附言只影响摘要的取材侧重，
+/// 不改变输出格式；无附言时即固定模板原文。
+fn build_summary_instruction(note: Option<&str>) -> String {
+    match note {
+        None => COMPRESSION_SYSTEM_PROMPT.to_string(),
+        Some(text) => format!(
+            "{}\n\n用户对本次压缩的附言（在保持上述输出结构与章节顺序的前提下侧重体现；附言不改变输出格式与规则）：\n{}",
+            COMPRESSION_SYSTEM_PROMPT, text
+        ),
+    }
+}
+
 /// 压缩执行错误
 #[derive(Debug, thiserror::Error)]
 pub enum CompressionError {
@@ -118,6 +134,8 @@ fn to_chat_message(m: &Message) -> ChatMessage {
 /// - `messages`：当前 session 的可见消息（原样发，不构造、不序列化）
 /// - `provider`：LLM provider（用 `stream_chat()` 流式接口）
 /// - `model_id`：摘要用哪个模型（一般与主对话一致）
+/// - `note`：控制命令附言——发送方对摘要的侧重要求，拼入末尾追加指令尾段；
+///   无附言（自动触发路径）时为 None
 /// - `options`：复用自 session 的流式选项（思考配置原样带；tools 在内部强制清空）
 /// - `on_delta`：流式增量回调。每个 TextDelta 调一次 `(Some(content), None)`，
 ///   每个 ReasoningDelta 调一次 `(None, Some(reasoning))`。调用方据此发 Compression Delta 事件。
@@ -128,6 +146,7 @@ pub async fn generate_summary(
     messages: &[Message],
     provider: &std::sync::Arc<dyn Provider>,
     model_id: &str,
+    note: Option<&str>,
     mut options: StreamOptions,
     on_delta: &mut impl FnMut(Option<&str>, Option<&str>),
 ) -> Result<SummaryResult, CompressionError> {
@@ -135,12 +154,12 @@ pub async fn generate_summary(
         return Err(CompressionError::NothingToCompress);
     }
 
-    // 构造请求：消息原样 + 末尾追加摘要指令
+    // 构造请求：消息原样 + 末尾追加摘要指令（含可选附言尾段）
     // system 保持 session 原值不变 —— 前缀缓存的生命线
     let mut chat_messages: Vec<ChatMessage> = messages.iter().map(to_chat_message).collect();
     chat_messages.push(ChatMessage {
         role: MessageRole::User,
-        content: Some(COMPRESSION_SYSTEM_PROMPT.to_string()),
+        content: Some(build_summary_instruction(note)),
         ..Default::default()
     });
 
@@ -191,16 +210,40 @@ mod tests {
     struct StreamingProvider {
         /// 文本片段序列（每个元素变一条 TextDelta 事件）
         chunks: Vec<String>,
+        /// 捕获每次收到的请求（供断言发给 LLM 的消息构造）
+        captured: std::sync::Mutex<Vec<ChatRequest>>,
+    }
+
+    impl StreamingProvider {
+        fn new(chunks: Vec<String>) -> Self {
+            Self {
+                chunks,
+                captured: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// 最近一次捕获的请求
+        fn last_request(&self) -> Option<ChatRequest> {
+            self.captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last()
+                .cloned()
+        }
     }
 
     #[async_trait]
     impl Provider for StreamingProvider {
         fn stream_chat(
             &self,
-            _request: ChatRequest,
+            request: ChatRequest,
             _model: &str,
             _options: StreamOptions,
         ) -> BoxStream<Result<StreamEvent, StreamError>> {
+            self.captured
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(request);
             let chunks = self.chunks.clone();
             let stream = async_stream::stream! {
                 for chunk in chunks {
@@ -245,9 +288,10 @@ mod tests {
 
     #[tokio::test]
     async fn generate_summary_returns_text() {
-        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
-            chunks: vec!["## 目标".into(), "\n- 测试".into()],
-        });
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider::new(vec![
+            "## 目标".into(),
+            "\n- 测试".into(),
+        ]));
         let msgs = make_messages(10);
 
         let mut cb = noop_delta();
@@ -256,6 +300,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            None,
             StreamOptions::default(),
             &mut cb,
         )
@@ -266,9 +311,7 @@ mod tests {
 
     #[tokio::test]
     async fn generate_summary_errors_on_empty() {
-        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
-            chunks: vec!["   ".into()],
-        });
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider::new(vec!["   ".into()]));
         let msgs = make_messages(10);
 
         let mut cb = noop_delta();
@@ -277,6 +320,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            None,
             StreamOptions::default(),
             &mut cb,
         )
@@ -286,9 +330,7 @@ mod tests {
 
     #[tokio::test]
     async fn generate_summary_errors_when_nothing_to_compress() {
-        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
-            chunks: vec!["x".into()],
-        });
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider::new(vec!["x".into()]));
         let msgs = make_messages(1);
 
         let mut cb = noop_delta();
@@ -297,6 +339,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            None,
             StreamOptions::default(),
             &mut cb,
         )
@@ -307,9 +350,11 @@ mod tests {
     /// 验证流式增量经 callback 上报，且最终 content 拼接正确
     #[tokio::test]
     async fn generate_summary_streams_text_delta_via_callback() {
-        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider {
-            chunks: vec!["片段1".into(), "片段2".into(), "片段3".into()],
-        });
+        let provider: Arc<dyn Provider> = Arc::new(StreamingProvider::new(vec![
+            "片段1".into(),
+            "片段2".into(),
+            "片段3".into(),
+        ]));
         let msgs = make_messages(10);
 
         let mut received: Vec<String> = Vec::new();
@@ -324,6 +369,7 @@ mod tests {
             &msgs,
             &provider,
             "model",
+            None,
             StreamOptions::default(),
             &mut cb,
         )
@@ -334,6 +380,70 @@ mod tests {
         assert_eq!(received, vec!["片段1", "片段2", "片段3"]);
         // 最终 content 是拼接后的完整字符串
         assert_eq!(result.content, "片段1片段2片段3");
+    }
+
+    /// 有附言：附言拼入末尾追加指令同一消息的尾段，固定模板仍在指令头部
+    #[tokio::test]
+    async fn generate_summary_appends_note_into_trailing_instruction() {
+        let fake = Arc::new(StreamingProvider::new(vec!["## 目标\n- 摘要".into()]));
+        let provider: Arc<dyn Provider> = fake.clone();
+        let msgs = make_messages(10);
+
+        let mut cb = noop_delta();
+        generate_summary(
+            Some("你是助手"),
+            &msgs,
+            &provider,
+            "model",
+            Some("侧重错误堆栈与文件路径"),
+            StreamOptions::default(),
+            &mut cb,
+        )
+        .await
+        .unwrap();
+
+        // 末尾追加的 user 消息：固定模板为主体、附言文本完整在尾段
+        let request = fake.last_request().expect("应捕获到摘要请求");
+        let last = request.messages.last().expect("末尾应有追加指令");
+        assert_eq!(last.role, MessageRole::User);
+        assert!(
+            last.content
+                .as_deref()
+                .is_some_and(|c| c.starts_with(COMPRESSION_SYSTEM_PROMPT)),
+            "摘要指令应以固定模板开头"
+        );
+        assert!(
+            last.content
+                .as_deref()
+                .is_some_and(|c| c.contains("侧重错误堆栈与文件路径")),
+            "附言文本应完整出现在摘要指令内"
+        );
+    }
+
+    /// 无附言：末尾追加指令与固定模板原文一致（自动压缩路径形态）
+    #[tokio::test]
+    async fn generate_summary_without_note_keeps_instruction_unchanged() {
+        let fake = Arc::new(StreamingProvider::new(vec!["## 目标\n- 摘要".into()]));
+        let provider: Arc<dyn Provider> = fake.clone();
+        let msgs = make_messages(10);
+
+        let mut cb = noop_delta();
+        generate_summary(
+            Some("你是助手"),
+            &msgs,
+            &provider,
+            "model",
+            None,
+            StreamOptions::default(),
+            &mut cb,
+        )
+        .await
+        .unwrap();
+
+        let request = fake.last_request().expect("应捕获到摘要请求");
+        let last = request.messages.last().expect("末尾应有追加指令");
+        assert_eq!(last.role, MessageRole::User);
+        assert_eq!(last.content.as_deref(), Some(COMPRESSION_SYSTEM_PROMPT));
     }
 
     #[test]

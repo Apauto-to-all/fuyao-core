@@ -115,6 +115,8 @@ impl Provider for ControllableProvider {
 struct MockProvider {
     responses: std::sync::Mutex<Vec<Vec<Result<StreamEvent, StreamError>>>>,
     call_count: AtomicUsize,
+    /// 捕获每次收到的请求（供断言发给 LLM 的消息构造）
+    captured: std::sync::Mutex<Vec<fuyao_provider::ChatRequest>>,
 }
 
 impl MockProvider {
@@ -122,7 +124,17 @@ impl MockProvider {
         Self {
             responses: std::sync::Mutex::new(responses),
             call_count: AtomicUsize::new(0),
+            captured: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// 最近一次捕获的请求
+    fn last_request(&self) -> Option<fuyao_provider::ChatRequest> {
+        self.captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
     }
 
     /// 构造固定的文本回复流
@@ -200,10 +212,14 @@ impl MockProvider {
 impl Provider for MockProvider {
     fn stream_chat(
         &self,
-        _request: fuyao_provider::ChatRequest,
+        request: fuyao_provider::ChatRequest,
         _model: &str,
         _options: fuyao_provider::StreamOptions,
     ) -> BoxStream<Result<StreamEvent, StreamError>> {
+        self.captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(request);
         let mut responses = self.responses.lock().unwrap();
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let events = if responses.is_empty() {
@@ -312,14 +328,20 @@ fn make_inbound_with_mode(content: &str, mode: UserMessageMode) -> QueueEntry {
     })
 }
 
-/// 构造测试用控制命令条目（Guide 模式，默认 Compress 命令）
+/// 构造测试用控制命令条目（Guide 模式，默认 Compress 命令，无附言）
 fn make_control_inbound(command: ControlCommand) -> QueueEntry {
+    make_control_inbound_with_note(command, None)
+}
+
+/// 构造测试用控制命令条目（Guide 模式，可携带附言）
+fn make_control_inbound_with_note(command: ControlCommand, note: Option<&str>) -> QueueEntry {
     QueueEntry::Control(OutputControlMessage {
         base: EventBase::default(),
         payload: OutputControlPayload {
             command,
             mode: UserMessageMode::Guide,
             client_message_id: None,
+            note: note.map(String::from),
         },
     })
 }
@@ -2921,7 +2943,7 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     preload_user(&h, "第四段对话内容").await;
     // last_usage 为 None（harness 默认）——自动压缩会早退，手动压缩必须照常执行
 
-    super::compression::run_manual_compression(&h.ctx).await;
+    super::compression::run_manual_compression(&h.ctx, None).await;
 
     let events = collect_events(&mut h.rx_event).await;
 
@@ -3067,6 +3089,131 @@ async fn control_only_batch_executes_command_without_running_turn() {
     assert!(guide.lock().unwrap().is_empty(), "guide 应被批次消费清空");
 }
 
+/// 带附言的 Compress 命令全链路：回显原样携带附言 + 附言进入摘要请求末尾指令
+///
+/// 验证：guide 预排 Control(Compress, note) → run_session 主循环消费 →
+/// ① 回显 `OutputEvent::Control` 的 note 与原条目逐字一致（忠实转发）；
+/// ② 摘要 LLM 请求的末尾追加消息包含附言文本与尾段标记——附言确实进入了
+/// 发给模型的摘要指令；③ 压缩照常执行（Started / Ended 成对）。
+#[tokio::test]
+async fn manual_compression_note_travels_to_echo_and_summary_request() {
+    use fuyao_api::message::output::CompressionPayload;
+
+    const NOTE: &str = "侧重错误堆栈与文件路径";
+
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "压缩摘要",
+    )]));
+
+    let store = temp_store().await;
+    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
+    session.id = "test_session".to_string();
+    store.create(&session).await.unwrap();
+
+    let guide = empty_queue();
+    let pending = empty_queue();
+    // guide 预排一条带附言的 Compress 命令条目
+    guide
+        .lock()
+        .unwrap()
+        .push_back(make_control_inbound_with_note(
+            ControlCommand::Compress,
+            Some(NOTE),
+        ));
+    // 预置多条可见消息（压缩对象）
+    for content in ["第一段对话内容", "第二段对话内容", "第三段对话内容"] {
+        let mut m = fuyao_api::Message::user(content.to_string());
+        store.insert_message(&session.id, &mut m).await.unwrap();
+    }
+
+    let (_tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
+    let (_tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+    let (tx_event, mut rx_event) = mpsc::unbounded_channel();
+
+    let providers = Arc::new(fuyao_provider::ProviderRegistry::with_instance(
+        "test",
+        provider.clone(),
+    ));
+    let ctx = test_ctx_builder(
+        Arc::clone(&store),
+        providers,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        Emitter::new(tx_event, "test_session".to_string()),
+        fuyao_api::AgentPaths::default(),
+    )
+    .guide(Arc::clone(&guide))
+    .pending(Arc::clone(&pending))
+    .shutdown_token(tokio_util::sync::CancellationToken::new())
+    .build();
+    let task = tokio::spawn(run_session(
+        ctx,
+        SessionRx {
+            inbound: rx_inbound,
+            interrupt: rx_interrupt,
+        },
+    ));
+
+    // 等 Compression Ended 事件（命令执行完成），2 秒超时防止挂死
+    let events = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut collected = Vec::new();
+        while let Some(ev) = rx_event.recv().await {
+            let is_ended = matches!(
+                &ev,
+                OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Ended(_))
+            );
+            collected.push(ev);
+            if is_ended {
+                break;
+            }
+        }
+        collected
+    })
+    .await
+    .expect("2 秒内应执行完压缩命令并发出 Ended 事件");
+    task.abort();
+
+    // ① 回显原样携带附言：note 与原条目逐字一致（忠实转发，不增不减）
+    let echoed_note = events
+        .iter()
+        .find_map(|e| match e {
+            OutputEvent::Control(m) => Some(m.payload.note.clone()),
+            _ => None,
+        })
+        .flatten();
+    assert_eq!(
+        echoed_note.as_deref(),
+        Some(NOTE),
+        "回显事件应原样携带命令附言"
+    );
+
+    // ② 压缩照常执行：Started / Ended 成对出现
+    let has_started = events.iter().any(|e| {
+        matches!(
+            e,
+            OutputEvent::Compression(m) if matches!(&m.payload, CompressionPayload::Started(_))
+        )
+    });
+    let has_ended = matches!(
+        events.last(),
+        Some(OutputEvent::Compression(m))
+            if matches!(&m.payload, CompressionPayload::Ended(_))
+    );
+    assert!(has_started, "带附言的命令应执行压缩并发出 Started 事件");
+    assert!(has_ended, "超时收集循环以 Ended 收尾");
+
+    // ③ 附言进入摘要请求：末尾追加消息含尾段标记与附言全文
+    let request = provider.last_request().expect("应捕获到摘要请求");
+    let last = request.messages.last().expect("末尾应有追加指令");
+    assert_eq!(last.role, fuyao_api::MessageRole::User);
+    let instruction = last.content.as_deref().unwrap_or_default();
+    assert!(
+        instruction.contains("用户对本次压缩的附言"),
+        "摘要指令应含附言尾段标记"
+    );
+    assert!(instruction.contains(NOTE), "附言文本应完整进入摘要指令");
+}
+
 /// 消费时刻回显先于执行：命令条目被消费时先把 `OutputEvent::Control` 发给外部，
 /// 随后才出现命令的执行产物（Compression 事件）
 ///
@@ -3101,6 +3248,7 @@ async fn control_consumption_echoes_command_event_before_execution() {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Guide,
                 client_message_id: Some("cmd-order".to_string()),
+                note: None,
             },
         }));
     // 预置多条可见消息（压缩对象）

@@ -25,6 +25,9 @@ pub struct ControlMessage {
 }
 
 /// 控制命令载荷（输出侧）
+///
+/// 附言是发送方的意图内容，是否消费由各命令自决；触发参数（如压缩的模型、
+/// 上下文长度）仍由引擎在执行时按 session 配置现解析，不随消息携带。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ControlPayload {
     /// 要执行的命令
@@ -35,6 +38,12 @@ pub struct ControlPayload {
     /// （撤销排队中尚未生效的命令 / 消费回显配对），不落库
     #[serde(default)]
     pub client_message_id: Option<String>,
+    /// 控制命令附言：发送方随命令附带的可选自由文本（如手动压缩时指定摘要
+    /// 的侧重要求）。随消费回显原样携带，不落库；新增命令禁止默认把附言设为
+    /// 必填——确需必填且缺失即无法实现功能时，由该命令的消费点执行体校验并
+    /// 发错误事件，引擎入口不做必填校验
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[cfg(test)]
@@ -42,7 +51,7 @@ mod tests {
     use super::*;
     use crate::message::EventBase;
 
-    /// 输出侧控制消息字段完整（命令 / 时机 / 标识）
+    /// 输出侧控制消息字段完整（命令 / 时机 / 标识 / 附言）
     #[test]
     fn output_control_message_holds_fields() {
         let msg = ControlMessage {
@@ -51,11 +60,43 @@ mod tests {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Guide,
                 client_message_id: Some("cmd-9".to_string()),
+                note: Some("侧重未完成的任务".to_string()),
             },
         };
         assert_eq!(msg.payload.command, ControlCommand::Compress);
         assert_eq!(msg.payload.mode, UserMessageMode::Guide);
         assert_eq!(msg.payload.client_message_id.as_deref(), Some("cmd-9"));
+        assert_eq!(msg.payload.note.as_deref(), Some("侧重未完成的任务"));
+    }
+
+    /// 输出侧附言 serde 往返：携带与缺省两形态（缺省反序列化为 None）
+    #[test]
+    fn output_control_message_note_serde_roundtrip() {
+        let carried = ControlMessage {
+            base: EventBase::default(),
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Pending,
+                client_message_id: None,
+                note: Some("保留关键决策".to_string()),
+            },
+        };
+        let json = serde_json::to_string(&carried).expect("序列化失败");
+        let de: ControlMessage = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(de.payload.note.as_deref(), Some("保留关键决策"));
+
+        let absent = ControlMessage {
+            base: EventBase::default(),
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Pending,
+                client_message_id: None,
+                note: None,
+            },
+        };
+        let json = serde_json::to_string(&absent).expect("序列化失败");
+        let de: ControlMessage = serde_json::from_str(&json).expect("反序列化失败");
+        assert_eq!(de.payload.note, None, "未携带附言应反序列化为 None");
     }
 
     /// 输出侧控制消息 serde 往返
@@ -67,6 +108,7 @@ mod tests {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Pending,
                 client_message_id: None,
+                note: None,
             },
         };
         let json = serde_json::to_string(&msg).expect("序列化失败");

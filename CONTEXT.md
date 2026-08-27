@@ -14,9 +14,10 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | ReAct 循环 | `react` 模块 | 每 session 一个 tokio task：想 → 调一批工具 → 消费 guide 队列 → 再想 → 最终回复 |
 | 轮次 | `run_turn` / `TurnOutcome` | 单轮 ReAct 的执行与退出原因（`Completed` / `Interrupted` / `Failed`） |
 | dispatch 管道 | `dispatch` | 统一输出处理链：`intercept`（同步原地修改 / 阻止）→ `deliver`（发送 + 观察） |
-| 输出事件 | `OutputEvent` | Engine → UI 的唯一对外事件，11 个变体（`Chunk` / `User` / `ToolCall` / `ToolResult` / `Assistant` / `Interrupt` / `Error` / `Compression` / `Title` / `Retry` / `ChildSession`） |
+| 输出事件 | `OutputEvent` | Engine → UI 的唯一对外事件，13 个变体（`Chunk` / `User` / `Control` / `ToolCall` / `ToolResult` / `Assistant` / `Interrupt` / `Error` / `PluginNotice` / `Compression` / `Title` / `Retry` / `ChildSession`） |
 | 输入事件 | `InputEvent` | UI → Engine 的入口事件（`User` / `Interrupt` / `Control`），入口即转 `OutputEvent`，内核不区分方向 |
 | 控制命令 | `ControlCommand` / `ControlMessage` | 命令主循环做事的消息（如手动压缩）：与用户消息同型排队、同序消费，消费点先以 `OutputEvent::Control` 回显对外、后执行命令本体，执行产物照常走输出事件流 |
+| 控制命令附言 | `ControlPayload.note` | 发送方随命令附带的可选自由文本（如手动压缩的摘要侧重要求）：不落库、回显原样携带，是否消费由各命令自决——多数命令视作一段提示词交给 AI 自行理解；新增命令禁止默认把附言设为必填（见 ADR-0001） |
 | 事件信封 | `EventBase` | 每条事件带 `seq`（落库回填序号）/ `timestamp` / `session_id`（全程标签） |
 | 中断协议 | `interrupt` 模块 | 三段 select! 收尾：`finish_streaming` / `finish_tool_batch` / `notify_idle`，先发 Interrupt 通知再补增量结果落库 |
 | 停止屏障 | `stop_session` | 返回即该 session DB 已静默（等 TurnPhase 回 Idle），是「先停后改库」组合操作的前半步 |

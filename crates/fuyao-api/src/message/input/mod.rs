@@ -92,6 +92,7 @@ mod tests {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Guide,
                 client_message_id: None,
+                note: None,
             },
         });
         match &event {
@@ -131,6 +132,7 @@ mod tests {
                 command: ControlCommand::Compress,
                 mode: UserMessageMode::Pending,
                 client_message_id: Some("cmd-1".to_string()),
+                note: Some("侧重阻塞项".to_string()),
             },
         });
         let json = serde_json::to_string(&event).expect("序列化失败");
@@ -140,6 +142,7 @@ mod tests {
                 assert_eq!(msg.payload.command, ControlCommand::Compress);
                 assert_eq!(msg.payload.mode, UserMessageMode::Pending);
                 assert_eq!(msg.payload.client_message_id.as_deref(), Some("cmd-1"));
+                assert_eq!(msg.payload.note.as_deref(), Some("侧重阻塞项"));
             }
             _ => panic!("反序列化后应为 Control 变体"),
         }

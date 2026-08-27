@@ -509,11 +509,12 @@ async fn handle_inbound_item(ctx: &SessionCtx, entry: QueueEntry) {
 ///
 /// 调用方为 [`consume_batch`]（主循环顶与 turn 内时机①②的批次处理共用）。
 async fn handle_control(ctx: &SessionCtx, msg: OutputControlMessage) {
-    // 回显前先取命令本体快照：回显经统一管道时拦截钩子可原地改写消息，
-    // 实际执行的命令以队列原条目为准
+    // 回显前先取命令本体与附言快照：回显经统一管道时拦截钩子可原地改写消息，
+    // 实际执行的以队列原条目为准
     let command = msg.payload.command.clone();
+    let note = msg.payload.note.clone();
     dispatch::dispatch(&ctx.emitter, &ctx.hooks, OutputEvent::Control(msg)).await;
     match command {
-        ControlCommand::Compress => compression::run_manual_compression(ctx).await,
+        ControlCommand::Compress => compression::run_manual_compression(ctx, note.as_deref()).await,
     }
 }
