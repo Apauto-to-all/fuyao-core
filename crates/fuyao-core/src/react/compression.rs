@@ -305,7 +305,7 @@ async fn run_compression(
             system_prompt.as_deref(),
             &visible_messages,
             provider,
-            &model.model_id,
+            &model.model,
             note,
             compression_options,
             &mut on_delta,

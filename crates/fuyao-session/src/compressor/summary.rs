@@ -133,7 +133,8 @@ fn to_chat_message(m: &Message) -> ChatMessage {
 /// - `system_prompt`：session 原本的 system_prompt（保持不变，前缀缓存命中）
 /// - `messages`：当前 session 的可见消息（原样发，不构造、不序列化）
 /// - `provider`：LLM provider（用 `stream_chat()` 流式接口）
-/// - `model_id`：摘要用哪个模型（一般与主对话一致）
+/// - `model`：摘要用哪个模型（裸模型名，不带 provider_id 前缀——原样进请求体
+///   `model` 字段，与主对话 turn 同口径；完整 model_id 由调用方拆解后只传后半段）
 /// - `note`：控制命令附言——发送方对摘要的侧重要求，拼入末尾追加指令尾段；
 ///   无附言（自动触发路径）时为 None
 /// - `options`：复用自 session 的流式选项（思考配置原样带；tools 在内部强制清空）
@@ -145,7 +146,7 @@ pub async fn generate_summary(
     system_prompt: Option<&str>,
     messages: &[Message],
     provider: &std::sync::Arc<dyn Provider>,
-    model_id: &str,
+    model: &str,
     note: Option<&str>,
     mut options: StreamOptions,
     on_delta: &mut impl FnMut(Option<&str>, Option<&str>),
@@ -171,7 +172,7 @@ pub async fn generate_summary(
     // 调 provider（流式 stream_chat）。压缩铁律：强制禁用工具（独立摘要流，不进 ReAct）
     options.tools = None;
     let mut stream: BoxStream<Result<StreamEvent, StreamError>> =
-        provider.stream_chat(request, model_id, options);
+        provider.stream_chat(request, model, options);
 
     let mut content = String::new();
     while let Some(result) = stream.next().await {

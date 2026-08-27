@@ -117,6 +117,8 @@ struct MockProvider {
     call_count: AtomicUsize,
     /// 捕获每次收到的请求（供断言发给 LLM 的消息构造）
     captured: std::sync::Mutex<Vec<fuyao_provider::ChatRequest>>,
+    /// 捕获每次收到的 model 参数（供断言传给 provider 的模型名形态）
+    captured_models: std::sync::Mutex<Vec<String>>,
 }
 
 impl MockProvider {
@@ -125,12 +127,22 @@ impl MockProvider {
             responses: std::sync::Mutex::new(responses),
             call_count: AtomicUsize::new(0),
             captured: std::sync::Mutex::new(Vec::new()),
+            captured_models: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     /// 最近一次捕获的请求
     fn last_request(&self) -> Option<fuyao_provider::ChatRequest> {
         self.captured
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last()
+            .cloned()
+    }
+
+    /// 最近一次收到的 model 参数
+    fn last_model(&self) -> Option<String> {
+        self.captured_models
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .last()
@@ -213,13 +225,17 @@ impl Provider for MockProvider {
     fn stream_chat(
         &self,
         request: fuyao_provider::ChatRequest,
-        _model: &str,
+        model: &str,
         _options: fuyao_provider::StreamOptions,
     ) -> BoxStream<Result<StreamEvent, StreamError>> {
         self.captured
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(request);
+        self.captured_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(model.to_string());
         let mut responses = self.responses.lock().unwrap();
         self.call_count.fetch_add(1, Ordering::SeqCst);
         let events = if responses.is_empty() {
@@ -2973,6 +2989,30 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     let ended = ended.expect("应有 Compression Ended 事件");
     assert_eq!(ended.reason, CompressionReason::Manual);
     assert_eq!(ended.content, "压缩摘要");
+}
+
+/// 压缩摘要调用必须把裸模型名（不带 provider_id 前缀）传给 provider
+///
+/// provider.stream_chat 的 model 参数原样进请求体 `model` 字段；带前缀的完整
+/// model_id 会被远端网关当作渠道名解析，返回 404 model_not_found。
+#[tokio::test]
+async fn manual_compression_passes_bare_model_name_to_provider() {
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "压缩摘要",
+    )]));
+    let h = make_harness(provider.clone(), Arc::new(ToolRegistry::builder().build())).await;
+    // harness 的 model_id 为 "test/test-model"（provider_id=test）：
+    // 压缩路径必须传裸名 "test-model" 给 provider
+    preload_user(&h, "第一段对话内容").await;
+    preload_user(&h, "第二段对话内容").await;
+
+    super::compression::run_manual_compression(&h.ctx, None).await;
+
+    let model = provider.last_model().expect("压缩应调用过 provider");
+    assert_eq!(
+        model, "test-model",
+        "传给 provider 的 model 应为裸模型名（不带 provider_id 前缀），实际: {model}"
+    );
 }
 
 /// 主循环批次只含 Control 条目：命令在对话 LLM 调用之前执行，且不跑 turn
