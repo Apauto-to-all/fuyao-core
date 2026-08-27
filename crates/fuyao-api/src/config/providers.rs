@@ -27,8 +27,8 @@
 //! limit = { context = 1000000, output = 65536 }
 //! ```
 //!
-//! - `api_protocol` 必填校验：每个供应商必须声明 API 协议且为三选一
-//!   （`openai-completions` / `openai-responses` / `anthropic-messages`）——缺失 /
+//! - `api_protocol` 必填校验：每个供应商必须声明 API 协议且为两选一
+//!   （`openai-completions` / `anthropic-messages`）——缺失 /
 //!   非字符串 / 未知值直接判为配置错误（fail-loud），错误信息带 `provider_id`
 //!   定位并列出全部合法取值。
 
@@ -271,8 +271,8 @@ fn parse_provider_options(table: &toml::Table) -> ProviderOptions {
 ///   fail-loud），错误信息带 `{provider_id}` 定位
 /// - name：必须字段且必须为字符串——缺失 / 类型不符返回 `Err`（配置错误，
 ///   fail-loud），错误信息带 `{provider_id}` 定位
-/// - api_protocol：必须字段且为三选一枚举（`openai-completions` /
-///   `openai-responses` / `anthropic-messages`）——缺失 / 非字符串 / 未知值
+/// - api_protocol：必须字段且为两选一枚举（`openai-completions` /
+///   `anthropic-messages`）——缺失 / 非字符串 / 未知值
 ///   返回 `Err`（配置错误，fail-loud），错误信息列出全部合法取值
 /// - models：可选，遍历并解析每个 Model；模型条目残缺或 `limit.context` 非法时
 ///   返回 `Err`（配置错误，整个加载失败）
@@ -815,12 +815,11 @@ mod tests {
 
     // ===== api_protocol 必填校验 =====
 
-    /// 三选一全部合法取值可解析进 Provider 配置
+    /// 两选一全部合法取值可解析进 Provider 配置
     #[test]
     fn parse_all_api_protocol_values() {
         for (config_str, expected) in [
             ("openai-completions", ApiProtocol::OpenaiCompletions),
-            ("openai-responses", ApiProtocol::OpenaiResponses),
             ("anthropic-messages", ApiProtocol::AnthropicMessages),
         ] {
             let toml_str = format!(
@@ -858,7 +857,7 @@ mod tests {
         assert!(msg.contains("deepseek"), "错误信息应含 provider_id：{msg}");
         assert!(msg.contains("api_protocol"), "错误应指向字段：{msg}");
         assert!(
-            msg.contains("openai-completions / openai-responses / anthropic-messages"),
+            msg.contains("openai-completions / anthropic-messages"),
             "错误信息应列出全部合法取值：{msg}"
         );
     }
@@ -882,7 +881,7 @@ mod tests {
             "错误信息应含实际写出值：{msg}"
         );
         assert!(
-            msg.contains("openai-completions / openai-responses / anthropic-messages"),
+            msg.contains("openai-completions / anthropic-messages"),
             "错误信息应列出全部合法取值：{msg}"
         );
     }

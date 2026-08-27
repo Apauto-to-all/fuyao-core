@@ -311,37 +311,4 @@ mod tests {
 
         fuyao_provider::clear_cache(&paths);
     }
-
-    /// 配置了未实现协议（如 openai-responses）：加载可过、配置进缓存，但实例
-    /// 构造在工厂分派处明确报「尚未实现」跳过——其余供应商照常刷新
-    #[tokio::test]
-    async fn reload_skips_unimplemented_protocol() {
-        let home = tempfile::tempdir().unwrap();
-        let paths = unique_paths("reload_unimplemented", home.path());
-        // alpha 为可用供应商（openai-completions + 明文 key）；beta 配置合法但
-        // 协议未实现
-        std::fs::write(
-            home.path().join("fuyao.toml"),
-            "[providers.alpha]\nname = \"A\"\napi_protocol = \"openai-completions\"\n\
-             options = { api_key = \"sk-ok\" }\n\
-             [providers.alpha.models.\"m1\"]\nname = \"m1\"\nlimit = { context = 64000 }\n\
-             [providers.beta]\nname = \"B\"\napi_protocol = \"openai-responses\"\n\
-             options = { api_key = \"sk-ok\" }\n\
-             [providers.beta.models.\"m2\"]\nname = \"m2\"\nlimit = { context = 64000 }\n",
-        )
-        .unwrap();
-        let engine = bare_engine(paths.clone()).await;
-
-        let skipped = engine.reload_providers().expect("刷新应成功");
-
-        assert_eq!(skipped, vec!["beta".to_string()], "仅未实现协议进跳过名单");
-        assert!(!engine.providers.contains("beta"), "未实现协议不注册实例");
-        assert!(
-            fuyao_provider::get_provider("beta", &paths).is_some(),
-            "落盘存在的配置仍进缓存（实例与配置解耦）"
-        );
-        assert!(engine.providers.contains("alpha"), "其余供应商照常刷新");
-
-        fuyao_provider::clear_cache(&paths);
-    }
 }

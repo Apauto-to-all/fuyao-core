@@ -4,7 +4,7 @@
 //! 分派入口：按 Provider 配置的 `api_protocol` 选定 wire 实现。新增协议实现时
 //! 在此 match 补一支即可，调用方接线不动。
 //!
-//! 未实现协议的容错粒度：单供应商构造失败由调用方 WARN + 跳过（不拖垮其余
+//! 构造失败的容错粒度：单供应商失败由调用方 WARN + 跳过（不拖垮其余
 //! 供应商），错误消息明确到可以照着改（见 ADR-0002）。
 
 use std::sync::Arc;
@@ -19,9 +19,6 @@ use crate::provider::Provider as ProviderTrait;
 /// 供应商实例构造错误
 #[derive(Debug, Error)]
 pub enum BuildProviderError {
-    /// API 协议的 wire 实现尚未填充：配置可写、加载可过，构造期在此明确拦下
-    #[error("api_protocol = {0} 尚未实现（当前仅支持 openai-completions / anthropic-messages）")]
-    ProtocolUnimplemented(ApiProtocol),
     /// OpenAI 兼容实例构造失败（API Key 未解析到 / HTTP 客户端构建失败，细节已记 WARN 日志）
     #[error("openai-completions 实例构造失败（通常是 API Key 未配置或 HTTP 客户端构建失败）")]
     OpenaiConstruction,
@@ -33,9 +30,8 @@ pub enum BuildProviderError {
 /// 按 Provider 配置的 `api_protocol` 构造供应商实例
 ///
 /// `provider` 为进程级缓存中的配置（含协议声明），`provider_id` 用于 API Key /
-/// base_url 解析链。三支分派穷尽枚举：`openai-completions` / `anthropic-messages`
-/// 各走自身 wire 实现，构造失败落各自错误分支；`openai-responses` 为占位——
-/// 返回 [`BuildProviderError::ProtocolUnimplemented`]。
+/// base_url 解析链。两支分派穷尽枚举：`openai-completions` /
+/// `anthropic-messages` 各走自身 wire 实现，构造失败落各自错误分支。
 pub fn build_provider(
     provider_id: &str,
     provider: &ProviderConfig,
@@ -48,9 +44,6 @@ pub fn build_provider(
         ApiProtocol::AnthropicMessages => AnthropicProvider::new(provider_id, agent_paths)
             .map(|instance| Arc::new(instance) as Arc<dyn ProviderTrait>)
             .ok_or(BuildProviderError::AnthropicConstruction),
-        ApiProtocol::OpenaiResponses => Err(BuildProviderError::ProtocolUnimplemented(
-            provider.api_protocol,
-        )),
     }
 }
 
@@ -149,35 +142,6 @@ mod tests {
         assert!(
             matches!(err, BuildProviderError::AnthropicConstruction),
             "应落在 Anthropic 构造失败分支"
-        );
-
-        clear_cache(&paths);
-    }
-
-    /// 未实现协议（openai-responses）：明确报「尚未实现」且错误消息含配置拼写（可照着改）
-    #[test]
-    fn unimplemented_protocols_report_explicit_error() {
-        let paths = unique_paths("factory_unimplemented");
-
-        let provider = test_provider(ApiProtocol::OpenaiResponses, Some("sk-test"));
-        let err = build_provider("vendor", &provider, &paths)
-            .err()
-            .expect("未实现协议应报错");
-        assert!(
-            matches!(
-                err,
-                BuildProviderError::ProtocolUnimplemented(ApiProtocol::OpenaiResponses)
-            ),
-            "应报协议未实现：{err}"
-        );
-        assert!(
-            err.to_string()
-                .contains(ApiProtocol::OpenaiResponses.as_config_str()),
-            "错误消息应含协议的配置拼写：{err}"
-        );
-        assert!(
-            err.to_string().contains("尚未实现"),
-            "错误消息应说明未实现：{err}"
         );
 
         clear_cache(&paths);

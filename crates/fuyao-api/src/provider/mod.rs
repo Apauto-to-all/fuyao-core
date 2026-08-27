@@ -29,27 +29,21 @@ pub use model::{
 pub enum ApiProtocol {
     /// OpenAI Chat Completions 兼容协议
     OpenaiCompletions,
-    /// OpenAI Responses 协议
-    OpenaiResponses,
     /// Anthropic Messages 协议
     AnthropicMessages,
 }
 
 impl ApiProtocol {
     /// 全部合法配置取值（错误信息列值用，与 [`ApiProtocol::from_config_str`] 识别集一致）
-    pub const ALL_CONFIG_STRS: &'static [&'static str] = &[
-        "openai-completions",
-        "openai-responses",
-        "anthropic-messages",
-    ];
+    pub const ALL_CONFIG_STRS: &'static [&'static str] =
+        &["openai-completions", "anthropic-messages"];
 
     /// 配置字符串解析为枚举（与 [`ApiProtocol::as_config_str`] 互逆）
     ///
-    /// 精确匹配三个合法取值；未命中返回 `None`，由调用方组织 fail-loud 错误。
+    /// 精确匹配全部合法取值；未命中返回 `None`，由调用方组织 fail-loud 错误。
     pub fn from_config_str(s: &str) -> Option<Self> {
         match s {
             "openai-completions" => Some(Self::OpenaiCompletions),
-            "openai-responses" => Some(Self::OpenaiResponses),
             "anthropic-messages" => Some(Self::AnthropicMessages),
             _ => None,
         }
@@ -59,7 +53,6 @@ impl ApiProtocol {
     pub fn as_config_str(&self) -> &'static str {
         match self {
             Self::OpenaiCompletions => "openai-completions",
-            Self::OpenaiResponses => "openai-responses",
             Self::AnthropicMessages => "anthropic-messages",
         }
     }
@@ -175,6 +168,9 @@ mod tests {
     /// Display 与配置字符串同形（日志直接打印枚举即得配置拼写）
     #[test]
     fn api_protocol_display_matches_config_str() {
-        assert_eq!(ApiProtocol::OpenaiResponses.to_string(), "openai-responses");
+        assert_eq!(
+            ApiProtocol::AnthropicMessages.to_string(),
+            "anthropic-messages"
+        );
     }
 }
