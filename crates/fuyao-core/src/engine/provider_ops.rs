@@ -312,7 +312,7 @@ mod tests {
         fuyao_provider::clear_cache(&paths);
     }
 
-    /// 配置了未实现协议（如 anthropic-messages）：加载可过、配置进缓存，但实例
+    /// 配置了未实现协议（如 openai-responses）：加载可过、配置进缓存，但实例
     /// 构造在工厂分派处明确报「尚未实现」跳过——其余供应商照常刷新
     #[tokio::test]
     async fn reload_skips_unimplemented_protocol() {
@@ -325,7 +325,7 @@ mod tests {
             "[providers.alpha]\nname = \"A\"\napi_protocol = \"openai-completions\"\n\
              options = { api_key = \"sk-ok\" }\n\
              [providers.alpha.models.\"m1\"]\nname = \"m1\"\nlimit = { context = 64000 }\n\
-             [providers.beta]\nname = \"B\"\napi_protocol = \"anthropic-messages\"\n\
+             [providers.beta]\nname = \"B\"\napi_protocol = \"openai-responses\"\n\
              options = { api_key = \"sk-ok\" }\n\
              [providers.beta.models.\"m2\"]\nname = \"m2\"\nlimit = { context = 64000 }\n",
         )

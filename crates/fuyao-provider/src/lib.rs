@@ -5,7 +5,7 @@
 //! 基于 reqwest 自建 HTTP 客户端，不依赖 async-openai。
 
 pub mod admin;
-pub mod anthropic;
+mod anthropic;
 mod error;
 mod factory;
 mod openai;
@@ -16,6 +16,7 @@ mod sse;
 mod stream_decoder;
 
 pub use admin::{ProviderAdminError, ProviderModelSpec, ProviderSpec};
+pub use anthropic::AnthropicProvider;
 pub use error::ProviderError;
 pub use factory::{BuildProviderError, build_provider};
 pub use openai::OpenAIProvider;
