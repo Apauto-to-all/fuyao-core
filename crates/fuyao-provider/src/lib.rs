@@ -11,6 +11,7 @@ mod openai;
 mod provider;
 mod registry;
 mod resolver;
+mod sse;
 mod stream_decoder;
 
 pub use admin::{ProviderAdminError, ProviderModelSpec, ProviderSpec};

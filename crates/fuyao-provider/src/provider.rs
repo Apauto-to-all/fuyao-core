@@ -49,6 +49,10 @@ pub struct StreamUsage {
     pub completion_reasoning_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cached_tokens: Option<u32>,
+    /// 提示词缓存写入桶的 token 数：prompt cache 写入侧的用量留痕，
+    /// 仅作数据落点，不参与费用计算
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_creation_tokens: Option<u32>,
 }
 
 /// 完成原因
@@ -330,6 +334,23 @@ mod tests {
         let usage = StreamUsage::default();
         assert_eq!(usage.prompt_tokens, 0);
         assert_eq!(usage.completion_tokens, 0);
+    }
+
+    #[test]
+    fn stream_usage_cache_creation_none_not_serialized() {
+        let usage = StreamUsage::default();
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(!json.contains("prompt_cache_creation_tokens"));
+    }
+
+    #[test]
+    fn stream_usage_cache_creation_some_serialized() {
+        let usage = StreamUsage {
+            prompt_cache_creation_tokens: Some(42),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"prompt_cache_creation_tokens\":42"));
     }
 
     #[test]

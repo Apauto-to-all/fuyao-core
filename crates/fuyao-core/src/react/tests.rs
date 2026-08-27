@@ -2406,6 +2406,7 @@ async fn usage_flows_to_final_assistant_message() {
         total_tokens: 200,
         completion_reasoning_tokens: Some(30),
         prompt_cached_tokens: Some(40),
+        prompt_cache_creation_tokens: None,
     };
     let provider = Arc::new(MockProvider::new(vec![
         MockProvider::text_response_with_usage("回复内容", usage),
@@ -2489,6 +2490,7 @@ async fn cost_accumulated_per_assistant_message() {
         total_tokens: 150,
         completion_reasoning_tokens: Some(10),
         prompt_cached_tokens: Some(20),
+        prompt_cache_creation_tokens: None,
     };
     let final_usage = StreamUsage {
         prompt_tokens: 200,
@@ -2496,6 +2498,7 @@ async fn cost_accumulated_per_assistant_message() {
         total_tokens: 280,
         completion_reasoning_tokens: Some(20),
         prompt_cached_tokens: Some(40),
+        prompt_cache_creation_tokens: None,
     };
     let provider = Arc::new(MockProvider::new(vec![
         MockProvider::tool_call_response_with_usage("c_cost", "echo", r#"{}"#, tool_usage),

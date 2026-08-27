@@ -110,6 +110,9 @@ impl StreamAggregator {
                 if usage.prompt_cached_tokens.is_some() {
                     self.usage.prompt_cached_tokens = usage.prompt_cached_tokens;
                 }
+                if usage.prompt_cache_creation_tokens.is_some() {
+                    self.usage.prompt_cache_creation_tokens = usage.prompt_cache_creation_tokens;
+                }
                 vec![]
             }
         }
@@ -382,6 +385,7 @@ mod tests {
                 total_tokens: 150,
                 completion_reasoning_tokens: Some(20),
                 prompt_cached_tokens: Some(30),
+                prompt_cache_creation_tokens: None,
             },
             finish_reason: FinishReason::Stop,
         });
@@ -405,6 +409,7 @@ mod tests {
                 total_tokens: 150,
                 completion_reasoning_tokens: Some(20),
                 prompt_cached_tokens: Some(30),
+                prompt_cache_creation_tokens: Some(15),
             },
             finish_reason: FinishReason::Stop,
         });
@@ -417,6 +422,7 @@ mod tests {
                 total_tokens: 0,
                 completion_reasoning_tokens: None,
                 prompt_cached_tokens: None,
+                prompt_cache_creation_tokens: None,
             },
             finish_reason: FinishReason::Stop,
         });
@@ -426,5 +432,6 @@ mod tests {
         assert_eq!(usage.total_tokens, 150);
         assert_eq!(usage.completion_reasoning_tokens, Some(20));
         assert_eq!(usage.prompt_cached_tokens, Some(30));
+        assert_eq!(usage.prompt_cache_creation_tokens, Some(15));
     }
 }

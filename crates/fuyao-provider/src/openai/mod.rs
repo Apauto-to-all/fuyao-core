@@ -20,6 +20,7 @@ use crate::provider::{
     BoxStream, ChatRequest, ChatResponse, FinishReason as ProviderFinishReason, Provider,
     StreamError, StreamEvent, StreamOptions as ProviderStreamOptions, StreamUsage,
 };
+use crate::sse::LineAssembler;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use fuyao_api::{AgentPaths, ToolCallData};
@@ -167,7 +168,7 @@ impl Provider for OpenAIProvider {
             let mut bytes_stream = response.bytes_stream();
             // SSE 行组装器：字节上按 \n 切行，跨 chunk 的半行 / 半个多字节
             // 字符滞留其内部缓冲等续包，行内非法 UTF-8 以替换字符顶替
-            let mut assembler = sse::LineAssembler::new();
+            let mut assembler = LineAssembler::new();
 
             while let Some(item) = bytes_stream.next().await {
                 let bytes = match item {
@@ -263,6 +264,7 @@ impl Provider for OpenAIProvider {
                     .completion_tokens_details
                     .and_then(|d| d.reasoning_tokens),
                 prompt_cached_tokens: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+                prompt_cache_creation_tokens: None,
             },
             None => StreamUsage::default(),
         };
