@@ -84,10 +84,32 @@ const BUILTIN_ENTRIES: &[BuiltinEntry] = &[
     BuiltinEntry {
         kind: BuiltinKind::Skills,
         name: "fuyao-config",
-        files: &[(
-            "SKILL.md",
-            include_str!("assets/skills/fuyao-config/SKILL.md"),
-        )],
+        files: &[
+            (
+                "SKILL.md",
+                include_str!("assets/skills/fuyao-config/SKILL.md"),
+            ),
+            (
+                "references/config.md",
+                include_str!("assets/skills/fuyao-config/references/config.md"),
+            ),
+            (
+                "references/instructions.md",
+                include_str!("assets/skills/fuyao-config/references/instructions.md"),
+            ),
+            (
+                "references/providers.md",
+                include_str!("assets/skills/fuyao-config/references/providers.md"),
+            ),
+            (
+                "references/skills.md",
+                include_str!("assets/skills/fuyao-config/references/skills.md"),
+            ),
+            (
+                "references/agents.md",
+                include_str!("assets/skills/fuyao-config/references/agents.md"),
+            ),
+        ],
     },
 ];
 

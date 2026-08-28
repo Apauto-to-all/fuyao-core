@@ -292,8 +292,6 @@ mod tests {
         assert!(!def.description.is_empty());
         assert!(def.skill_dir.is_none(), "内置技能无磁盘目录");
         assert!(!def.body.is_empty());
-        // fuyao-config 资产仅含 SKILL.md，无关联文件
-        assert!(def.linked_files.is_empty());
     }
 
     /// 文件系统与内置均未命中 → NotFound
@@ -334,9 +332,6 @@ mod tests {
     /// 关联文件推导：只有关联子目录下的文件计入分组，SKILL.md 与根级文件不计入
     #[test]
     fn builtin_linked_files_groups_by_linked_subdirs() {
-        let entry = crate::builtin::builtin_entry(BuiltinKind::Skills, "fuyao-config").unwrap();
-        assert!(builtin_linked_files(entry.files()).is_empty());
-
         // 构造带各类文件形态的静态文件集，直接验证推导函数的分组口径
         let files: &'static [(&'static str, &'static str)] = &[
             ("SKILL.md", "skill"),
