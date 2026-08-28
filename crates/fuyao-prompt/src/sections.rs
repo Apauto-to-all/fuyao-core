@@ -18,7 +18,6 @@ use crate::loader::{
 };
 use chrono::Local;
 use fuyao_api::{AgentConfig, AgentDefinition, AgentPaths, DefinitionOption};
-use fuyao_skills::find_all_skills;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -192,8 +191,10 @@ pub fn build_instructions_section(agent_paths: &AgentPaths) -> String {
 /// 构建 Skills 索引 section（Layer 3）
 ///
 /// 列出可用的 Skills 名称和摘要，供 Agent 快速了解可用技能。
+/// 数据来自 [`crate::skills_index::list_skills`]：文件系统四层发现 + 内置技能
+/// 兜底（内置技能从此进入系统提示词技能索引）。
 pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
-    let all_skills = match find_all_skills(agent_paths) {
+    let all_skills = match crate::skills_index::list_skills(agent_paths) {
         Ok(skills) => skills,
         Err(_) => return String::new(),
     };
@@ -223,7 +224,7 @@ pub fn build_skills_section(agent_paths: &AgentPaths) -> String {
 /// （去重键与对外名），`definition` = 解析得到的完整定义。
 ///
 /// 遍历顺序遵循 [`AgentPaths::agents_def_dirs`] 的优先级（workspace > agent > global > extra），
-/// 同名定义首现胜（高优先级层覆盖低优先级层）；内置定义（[`crate::default::builtin_definition_names`]）
+/// 同名定义首现胜（高优先级层覆盖低优先级层）；内置定义（[`crate::builtin::builtin_names`]）
 /// 作为最低优先级注入，与用户文件同名时用户文件胜。最后按 id 升序排序。
 ///
 /// 单个定义文件损坏（存在但解析失败）记 WARN 后跳过，不拖垮整个列举——
@@ -275,9 +276,8 @@ fn collect_definitions(agent_paths: &AgentPaths) -> Vec<DefinitionOption> {
     }
 
     // 内置定义（最低优先级）：与用户文件同名时用户文件胜
-    for builtin_name in crate::default::builtin_definition_names() {
-        // 清单元素为 &str，contains_key 的泛型参数不做自动解引用，需显式解一层
-        if by_id.contains_key(*builtin_name) {
+    for builtin_name in crate::builtin::builtin_names(crate::builtin::BuiltinKind::Agents) {
+        if by_id.contains_key(builtin_name) {
             continue;
         }
         if let Some(def) = load_builtin_definition(builtin_name) {
@@ -386,11 +386,11 @@ mod tests {
     }
 
     #[test]
-    fn build_skills_section_empty_for_default() {
+    fn build_skills_section_includes_builtin_skill() {
+        // 默认无文件系统 skills 目录 → 内置技能 fuyao-config 仍进入技能索引
         let ctx = AgentPaths::default();
         let section = build_skills_section(&ctx);
-        // 默认没有 skills 目录，应该返回空
-        assert!(section.is_empty());
+        assert!(section.contains("fuyao-config"), "应含内置技能：{section}");
     }
 
     #[test]

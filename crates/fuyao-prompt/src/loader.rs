@@ -164,18 +164,18 @@ pub(crate) fn parse_definition_from_content(
 
 /// 加载内置默认 Agent 定义
 ///
-/// 按 name 查 [`default::builtin_definition_md`] 取编译期嵌入的 Markdown，再解析。
+/// 按 name 查 [`crate::builtin::builtin_agent_md`] 取编译期嵌入的 Markdown，再解析。
 /// 覆盖链：用户 `agents/{name}.md` → 内置默认（本函数）。
 ///
 /// 解析失败（内置文件格式错误）直接 panic：编译期嵌入内容受开发者完全掌控，
 /// 解析失败属开发期 bug，应尽早暴露而非伪装成「未找到」。
 ///
-/// 返回 `None`：name 不在内置默认表中（未知 name，由调用方决定错误语义）。
+/// 返回 `None`：name 不在内置表中（未知 name，由调用方决定错误语义）。
 pub fn load_builtin_definition(name: &str) -> Option<AgentDefinition> {
-    let md = crate::default::builtin_definition_md(name)?;
+    let md = crate::builtin::builtin_agent_md(name)?;
     Some(
         parse_definition_from_content(md, None)
-            .expect("内置 Agent 定义解析失败：defaults/ 下的 .md 格式错误"),
+            .expect("内置 Agent 定义解析失败：builtin/assets/agents/ 下的 .md 格式错误"),
     )
 }
 

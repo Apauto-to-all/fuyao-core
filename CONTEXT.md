@@ -48,7 +48,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | agent_id | `AgentPaths` | 独立 Agent 实体（**数据隔离单元**）：`global/{名}` / `workspace/{名}`（来源前缀必须显式），决定 sessions.db / 缓存 / 日志选址 |
 | Agent 定义 | `AgentDefinition` | 提示词人格（**一项能力**），终端用户称「智能体」；`agents/{name}.md`（frontmatter + 正文） |
 | 四层解析 | `LayeredPaths` | 同名定义查找链 workspace > agent > global > extra，最低优先级为内置表 |
-| 内置定义 | `default` / `explore` / `executor` | 编译期 `include_str!` 嵌入；`default` 是框架保证恒存在的出厂主定义 |
+| 内置定义 | `builtin::builtin_agent_md` | 编译期 `include_str!` 嵌入的 `default` / `explore` / `executor`，经统一内置资产模块承载；`default` 是框架保证恒存在的出厂主定义 |
 | 定义模式 | `AgentMode` | `Primary`（主代理人格）/ `Subagent`（专职子代理），职责互斥 |
 | 子代理 | `subagent` 工具 | 派生 child session 跑专职定义，最终回复以 `ToolOutput::text` 回喂父循环；`child_invisible=true` 递归防护 |
 
@@ -76,6 +76,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 内置工具 | 10 个 | `read` / `write` / `glob` / `grep` / `edit` / `bash` / `skill` / `subagent` / `todowrite` / `webfetch` |
 | MCP 工具 | `mcp_{server}_{tool}` | 前缀命名；MCPConnection 长连接自动重连，实例级熔断 `CircuitBreaker` |
 | 技能 | Skills | Agent Skills 协议三层渐进披露：Tier 1 元数据发现 → Tier 2 完整内容 → Tier 3 关联文件按需加载 |
+| 内置资产模块 | `fuyao_prompt::builtin` | 所有编译期内置资产的唯一上车道：资产目录与运行时目录约定同构（assets/agents/{name}.md、assets/skills/{name}/SKILL.md），单一静态表派生名字清单与查找（无第二份清单可漂移）；内置恒为解析链最低优先级兜底、四层文件系统同名覆盖、零落盘 |
 | 工具上下文 | `ToolCallContext` | 编排层注入（session_id / agent_paths / 能力聚合：`subagent_ops` 弱引用 / `event_forwarder` / `todo_store`） |
 | 并行调度 | `should_parallelize` | 智能判定（never_parallel / 路径重叠 / parallel_safe）→ JoinSet 并发或串行；「完成一个通知一个」 |
 

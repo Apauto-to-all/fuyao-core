@@ -15,4 +15,5 @@ mod loader;
 pub use error::SkillsError;
 pub use finder::{find_all_skills, find_skill_md_by_name};
 pub use fuyao_api::{SkillDefinition, SkillMeta};
+pub use helpers::{find_first_non_heading, parse_skill_frontmatter, truncate_skill_fields};
 pub use loader::{load_skill, load_skill_file};

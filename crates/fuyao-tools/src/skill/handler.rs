@@ -7,12 +7,12 @@
 
 use super::types::{SkillArgs, SkillFileResult, SkillListResult, SkillMetaItem, SkillViewResult};
 use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
-use fuyao_skills::{find_all_skills, load_skill, load_skill_file};
+use fuyao_prompt::{list_skills, load_skill, load_skill_file};
 use serde_json::Value;
 
 /// 格式化 Skill 未找到错误
 fn format_skill_not_found(name: &str, agent_paths: &fuyao_api::AgentPaths) -> String {
-    let available = find_all_skills(agent_paths).unwrap_or_default();
+    let available = list_skills(agent_paths).unwrap_or_default();
     if available.is_empty() {
         format!("未找到 Skill '{}'。当前没有可用的 Skills", name)
     } else {
@@ -56,7 +56,7 @@ fn skill_list_handler(ctx: &ToolCallContext) -> ToolOutput {
         None => return ToolOutput::error("无法获取 Agent 路径上下文"),
     };
 
-    let all_skills = match find_all_skills(agent_paths) {
+    let all_skills = match list_skills(agent_paths) {
         Ok(skills) => skills,
         Err(e) => return ToolOutput::error(format!("加载 Skills 失败: {e}")),
     };

@@ -1169,7 +1169,6 @@ dependencies = [
  "fuyao-api",
  "fuyao-prompt",
  "fuyao-session",
- "fuyao-skills",
  "glob",
  "grep-regex",
  "grep-searcher",
