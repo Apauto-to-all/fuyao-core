@@ -19,8 +19,8 @@
 //! seq 生成规则:插入时事务内以 `COALESCE(MAX(seq), 0) + 1` 分配新 seq,
 //! 事务保证并发安全。普通消息与 compaction 边界消息共享同一 seq 序列。
 //! `insert_message` 把该标量子查询折叠进 INSERT 的 VALUES 槽位,
-//! `RETURNING seq` 取回分配值;事务内整批复制路径(fork)取一次起点后
-//! 连续递增分配,分配规则相同。
+//! `RETURNING seq` 取回分配值;fork 类整批复制路径在 SQL 引擎侧以
+//! `INSERT ... SELECT` + `ROW_NUMBER()` 直接完成连续重分配,不经本模块。
 
 use super::row::MessageRow;
 use crate::error::SessionError;
@@ -62,9 +62,48 @@ impl super::SessionStore {
     ) -> Result<i64, SessionError> {
         let mut tx = self.pool.begin().await?;
 
-        let next_seq = Self::insert_message_row_allocating_seq(&mut tx, session_id, msg).await?;
+        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
+        let tool_calls_json = msg
+            .tool_calls
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
 
-        // 普通消息(kind=Message):事务内原子累加 sessions 表统计字段。
+        // 图片列表存 JSON 数组(`[{mime_type, data}]`),空列表存 NULL
+        let images_json = (!msg.images.is_empty())
+            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
+
+        // 1. INSERT 消息行:seq 分配折叠进 VALUES 的标量子查询
+        //    (`COALESCE(MAX(seq), 0) + 1`,并发安全),`RETURNING seq`
+        //    把实际分配值带回,省掉一次独立的 MAX(seq) 预查询往返
+        let (next_seq,): (i64,) = sqlx::query_as(
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), ?17)
+             RETURNING seq",
+        )
+        .bind(session_id)
+        .bind(msg.model_id.as_deref())
+        .bind(msg.role.as_str())
+        .bind(msg.content.as_deref())
+        .bind(images_json.as_deref())
+        .bind(msg.tool_call_id.as_deref())
+        .bind(tool_calls_json.as_deref())
+        .bind(msg.tool_name.as_deref())
+        .bind(msg.timestamp)
+        .bind(msg.prompt_tokens)
+        .bind(msg.completion_tokens)
+        .bind(msg.reasoning_tokens)
+        .bind(msg.cached_tokens)
+        .bind(msg.cost)
+        .bind(msg.finish_reason.as_deref())
+        .bind(msg.reasoning.as_deref())
+        .bind(msg.kind.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        // 2. 普通消息(kind=Message):事务内原子累加 sessions 表统计字段。
         // compaction 边界消息由 mark_compaction 独立路径处理,不走本分支,不误增计数。
         // tool_call_count 按 role=Tool 单独 +1;token/cost 始终加(非 assistant 恒为 0,加 0 无害)。
         if matches!(msg.kind, fuyao_api::MessageKind::Message) {
@@ -100,108 +139,6 @@ impl super::SessionStore {
 
         msg.seq = next_seq;
         Ok(next_seq)
-    }
-
-    /// 在事务内插入一条消息行并内联分配 seq(单条落库路径专用)
-    ///
-    /// seq 分配折叠进 INSERT 本身:VALUES 的 seq 槽位是标量子查询
-    /// `COALESCE(MAX(seq), 0) + 1`(事务保证并发安全),`RETURNING seq`
-    /// 把实际分配值带回,省掉一次独立的 MAX(seq) 预查询往返。
-    /// 事务内整批复制路径(fork)不适用此形态(一次取起点后连续递增),
-    /// 走显式 seq 的 [`Self::insert_message_row`]。本函数只负责写行并返回分配的 seq,
-    /// 不触碰 sessions 统计——统计累加条件由调用方维护。
-    async fn insert_message_row_allocating_seq(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        session_id: &str,
-        msg: &Message,
-    ) -> Result<i64, SessionError> {
-        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
-        let tool_calls_json = msg
-            .tool_calls
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-
-        // 图片列表存 JSON 数组(`[{mime_type, data}]`),空列表存 NULL
-        let images_json = (!msg.images.is_empty())
-            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
-
-        let (next_seq,): (i64,) = sqlx::query_as(
-            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), ?17)
-             RETURNING seq",
-        )
-        .bind(session_id)
-        .bind(msg.model_id.as_deref())
-        .bind(msg.role.as_str())
-        .bind(msg.content.as_deref())
-        .bind(images_json.as_deref())
-        .bind(msg.tool_call_id.as_deref())
-        .bind(tool_calls_json.as_deref())
-        .bind(msg.tool_name.as_deref())
-        .bind(msg.timestamp)
-        .bind(msg.prompt_tokens)
-        .bind(msg.completion_tokens)
-        .bind(msg.reasoning_tokens)
-        .bind(msg.cached_tokens)
-        .bind(msg.cost)
-        .bind(msg.finish_reason.as_deref())
-        .bind(msg.reasoning.as_deref())
-        .bind(msg.kind.as_str())
-        .fetch_one(&mut **tx)
-        .await?;
-        Ok(next_seq)
-    }
-
-    /// 在事务内以指定 seq 插入一条消息行(整批复制路径的 INSERT)
-    ///
-    /// seq 由调用方分配(事务内取一次起点后连续递增),本函数只负责写行,
-    /// 不触碰 sessions 统计——统计累加由调用方按复制结果聚合维护。
-    pub(super) async fn insert_message_row(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        session_id: &str,
-        msg: &Message,
-        seq: i64,
-    ) -> Result<(), SessionError> {
-        // tool_calls 列存 flat 数组 JSON（typed 直接序列化：id / name / arguments 三字段平铺）
-        let tool_calls_json = msg
-            .tool_calls
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-
-        // 图片列表存 JSON 数组(`[{mime_type, data}]`),空列表存 NULL
-        let images_json = (!msg.images.is_empty())
-            .then(|| serde_json::to_string(&msg.images).unwrap_or_default());
-
-        sqlx::query(
-            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        )
-        .bind(session_id)
-        .bind(msg.model_id.as_deref())
-        .bind(msg.role.as_str())
-        .bind(msg.content.as_deref())
-        .bind(images_json.as_deref())
-        .bind(msg.tool_call_id.as_deref())
-        .bind(tool_calls_json.as_deref())
-        .bind(msg.tool_name.as_deref())
-        .bind(msg.timestamp)
-        .bind(msg.prompt_tokens)
-        .bind(msg.completion_tokens)
-        .bind(msg.reasoning_tokens)
-        .bind(msg.cached_tokens)
-        .bind(msg.cost)
-        .bind(msg.finish_reason.as_deref())
-        .bind(msg.reasoning.as_deref())
-        .bind(seq)
-        .bind(msg.kind.as_str())
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
     }
 
     // ── 计数 ───────────────────────────────────────────────────

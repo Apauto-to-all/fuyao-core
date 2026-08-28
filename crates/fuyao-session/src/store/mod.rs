@@ -1,7 +1,8 @@
 //! SQLite 存储层
 //!
 //! 使用 sqlx（async）+ SqlitePool 连接池，原生 async，无需 spawn_blocking 包装。
-//! SessionStore 是 session 持久化的唯一入口，持有连接池供外部（如引擎层）共享。
+//! SessionStore 是 session 持久化的唯一入口：全部 SQL（sessions / messages /
+//! todos 三表）收敛在 store 模块内经其方法执行，连接池为私有字段不外泄。
 //!
 //! 模块组织（按职责分文件，各文件单一职责）：
 //! - [`row`]：sessions / messages 表的行映射（DB 行 ↔ 领域类型）
@@ -48,7 +49,7 @@ use std::time::Duration;
 /// 会话存储层
 ///
 /// 持有 SqlitePool 连接池，提供 Session + Message 的 CRUD。
-/// 连接池可经 [`pool`](Self::pool) 对外共享，供引擎层或兄弟模块复用同一连接池。
+/// 连接池为私有字段，SQL 只经本类型的方法执行，不向其他模块暴露数据库句柄。
 pub struct SessionStore {
     pool: SqlitePool,
 }

@@ -19,7 +19,8 @@
 //!   重建值才是模型看到的）；标题为 `fork {源标题}`（源标题缺失时取「新会话」），
 //!   与源会话区分；统计从 0 起算
 //! - **消息**：`seq < target` 的全部消息（含压缩前旧消息与更早的 compaction 边界）
-//!   按 seq 升序整批复制，seq 从 1 起连续重新分配
+//!   经 SQL 引擎侧单条 `INSERT ... SELECT` 整批复制（消息数据不经过 Rust），
+//!   seq 经 `ROW_NUMBER()` 按 seq 升序从 1 起连续重新分配
 //! - **元数据**：count 类（message_count / tool_call_count）、压缩元数据
 //!   （last_compacted_seq / compression_count）、消费类（token 四项 / cost）全部按
 //!   复制结果聚合重算——复制完全等于「在新会话重新产生这些消息」
@@ -40,9 +41,7 @@
 //! 消息 seq 单调递增且插入后不改，活跃 turn 的落库只发生在目标之后——分支快照
 //! （`seq < target`）不受源会话并发写影响，派生无需先停 turn。
 
-use super::row::MessageRow;
 use crate::error::SessionError;
-use fuyao_api::Message;
 
 impl super::SessionStore {
     /// 把会话派生到目标消息之前（复制 seq < target 的全部消息到新独立 session）
@@ -52,7 +51,8 @@ impl super::SessionStore {
     /// 2. 校验 fork 目标：存在且为 user 消息或 compaction 消息
     ///    （复用 [`super::rollback::validate_cut_target`] 共用校验）
     /// 3. 构造新 session 行落库（独立主会话，随机 id，主键冲突重新生成重试）
-    /// 4. 复制 seq < target 的全部消息（按 seq 升序，新 seq 从事务内起点连续分配）
+    /// 4. 单条 `INSERT ... SELECT` 在 SQL 引擎侧复制 seq < target 的全部消息，
+    ///    seq 经 `ROW_NUMBER()` 按 seq 升序从 1 连续重分配，消息数据全程不经过 Rust
     /// 5. 按复制结果聚合重算新会话的 count 类 / 压缩元数据 / 消费类字段
     ///
     /// # 参数
@@ -114,31 +114,26 @@ impl super::SessionStore {
             }
         }
 
-        // 4. 复制 seq < target 的全部消息到新会话（含压缩前旧消息与更早的
-        //    compaction 边界）：seq 从事务内 COALESCE(MAX(seq), 0) + 1 起点连续
-        //    递增分配
-        let rows: Vec<MessageRow> = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages WHERE session_id = ?1 AND seq < ?2 ORDER BY seq",
+        // 4. 引擎侧整批复制 seq < target 的全部消息到新会话（含压缩前旧消息与更早的
+        //    compaction 边界）：一条 INSERT ... SELECT 完成，与逐行「读进 Rust 再写回」
+        //    相比，N 条消息从 2N 次行数据穿越 + N 次语句执行降为 1 次语句执行。
+        //    ROW_NUMBER() 按 seq 升序从 1 连续重分配（源 seq 单调唯一，序号即新 seq；
+        //    新会话无既有消息，UNIQUE 约束必满足）
+        sqlx::query(
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+             SELECT ?3, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning,
+                ROW_NUMBER() OVER (ORDER BY seq), kind
+             FROM messages WHERE session_id = ?1 AND seq < ?2",
         )
         .bind(session_id)
         .bind(target_seq)
-        .fetch_all(&mut *tx)
-        .await?;
-        let copied: Vec<Message> = rows.into_iter().map(Message::from).collect();
-
-        let base_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
-        )
         .bind(&new_session.id)
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        for (offset, msg) in copied.iter().enumerate() {
-            Self::insert_message_row(&mut tx, &new_session.id, msg, base_seq + offset as i64)
-                .await?;
-        }
 
         // 5. 按复制结果聚合重算新会话的全部派生字段（新会话行从 0 起算，聚合即终值）：
         //    message_count 只数 kind='message' 的普通消息，tool_call_count 数其中

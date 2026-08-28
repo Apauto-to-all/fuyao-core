@@ -18,7 +18,8 @@
 //!   压缩重建过，重建值才是模型看到的）；标题取默认；count 类与消费类从 0 起算、
 //!   按复制结果聚合；压缩元数据不继承（新会话自身从未执行压缩，复制进来的
 //!   compaction 边界行本身就是可见窗口下界）
-//! - **消息**：可见窗口整窗复制，seq 从 1 起连续重新分配
+//! - **消息**：可见窗口整窗复制——SQL 引擎侧单条 `INSERT ... SELECT` 完成，
+//!   消息数据不经过 Rust，seq 经 `ROW_NUMBER()` 从 1 起连续重新分配
 //!
 //! # 单事务原子
 //!
@@ -29,20 +30,20 @@
 //!
 //! 只读源会话、只写新会话，与源会话的活跃 turn 互不干扰。
 
-use super::row::MessageRow;
 use crate::error::SessionError;
-use fuyao_api::{Message, MessageKind, MessageRole};
 
 impl super::SessionStore {
     /// 把源会话的可见窗口整窗复制为新会话，`parent_session_id` 由调用方指定
     ///
     /// 单事务原子，四步：
     /// 1. 取源 session 行（workspace / system_prompt），不存在报 NotFound
-    /// 2. 事务内加载可见窗口（最新 compaction 摘要 + 摘要后全部消息，无摘要则全量，
-    ///    与 [`SessionStore::load_visible_messages`](super::visible_window::SessionStore::load_visible_messages)
-    ///    同一口径）
-    /// 3. 构造新 session 行落库（parent 由参数决定，随机 id 主键冲突重新生成重试）
-    /// 4. 复制窗口消息（seq 连续重分配）并按复制结果聚合累加 count 类 / 消费类字段
+    /// 2. 构造新 session 行落库（parent 由参数决定，随机 id 主键冲突重新生成重试）
+    /// 3. 单条 `INSERT ... SELECT` 在 SQL 引擎侧整窗复制可见窗口（最新 compaction
+    ///    摘要 + 摘要后全部消息，无摘要则全量，与
+    ///    [`SessionStore::load_visible_messages`](super::visible_window::SessionStore::load_visible_messages)
+    ///    同一口径），seq 经 `ROW_NUMBER()` 按 seq 升序从 1 连续重分配，
+    ///    消息数据全程不经过 Rust
+    /// 4. 对复制出的行单次聚合 count 类 / 消费类字段，写回新会话行
     ///
     /// # 参数
     /// - `source_id`:源会话（本操作不动其任何数据）
@@ -71,25 +72,8 @@ impl super::SessionStore {
             return Err(SessionError::NotFound(source_id.to_string()));
         };
 
-        // 2. 事务内加载可见窗口（与 load_visible_messages 同口径的单条 SQL：
-        //    seq >= 最新 compaction 摘要的 seq，无摘要 COALESCE 退化为全量）
-        let rows: Vec<MessageRow> = sqlx::query_as::<_, MessageRow>(
-            "SELECT id, session_id, model_id, role, content, images, tool_call_id,
-                    tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                    reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
-             FROM messages
-             WHERE session_id = ?1
-               AND seq >= COALESCE((SELECT MAX(seq) FROM messages
-                                    WHERE session_id = ?1 AND kind = 'compaction'), 0)
-             ORDER BY seq",
-        )
-        .bind(source_id)
-        .fetch_all(&mut *tx)
-        .await?;
-        let copied: Vec<Message> = rows.into_iter().map(Message::from).collect();
-
-        // 3. 构造新 session 行并落库：parent 由调用方指定，计数字段从 0 起算
-        //    （第 4 步按复制结果累加到位）。随机 id 主键冲突时重新生成重试，
+        // 2. 构造新 session 行并落库：parent 由调用方指定，计数字段从 0 起算
+        //    （第 4 步按复制结果聚合到位）。随机 id 主键冲突时重新生成重试，
         //    仅重试主键冲突——其它错误（磁盘满、连接断等）重试无意义且掩盖真实故障
         let mut new_session =
             super::session::new_session(workspace, parent_session_id, system_prompt);
@@ -113,61 +97,73 @@ impl super::SessionStore {
             }
         }
 
-        // 4. 复制可见窗口消息到新会话：seq 从事务内 COALESCE(MAX(seq), 0) + 1 起点连续
-        //    递增分配（新会话无消息，起点即 1）
-        let base_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
+        // 3. 引擎侧整窗复制：一条 INSERT ... SELECT 完成，与逐行「读进 Rust 再写回」
+        //    相比，N 条消息从 2N 次行数据穿越 + N 次语句执行降为 1 次语句执行。
+        //    窗口口径与 load_visible_messages 相同：seq >= 最新 compaction 摘要的 seq，
+        //    无摘要 COALESCE 退化为全量；ROW_NUMBER() 按 seq 升序从 1 连续重分配
+        //    （源 seq 单调唯一，序号即新 seq；新会话无既有消息，UNIQUE 约束必满足）
+        sqlx::query(
+            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+             SELECT ?2, model_id, role, content, images, tool_call_id,
+                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
+                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning,
+                ROW_NUMBER() OVER (ORDER BY seq), kind
+             FROM messages
+             WHERE session_id = ?1
+               AND seq >= COALESCE((SELECT MAX(seq) FROM messages
+                                    WHERE session_id = ?1 AND kind = 'compaction'), 0)",
+        )
+        .bind(source_id)
+        .bind(&new_session.id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 4. 对复制出的行单次聚合 count 类 / 消费类字段（新会话行从 0 起算，
+        //    聚合即终值）。仅 kind='message' 的普通消息参与——compaction 边界行
+        //    不增计数、不计 token/费用，也不刷新 last_active_at
+        let (
+            message_count,
+            tool_call_count,
+            prompt_sum,
+            completion_sum,
+            reasoning_sum,
+            cached_sum,
+            cost_sum,
+        ): (i64, i64, i64, i64, i64, i64, f64) = sqlx::query_as(
+            "SELECT
+                COUNT(*) FILTER (WHERE kind = 'message'),
+                COUNT(*) FILTER (WHERE role = 'tool'),
+                COALESCE(SUM(prompt_tokens) FILTER (WHERE kind = 'message'), 0),
+                COALESCE(SUM(completion_tokens) FILTER (WHERE kind = 'message'), 0),
+                COALESCE(SUM(reasoning_tokens) FILTER (WHERE kind = 'message'), 0),
+                COALESCE(SUM(cached_tokens) FILTER (WHERE kind = 'message'), 0),
+                COALESCE(SUM(cost) FILTER (WHERE kind = 'message'), 0.0)
+             FROM messages WHERE session_id = ?1",
         )
         .bind(&new_session.id)
         .fetch_one(&mut *tx)
         .await?;
-        for (offset, msg) in copied.iter().enumerate() {
-            Self::insert_message_row(&mut tx, &new_session.id, msg, base_seq + offset as i64)
-                .await?;
-        }
 
-        // 按复制结果聚合累加 count 类 / 消费类字段（新会话行从 0 起算，聚合即终值）。
-        // 仅 kind='message' 的普通消息参与——compaction 边界行不增计数、
-        // 不计 token/费用，也不刷新 last_active_at
-        let normal: Vec<&Message> = copied
-            .iter()
-            .filter(|m| matches!(m.kind, MessageKind::Message))
-            .collect();
-        if !normal.is_empty() {
-            let message_delta: i64 = normal.len() as i64;
-            let tool_delta: i64 = normal
-                .iter()
-                .filter(|m| matches!(m.role, MessageRole::Tool))
-                .count() as i64;
-            let prompt_sum: i64 = normal.iter().map(|m| m.prompt_tokens).sum();
-            let completion_sum: i64 = normal.iter().map(|m| m.completion_tokens).sum();
-            let reasoning_sum: i64 = normal.iter().map(|m| m.reasoning_tokens).sum();
-            let cached_sum: i64 = normal.iter().map(|m| m.cached_tokens).sum();
-            let cost_sum: f64 = normal.iter().map(|m| m.cost).sum();
-
-            sqlx::query(
-                "UPDATE sessions SET
-                    message_count = message_count + ?2,
-                    tool_call_count = tool_call_count + ?3,
-                    total_prompt_tokens = total_prompt_tokens + ?4,
-                    total_completion_tokens = total_completion_tokens + ?5,
-                    total_reasoning_tokens = total_reasoning_tokens + ?6,
-                    total_cached_tokens = total_cached_tokens + ?7,
-                    total_cost = total_cost + ?8,
-                    last_active_at = unixepoch()
-                 WHERE id = ?1",
-            )
-            .bind(&new_session.id)
-            .bind(message_delta)
-            .bind(tool_delta)
-            .bind(prompt_sum)
-            .bind(completion_sum)
-            .bind(reasoning_sum)
-            .bind(cached_sum)
-            .bind(cost_sum)
-            .execute(&mut *tx)
-            .await?;
-        }
+        sqlx::query(
+            "UPDATE sessions SET
+                message_count = ?2, tool_call_count = ?3,
+                total_prompt_tokens = ?4, total_completion_tokens = ?5,
+                total_reasoning_tokens = ?6, total_cached_tokens = ?7,
+                total_cost = ?8
+             WHERE id = ?1",
+        )
+        .bind(&new_session.id)
+        .bind(message_count)
+        .bind(tool_call_count)
+        .bind(prompt_sum)
+        .bind(completion_sum)
+        .bind(reasoning_sum)
+        .bind(cached_sum)
+        .bind(cost_sum)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
 
@@ -175,7 +171,7 @@ impl super::SessionStore {
             source_session_id = source_id,
             new_session_id = %new_session.id,
             parent_session_id = new_session.parent_session_id.as_deref().unwrap_or(""),
-            message_count = normal.len() as i64,
+            message_count = message_count,
             "可见窗口已整窗复制为新会话"
         );
 
