@@ -16,7 +16,8 @@
 //!
 //! - **新 session**：独立主会话（`parent_session_id = None`），随机 id（冲突重试）；
 //!   workspace 与 system_prompt 复制源持久化原值（源提示词可能已被压缩重建过，
-//!   重建值才是模型看到的）；标题取默认；统计从 0 起算
+//!   重建值才是模型看到的）；标题为 `fork {源标题}`（源标题缺失时取「新会话」），
+//!   与源会话区分；统计从 0 起算
 //! - **消息**：`seq < target` 的全部消息（含压缩前旧消息与更早的 compaction 边界）
 //!   按 seq 升序整批复制，seq 从 1 起连续重新分配
 //! - **元数据**：count 类（message_count / tool_call_count）、压缩元数据
@@ -72,12 +73,12 @@ impl super::SessionStore {
         let mut tx = self.pool.begin().await?;
 
         // 1. 取源 session 行：分支继承 workspace 与 system_prompt
-        let source_row: Option<(Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT workspace, system_prompt FROM sessions WHERE id = ?1")
+        let source_row: Option<(Option<String>, Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT workspace, system_prompt, title FROM sessions WHERE id = ?1")
                 .bind(session_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let Some((workspace, system_prompt)) = source_row else {
+        let Some((workspace, system_prompt, source_title)) = source_row else {
             return Err(SessionError::NotFound(session_id.to_string()));
         };
 
@@ -88,6 +89,11 @@ impl super::SessionStore {
         //    （第 5 步按复制结果重算到位）。随机 id 主键冲突时重新生成重试，
         //    仅重试主键冲突——其它错误（磁盘满、连接断等）重试无意义且掩盖真实故障
         let mut new_session = super::session::new_session(workspace, None, system_prompt);
+        // 分支标题 = `fork {源标题}`，在列表中与源会话区分；源标题为 NULL 时退回默认「新会话」
+        new_session.title = Some(format!(
+            "fork {}",
+            source_title.as_deref().unwrap_or("新会话")
+        ));
         for attempt in 0..=super::session::ID_CONFLICT_MAX_RETRIES {
             match Self::insert_session_row(&mut *tx, &new_session).await {
                 Ok(()) => break,
@@ -433,6 +439,47 @@ mod tests {
         let source_meta = store.get(&session.id).await.unwrap().unwrap();
         assert_eq!(source_meta.total_prompt_tokens, 6000);
         assert_eq!(source_meta.total_completion_tokens, 1000);
+    }
+
+    // ===== 分支标题继承源标题并加 fork 前缀 =====
+
+    #[tokio::test]
+    async fn fork_to_branch_title_prefixed_with_source_title() {
+        let store = temp_store().await;
+        let session = seed_source(&store).await;
+        store
+            .update_session(&session.id, Some("调试循环"), None)
+            .await
+            .unwrap();
+        insert_user(&store, &session.id, "u1").await; // seq 1
+        let u2 = insert_user(&store, &session.id, "u2").await; // seq 2
+
+        let branch_id = store.fork_to(&session.id, u2).await.unwrap();
+
+        let branch_meta = store.get(&branch_id).await.unwrap().unwrap();
+        assert_eq!(branch_meta.title.as_deref(), Some("fork 调试循环"));
+        // 源会话标题不动
+        let source_meta = store.get(&session.id).await.unwrap().unwrap();
+        assert_eq!(source_meta.title.as_deref(), Some("调试循环"));
+    }
+
+    #[tokio::test]
+    async fn fork_to_branch_title_falls_back_when_source_title_missing() {
+        // 源标题为 NULL（从未生成过标题）时，分支标题退回 fork 新会话
+        let store = temp_store().await;
+        let session = seed_source(&store).await;
+        sqlx::query("UPDATE sessions SET title = NULL WHERE id = ?1")
+            .bind(&session.id)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        insert_user(&store, &session.id, "u1").await; // seq 1
+        let u2 = insert_user(&store, &session.id, "u2").await; // seq 2
+
+        let branch_id = store.fork_to(&session.id, u2).await.unwrap();
+
+        let branch_meta = store.get(&branch_id).await.unwrap().unwrap();
+        assert_eq!(branch_meta.title.as_deref(), Some("fork 新会话"));
     }
 
     // ===== 边界：fork 到首条消息（分支为空）=====

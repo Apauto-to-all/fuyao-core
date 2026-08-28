@@ -21,7 +21,6 @@
 //! 事件已落 DB，转发失败仅 WARN 不阻断。
 
 use super::types::{SubagentArgs, validate_subagent_type};
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 
@@ -34,12 +33,6 @@ use fuyao_api::message::{EventBase, InputEvent};
 use fuyao_api::{
     AgentConfig, CancellationToken, ChildSessionSource, ToolCallContext, ToolOutput, parse_args,
 };
-
-/// 子代理执行超时兜底
-///
-/// 防子 session 卡死（LLM 无响应、工具死循环等）导致父 ReAct 永久阻塞。
-/// 触发后强制 destroy_session 退出。
-const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 子代理工具执行入口
 ///
@@ -138,11 +131,10 @@ pub async fn subagent_handler(
     //    终态 Assistant 同时截留 content 作工具返回值
     let mut final_content = String::new();
     let mut got_final = false;
-    let deadline = tokio::time::Instant::now() + SUBAGENT_TIMEOUT;
 
     loop {
         tokio::select! {
-            biased; // 取消 / 超时优先
+            biased; // 取消优先
 
             _ = cancel.cancelled() => {
                 tracing::info!(child_id = %child_id, "子代理被父取消");
@@ -150,21 +142,6 @@ pub async fn subagent_handler(
                 drain_child_events(&ctx, &child_id, &mut child_rx);
                 emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
                 return ToolOutput::text("⚠️ 子代理被父取消");
-            }
-
-            _ = tokio::time::sleep_until(deadline) => {
-                tracing::warn!(
-                    child_id = %child_id,
-                    timeout_secs = SUBAGENT_TIMEOUT.as_secs(),
-                    "子代理执行超时"
-                );
-                let _ = ops.destroy_session(&child_id, "超时").await;
-                drain_child_events(&ctx, &child_id, &mut child_rx);
-                emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
-                return ToolOutput::error(format!(
-                    "子代理执行超时（{}s）",
-                    SUBAGENT_TIMEOUT.as_secs()
-                ));
             }
 
             ev = child_rx.recv() => {

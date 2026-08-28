@@ -3825,20 +3825,26 @@ async fn title_spawns_once_on_first_injection() {
         "首次判定应消耗判定门"
     );
 
-    // 等 Title 事件（fire-and-forget task 落库 + 发事件）
-    let title = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    // 等两个 Title 事件：先占位标题（首条 user 内容，同步发），后 LLM 生成的
+    // 标题（fire-and-forget task 落库 + 发事件）
+    let titles = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut titles = Vec::new();
         while let Some(ev) = h.rx_event.recv().await {
             if let OutputEvent::Title(m) = ev {
-                return Some(m.payload.title);
+                titles.push(m.payload.title);
+                if titles.len() == 2 {
+                    return titles;
+                }
             }
         }
-        None
+        titles
     })
-    .await;
+    .await
+    .expect("2 秒内应收到两个 Title 事件");
+    assert_eq!(titles[0], "第一个问题", "首个 Title 事件应为占位标题");
     assert_eq!(
-        title.expect("2 秒内应收到 Title 事件").as_deref(),
-        Some("测试标题"),
-        "标题事件应携带 chat 返回的标题"
+        titles[1], "测试标题",
+        "第二个 Title 事件应为 LLM 生成的标题"
     );
 
     // 第二次调用：判定门已消耗，不再触发（无新 Title 事件）
@@ -3907,19 +3913,24 @@ async fn title_generated_for_child_session() {
         "子 session 首次判定应消耗判定门"
     );
 
-    // 子 session 与主 session 同一条生成路径：等 Title 事件（fire-and-forget task 落库 + 发事件）
-    let title = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    // 子 session 与主 session 同一条生成路径：等两个 Title 事件（占位 + LLM 生成）
+    let titles = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut titles = Vec::new();
         while let Some(ev) = rx_event.recv().await {
             if let OutputEvent::Title(m) = ev {
-                return Some(m.payload.title);
+                titles.push(m.payload.title);
+                if titles.len() == 2 {
+                    return titles;
+                }
             }
         }
-        None
+        titles
     })
-    .await;
+    .await
+    .expect("2 秒内应收到两个 Title 事件");
+    assert_eq!(titles[0], "子会话首问", "首个 Title 事件应为占位标题");
     assert_eq!(
-        title.expect("2 秒内应收到 Title 事件").as_deref(),
-        Some("测试标题"),
+        titles[1], "测试标题",
         "子 session 不应被豁免，应生成标题并发 Title 事件"
     );
 }
