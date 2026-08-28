@@ -6,9 +6,11 @@
 mod init;
 mod logging;
 mod mcp;
+mod plugins;
 mod tools;
 
 pub use init::{InitError, InitResult, init_engine};
 pub use logging::LogGuard;
 pub(crate) use logging::init_logging;
+pub use plugins::build_plugin_host;
 pub use tools::build_tool_registry;

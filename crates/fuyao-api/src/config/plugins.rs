@@ -17,6 +17,16 @@ pub struct PluginsConfig {
     pub enabled: HashMap<String, bool>,
 }
 
+impl PluginsConfig {
+    /// 插件是否被禁用
+    ///
+    /// - 显式 `false`：返回 `true`（被禁用）
+    /// - 未列出或显式 `true`：返回 `false`（默认启用）
+    pub fn is_plugin_disabled(&self, name: &str) -> bool {
+        self.enabled.get(name) == Some(&false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,5 +54,20 @@ session = true
         let toml_str = "";
         let c: PluginsConfig = toml::from_str(toml_str).unwrap();
         assert!(c.enabled.is_empty());
+    }
+
+    /// is_plugin_disabled 三种情况：显式 false / 显式 true / 未列出
+    #[test]
+    fn is_plugin_disabled_semantics() {
+        let mut c = PluginsConfig::default();
+        c.enabled.insert("loop_guard".to_string(), false);
+        c.enabled.insert("other".to_string(), true);
+
+        // 显式 false → 被禁用
+        assert!(c.is_plugin_disabled("loop_guard"));
+        // 显式 true → 启用
+        assert!(!c.is_plugin_disabled("other"));
+        // 未列出 → 默认启用
+        assert!(!c.is_plugin_disabled("unlisted"));
     }
 }

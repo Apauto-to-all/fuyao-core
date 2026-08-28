@@ -18,10 +18,12 @@ mod runtime;
 use std::sync::Arc;
 
 use fuyao_api::EngineParams;
-use fuyao_core::{Engine, PluginHost};
+use fuyao_core::Engine;
 use fuyao_session::SessionStore;
 
-pub use bootstrap::{InitError, InitResult, LogGuard, build_tool_registry, init_engine};
+pub use bootstrap::{
+    InitError, InitResult, LogGuard, build_plugin_host, build_tool_registry, init_engine,
+};
 pub use manager::list_agent_ids;
 pub use manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 pub use runtime::{App, Discovery, SessionManager};
@@ -85,10 +87,9 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
     let (tools, mcp_manager) = build_tool_registry().await;
 
     // 3. 装配插件工厂（per-session 实例化的引擎级入口）
-    //    每个 session 启动时由 Engine 调 create_instances 生成独立实例，
-    //    多 session 并发时各插件状态互不串台。
-    let mut plugin_host = PluginHost::new();
-    plugin_host.add(Box::new(fuyao_guard::LoopGuardPlugin::new()));
+    //    按 [plugins.enabled] 过滤内置插件；每个 session 启动时由 Engine 调
+    //    create_instances 生成独立实例，多 session 并发时各插件状态互不串台。
+    let plugin_host = build_plugin_host();
 
     // 4. 创建会话存储（所有权归装配层，注入 Engine 与 SessionManager 共享）
     //    store 由装配层创建，Engine 与 SessionManager 各持 Arc 克隆，共享同一连接池。
