@@ -14,6 +14,8 @@
 //!   sessions 的 compression_count / last_compacted_seq）
 //! - [`fork`]：对话派生（复制 seq < target 的消息到新独立会话，单事务：建行 +
 //!   复制 + 按复制结果重算元数据；目标必须是 user / compaction 消息）
+//! - [`fork_visible`]：可见窗口派生（整窗复制最新摘要起的可见上下文为新会话，
+//!   parent 由调用方指定，单事务：建行 + 复制 + 按复制结果聚合计数）
 //! - [`visible_window`]：给 LLM 的可见窗口查询（压缩感知，最新摘要 + 摘要后新消息）。
 //!   与 [`message`] 的「给人看的」查询路径正交
 //! - [`rollback`]：对话回退（删目标 seq 之后消息 + 局部 UPDATE 重算 count 类与
@@ -22,6 +24,7 @@
 
 pub(crate) mod compaction;
 mod fork;
+mod fork_visible;
 mod message;
 mod rollback;
 mod row;

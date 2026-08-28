@@ -1,13 +1,10 @@
-//! fork / 子任务 session 创建与 stop_session 停止原语的语义单元测试
+//! 子任务 session 创建与 stop_session 停止原语的语义单元测试
 //!
-//! fork / 子任务部分覆盖 parent_session_id 在三种创建路径下的正确设置：
-//! - fork_session（纯 fork）：parent = None
-//! - create_child_session 的 Fork 模式：parent = 父 id
-//! - create_child_session 的 Fresh 模式：parent = 父 id
-//!
-//! 前两个直接测 [`Engine::build_forked_session`]（仅做 DB 层加载 + 复制，
-//! 不 assemble / 不 spawn task）；Fresh 模式测公开 [`Engine::create_child_session`]
-//! （会 spawn 一个 idle session task，测试末尾用 end_session 收尾拆除）。
+//! 子任务部分覆盖 [`Engine::create_child_session`] 两种上下文模式（均走公开方法，
+//! 会 spawn idle session task，测试末尾用 end_session 收尾拆除）：
+//! - Fresh 模式：空上下文，parent = 父 id
+//! - Fork 模式：整窗复制源可见上下文，parent = 父 id（复制 SQL 与计数聚合语义
+//!   由 fuyao-session 存储层 fork_visible 模块的测试覆盖）
 //!
 //! stop_session 部分覆盖其三段语义：未挂载幂等（Ok）、idle 幂等（Ok）、
 //! 屏障语义（返回即 turn 已终止且中断收尾落库完毕）。
@@ -72,69 +69,66 @@ async fn seed_source_session(engine: &Engine) -> SessionId {
 }
 
 #[tokio::test]
-async fn build_forked_session_pure_fork_parent_is_none() {
-    // fork_session 路径：build_forked_session(parent=None) → 独立 session（parent 为 None）
+async fn create_child_session_fork_copies_visible_context_and_sets_parent() {
+    // create_child_session 的 Fork 模式：整窗复制源可见上下文，parent 标记为父 id
     let (engine, _dir) = make_engine().await;
     let source_id = seed_source_session(&engine).await;
+    // 父 session 入调度表：create_child_session 从父继承 model_config，父必须活跃
+    let parent_id = engine.create_session(engine_test_params()).await.unwrap().0;
 
-    let new = engine.build_forked_session(&source_id, None).await.unwrap();
-
-    // parent_session_id 为 None（独立 session，非子任务）
-    assert!(new.parent_session_id.is_none());
-    // system_prompt 复制源值
-    assert_eq!(new.system_prompt.as_deref(), Some("源系统提示词"));
-
-    // 落库后读回一致：parent None + 可见消息复制到位 + 计数对齐
-    // message_count 由 insert_message 事务内累加进 sessions 表，
-    // 内存返回值不回读——一律从 DB 行验证
-    let loaded = engine.store.get(&new.id).await.unwrap().unwrap();
-    assert!(loaded.parent_session_id.is_none());
-    assert_eq!(
-        loaded.message_count, 2,
-        "DB message_count 应对齐复制消息条数"
-    );
-    let visible = engine.store.load_visible_messages(&new.id).await.unwrap();
-    assert_eq!(visible.len(), 2);
-    assert_eq!(visible[0].content.as_deref(), Some("源消息1"));
-    assert_eq!(visible[1].content.as_deref(), Some("源回复"));
-}
-
-#[tokio::test]
-async fn build_forked_session_child_fork_parent_is_set() {
-    // create_child_session 的 Fork 模式路径：build_forked_session(parent=Some) → parent 为父 id
-    let (engine, _dir) = make_engine().await;
-    let source_id = seed_source_session(&engine).await;
-
-    let parent_id = "parent-xyz".to_string();
-    let new = engine
-        .build_forked_session(&source_id, Some(parent_id.clone()))
+    let (child_id, _rx) = engine
+        .create_child_session(
+            &parent_id,
+            ChildSessionSource::Fork(source_id.clone()),
+            AgentConfig {
+                definition: "explore".to_string(),
+            },
+        )
         .await
         .unwrap();
 
-    // parent_session_id 标记为父 id（子任务 session）
-    assert_eq!(new.parent_session_id.as_deref(), Some(parent_id.as_str()));
-    // 可见消息复制到位
-    let visible = engine.store.load_visible_messages(&new.id).await.unwrap();
-    assert_eq!(visible.len(), 2);
-
-    // 落库后 parent 一致
-    let loaded = engine.store.get(&new.id).await.unwrap().unwrap();
+    // 落库后 parent_session_id 为父 id，system_prompt 复制源值（不从子代理配置重建）
+    let loaded = engine.store.get(&child_id).await.unwrap().unwrap();
     assert_eq!(
         loaded.parent_session_id.as_deref(),
         Some(parent_id.as_str())
     );
+    assert_eq!(loaded.system_prompt.as_deref(), Some("源系统提示词"));
+
+    // 可见消息复制到位 + 计数对齐
+    assert_eq!(
+        loaded.message_count, 2,
+        "DB message_count 应对齐复制的消息条数"
+    );
+    let visible = engine.store.load_visible_messages(&child_id).await.unwrap();
+    assert_eq!(visible.len(), 2);
+    assert_eq!(visible[0].content.as_deref(), Some("源消息1"));
+    assert_eq!(visible[1].content.as_deref(), Some("源回复"));
+
+    // 收尾：拆除 create_child_session spawn 出来的 idle session task
+    let _ = engine.end_session(&child_id, "测试结束").await;
 }
 
 #[tokio::test]
-async fn build_forked_session_missing_source_returns_not_found() {
-    // 源 session 不存在 → SessionNotFound（而非 Storage / panic）
+async fn create_child_session_fork_missing_source_returns_not_found() {
+    // Fork 模式源 session 不存在 → SessionNotFound（而非 Storage / panic）
     let (engine, _dir) = make_engine().await;
+    let parent_id = engine.create_session(engine_test_params()).await.unwrap().0;
 
     let err = engine
-        .build_forked_session(&"nonexistent".to_string(), None)
+        .create_child_session(
+            &parent_id,
+            ChildSessionSource::Fork("nonexistent".to_string()),
+            AgentConfig {
+                definition: "explore".to_string(),
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::SessionNotFound(_)));
+
+    // 收尾：拆除父 session task
+    let _ = engine.end_session(&parent_id, "测试结束").await;
 }
 
 #[tokio::test]

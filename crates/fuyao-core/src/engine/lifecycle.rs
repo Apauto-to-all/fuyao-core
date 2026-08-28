@@ -1,17 +1,19 @@
-//! 会话生命周期管理（创建 / 恢复 / 派生 / 子任务）
+//! 会话生命周期管理（创建 / 恢复 / 子任务）
 //!
 //! 本模块集中 [`Engine`] 的「出生」相关动作：
 //! - [`Engine::create_session`]：从零创建新 session
 //! - [`Engine::resume_session`]：从数据库恢复老 session
-//! - [`Engine::fork_session`]：派生独立 session（复制源可见上下文）
 //! - [`Engine::create_child_session`]：创建带父标记的子任务 session（rx 直接交调用方，不进 fan-in）
 //!
 //! 以及这些动作共用的内部装配逻辑（[`Engine::assemble_session`] /
-//! [`Engine::assemble_session_hooks`]）与 fork 拷贝核心
-//! （[`Engine::build_forked_session`]）。
+//! [`Engine::assemble_session_hooks`]）。
 //!
 //! 所有创建方法都返 `(SessionId, Receiver<OutputEvent>)`——id 用于后续 send/end，
 //! rx 用于消费该 session 的产出事件（per-session 通道化）。
+//!
+//! 独立会话的派生（fork 分支）不经引擎动作：由存储层
+//! `SessionStore::fork_to` 直接落库，需要继续对话时走
+//! [`Engine::resume_session`] 激活。
 
 use super::*;
 use crate::emit::Emitter;
@@ -117,76 +119,6 @@ impl Engine {
         Ok((id.clone(), rx_event))
     }
 
-    /// 派生对话（fork：从源 session 复制可见上下文到新独立 session）
-    ///
-    /// 创建一个新 Session 作为源 session 的派生：复制源 session 的**系统提示词**与
-    /// **可见消息**到新 session。新 session 是独立 session（**不是**子任务），
-    /// 其 `parent_session_id` 保持 `None`——适合「分支对话探索」这类仍属主对话的形态。
-    /// 新 session 装配完成后即可立即接收 `send` 跑 ReAct，与 `create_session` 产出的等价。
-    ///
-    /// 若要创建带父标记的子任务 session（后台任务 / 子代理），用
-    /// [`create_child_session`](Self::create_child_session)。
-    ///
-    /// # 复制语义
-    /// - **系统提示词**：取 sessions 表持久化的 `system_prompt` 原值，不从 `agent_config` 重建
-    ///   （源 session 的提示词可能已被压缩重建过，重建值才是模型真正看到的）
-    /// - **可见消息**：用 `load_visible_messages`（尊重 compaction 边界），**不用** `load_full_history`
-    ///   （后者含压缩前旧消息 + 副本，仅审计用）。`insert_messages_batch` 单事务批量写入
-    ///   新 session，自动分配新 seq（与压缩 `apply` 的 copy-to-new-seq 模式一致）
-    /// - **派生归属**：`parent_session_id = None`（独立 session，非子任务）
-    ///
-    /// # SessionParams 处理
-    /// 与 `resume_session` 对称——由调用方提供 `SessionParams`（`agent_config` + `model_config`）。
-    /// `agent_config` 贯穿到 `SessionCtx` 供未来压缩重建提示词用；`model_config` 决定首轮用哪个模型。
-    /// 注：本方法不重建 system_prompt（直接复制源的），故 `agent_config` 不影响 fork 时的初始提示词，
-    /// 仅在 fork 出的 session 自身后续压缩时才参与重建。
-    ///
-    /// # 统计字段初值
-    /// 新 session 的费用 / token 统计从 0 起算（派生会话自身的开销独立计量，不继承源 session 的花费）；
-    /// `message_count` 设为复制的**普通消息**条数（排除 compaction 边界，与 `emit_to_history`
-    /// 的计数语义一致——`mark_compaction` 不 bump 该计数）。
-    ///
-    /// # 返回
-    /// `(new_session_id, rx)`——rx 是新 session 的 per-session 出站通道。
-    ///
-    /// # 错误
-    /// - [`EngineError::SessionNotFound`]：源 session id 在数据库中不存在
-    /// - [`EngineError::Storage`]：复制消息或落库失败
-    /// - [`EngineError::Prompt`]：`agent_config.definition` 未知名，或 mode 与主 Agent 用途不符
-    pub async fn fork_session(
-        &self,
-        source_id: &SessionId,
-        params: SessionParams,
-    ) -> Result<(SessionId, mpsc::UnboundedReceiver<OutputEvent>), EngineError> {
-        // 纯 fork：复制源可见上下文，parent=None（fork 出的是独立 session，非子任务）
-        let new_session = self.build_forked_session(source_id, None).await?;
-        let new_session_id = new_session.id.clone();
-
-        // 加载完整 Agent 定义（fork 出的独立 session parent=None → 主 Agent 用途）
-        let definition = fuyao_prompt::resolve_definition(
-            &self.params.agent_paths,
-            &params.agent_config,
-            fuyao_prompt::PromptUsage::Primary,
-        )?;
-
-        // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表
-        // SessionParams 整体传下去（与 create_session / resume_session 对称）
-        // fork 出的是独立 session（parent=None）→ is_child=false
-        let (handle, rx_event) =
-            self.assemble_session(new_session_id.clone(), false, params, definition);
-        self.sessions
-            .lock()
-            .await
-            .insert(new_session_id.clone(), handle);
-
-        tracing::info!(
-            session_id = %new_session_id,
-            source_session_id = %source_id,
-            "派生对话已创建（独立 session，parent=None）"
-        );
-        Ok((new_session_id, rx_event))
-    }
-
     /// 创建子任务 session（后台任务 / 子代理地基）
     ///
     /// 产出一个带 `parent_session_id` 的子任务 session，经 `assemble_session` 装配 +
@@ -199,8 +131,8 @@ impl Engine {
     /// # 两种上下文模式（[`ChildSessionSource`]）
     /// - [`Fresh`](ChildSessionSource::Fresh)：空上下文，`system_prompt` 从 `agent_config` 构建
     ///   （与 `create_session` 一致）
-    /// - [`Fork`](ChildSessionSource::Fork)：复制某源 session 的可见消息 + `system_prompt`
-    ///   （复用 [`fork_session`](Self::fork_session) 的拷贝逻辑）
+    /// - [`Fork`](ChildSessionSource::Fork)：整窗复制某源 session 的可见消息 + `system_prompt`
+    ///   （经存储层 `SessionStore::fork_visible` 单事务落库）
     ///
     /// # 参数处理
     /// 调用方只提供子代理的 `agent_config`（definition）；`model_config` 由引擎从父 session
@@ -241,41 +173,43 @@ impl Engine {
             agent_config: child_agent_config,
             model_config,
         };
-        // 子任务 session 固定 Subagent 用途（parent_session_id = Some），definition 加载一次
-        // 供 Fresh 模式构建系统提示词 + assemble per-session 工具过滤复用
+        // 子任务 session 固定 Subagent 用途（parent_session_id = Some）。definition 加载一次：
+        // Fresh 模式构建 system_prompt 用 + assemble per-session 工具过滤复用；
+        // 在任何落库之前加载——definition 非法时两种模式都不产生 DB 副作用
         let usage = fuyao_prompt::PromptUsage::Subagent;
-        // 先按模式构造 + 落库新 session（不带 assemble，assemble 在统一出口做）
-        let (new_session, definition) = match source {
+        let definition = fuyao_prompt::resolve_definition(
+            &self.params.agent_paths,
+            &params.agent_config,
+            usage,
+        )?;
+        // 按模式构造 + 落库新 session（不带 assemble，assemble 在统一出口做）
+        let new_session_id = match source {
             ChildSessionSource::Fresh => {
-                // 全新子任务：空上下文，definition 加载后构建 system_prompt
-                let definition = fuyao_prompt::resolve_definition(
-                    &self.params.agent_paths,
-                    &params.agent_config,
-                    usage,
-                )?;
+                // 全新子任务：空上下文，system_prompt 从 agent_config 构建
                 let system_prompt =
                     build_system_prompt(&self.params.agent_paths, &definition, usage);
                 let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
                 let mut s = Session::new(workspace, None, Some(system_prompt));
                 s.parent_session_id = Some(parent_session_id.clone());
                 self.store.create_with_retry(&mut s).await?;
-                (s, definition)
+                s.id
             }
             ChildSessionSource::Fork(ref source_id) => {
-                // fork 子任务：复制源可见上下文，parent 标记为父 session id
-                let s = self
-                    .build_forked_session(source_id, Some(parent_session_id.clone()))
-                    .await?;
-                let definition = fuyao_prompt::resolve_definition(
-                    &self.params.agent_paths,
-                    &params.agent_config,
-                    usage,
-                )?;
-                (s, definition)
+                // fork 子任务：存储层整窗复制源可见上下文（单事务原子），parent 标记为父 id。
+                // 源不存在对齐 SessionNotFound 错误口径（与父 session 缺失一致），其余存储错误原样上抛
+                match self
+                    .store
+                    .fork_visible(source_id, Some(parent_session_id.clone()))
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(fuyao_session::SessionError::NotFound(_)) => {
+                        return Err(EngineError::SessionNotFound(source_id.clone()));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
             }
         };
-
-        let new_session_id = new_session.id.clone();
 
         // 装配 session（队列 / 通道 / hooks / task）+ 登记进调度表（与 create_session 对称）
         // create_child_session 产出的恒为子任务（parent_session_id 非空）→ is_child=true
@@ -292,70 +226,6 @@ impl Engine {
             "子任务 session 已创建"
         );
         Ok((new_session_id, rx_event))
-    }
-
-    /// 从源 session 复制可见消息 + system_prompt，构造并落库新 session（fork 拷贝核心）
-    ///
-    /// 共享给 [`fork_session`](Self::fork_session)（`parent_session_id = None`，纯 fork）
-    /// 与 [`create_child_session`](Self::create_child_session) 的 `Fork` 模式
-    /// （`parent_session_id = Some(父 id)`，子任务 fork）。仅做 DB 层的加载 + 复制 + 落库，
-    /// **不** assemble / **不**登记调度表——由调用方完成 `assemble_session` 与注册。
-    ///
-    /// # 复制语义
-    /// - **system_prompt**：取源 session 持久化原值，不从 `agent_config` 重建
-    /// - **可见消息**：用 `load_visible_messages`（尊重 compaction 边界），
-    ///   `insert_messages_batch` 单事务批量写入新 session，seq 连续重新分配
-    ///   （与压缩 `apply` 的 copy-to-new-seq 模式一致；消息复制整批原子，
-    ///   全部成功或全部回滚）
-    /// - **message_count**：对齐复制的**普通消息**条数（排除 compaction 边界，
-    ///   与 `emit_to_history` 计数语义一致）
-    /// - **统计字段**（token / 费用）：从 0 起算，不继承源 session
-    ///
-    /// # 错误
-    /// - [`EngineError::SessionNotFound`]：源 session id 在数据库中不存在
-    /// - [`EngineError::Storage`]：复制消息或落库失败。新 session 元数据行是独立事务
-    ///   先落库，复制阶段整批原子回滚——失败时仅剩一条无消息的孤立 session 行
-    ///   （未装配登记、不进调度表，不影响引擎调度）
-    pub(super) async fn build_forked_session(
-        &self,
-        source_id: &SessionId,
-        parent_session_id: Option<String>,
-    ) -> Result<Session, EngineError> {
-        // 1. 加载源 session（取持久化的 system_prompt + 校验存在）
-        let source = self
-            .store
-            .get(source_id)
-            .await?
-            .ok_or_else(|| EngineError::SessionNotFound(source_id.clone()))?;
-
-        // 2. 加载源 session 的可见消息（可见窗口 = 最新 compaction 摘要 + 摘要后全部消息），
-        //    fork 完整复制源会话可见窗口——子会话继承压缩边界之后的上下文
-        let visible = self.store.load_visible_messages(source_id).await?;
-
-        // 3. 构造新 session：系统提示词复制源值，parent_session_id 由调用方决定
-        //    计数字段（message_count 等）从 0 起算——下方批量复制消息时，
-        //    事务内会按消息 kind/role 一次性聚合累加（普通消息 +1 message_count，role=Tool +1 tool_call_count），
-        //    复制完成后 DB 里的计数值自然对齐复制的消息条数。
-        let mut new_session =
-            Session::new(source.workspace.clone(), None, source.system_prompt.clone());
-        new_session.parent_session_id = parent_session_id;
-
-        // 4. 落库新 session 元数据行（先建行，满足 messages.session_id 外键约束）。
-        //    id 随机生成，主键冲突时由 create_with_retry 重新生成重试。
-        self.store.create_with_retry(&mut new_session).await?;
-
-        // 5. 批量复制可见消息到新 session：visible 所有权直接移交批量落库
-        //    （seq 由批量方法统一重新分配，覆盖源 session 带来的旧值，无需逐条 clone 重置）
-        //    与压缩 apply 的 copy-to-new-seq 模式一致：整批单事务原子，全部成功或全部回滚，
-        //    失败即返回 Err（此时新 session 元数据行已先落库但未装配登记，为无消息的孤立行，
-        //    不影响引擎调度）
-        //    批量落库事务内一次性聚合累加 sessions 计数——复制完全等于"重新产生这些消息"
-        let mut copies = visible;
-        self.store
-            .insert_messages_batch(&new_session.id, &mut copies)
-            .await?;
-
-        Ok(new_session)
     }
 
     /// 装配 session（create_session / resume_session 公共方法）

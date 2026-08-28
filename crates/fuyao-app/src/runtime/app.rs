@@ -2,7 +2,7 @@
 //!
 //! 装配层承担 fan-in 职责，重建单一出口。
 //! - [`App`] 持有 [`Engine`] + fan_out 通道（bounded）+ forward_tasks 表
-//! - 每个**主 session**（create_session / resume_session / fork_session）创建时 spawn 一个 forwarder
+//! - 每个**主 session**（create_session / resume_session）创建时 spawn 一个 forwarder
 //! - 暴露 [`App::recv`] 给上层消费者，语义等价于原 `Engine::recv`
 //! - [`App::shutdown`] 两段式：engine.shutdown 等 session task 退出 → forwarder 自然退出 → drop fan_out_tx
 //!
@@ -127,19 +127,6 @@ impl App {
             return Ok(id.clone());
         }
         let (id, rx) = self.engine.resume_session(id, params).await?;
-        self.register_forwarder(id.clone(), rx).await;
-        Ok(id)
-    }
-
-    /// 派生对话（fork：从源 session 复制可见上下文到新独立 session）
-    ///
-    /// 镜像 [`Engine::fork_session`]。
-    pub async fn fork_session(
-        &self,
-        source_id: &SessionId,
-        params: SessionParams,
-    ) -> Result<SessionId, EngineError> {
-        let (id, rx) = self.engine.fork_session(source_id, params).await?;
         self.register_forwarder(id.clone(), rx).await;
         Ok(id)
     }
