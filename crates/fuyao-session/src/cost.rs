@@ -71,7 +71,7 @@ fn line(tokens: i64, price: Option<Decimal>) -> Decimal {
 /// output 同价或未单列）。
 ///
 /// # Arguments
-/// * `cost` - 模型价格表（平价 + 梯度；梯度按 `usage.prompt` 命中）
+/// * `cost` - 模型价格表（非梯度价格 + 梯度；梯度按 `usage.prompt` 命中）
 /// * `usage` - token 用量四桶
 ///
 /// # Returns
@@ -110,7 +110,7 @@ mod tests {
         v.parse().unwrap()
     }
 
-    /// 平价表构造（价格/M）
+    /// 非梯度价格表构造（价格/M）
     fn flat_cost(
         input: Option<Decimal>,
         output: Option<Decimal>,
@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn tiers_override_flat_prices_per_matched_tier() {
-        // 梯度非空时整体取代平价：命中梯度内缺价的桶免费，不回退平价
+        // 梯度非空时整体取代非梯度价格：命中梯度内缺价的桶免费，不回退非梯度价格
         let cost = ModelCost {
             input: Some(d("999")),
             output: Some(d("999")),

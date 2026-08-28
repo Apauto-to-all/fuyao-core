@@ -46,15 +46,15 @@ pub struct ModelCost {
 
     /// 价格梯度区间列表（按 max_tokens 升序，加载时排序）
     ///
-    /// 非空时整体取代平价四字段：按单次请求的 prompt_tokens 命中一个梯度，
-    /// 梯度内缺价的桶免费，不回退平价。
+    /// 非空时整体取代非梯度价格四字段：按单次请求的 prompt_tokens 命中一个梯度，
+    /// 梯度内缺价的桶免费，不回退非梯度价格。
     pub tiers: Vec<PriceTier>,
 }
 
 /// 某次请求规模下的有效单价（价格/M）
 ///
-/// 价格表的查询结果：平价直接取四字段，梯度按 prompt_tokens 命中一个区间。
-/// 每个桶只有一份单价——计费侧对号入座，不关心价格来自平价还是梯度。
+/// 价格表的查询结果：非梯度价格直接取四字段，梯度按 prompt_tokens 命中一个区间。
+/// 每个桶只有一份单价——计费侧对号入座，不关心价格来自非梯度价格还是梯度。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnitPrices {
     /// 输入 tokens 单价

@@ -12,33 +12,52 @@
 
 ```toml
 [providers.deepseek]
-name = "DeepSeek"                          # 显示名（必填）
+name = "DeepSeek 深度求索"                  # 显示名（必填）
 api_protocol = "openai-completions"        # 协议（必填）：openai-completions / anthropic-messages
 api_key_env_vars = ["DEEPSEEK_API_KEY"]    # API Key 环境变量名（推荐）
 
 [providers.deepseek.options]
-base_url = "https://api.deepseek.com/v1"   # 自定义 base URL
+base_url = "https://api.deepseek.com"      # 自定义 base URL
 
-[providers.deepseek.models."deepseek-v4-flash"]   # 模型 ID = TOML 键名
-name = "deepseek-v4-flash"                 # 模型显示名（必填）
-limit = { context = 131072, input = 900000, output = 65536 }  # context 必填
-modalities = { input = ["text"], output = ["text"] }          # 可选，默认纯文本
-reasoning_efforts = ["low", "medium", "high"]                 # 思考强度档位，可选
-
-[providers.deepseek.models."deepseek-v4-flash".cost]
-input = 2
-output = 12
-reasoning = 4
-cache = 0.4
-
-[[providers.deepseek.models."deepseek-v4-flash".cost.tiers]]  # 梯度价格，可选
-max_tokens = 256000
-input = 3
-output = 12
-cache = 0.4
+[providers.deepseek.models."deepseek-v4-flash"]     # 模型 ID = TOML 键名
+name = "DeepSeek v4 Flash"                 # 模型显示名（必填）
+limit = { context = 1000000, output = 384000 }      # context 必填
+cost = { input = 1.5, output = 4.5, cache = 0.05 }  # 价格/M tokens
+reasoning_efforts = ["low", "high", "max"]          # 思考强度档位，可选
 ```
 
-引用模型时用 `provider_id/model_id` 格式，如 `deepseek/deepseek-v4-flash`。需要梯度价格（`cost.tiers`）时，`cost` 必须写成上例的段表形式——内联表 `{ … }` 定义后不能再被 tiers 扩展，混用会导致 TOML 解析失败。
+梯度价格模型（阿里云百炼 qwen3.6-flash）。`cost.tiers` 非空时整体取代非梯度价格，按**单次请求的 prompt_tokens** 命中分档（≤ `max_tokens` 即该档，超出全部区间取末档兜底），分档上限应落在 `limit.context` 以内：
+
+```toml
+[providers.aliyun]
+name = "阿里云百炼"
+api_protocol = "openai-completions"
+api_key_env_vars = ["DASHSCOPE_API_KEY"]
+
+[providers.aliyun.options]
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+[providers.aliyun.models."qwen3.6-flash"]
+name = "Qwen3.6 Flash"
+limit = { context = 1000000, output = 65536 }
+modalities = { input = ["text", "image"], output = ["text"] }   # 可选，默认纯文本
+
+[providers.aliyun.models."qwen3.6-flash".cost]
+
+[[providers.aliyun.models."qwen3.6-flash".cost.tiers]]
+max_tokens = 256000        # prompt_tokens ≤ 256K 走这档
+input = 1.2
+output = 7.2
+cache = 0.24
+
+[[providers.aliyun.models."qwen3.6-flash".cost.tiers]]
+max_tokens = 1000000       # 256K 以上走这档（末档兜底）
+input = 4.8
+output = 28.8
+cache = 0.96
+```
+
+引用模型时用 `provider_id/model_id` 格式，如 `deepseek/deepseek-v4-flash`。需要梯度价格（`cost.tiers`）时，`cost` 必须写成段表形式——内联表 `{ … }` 定义后不能再被 tiers 扩展，混用会导致 TOML 解析失败。
 
 ## 字段说明
 
@@ -58,11 +77,11 @@ Model 级（`[providers.{id}.models.{模型ID}]`）：
 | --- | --- | --- |
 | `name` | 是 | 显示名 |
 | `limit.context` | 是 | 上下文窗口（正整数）；上下文压缩的触发公式直接消费该值，缺失即加载报错 |
-| `limit.input` / `limit.output` | 否 | 输入 / 输出上限 |
+| `limit.input` / `limit.output` | 否 | 单次输入 / 输出上限；`input` 不应超过 `limit.context`（输入必须装得进上下文窗口） |
 | `cost.input` / `cost.output` / `cost.reasoning` / `cost.cache` | 否 | 单价，整数或浮点均可 |
 | `modalities.input` / `modalities.output` | 否 | 支持的模态（如 `["text", "image"]`），默认纯文本 |
 | `reasoning_efforts` | 否 | 思考强度档位名列表，任意字符串透传 |
-| `cost.tiers` | 否 | 梯度价格：按 `max_tokens` 分档的多组 `{max_tokens, input, output, reasoning, cache}`（各单价可选） |
+| `cost.tiers` | 否 | 梯度价格：多组 `{max_tokens, input, output, reasoning, cache}`（各单价可选）；按**单次请求的 prompt_tokens** 命中分档（≤ `max_tokens` 即该档，超出全部区间取末档），非空时整体取代非梯度价格四字段，分档上限应落在 `limit.context` 以内 |
 
 ## API Key 安全
 
