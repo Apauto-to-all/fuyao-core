@@ -121,6 +121,56 @@ impl Default for ChatMessage {
     }
 }
 
+/// 缺结果的 tool_call 占位内容——固定标记，模型据此得知该调用未产出结果（可决定重试）
+pub const UNANSWERED_TOOL_RESULT_MARKER: &str = "[工具执行被拦截或中断]";
+
+/// 为缺结果的 tool_call 补占位 tool_result（wire 协议配对不变量）
+///
+/// OpenAI / Anthropic 协议要求 assistant 消息的每个 tool_call 都有配对的 tool
+/// 结果消息。被拦截 Block、中断、进程崩溃的工具调用不会落结果——消息序列进
+/// wire 前统一过此函数：以全序列已存在的 tool 结果 id 集合为基准，为缺失项
+/// 紧随其 assistant 消息之后插入一条占位 tool_result（content 为固定中断标记）。
+/// 幂等：全部配对的序列原样通过，不增不改。
+///
+/// id 为空的 tool_call 跳过（无法构造配对关系）。
+pub fn pair_missing_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    // 全序列已有结果的 tool_call_id 集合（结果可能出现在序列任意位置；owned，
+    // 不借用 messages——消息本体随后被循环消费移入结果序列）
+    let answered_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|m| matches!(m.role, MessageRole::Tool))
+        .filter_map(|m| m.tool_call_id.clone())
+        .collect();
+
+    let mut paired = Vec::with_capacity(messages.len());
+    for m in messages {
+        // assistant 且带调用时，缺结果项先取所有权收走（借用在本体移入 paired 前结束；
+        // 仅悬挂项付一次克隆成本，正常配对序列零开销）
+        let missing: Vec<(String, String)> = if matches!(m.role, MessageRole::Assistant)
+            && let Some(tool_calls) = m.tool_calls.as_ref()
+        {
+            tool_calls
+                .iter()
+                .filter(|tc| !tc.id.is_empty() && !answered_ids.contains(tc.id.as_str()))
+                .map(|tc| (tc.id.clone(), tc.name.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        paired.push(m);
+        for (id, name) in missing {
+            paired.push(ChatMessage {
+                role: MessageRole::Tool,
+                content: Some(UNANSWERED_TOOL_RESULT_MARKER.to_string()),
+                tool_call_id: Some(id),
+                tool_name: Some(name),
+                ..ChatMessage::default()
+            });
+        }
+    }
+    paired
+}
+
 /// 非流式对话响应
 #[derive(Debug, Clone)]
 pub struct ChatResponse {
@@ -545,5 +595,141 @@ mod tests {
             error.backoff_duration(31),
             std::time::Duration::from_millis(2_147_483_647)
         );
+    }
+
+    // ===== pair_missing_tool_results 测试 =====
+
+    /// 构造带 tool_calls 的 assistant 消息
+    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::Assistant,
+            content: None,
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| ToolCallData {
+                        id: id.to_string(),
+                        name: format!("tool_{id}"),
+                        arguments: "{}".to_string(),
+                    })
+                    .collect(),
+            ),
+            ..ChatMessage::default()
+        }
+    }
+
+    /// 构造 tool 结果消息
+    fn tool_result(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: MessageRole::Tool,
+            content: Some("结果".to_string()),
+            tool_call_id: Some(id.to_string()),
+            tool_name: Some(format!("tool_{id}")),
+            ..ChatMessage::default()
+        }
+    }
+
+    #[test]
+    fn pairing_supplements_missing_after_assistant() {
+        // assistant 带 3 个调用，仅 c2 有结果 → c1/c3 紧随 assistant 之后补占位
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("问题".to_string()),
+                ..ChatMessage::default()
+            },
+            assistant_with_calls(&["c1", "c2", "c3"]),
+            tool_result("c2"),
+        ];
+
+        let paired = pair_missing_tool_results(messages);
+        // user + assistant + 占位c1 + 占位c3 + 结果c2 = 5
+        //（占位紧随 assistant 批量插入，既有结果保持原相对位置排在其后）
+        assert_eq!(paired.len(), 5);
+        // 占位 c1 位于 assistant 之后（索引 2）
+        assert_eq!(paired[2].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(
+            paired[2].content.as_deref(),
+            Some(UNANSWERED_TOOL_RESULT_MARKER)
+        );
+        assert_eq!(paired[2].tool_name.as_deref(), Some("tool_c1"));
+        assert!(matches!(paired[2].role, MessageRole::Tool));
+        // 占位 c3 紧随其后（索引 3），content 同为固定标记
+        assert_eq!(paired[3].tool_call_id.as_deref(), Some("c3"));
+        assert_eq!(
+            paired[3].content.as_deref(),
+            Some(UNANSWERED_TOOL_RESULT_MARKER)
+        );
+        // 原有结果原样保留（末位），内容不被改写
+        assert_eq!(paired[4].tool_call_id.as_deref(), Some("c2"));
+        assert_eq!(paired[4].content.as_deref(), Some("结果"));
+    }
+
+    #[test]
+    fn pairing_no_op_when_all_answered() {
+        // 全部调用有结果 → 序列原样通过，不增不改
+        let messages = vec![
+            assistant_with_calls(&["c1", "c2"]),
+            tool_result("c1"),
+            tool_result("c2"),
+        ];
+        let paired = pair_missing_tool_results(messages);
+        assert_eq!(paired.len(), 3);
+        assert!(
+            paired
+                .iter()
+                .all(|m| m.content.as_deref() != Some(UNANSWERED_TOOL_RESULT_MARKER)),
+            "不应插入占位"
+        );
+    }
+
+    #[test]
+    fn pairing_ignores_assistant_without_tool_calls() {
+        // 无调用的 assistant / 纯 user 对话不触发补充
+        let messages = vec![
+            ChatMessage {
+                role: MessageRole::User,
+                content: Some("你好".to_string()),
+                ..ChatMessage::default()
+            },
+            ChatMessage {
+                role: MessageRole::Assistant,
+                content: Some("回复".to_string()),
+                ..ChatMessage::default()
+            },
+        ];
+        let paired = pair_missing_tool_results(messages);
+        assert_eq!(paired.len(), 2);
+    }
+
+    #[test]
+    fn pairing_skips_empty_id() {
+        // id 为空的调用无法构造配对关系，跳过不补
+        let mut assistant = assistant_with_calls(&[""]);
+        assistant.tool_calls = Some(vec![ToolCallData {
+            id: String::new(),
+            name: "bad".to_string(),
+            arguments: "{}".to_string(),
+        }]);
+        let paired = pair_missing_tool_results(vec![assistant]);
+        assert_eq!(paired.len(), 1, "空 id 不补占位");
+    }
+
+    #[test]
+    fn pairing_handles_multiple_assistant_messages() {
+        // 多个 assistant 批次各自独立配对：第一批全有结果，第二批全缺
+        let messages = vec![
+            assistant_with_calls(&["a1"]),
+            tool_result("a1"),
+            assistant_with_calls(&["b1", "b2"]),
+        ];
+        let paired = pair_missing_tool_results(messages);
+        // 第一批(2) + 第二批 assistant(1) + 两个占位(2) = 5
+        assert_eq!(paired.len(), 5);
+        let supplemented: Vec<&str> = paired
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(UNANSWERED_TOOL_RESULT_MARKER))
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(supplemented, vec!["b1", "b2"]);
     }
 }

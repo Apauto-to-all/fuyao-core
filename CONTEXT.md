@@ -10,7 +10,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 | 术语 | 代码标识 | 含义 |
 | --- | --- | --- |
-| 引擎 | `Engine` | 能力共享层，启动一次装配 provider / store / 工具 / 插件工厂；对外四动作 `create_session` / `resume_session` / `send` / `shutdown`，另有 `fork_session` / `create_child_session` / `stop_session` / `reload_providers` 等扩展 |
+| 引擎 | `Engine` | 能力共享层，启动一次装配 provider / store / 工具 / 插件工厂；对外四动作 `create_session` / `resume_session` / `send` / `shutdown`，另有 `create_child_session` / `stop_session` / `reload_providers` 等扩展 |
 | ReAct 循环 | `react` 模块 | 每 session 一个 tokio task：想 → 调一批工具 → 消费 guide 队列 → 再想 → 最终回复 |
 | 轮次 | `run_turn` / `TurnOutcome` | 单轮 ReAct 的执行与退出原因（`Completed` / `Interrupted` / `Failed`） |
 | dispatch 管道 | `dispatch` | 统一输出处理链：`intercept`（同步原地修改 / 阻止）→ `deliver`（发送 + 观察） |
@@ -31,9 +31,10 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 存储层 | `SessionStore` | SQLite（WAL）唯一入口；sessions / messages / todos 三表 |
 | 落库序号 | `seq` | 事务内分配，事件级落库后回填到 `EventBase` |
 | 可见窗口 | `load_visible_messages` | 给 LLM 的压缩感知窗口（最新 compaction 摘要 + 其后新消息），与「给人看的」查询路径正交 |
+| 配对兜底 | `pair_missing_tool_results` | wire 消息序列中为缺结果的 tool_call 补占位 tool_result（content 固定「[工具执行被拦截或中断]」标记，读时合成不落库）；主对话与压缩两路共用同一函数——被拦截 / 中断 / 崩溃留下的悬挂对不破协议配对，两路请求前缀序列同口径 |
 | 上下文压缩 | `compaction` / `run_compression` | 插一条 `kind='compaction'` 边界消息 + 更新元数据，旧消息物理保留；触发公式 `prompt_tokens >= threshold × (context_length - summary_max_tokens)` |
 | 回退 | `rollback_to` | 删目标（user 或 compaction 边界）及其后消息；计数类重算，费用不抹账（回退不抹账） |
-| 派生 | `fork_session` / `fork_to` | 复制源会话到新独立会话（parent=None），非破坏（源不动）。两个面：Engine/App 层复制完整可见上下文（活装配，可直接对话）；SessionManager/存储层按目标消息切割复制（`seq < target` 全部消息，纯存储分支，目标必须是 user / compaction 消息，与回退共用目标校验） |
+| 派生 | `fork_session` / `fork_to` | 复制源会话到新独立主会话（parent=None），非破坏（源不动）。两个面：SessionManager / 存储层按目标消息切割复制（`seq < target` 全部消息，纯存储操作非活装配，续聊需 `resume_session`，目标必须是 user / compaction 消息，与回退共用目标校验）；`create_child_session` 的 `Fork` 源复制为子会话（活装配可直接对话，带父标记） |
 | 子会话 | `create_child_session` | 带父标记（`parent_session_id`），rx 不进 fan-in；`Fresh`（空上下文）/ `Fork`（复制）两源 |
 | 双队列 | guide / pending | 用户消息与控制命令消息共用的排队层：条目（`QueueEntry`）自带 mode 决定入队与生效时机——`Guide`（引导队列，工具批完成后即投递）/ `Pending`（排队队列，最终回复后才投递） |
 | 计费 | `calculate_cost` | 全部费用运算集中于此，Decimal 精确，按 `PriceTier` 分档；assistant 消息经 `emit_billed_to_history` 唯一计费时机 |
@@ -95,7 +96,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 三层合并 | `load_merged_config` | `fuyao.toml`：global（`~/.fuyao/`）→ agent 目录 → workspace，递归深合并（嵌套字段级，数组整体覆盖） |
 | 供应商单点 | `[providers]` | 只允许出现在 global 层（单一事实源），他层出现即加载报错；分层的是「选择」，单点的是「定义」 |
 | 全局句柄 | `set_config` / `get_config` | `OnceLock<Arc<FuyaoConfig>>` 进程级只读配置 |
-| 装配门面 | `FuyaoApp` | 一键装配（init → 收集工具 → 装插件 → 启动引擎），四门面：`app`（运行时）/ `sessions`（会话管理）/ `discovery`（选择支持）/ `providers`（供应商管理） |
+| 装配门面 | `FuyaoApp` | 一键装配（init → 收集工具 → 装插件 → 启动引擎），三门面：`app`（运行时）/ `sessions`（会话管理）/ `discovery`（选择支持）；供应商管理（`ProviderManager`）为独立构造的管理入口（纯文件读写，不依赖引擎） |
 | fan-in 汇聚 | `App::recv` | 主 session 的 per-session rx 汇聚进单一 fan_out 通道（容量 512），上层 UI 单一出口消费 |
 
 ## 关键不变量

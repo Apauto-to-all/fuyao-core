@@ -13,7 +13,7 @@ use crate::stream::StreamResult;
 use crate::tool_registry::ToolRegistry;
 use fuyao_api::message::output::{AssistantPayload, ToolCallMessage, ToolCallPayload};
 use fuyao_api::message::{EventBase, OutputEvent};
-use fuyao_api::{AgentPaths, MessageRole, ModelConfig, ToolCallData};
+use fuyao_api::{AgentPaths, ModelConfig, ToolCallData};
 use fuyao_provider::{ChatMessage, ChatRequest, StreamOptions};
 use fuyao_session::SessionStore;
 use std::collections::HashMap;
@@ -57,8 +57,9 @@ pub(crate) struct ResolvedModel {
 /// 这里现读即最新值）。
 ///
 /// **配对兜底**：OpenAI/Anthropic 协议要求每个 assistant 的 tool_call 都有对应的
-/// tool 结果消息。被拦截 Block、中断的工具调用不会有结果——这里在拼消息时
-/// 为缺结果的 tool_call 补一条 error tool_result（content 标记中断）。
+/// tool 结果消息。被拦截 Block、中断、崩溃的工具调用不会有结果——拼消息后统一过
+/// [`fuyao_provider::pair_missing_tool_results`] 补占位（与压缩路径共用同一函数，
+/// 两路请求的消息序列口径一致）。
 pub(crate) async fn build_chat_request(store: &SessionStore, session_id: &str) -> ChatRequest {
     let history = match store.load_visible_messages(session_id).await {
         Ok(msgs) => msgs,
@@ -92,49 +93,21 @@ pub(crate) async fn build_chat_request(store: &SessionStore, session_id: &str) -
         }
     };
 
-    // 先收集所有已有 tool 结果的 tool_call_id（用于配对检查）
-    let mut answered_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for m in &history {
-        if matches!(m.role, MessageRole::Tool)
-            && let Some(id) = &m.tool_call_id
-        {
-            answered_ids.insert(id.as_str());
-        }
-    }
-
-    let mut messages = Vec::with_capacity(history.len());
-    for m in &history {
-        messages.push(ChatMessage {
-            role: m.role,
-            content: m.content.clone(),
-            images: m.images.clone(),
-            reasoning: m.reasoning.clone(),
-            tool_calls: m.tool_calls.clone(),
-            tool_call_id: m.tool_call_id.clone(),
-            tool_name: m.tool_name.clone(),
-        });
-
-        // assistant 消息后：为缺结果的 tool_call 补 error tool_result
-        if matches!(m.role, MessageRole::Assistant)
-            && let Some(tool_calls) = m.tool_calls.as_ref()
-        {
-            // typed 直接迭代，id / name 即字段
-            for tc in tool_calls {
-                if !tc.id.is_empty() && !answered_ids.contains(tc.id.as_str()) {
-                    // 缺结果：补 error tool_result
-                    messages.push(ChatMessage {
-                        role: MessageRole::Tool,
-                        content: Some("[工具执行被拦截或中断]".to_string()),
-                        images: vec![],
-                        reasoning: None,
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                        tool_name: Some(tc.name.clone()),
-                    });
-                }
-            }
-        }
-    }
+    // 消息映射后统一配对兜底：为缺结果的 tool_call 补占位 tool_result
+    let messages = fuyao_provider::pair_missing_tool_results(
+        history
+            .iter()
+            .map(|m| ChatMessage {
+                role: m.role,
+                content: m.content.clone(),
+                images: m.images.clone(),
+                reasoning: m.reasoning.clone(),
+                tool_calls: m.tool_calls.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+                tool_name: m.tool_name.clone(),
+            })
+            .collect(),
+    );
 
     ChatRequest {
         messages,
@@ -310,6 +283,7 @@ pub(crate) fn tool_call_event_to_data(event: &OutputEvent) -> Option<ToolCallDat
 mod tests {
     use super::*;
     use crate::ToolRegistryBuilder;
+    use fuyao_api::MessageRole;
     use fuyao_api::{Message, Session};
 
     /// 构造带工具调用的 assistant Message
@@ -382,7 +356,7 @@ mod tests {
         // c1 和 c3 被补充
         let supplemented_ids: Vec<_> = tool_msgs
             .iter()
-            .filter(|m| m.content.as_deref() == Some("[工具执行被拦截或中断]"))
+            .filter(|m| m.content.as_deref() == Some(fuyao_provider::UNANSWERED_TOOL_RESULT_MARKER))
             .filter_map(|m| m.tool_call_id.as_deref())
             .collect();
         assert_eq!(

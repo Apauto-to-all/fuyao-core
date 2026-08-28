@@ -22,7 +22,8 @@ pub use factory::{BuildProviderError, build_provider};
 pub use openai::OpenAIProvider;
 pub use provider::{
     BoxStream, ChatMessage, ChatRequest, ChatResponse, FinishReason, Provider, StreamError,
-    StreamEvent, StreamOptions, StreamUsage,
+    StreamEvent, StreamOptions, StreamUsage, UNANSWERED_TOOL_RESULT_MARKER,
+    pair_missing_tool_results,
 };
 pub use registry::{
     ProviderRegistry, agent_paths_cache_key, clear_cache, get_model, get_provider, list_models,

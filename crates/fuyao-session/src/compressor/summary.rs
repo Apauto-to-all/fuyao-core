@@ -2,6 +2,8 @@
 //!
 //! 关键约束（保留前缀缓存）：
 //! - **消息原样发**：所有 user/assistant/tool 消息保持原 role/content/tool_calls 不变
+//! - **配对兜底**：缺结果的 tool_call（被拦截 / 中断 / 崩溃）补占位 tool_result
+//!   （`pair_missing_tool_results`，与主对话请求共用），协议配对不破、序列口径一致
 //! - **system 不变**：用 session 原本的 system_prompt（前缀缓存完整命中）
 //! - **末尾追加一条 user 消息**：内容为固定摘要指令（`COMPRESSION_SYSTEM_PROMPT`），
 //!   可选拼入发送方的控制命令附言尾段（手动触发路径；附言只影响摘要取材侧重，
@@ -122,12 +124,14 @@ fn to_chat_message(m: &Message) -> ChatMessage {
     }
 }
 
-/// 生成摘要：消息原样发 + 末尾追加摘要指令 + 流式收集
+/// 生成摘要：消息原样发 + 配对兜底 + 末尾追加摘要指令 + 流式收集
 ///
 /// **压缩铁律**：压缩 = 复用 session 当前模型配置（model + thinking_type + reasoning_effort
 /// 原样），仅禁用工具，流式调一次。与主对话唯一的差别是 tools 为空——独立摘要流，不进
-/// ReAct。system / messages 原样不动（前缀缓存生命线）。options 由调用方从 session 物化值
-/// 构造，本函数在执行边界强制 tools=None，确保「禁用工具」不变量不被绕过。
+/// ReAct。system / messages 原样不动（前缀缓存生命线），缺结果的 tool_call 补占位
+/// tool_result（与主对话 [`fuyao_provider::pair_missing_tool_results`] 同一函数）。
+/// options 由调用方从 session 物化值构造，本函数在执行边界强制 tools=None，
+/// 确保「禁用工具」不变量不被绕过。
 ///
 /// # 参数
 /// - `system_prompt`：session 原本的 system_prompt（保持不变，前缀缓存命中）
@@ -155,9 +159,12 @@ pub async fn generate_summary(
         return Err(CompressionError::NothingToCompress);
     }
 
-    // 构造请求：消息原样 + 末尾追加摘要指令（含可选附言尾段）
+    // 构造请求：消息原样 + 配对兜底 + 末尾追加摘要指令（含可选附言尾段）
     // system 保持 session 原值不变 —— 前缀缓存的生命线
-    let mut chat_messages: Vec<ChatMessage> = messages.iter().map(to_chat_message).collect();
+    // 配对兜底与主对话请求共用同一函数：缺结果的 tool_call（被拦截 / 中断 / 崩溃）
+    // 在两路请求里补出相同的占位序列——协议配对不破，前缀缓存口径一致
+    let mut chat_messages =
+        fuyao_provider::pair_missing_tool_results(messages.iter().map(to_chat_message).collect());
     chat_messages.push(ChatMessage {
         role: MessageRole::User,
         content: Some(build_summary_instruction(note)),
@@ -456,8 +463,8 @@ mod tests {
             name: "bash".into(),
             arguments: "{}".into(),
         }]);
-        msg.tool_call_id = Some("call_1".to_string());
-        msg.tool_name = Some("bash".to_string());
+        msg.tool_call_id = Some("call_1".into());
+        msg.tool_name = Some("bash".into());
 
         let cm = to_chat_message(&msg);
         assert_eq!(cm.role, MessageRole::Assistant);
@@ -467,5 +474,60 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(cm.tool_call_id.as_deref(), Some("call_1"));
         assert_eq!(cm.tool_name.as_deref(), Some("bash"));
+    }
+
+    #[tokio::test]
+    async fn generate_summary_pairs_dangling_tool_calls() {
+        // 崩溃 / 中断场景：assistant 带 2 个调用，仅 c2 落了结果，c1 悬挂。
+        // 摘要请求应为 c1 补占位 tool_result（协议配对），占位位于 assistant 之后、
+        // 追加的摘要指令之前
+        let provider = Arc::new(StreamingProvider::new(vec!["## 目标".into()]));
+        let mut assistant = Message::assistant(None);
+        assistant.tool_calls = Some(vec![
+            fuyao_api::ToolCallData {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            },
+            fuyao_api::ToolCallData {
+                id: "c2".into(),
+                name: "grep".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let msgs = vec![
+            Message::user("问题".to_string()),
+            assistant,
+            Message::tool_result("c2".into(), "grep".into(), "结果".into()),
+        ];
+
+        let mut cb = noop_delta();
+        let result = generate_summary(
+            Some("你是助手"),
+            &msgs,
+            &(provider.clone() as Arc<dyn Provider>),
+            "model",
+            None,
+            StreamOptions::default(),
+            &mut cb,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let request = provider.last_request().expect("应捕获到摘要请求");
+        // user + assistant + 占位c1 + 结果c2 + 追加指令 = 5
+        assert_eq!(request.messages.len(), 5);
+        // 占位 c1 紧随 assistant（索引 2）
+        let placeholder = &request.messages[2];
+        assert!(matches!(placeholder.role, MessageRole::Tool));
+        assert_eq!(placeholder.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(
+            placeholder.content.as_deref(),
+            Some(fuyao_provider::UNANSWERED_TOOL_RESULT_MARKER)
+        );
+        // 末条仍是追加的摘要指令（占位不落最后）
+        let last = request.messages.last().expect("末尾应有追加指令");
+        assert!(matches!(last.role, MessageRole::User));
+        assert_eq!(last.content.as_deref(), Some(COMPRESSION_SYSTEM_PROMPT));
     }
 }
