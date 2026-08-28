@@ -59,11 +59,11 @@ pub trait SubagentOps: Send + Sync {
         event: InputEvent,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-    /// 销毁指定 session（带原因）
-    fn end_session<'a>(
+    /// 销毁指定 session（带原因，运行时资源回收：停 task、dispose 插件实例）
+    fn destroy_session<'a>(
         &'a self,
         id: &'a str,
-        end_reason: &'a str,
+        reason: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 

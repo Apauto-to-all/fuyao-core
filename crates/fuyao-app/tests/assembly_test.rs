@@ -1,6 +1,6 @@
 //! fuyao-app 集成测试：装配链路
 //!
-//! 聚焦**装配层专属**行为（不测引擎核心 ReAct / retry / shutdown / end_session——
+//! 聚焦**装配层专属**行为（不测引擎核心 ReAct / retry / shutdown / destroy_session——
 //! 那些已迁移至 `fuyao-core/tests/`，由 Engine 直连验证）：
 //! 1. `build_tool_registry`：内置工具（fuyao-tools 静态表）按 `[tools.enabled]` 注入注册表，
 //!    断言核心工具 read/write/glob/grep/bash 存在。

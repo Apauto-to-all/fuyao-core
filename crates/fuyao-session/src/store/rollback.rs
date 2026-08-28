@@ -233,8 +233,7 @@ mod tests {
     async fn rollback_to_user_deletes_target_and_after_recounts() {
         // 场景：u1, a1, u2, a2 → 回退到 u2 → 删 u2, a2 → message_count 从 4 变 2
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "u1").await; // seq 1
         insert_assistant(&store, &session.id, "a1").await; // seq 2
@@ -264,8 +263,7 @@ mod tests {
         // 场景：u1, a1(带 tool_call), t1(结果), u2, a2(带 tool_call), t2(结果)
         //       → 回退到 u2 → 删 u2, a2, t2 → tool_call_count 从 2 变 1
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "u1").await; // seq 1
         let mut a1 = Message::assistant(None);
@@ -303,8 +301,7 @@ mod tests {
         // 场景：u1, a1, [compaction@seq3], u2, a2 → 回退到 compaction@seq3
         //       → 删 compaction, u2, a2 → 压缩元数据清空
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "u1").await; // seq 1
         insert_assistant(&store, &session.id, "a1").await; // seq 2
@@ -341,8 +338,7 @@ mod tests {
         // 场景：u1, [c1@2], u2, [c2@4], u3, a3
         //       → 回退到 u2@seq3 → 删 u2, c2, u3, a3 → last_compacted_seq 落到 c1
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "u1").await; // seq 1
         let c1 = store
@@ -375,8 +371,7 @@ mod tests {
     async fn rollback_across_all_compactions_clears_metadata() {
         // 场景：u1, [c1@2], [c2@3], u2 → 回退到 u1 → 全删（含 u1 本体）→ 全清
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let u1 = insert_user(&store, &session.id, "u1").await; // seq 1
         store
@@ -406,8 +401,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_rejects_assistant_target() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "u1").await; // seq 1
         let a1 = insert_assistant(&store, &session.id, "a1").await; // seq 2
 
@@ -425,8 +419,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_rejects_tool_target() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "u1").await; // seq 1
         let t_seq = insert_tool(&store, &session.id, "call_1", "结果").await; // seq 2
 
@@ -449,8 +442,7 @@ mod tests {
     #[tokio::test]
     async fn rollback_errors_when_target_seq_missing() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "u1").await; // seq 1
 
         // seq=99 不存在
@@ -466,8 +458,7 @@ mod tests {
         // 消费类字段现由 insert_message 事务内累加(assistant 消息贡献 token/cost),
         // 这里插入一条带消费的 assistant 消息构造真实消费,再回退删它,验证账本不动。
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let u1 = insert_user(&store, &session.id, "u1").await; // seq 1
         let mut a1 = Message::assistant(None);
@@ -502,8 +493,7 @@ mod tests {
     async fn rollback_to_only_message_empties_session() {
         // 目标就是最新且唯一消息 → 连它一起删 → 会话消息清空，元数据归零
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         let u1 = insert_user(&store, &session.id, "u1").await; // seq 1
 
         store.rollback_to(&session.id, u1).await.unwrap();

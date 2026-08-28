@@ -31,7 +31,7 @@
 
 use super::row::MessageRow;
 use crate::error::SessionError;
-use fuyao_api::{Message, MessageKind, MessageRole, Session};
+use fuyao_api::{Message, MessageKind, MessageRole};
 
 impl super::SessionStore {
     /// 把源会话的可见窗口整窗复制为新会话，`parent_session_id` 由调用方指定
@@ -91,8 +91,8 @@ impl super::SessionStore {
         // 3. 构造新 session 行并落库：parent 由调用方指定，计数字段从 0 起算
         //    （第 4 步按复制结果累加到位）。随机 id 主键冲突时重新生成重试，
         //    仅重试主键冲突——其它错误（磁盘满、连接断等）重试无意义且掩盖真实故障
-        let mut new_session = Session::new(workspace, None, system_prompt);
-        new_session.parent_session_id = parent_session_id;
+        let mut new_session =
+            super::session::new_session(workspace, parent_session_id, system_prompt);
         for attempt in 0..=super::session::ID_CONFLICT_MAX_RETRIES {
             match Self::insert_session_row(&mut *tx, &new_session).await {
                 Ok(()) => break,
@@ -105,7 +105,7 @@ impl super::SessionStore {
                             session_id = %new_session.id,
                             cause = "session id 主键冲突，重新生成 id 重试",
                         );
-                        new_session.regenerate_id();
+                        new_session.id = super::session::generate_id();
                     } else {
                         return Err(e);
                     }
@@ -227,13 +227,14 @@ mod tests {
 
     /// 落库一个带 workspace 与 system_prompt 的源会话
     async fn seed_source(store: &SessionStore) -> fuyao_api::Session {
-        let session = fuyao_api::Session::new(
-            Some("/proj".to_string()),
-            None,
-            Some("系统提示词".to_string()),
-        );
-        store.create(&session).await.unwrap();
-        session
+        store
+            .create_session(
+                Some("/proj".to_string()),
+                None,
+                Some("系统提示词".to_string()),
+            )
+            .await
+            .unwrap()
     }
 
     // ===== 整窗复制 + parent 标记 =====

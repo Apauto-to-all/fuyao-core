@@ -8,7 +8,7 @@
 //! 以及这些动作共用的内部装配逻辑（[`Engine::assemble_session`] /
 //! [`Engine::assemble_session_hooks`]）。
 //!
-//! 所有创建方法都返 `(SessionId, Receiver<OutputEvent>)`——id 用于后续 send/end，
+//! 所有创建方法都返 `(SessionId, Receiver<OutputEvent>)`——id 用于后续 send/destroy，
 //! rx 用于消费该 session 的产出事件（per-session 通道化）。
 //!
 //! 独立会话的派生（fork 分支）不经引擎动作：由存储层
@@ -42,14 +42,15 @@ impl Engine {
         // 构建系统提示词（Agent 配置决定人格）
         let system_prompt = build_system_prompt(&self.params.agent_paths, &definition, usage);
 
-        // 创建 Session（8 位 id）。工作目录来自 agent_paths.workspace，创建时定死，
-        // 经 normalize_workspace 统一分隔符为正斜杠（跨平台形态一致，按项目过滤匹配稳定）。
+        // 创建并落库 Session（8 位 id，主键冲突自动重试）。工作目录来自
+        // agent_paths.workspace，创建时定死，经 normalize_workspace 统一分隔符为
+        // 正斜杠（跨平台形态一致，按项目过滤匹配稳定）。
+        // 消息产生时由 emit_to_history 单条 insert_message 落库。
         let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
-        let mut session = Session::new(workspace, None, Some(system_prompt));
-
-        // 落库元数据（消息产生时由 emit_to_history 单条 insert_message 落库）。
-        // id 随机生成，主键冲突时由 create_with_retry 重新生成重试。
-        self.store.create_with_retry(&mut session).await?;
+        let session = self
+            .store
+            .create_session(workspace, None, Some(system_prompt))
+            .await?;
 
         let session_id = session.id.clone();
 
@@ -185,14 +186,19 @@ impl Engine {
         // 按模式构造 + 落库新 session（不带 assemble，assemble 在统一出口做）
         let new_session_id = match source {
             ChildSessionSource::Fresh => {
-                // 全新子任务：空上下文，system_prompt 从 agent_config 构建
+                // 全新子任务：空上下文，system_prompt 从 agent_config 构建，
+                // parent 标记为父 id（子任务会话，主列表不展示、按父定位）
                 let system_prompt =
                     build_system_prompt(&self.params.agent_paths, &definition, usage);
                 let workspace = fuyao_api::normalize_workspace(&self.params.agent_paths.workspace);
-                let mut s = Session::new(workspace, None, Some(system_prompt));
-                s.parent_session_id = Some(parent_session_id.clone());
-                self.store.create_with_retry(&mut s).await?;
-                s.id
+                self.store
+                    .create_session(
+                        workspace,
+                        Some(parent_session_id.clone()),
+                        Some(system_prompt),
+                    )
+                    .await?
+                    .id
             }
             ChildSessionSource::Fork(ref source_id) => {
                 // fork 子任务：存储层整窗复制源可见上下文（单事务原子），parent 标记为父 id。

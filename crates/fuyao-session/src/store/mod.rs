@@ -5,8 +5,10 @@
 //!
 //! 模块组织（按职责分文件，各文件单一职责）：
 //! - [`row`]：sessions / messages 表的行映射（DB 行 ↔ 领域类型）
-//! - [`session`]：sessions 表的全部操作——生命周期读写（create/get/delete/list）+
-//!   单字段局部更新（update_system_prompt / update_title / end_session）
+//! - [`session`]：sessions 表的写操作面——创建（create_session，构造 + 落库 +
+//!   id 冲突重试一条龙）/ 删除（delete 会话组级联）/ 元数据更新（update_session）
+//! - [`session_query`]：sessions 表的只读查询面——get / list_all /
+//!   list_child_sessions / count_with_filter
 //! - [`message`]：messages 表的全部操作——写入（insert，事务内同时累加 sessions
 //!   计数 / 费用）/ 计数（count_user_messages）/ 查询（load_full_history 全量审计 /
 //!   list_messages_before 游标分页浏览）
@@ -29,6 +31,7 @@ mod message;
 mod rollback;
 mod row;
 mod session;
+mod session_query;
 mod todo;
 mod visible_window;
 

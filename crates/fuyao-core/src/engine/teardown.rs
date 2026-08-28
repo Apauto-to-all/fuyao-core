@@ -1,11 +1,11 @@
 //! 会话销毁与引擎关闭（单 session 销毁 / 引擎级关闭）
 //!
 //! 本模块集中 [`Engine`] 的「死亡」相关动作：
-//! - [`Engine::end_session`]：销毁单个 session（不影响其他 session）
+//! - [`Engine::destroy_session`]：销毁单个 session（不影响其他 session）
 //! - [`Engine::shutdown`]：关闭整个引擎（cancel 所有 session task 并并发收尾）
 //!
 //! 两条路径共用私有 helper [`end_one_session`] 完成实际收尾（cancel+超时+abort 兜底），
-//! 差异只在「动哪个 token」：end_session 动单个 child_token，shutdown 动引擎 root token。
+//! 差异只在「动哪个 token」：destroy_session 动单个 child_token，shutdown 动引擎 root token。
 
 use super::*;
 
@@ -20,10 +20,8 @@ impl Engine {
     /// 2. 从调度表移除该 session 的 `SessionHandle`（不存在 → `Err(SessionNotFound)`）
     /// 3. cancel 该 session 的 **child_token**（**不动引擎 root token**，其他 session 不受影响）
     ///    → task 走与 shutdown 完全相同的优雅退出路径（idle select! / turn 中段 select! /
-    ///    retry 退避 sleep 全部监听 child_token），退出前调 `store.update(session)` 落 in-flight 状态
+    ///    retry 退避 sleep 全部监听 child_token），退出即收尾完成
     /// 4. 超时（`SHUTDOWN_TASK_TIMEOUT`）等待 task 退出，超时 `abort_handle.abort()` 兜底强杀
-    /// 5. task 退出**之后**调 `store.end_session(id, reason)` 填 `ended_at` / `end_reason`
-    ///    （时序关键：必须在 task 退出后调，否则会被 task 退出时的全量 `update(session)` 覆盖）
     ///
     /// 与 `shutdown` 的关系：二者共用私有 helper [`end_one_session`] 完成实际收尾，
     /// 差异只在"影响范围"——本方法动一个 child_token，shutdown 动引擎 root token + flag。
@@ -33,8 +31,7 @@ impl Engine {
     /// # 错误
     /// - [`EngineError::Shutdown`]：引擎已 shutdown
     /// - [`EngineError::SessionNotFound`]：session id 不在活跃调度表（已结束或从未创建）
-    /// - [`EngineError::Storage`]：落库 `ended_at` / `end_reason` 失败（task 已退出，但元数据未更新）
-    pub async fn end_session(&self, id: &SessionId, end_reason: &str) -> Result<(), EngineError> {
+    pub async fn destroy_session(&self, id: &SessionId, reason: &str) -> Result<(), EngineError> {
         // shutdown 同步快路径检查：引擎已关 → end 单 session 无意义
         if self.shutdown.load(Ordering::Acquire) {
             return Err(EngineError::Shutdown);
@@ -58,7 +55,7 @@ impl Engine {
             SessionExitOutcome::Finished => {
                 tracing::info!(
                     session_id = %id,
-                    end_reason = end_reason,
+                    reason = reason,
                     "session 已正常结束"
                 );
             }
@@ -78,10 +75,8 @@ impl Engine {
             }
         }
 
-        // task 退出后再写 ended_at / end_reason，保证是最终值
-        // （task 退出前的 store.update(session) 落的是当前元数据，ended_at/end_reason 仍为 None；
-        //  这里的单字段 UPDATE 把它们写成最终值，不被覆盖）
-        self.store.end_session(id, end_reason).await?;
+        // task 退出即销毁完成——持久化层无需收尾写入（消息产生即落库，
+        // 计数 / 费用由 insert_message 事务内原子维护，DB 无终态字段要补）
         Ok(())
     }
 
@@ -94,8 +89,8 @@ impl Engine {
     /// 1. shutdown flag 置位（`AtomicBool::store(true)`）→ 后续 `send` 立即返回 `Err(Shutdown)`，
     ///    `recv` 先 drain 残余事件再返回 None（不丢 shutdown 前最后几条产出）
     /// 2. cancel 引擎级 shutdown_token → 所有 session task 的 select! 同时收到 cancelled 信号
-    /// 3. 每个 session task 优雅退出：select! 监听 cancelled → break 主循环 →
-    ///    退出前调一次 `store.update(session)` 落库（保护 in-flight 状态，失败仅 warn 不阻塞）
+    /// 3. 每个 session task 优雅退出：select! 监听 cancelled → break 主循环，
+    ///    消息与统计已在产生时即落库（insert_message 事务内原子维护），退出无需补写
     /// 4. **并发**收尾所有 task（每个 handle spawn 一个 [`end_one_session`] 进 JoinSet）：
     ///    每个 task 独立享 `SHUTDOWN_TASK_TIMEOUT` 超时预算，超时则 `abort_handle.abort()` 兜底强杀；
     ///    收尾内含该 session 插件实例的逆序 dispose（生命周期闭环，见 [`end_one_session`]）。
@@ -139,7 +134,7 @@ impl Engine {
         }
 
         // 4. 并发收尾：每个 handle spawn 一个 end_one_session
-        //    （内含 cancel+超时+abort 兜底+插件实例 dispose，与 end_session 单 session 版本共用同一份收尾逻辑）
+        //    （内含 cancel+超时+abort 兜底+插件实例 dispose，与 destroy_session 单 session 版本共用同一份收尾逻辑）
         let mut set: JoinSet<(SessionId, SessionExitOutcome)> = JoinSet::new();
         for (id, handle) in handles {
             set.spawn(async move {
@@ -212,7 +207,7 @@ impl Engine {
 
 /// session task 收尾后的退出结局
 ///
-/// [`end_one_session`] 的返回值，[`Engine::end_session`] 与 [`Engine::shutdown`] 共用：
+/// [`end_one_session`] 的返回值，[`Engine::destroy_session`] 与 [`Engine::shutdown`] 共用：
 /// - `Finished`：task 正常退出（task 内 select! 收到 cancelled 后走中断路径落库退出）
 /// - `Panicked`：task 以 panic 退出（payload 已转字符串，供 WARN 日志输出）
 /// - `Aborted`：task 在 `SHUTDOWN_TASK_TIMEOUT` 内未退出，已 abort 强杀
@@ -224,9 +219,9 @@ enum SessionExitOutcome {
 
 /// 单个 session task 的收尾（cancel + 超时等待 + abort 兜底 + 插件实例 dispose）
 ///
-/// `Engine::end_session`（单 session 销毁）与 `Engine::shutdown`（全部 session 销毁）
+/// `Engine::destroy_session`（单 session 销毁）与 `Engine::shutdown`（全部 session 销毁）
 /// 共用本 helper，保证两条路径的收尾逻辑完全一致——差异只在"动哪个 token"：
-/// - `end_session`：在调用方先 cancel 该 session 的 **child_token** 再调本 helper
+/// - `destroy_session`：在调用方先 cancel 该 session 的 **child_token** 再调本 helper
 ///   （本 helper 不重复 cancel，避免与"child_token 已 cancel"假设耦合）
 /// - `shutdown`：在调用方先 cancel 引擎级 **root token**，所有 child 同时 cancel，
 ///   然后把每个 handle spawn 进本 helper

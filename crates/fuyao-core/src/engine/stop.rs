@@ -3,8 +3,8 @@
 //! [`Engine::stop_session`]：打断指定 session 在跑的 turn，并**等到它完全终止**
 //! （含中断收尾的补发落库）才返回——返回即该 session 的 DB 已静默。
 //!
-//! 与 [`teardown`](super::teardown) 模块的 `end_session`（会话销毁）正交：
-//! stop 后 session 保持存活（不写 `ended_at`、task 不退出、调度表不移除），
+//! 与 [`teardown`](super::teardown) 模块的 `destroy_session`（会话销毁）正交：
+//! stop 后 session 保持存活（task 不退出、调度表不移除），
 //! 只是清空在途运行。典型消费方是应用编排层的「先停后改库」两步组合
 //! （如数据库回退：先 stop 屏障停 turn，再做存储层写操作）。
 
@@ -32,7 +32,7 @@ impl Engine {
     /// # 幂等语义（「确保静默」，而非「必须有个 turn 可停」）
     ///
     /// - session 不在调度表（未挂载 / 已结束）→ 无 task 即无 DB 写入者，静默前提
-    ///   天然成立，直接 `Ok(())`——与 `end_session` 对缺失 id 报 `SessionNotFound`
+    ///   天然成立，直接 `Ok(())`——与 `destroy_session` 对缺失 id 报 `SessionNotFound`
     ///   的差异是刻意的：销毁是生命周期迁移（目标不存在是错误），停止是静默保证
     ///   （目标不存在则保证平凡成立）
     /// - 相位已 `Idle`（无 turn 在跑）→ 直接 `Ok(())`

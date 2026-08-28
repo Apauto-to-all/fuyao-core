@@ -53,7 +53,7 @@ pub(crate) struct ResolvedModel {
 /// messages 只装 user/assistant/tool 对话历史。
 ///
 /// **DB 唯一数据源**：消息与 system_prompt 均从 DB 现查——事件级落库模式下消息
-/// 不进内存，system_prompt 也不缓存（压缩重建后经 `update_system_prompt` 落库，
+/// 不进内存，system_prompt 也不缓存（压缩重建后经 `update_session` 落库，
 /// 这里现读即最新值）。
 ///
 /// **配对兜底**：OpenAI/Anthropic 协议要求每个 assistant 的 tool_call 都有对应的
@@ -336,9 +336,10 @@ mod tests {
         let store = fuyao_session::SessionStore::new(dir.join("test.db"))
             .await
             .expect("构造 SessionStore 失败");
-        let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-        session.id = "test_session".to_string();
-        store.create(&session).await.unwrap();
+        let session = store
+            .create_session(None, None, Some("系统提示词".to_string()))
+            .await
+            .expect("落库会话失败");
         (store, session)
     }
 

@@ -5,7 +5,7 @@
 //! - 模型优先级：`[models.fast]` → 当前引擎模型 → 放弃
 //! - 从引擎级共享的 ProviderRegistry 取 Provider 实例（fast 可能跨 Provider）
 //! - 用非流式 `provider.chat()`（标题是短文本，无需流式增量）
-//! - 只生成标题文本；落库（`SessionStore::update_title`）与事件发布由调用方负责（职责分离）
+//! - 只生成标题文本；落库（`SessionStore::update_session`）与事件发布由调用方负责（职责分离）
 //!
 //! # 三者独立（禁止绑定）
 //!

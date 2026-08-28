@@ -9,14 +9,13 @@
 //! - **费用累积持久化往返**:insert_message 插入带 cost 的 assistant 消息 →
 //!   store.get 读回,验证 total_cost / token 累积跨 DB 往返精确
 //! - **多 session 隔离**:N 个 session 各自插消息,互不串扰
-//! - **完整 session 生命周期**(create → insert_message 累加消费 → end_session → get 读回 ended_at)
 //!
 //! 全部使用默认配置(不调 set_config),走 get_config 未 set 返回 default 的兜底。
 
 mod common;
 
 use common::temp_store;
-use fuyao_api::{ImageContent, Message, MessageKind, MessageRole, Session};
+use fuyao_api::{ImageContent, Message, MessageKind, MessageRole};
 
 // ============================================================================
 // 消息可见性与统计一致性
@@ -26,8 +25,7 @@ use fuyao_api::{ImageContent, Message, MessageKind, MessageRole, Session};
 async fn visible_messages_match_inserted_count() {
     // 插入 N 条消息后，load_visible_messages 长度应等于插入数（未经压缩）
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     for i in 0..5 {
         let mut msg = Message::user(format!("消息_{i}"));
@@ -42,8 +40,7 @@ async fn visible_messages_match_inserted_count() {
 async fn messages_preserve_role_and_content_on_roundtrip() {
     // 消息插入后读回，role / content / kind 应保持（持久化往返契约）
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     let mut user_msg = Message::user("用户提问".to_string());
     store
@@ -70,8 +67,7 @@ async fn messages_preserve_role_and_content_on_roundtrip() {
 async fn images_preserve_on_roundtrip() {
     // 带图消息插入后读回，images 应完整保持（多图 + mime + base64 逐字段一致）
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     let images = vec![
         ImageContent {
@@ -100,8 +96,7 @@ async fn images_preserve_on_roundtrip() {
 async fn no_images_roundtrips_empty() {
     // 纯文本消息读回 images 恒为空（NULL 列 → 空 vec）
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     let mut msg = Message::user("纯文本".to_string());
     store.insert_message(&session.id, &mut msg).await.unwrap();
@@ -114,8 +109,7 @@ async fn no_images_roundtrips_empty() {
 async fn seq_is_monotonically_increasing_across_inserts() {
     // insert_message 分配的 seq 应单调递增（UNIQUE(session_id, seq) 保证）
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     let mut seqs = Vec::new();
     for i in 0..4 {
@@ -143,8 +137,7 @@ async fn insert_message_accumulates_metadata_roundtrip() {
     //   (user/tool 消息这些字段恒为 0,加 0 无害)
     // 本测试通过插入混合消息构造可精确断言的累计值,get 读回验证往返无丢失。
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     // 3 条 user → message_count = 3
     for i in 0..3 {
@@ -184,15 +177,17 @@ async fn insert_message_accumulates_metadata_roundtrip() {
 }
 
 #[tokio::test]
-async fn update_title_and_system_prompt_roundtrip() {
-    // 单字段更新（update_title / update_system_prompt）后 get 读回应反映新值
+async fn update_session_title_and_system_prompt_roundtrip() {
+    // 局部元数据更新（update_session）后 get 读回应反映新值
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
-    store.update_title(&session.id, "新标题").await.unwrap();
     store
-        .update_system_prompt(&session.id, "你是助手")
+        .update_session(&session.id, Some("新标题"), None)
+        .await
+        .unwrap();
+    store
+        .update_session(&session.id, None, Some("你是助手"))
         .await
         .unwrap();
 
@@ -211,8 +206,7 @@ async fn accumulated_cost_persists_through_insert_roundtrip() {
     // (DB 原子自增,DB 唯一数据源)。插入多条带 cost 的 assistant 消息后,
     // get 读回验证累积费用跨 DB 往返无精度漂移。
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     // 累积 5 条带 cost 的 assistant 消息(insert_message 事务内累加 total_cost)
     for _ in 0..5 {
@@ -237,8 +231,7 @@ async fn insert_message_only_counts_assistant_tokens_and_cost() {
     // 语义上等价于「只有 assistant 消息贡献 token/cost」。
     // 本测试验证混合消息落库场景下,token/cost 只反映 assistant 那条。
     let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
+    let session = store.create_session(None, None, None).await.unwrap();
 
     // 一条 user(token/cost 为 0)+ 一条 assistant(带 token/cost)+ 一条 tool(token/cost 为 0)
     let mut user_msg = Message::user("hi".to_string());
@@ -279,10 +272,8 @@ async fn insert_message_only_counts_assistant_tokens_and_cost() {
 async fn multiple_sessions_isolate_messages() {
     // 两个 session 各自插入消息，load_visible_messages 不应串扰
     let store = temp_store().await;
-    let session_a = Session::new(None, None, None);
-    let session_b = Session::new(None, None, None);
-    store.create(&session_a).await.unwrap();
-    store.create(&session_b).await.unwrap();
+    let session_a = store.create_session(None, None, None).await.unwrap();
+    let session_b = store.create_session(None, None, None).await.unwrap();
 
     for i in 0..3 {
         let mut msg = Message::user(format!("A_{i}"));
@@ -316,48 +307,10 @@ async fn count_and_list_all_reflect_multiple_sessions() {
     // count / list_all 应正确反映多 session 状态
     let store = temp_store().await;
     for _ in 0..3 {
-        let session = Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        store.create_session(None, None, None).await.unwrap();
     }
 
     assert_eq!(store.count_with_filter(None).await.unwrap(), 3);
     let listed = store.list_all(None, 100, 0).await.unwrap();
     assert_eq!(listed.len(), 3);
-}
-
-// ============================================================================
-// 完整 session 生命周期
-// ============================================================================
-
-#[tokio::test]
-async fn full_session_lifecycle_create_to_end() {
-    // 端到端 happy-path:create → insert_message(事务内累加消费) → end_session → get 读回 ended_at。
-    // 这条跨多方法的链路单测从未覆盖。
-    let store = temp_store().await;
-    let session = Session::new(None, None, None);
-    store.create(&session).await.unwrap();
-
-    // 插入对话:assistant 消息的 token/cost 由 insert_message 事务内累加进 sessions 表
-    let mut user_msg = Message::user("开始任务".to_string());
-    store
-        .insert_message(&session.id, &mut user_msg)
-        .await
-        .unwrap();
-    let mut assistant_msg = Message::assistant(Some("任务完成".to_string()));
-    assistant_msg.prompt_tokens = 200;
-    assistant_msg.completion_tokens = 80;
-    assistant_msg.cost = 0.02;
-    store
-        .insert_message(&session.id, &mut assistant_msg)
-        .await
-        .unwrap();
-
-    // 结束会话(单字段 UPDATE,不覆盖前面 insert_message 累加的消费字段)
-    store.end_session(&session.id, "正常结束").await.unwrap();
-
-    let read_back = store.get(&session.id).await.unwrap().unwrap();
-    assert!(read_back.ended_at.is_some(), "结束后 ended_at 应被设置");
-    assert_eq!(read_back.end_reason.as_deref(), Some("正常结束"));
-    assert!((read_back.total_cost - 0.02).abs() < 1e-9);
-    assert_eq!(read_back.total_prompt_tokens, 200);
 }

@@ -1,13 +1,12 @@
-//! Engine::end_session 单 session 销毁 + 子 session 生命周期
+//! Engine::destroy_session 单 session 销毁 + 子 session 生命周期
 //!
 //! 验证 [`Engine`] 自身的 session 生命周期管理，不经过装配层（fuyao-app）。
 //! 直连 `engine.create_session` / `create_child_session` 返回的 per-session 通道消费事件。
 //!
 //! 聚焦点：
-//! - end_session 后该 session 从调度表移除（后续 send 返 SessionNotFound）
-//! - end_session 落库 ended_at / end_reason
-//! - end_session 只销毁指定 session，不波及其他 session
-//! - end_session 触发该 session 插件实例的逆序 dispose（生命周期闭环）
+//! - destroy_session 后该 session 从调度表移除（后续 send 返 SessionNotFound）
+//! - destroy_session 只销毁指定 session，不波及其他 session
+//! - destroy_session 触发该 session 插件实例的逆序 dispose（生命周期闭环）
 //! - 子 session 的 per-session 通道独立于父 session（事件不串扰）
 //! - 子 session task 退出后其 rx 自然返 None
 
@@ -56,12 +55,12 @@ fn as_providers<P: fuyao_provider::Provider + 'static>(p: P) -> fuyao_provider::
 }
 
 // ============================================================================
-// Engine::end_session：单 session 销毁（与 shutdown 对称但只动一个 child_token）
+// Engine::destroy_session：单 session 销毁（与 shutdown 对称但只动一个 child_token）
 // ============================================================================
 
-/// end_session 后该 session 从调度表移除——后续 send 返回 `Err(SessionNotFound)`
+/// destroy_session 后该 session 从调度表移除——后续 send 返回 `Err(SessionNotFound)`
 #[tokio::test]
-async fn end_session_removes_from_schedule() {
+async fn destroy_session_removes_from_schedule() {
     let (agent_paths, _home) = temp_agent_paths();
     let store = make_store(&agent_paths).await;
     let engine = Engine::new(
@@ -82,100 +81,37 @@ async fn end_session_removes_from_schedule() {
         .await
         .expect("创建 session 失败");
 
-    // end_session 应正常返回 Ok（task 在 idle 状态，cancel 立即响应退出）
+    // destroy_session 应正常返回 Ok（task 在 idle 状态，cancel 立即响应退出）
     let done = timeout(
         Duration::from_secs(3),
-        engine.end_session(&session_id, "session_ended"),
+        engine.destroy_session(&session_id, "session_ended"),
     )
     .await;
-    assert!(done.is_ok(), "end_session 应在 3 秒内完成");
-    done.expect("end_session 未在 3s 内完成")
-        .expect("end_session 返回错误");
+    assert!(done.is_ok(), "destroy_session 应在 3 秒内完成");
+    done.expect("destroy_session 未在 3s 内完成")
+        .expect("destroy_session 返回错误");
 
-    // end_session 后再 send 应返回 SessionNotFound（session 已从调度表移除）
+    // destroy_session 后再 send 应返回 SessionNotFound（session 已从调度表移除）
     let event = guide_user_message("end 后的发送");
     let result = engine.send(&session_id, event).await;
     assert!(
         matches!(result, Err(EngineError::SessionNotFound(_))),
-        "end_session 后 send 应返回 Err(SessionNotFound)，实际: {result:?}"
+        "destroy_session 后 send 应返回 Err(SessionNotFound)，实际: {result:?}"
     );
 
     // 引擎本身仍未 shutdown，可继续创建新 session
     let new_id = engine.create_session(test_session_params()).await;
-    assert!(new_id.is_ok(), "end_session 后引擎应仍可创建新 session");
+    assert!(new_id.is_ok(), "destroy_session 后引擎应仍可创建新 session");
 
     engine.shutdown().await;
 }
 
-/// end_session 把 ended_at / end_reason 写进 DB（task 退出后单字段 UPDATE 落最终值）
-#[tokio::test]
-async fn end_session_persists_ended_at_and_reason() {
-    let (agent_paths, _home) = temp_agent_paths();
-    let store = make_store(&agent_paths).await;
-
-    let engine = Engine::new(
-        EngineParams {
-            agent_paths: agent_paths.clone(),
-        },
-        as_providers(MockProvider {
-            events: text_events("对话已结束"),
-        }),
-        fuyao_core::ToolRegistry::builder().build(),
-        PluginHost::new(),
-        store,
-    )
-    .await;
-
-    let (session_id, _rx_event) = engine
-        .create_session(test_session_params())
-        .await
-        .expect("创建 session 失败");
-
-    // end_session 前在 DB 中 ended_at / end_reason 都为 None
-    let db_path = agent_paths.sessions_db_path();
-    {
-        let store = fuyao_session::SessionStore::new(db_path.clone())
-            .await
-            .expect("打开 store 失败");
-        let before = store.get(&session_id).await.unwrap().unwrap();
-        assert!(before.ended_at.is_none());
-        assert!(before.end_reason.is_none());
-    }
-
-    // end_session 应在合理时间内完成
-    let done = timeout(
-        Duration::from_secs(3),
-        engine.end_session(&session_id, "session_ended"),
-    )
-    .await;
-    assert!(done.is_ok(), "end_session 应在 3 秒内完成");
-    done.unwrap().expect("end_session 返回错误");
-
-    // DB 验证：ended_at 已落库，end_reason == 传入值
-    let store = fuyao_session::SessionStore::new(db_path)
-        .await
-        .expect("重新打开 store 失败");
-    let loaded = store
-        .get(&session_id)
-        .await
-        .expect("DB 查询失败")
-        .expect("session 应存在");
-    assert!(loaded.ended_at.is_some(), "ended_at 应已落库");
-    assert_eq!(
-        loaded.end_reason.as_deref(),
-        Some("session_ended"),
-        "end_reason 应为传入值"
-    );
-
-    engine.shutdown().await;
-}
-
-/// end_session 只销毁指定 session——其他 session 不受影响，仍可正常 send + recv
+/// destroy_session 只销毁指定 session——其他 session 不受影响，仍可正常 send + recv
 ///
-/// 核心验证：end_session 只 cancel 该 session 的 child_token，不动引擎 root token，
-/// 故其他 session 的 task 不会被波及。这是 end_session 与 shutdown 的本质区别。
+/// 核心验证：destroy_session 只 cancel 该 session 的 child_token，不动引擎 root token，
+/// 故其他 session 的 task 不会被波及。这是 destroy_session 与 shutdown 的本质区别。
 #[tokio::test]
-async fn end_session_does_not_affect_other_sessions() {
+async fn destroy_session_does_not_affect_other_sessions() {
     let (agent_paths, _home) = temp_agent_paths();
     let store = make_store(&agent_paths).await;
 
@@ -204,11 +140,11 @@ async fn end_session_does_not_affect_other_sessions() {
     // 销毁 A
     let done = timeout(
         Duration::from_secs(3),
-        engine.end_session(&session_a, "session_ended"),
+        engine.destroy_session(&session_a, "session_ended"),
     )
     .await;
-    assert!(done.is_ok(), "end_session(A) 应在 3 秒内完成");
-    done.unwrap().expect("end_session(A) 返回错误");
+    assert!(done.is_ok(), "destroy_session(A) 应在 3 秒内完成");
+    done.unwrap().expect("destroy_session(A) 返回错误");
 
     // A 已销毁，再 send A 返回 SessionNotFound
     let event_a = guide_user_message("A 已死");
@@ -347,7 +283,7 @@ async fn child_session_has_independent_channel_from_parent() {
 
 /// 子 session task 退出后其 rx 自然返 None
 ///
-/// end_session 触发 child session task 退出（task 退出 → tx_session drop → rx 返 None）。
+/// destroy_session 触发 child session task 退出（task 退出 → tx_session drop → rx 返 None）。
 #[tokio::test]
 async fn child_session_rx_returns_none_after_session_exits() {
     let (agent_paths, _home) = temp_agent_paths();
@@ -399,34 +335,34 @@ async fn child_session_rx_returns_none_after_session_exits() {
     }
     assert!(got_assistant, "应从 child 通道收到 Assistant");
 
-    // end_session 触发 child session task 退出
+    // destroy_session 触发 child session task 退出
     engine
-        .end_session(&child_id, "child 任务完成")
+        .destroy_session(&child_id, "child 任务完成")
         .await
-        .expect("end_session 失败");
+        .expect("destroy_session 失败");
 
     // session task 退出 → tx_session drop → rx_child 后续 recv 返 None
     let result = timeout(Duration::from_secs(2), rx_child.recv()).await;
     match result {
         Ok(None) => { /* 期望：session task 退出后 rx 返 None */ }
         Ok(Some(ev)) => {
-            panic!("child session end_session 后 rx 应返 None，实际收到事件: {ev:?}")
+            panic!("child session destroy_session 后 rx 应返 None，实际收到事件: {ev:?}")
         }
-        Err(_) => panic!("child rx 在 end_session 后 2 秒未返回（卡住）"),
+        Err(_) => panic!("child rx 在 destroy_session 后 2 秒未返回（卡住）"),
     }
 
     engine.shutdown().await;
 }
 
 // ============================================================================
-// 插件实例 dispose 闭环：end_session 逆序销毁实例，工厂销毁留给 shutdown
+// 插件实例 dispose 闭环：destroy_session 逆序销毁实例，工厂销毁留给 shutdown
 // ============================================================================
 
-/// end_session 触发该 session 插件实例的**逆序** dispose（后注册的先销毁）；
-/// 工厂 dispose 不在 end_session 发生（引擎仍存活，工厂还可服务其他 session），
+/// destroy_session 触发该 session 插件实例的**逆序** dispose（后注册的先销毁）；
+/// 工厂 dispose 不在 destroy_session 发生（引擎仍存活，工厂还可服务其他 session），
 /// shutdown 时工厂才逆序销毁——完整闭环：实例（session 级）先于工厂（引擎级）
 #[tokio::test]
-async fn end_session_disposes_plugin_instances_in_reverse_order() {
+async fn destroy_session_disposes_plugin_instances_in_reverse_order() {
     let (agent_paths, _home) = temp_agent_paths();
     let store = make_store(&agent_paths).await;
 
@@ -463,20 +399,20 @@ async fn end_session_disposes_plugin_instances_in_reverse_order() {
     // 装配期只创建实例（create_instance），不触发 dispose
     assert!(log.lock().unwrap().is_empty(), "装配期不应有 dispose 调用");
 
-    // end_session：task 退出后逆序 dispose 实例
+    // destroy_session：task 退出后逆序 dispose 实例
     let done = timeout(
         Duration::from_secs(3),
-        engine.end_session(&session_id, "session_ended"),
+        engine.destroy_session(&session_id, "session_ended"),
     )
     .await;
-    assert!(done.is_ok(), "end_session 应在 3 秒内完成");
-    done.expect("end_session 未在 3s 内完成")
-        .expect("end_session 返回错误");
+    assert!(done.is_ok(), "destroy_session 应在 3 秒内完成");
+    done.expect("destroy_session 未在 3s 内完成")
+        .expect("destroy_session 返回错误");
 
     assert_eq!(
         log.lock().unwrap().clone(),
         vec!["instance:beta".to_string(), "instance:alpha".to_string()],
-        "end_session 应逆序 dispose 插件实例（后注册的 beta 先销毁），且不动工厂"
+        "destroy_session 应逆序 dispose 插件实例（后注册的 beta 先销毁），且不动工厂"
     );
 
     // shutdown 后工厂才销毁（同样逆序），流水呈现「实例 → 工厂」的完整闭环

@@ -316,8 +316,7 @@ mod tests {
     #[tokio::test]
     async fn insert_message_assigns_sequential_seq() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let mut m1 = Message::user("第一条".to_string());
         let seq1 = store.insert_message(&session.id, &mut m1).await.unwrap();
@@ -333,8 +332,7 @@ mod tests {
     #[tokio::test]
     async fn insert_message_serializes_tool_calls() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let mut msg = Message::assistant(None);
         msg.tool_calls = Some(vec![ToolCallData {
@@ -359,8 +357,7 @@ mod tests {
     async fn count_user_messages_only_counts_user_role() {
         // 只数 role=user 的普通消息:assistant / tool 不计,compaction 边界不计
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "首个问题").await;
         let mut assistant = Message::assistant(Some("回复".to_string()));
@@ -393,8 +390,7 @@ mod tests {
     #[tokio::test]
     async fn load_full_history_includes_compacted_messages() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "old").await;
         let mut m2 = Message::assistant(Some("reply".to_string()));
@@ -417,8 +413,7 @@ mod tests {
     async fn list_messages_before_returns_latest_first_descending() {
         // 第一页(before_seq=None):从最新一条开始,seq 倒序
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         for content in ["m1", "m2", "m3"] {
             insert_user(&store, &session.id, content).await;
         }
@@ -437,8 +432,7 @@ mod tests {
     async fn list_messages_before_paging_forward_with_cursor() {
         // 向前翻:用上次最旧 seq 作锚点,锚点本身不含,继续取更早一页
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         for content in ["m1", "m2", "m3", "m4", "m5"] {
             insert_user(&store, &session.id, content).await;
         }
@@ -474,8 +468,7 @@ mod tests {
     async fn list_messages_before_returns_empty_for_empty_session() {
         // 空会话:返回空 Vec,不报错
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let page = store
             .list_messages_before(&session.id, None, 50)
@@ -488,8 +481,7 @@ mod tests {
     async fn list_messages_before_includes_compaction_in_descending_order() {
         // compaction 消息不过滤,当作对话流节点正常显示,在 seq 倒序中按 seq 就位
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "old1").await; // seq 1
         store
             .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
@@ -513,8 +505,7 @@ mod tests {
     async fn list_messages_before_returns_remainder_when_fewer_than_limit() {
         // 条数 < limit:返回剩余全部,不报错
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "only").await;
 
         let page = store

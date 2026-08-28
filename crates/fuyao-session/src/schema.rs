@@ -48,8 +48,6 @@ CREATE TABLE IF NOT EXISTS schema_version (
 CREATE TABLE IF NOT EXISTS sessions (
     id                TEXT PRIMARY KEY,
     started_at        REAL NOT NULL,
-    ended_at          REAL,
-    end_reason        TEXT,
     message_count     INTEGER DEFAULT 0,
     tool_call_count   INTEGER DEFAULT 0,
     total_prompt_tokens      INTEGER DEFAULT 0,

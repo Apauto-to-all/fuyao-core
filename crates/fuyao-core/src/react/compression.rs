@@ -367,12 +367,12 @@ async fn run_compression(
             let new_prompt =
                 fuyao_prompt::build_system_prompt(&ctx.agent_paths, &ctx.definition, usage);
 
-            // 落库新 system_prompt（单字段 UPDATE，DB 唯一数据源）。
+            // 落库新 system_prompt（局部 UPDATE，DB 唯一数据源）。
             // 失败时仅 warn 跳过：compaction 边界已落库，下轮请求 build_chat_request
             // 从 DB 读到的仍是旧 prompt——影响有限，不阻塞压缩流程
             if let Err(e) = ctx
                 .store
-                .update_system_prompt(ctx.emitter.session_id(), &new_prompt)
+                .update_session(ctx.emitter.session_id(), None, Some(&new_prompt))
                 .await
             {
                 tracing::warn!(

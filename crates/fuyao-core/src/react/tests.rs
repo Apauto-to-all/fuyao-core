@@ -10,7 +10,6 @@ use super::*;
 use async_trait::async_trait;
 use futures_util::stream;
 use fuyao_api::MessageRole;
-use fuyao_api::Session;
 use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{UserMessageMode, UserMessageSource};
@@ -21,7 +20,6 @@ use fuyao_api::message::output::{
 };
 
 /// 测试固定使用的 session_id（落库后内核不再常驻内存 Session，只认 DB + id）
-const TEST_SESSION_ID: &str = "test_session";
 use fuyao_provider::{
     BoxStream, ChatResponse, FinishReason, Provider, StreamError, StreamEvent, StreamUsage,
 };
@@ -448,13 +446,15 @@ async fn make_harness_full(
     agent_paths: fuyao_api::AgentPaths,
 ) -> TestHarness {
     let store = temp_store().await;
-    // DB 唯一数据源：构造 Session 仅用于落库，落库后内核不再持有内存 Session，
-    // 只凭 session_id 查 DB。此处 create 完即丢弃 Session 对象。
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    // 强制 session.id 与 emitter 的 session_id 一致
+    // DB 唯一数据源：落库由存储层构造，落库后内核不再持有内存 Session，
+    // 只凭 session_id 查 DB。此处落库完即丢弃 Session 对象。
+    // session_id 由存储层生成，emitter / TestHarness 携带同一 id
     // （build_chat_request 用 emitter.session_id() 查 DB，必须匹配）
-    session.id = TEST_SESSION_ID.to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
+    let session_id = session.id.clone();
     drop(session);
     let (tx_event, rx_event) = mpsc::unbounded_channel();
     // 统一入站通道（外部 User / Control 条目与插件注入的 User 条目承载）：
@@ -471,13 +471,13 @@ async fn make_harness_full(
         providers,
         tools,
         hooks,
-        Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
+        Emitter::new(tx_event, session_id.clone()),
         agent_paths,
     )
     .build();
     TestHarness {
         ctx,
-        session_id: TEST_SESSION_ID.to_string(),
+        session_id,
         rx_inbound,
         tx_inbound,
         rx_interrupt,
@@ -557,7 +557,7 @@ async fn single_turn_no_tools() {
     );
     assert!(has_assistant, "应有 AssistantMessage 含「你好」");
     for ev in &events {
-        assert_eq!(event_session_id(ev), Some("test_session"));
+        assert_eq!(event_session_id(ev), Some(h.session_id.as_str()));
     }
     // user + assistant（事件级落库，从 DB 查询验证）
     let msgs = visible_messages(&h).await;
@@ -1323,9 +1323,10 @@ async fn pending_consumed_when_task_idle() {
     )]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -1345,7 +1346,7 @@ async fn pending_consumed_when_task_idle() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -1405,9 +1406,10 @@ async fn plugin_user_message_triggers_turn_when_idle() {
     )]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -1423,7 +1425,7 @@ async fn plugin_user_message_triggers_turn_when_idle() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -1481,9 +1483,10 @@ async fn turn_restart_on_new_inbound_after_drained() {
     ]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -1500,7 +1503,7 @@ async fn turn_restart_on_new_inbound_after_drained() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -1564,9 +1567,10 @@ async fn rapid_fire_messages_answered_in_single_turn() {
     ]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -1582,7 +1586,7 @@ async fn rapid_fire_messages_answered_in_single_turn() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -1620,7 +1624,7 @@ async fn rapid_fire_messages_answered_in_single_turn() {
     );
 
     // DB 顺序：user(问题1) → assistant(回复1) → user(问题2) → assistant(回复2)
-    let msgs = store.load_visible_messages("test_session").await.unwrap();
+    let msgs = store.load_visible_messages(&session.id).await.unwrap();
     let pos = |needle: &str| {
         msgs.iter()
             .position(|m| m.content.as_deref() == Some(needle))
@@ -1651,9 +1655,10 @@ async fn interrupted_turn_preserves_guide_until_new_inbound() {
     let provider: Arc<dyn Provider> = Arc::new(provider);
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(16);
@@ -1669,7 +1674,7 @@ async fn interrupted_turn_preserves_guide_until_new_inbound() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -1767,7 +1772,7 @@ async fn interrupted_turn_preserves_guide_until_new_inbound() {
     assert!(guide.lock().unwrap().is_empty(), "恢复消费后 guide 应跑空");
 
     // B 与 C 都应进 DB（旧剩余 + 新消息一起跑，不丢）
-    let msgs = store.load_visible_messages("test_session").await.unwrap();
+    let msgs = store.load_visible_messages(&session.id).await.unwrap();
     let users: Vec<_> = msgs
         .iter()
         .filter(|m| matches!(m.role, MessageRole::User))
@@ -2727,7 +2732,6 @@ async fn intercept_block_skips_final_assistant_in_history() {
 #[tokio::test]
 async fn inject_messages_intercepts_user_at_consume_time() {
     let (tx_event, _rx_event) = mpsc::unbounded_channel::<OutputEvent>();
-    let emitter = Emitter::new(tx_event, "test_session".to_string());
     let mut reg = HooksRegistry::default();
     reg.register_output_intercept(
         0,
@@ -2741,6 +2745,10 @@ async fn inject_messages_intercepts_user_at_consume_time() {
     reg.finalize();
     let hooks: fuyao_hooks::SharedHooks = Arc::new(reg);
     let store = temp_store().await;
+    // DB 唯一数据源：落库由存储层构造，之后只凭 session_id 查 DB
+    let session = store.create_session(None, None, None).await.unwrap();
+    let session_id = session.id.clone();
+    drop(session);
     let ctx = test_ctx_builder(
         store,
         Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -2749,17 +2757,10 @@ async fn inject_messages_intercepts_user_at_consume_time() {
         )),
         Arc::new(ToolRegistry::builder().build()),
         hooks,
-        emitter,
+        Emitter::new(tx_event, session_id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .build();
-    // DB 唯一数据源：构造 Session 仅用于落库，之后只凭 session_id 查 DB
-    let session = Session {
-        id: "test_session".to_string(),
-        ..Session::default()
-    };
-    let session_id = session.id.clone();
-    ctx.store.create(&session).await.unwrap();
 
     // 投两条消息进队列，注入后应都被拦截改写
     let msgs = vec![
@@ -2790,9 +2791,12 @@ async fn inject_messages_intercepts_user_at_consume_time() {
 #[tokio::test]
 async fn inject_messages_preserves_plugin_source_in_event() {
     let (tx_event, mut rx_event) = mpsc::unbounded_channel::<OutputEvent>();
-    let emitter = Emitter::new(tx_event, "test_session".to_string());
     let hooks: fuyao_hooks::SharedHooks = Arc::new(HooksRegistry::default());
     let store = temp_store().await;
+    // DB 唯一数据源：落库由存储层构造，之后只凭 session_id 查 DB
+    let session = store.create_session(None, None, None).await.unwrap();
+    let session_id = session.id.clone();
+    drop(session);
     let ctx = test_ctx_builder(
         store,
         Arc::new(fuyao_provider::ProviderRegistry::with_instance(
@@ -2801,16 +2805,10 @@ async fn inject_messages_preserves_plugin_source_in_event() {
         )),
         Arc::new(ToolRegistry::builder().build()),
         hooks,
-        emitter,
+        Emitter::new(tx_event, session_id),
         fuyao_api::AgentPaths::default(),
     )
     .build();
-    // DB 唯一数据源：构造 Session 仅用于落库，之后只凭 session_id 查 DB
-    let session = Session {
-        id: "test_session".to_string(),
-        ..Session::default()
-    };
-    ctx.store.create(&session).await.unwrap();
 
     // 构造一条 Plugin 来源消息（模拟 SessionSender.send_user 注入）
     let inbound = OutputUserMessage {
@@ -3082,9 +3080,11 @@ async fn manual_compression_resolve_failure_emits_failed_event() {
 
     // 空 ProviderRegistry：model_id 前缀 test 解析成功但实例查不到
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = TEST_SESSION_ID.to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
+    let session_id = session.id.clone();
     drop(session);
     let (tx_event, rx_event) = mpsc::unbounded_channel();
     let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(32);
@@ -3094,13 +3094,13 @@ async fn manual_compression_resolve_failure_emits_failed_event() {
         Arc::new(fuyao_provider::ProviderRegistry::default()),
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
+        Emitter::new(tx_event, session_id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .build();
     let mut h = TestHarness {
         ctx,
-        session_id: TEST_SESSION_ID.to_string(),
+        session_id,
         rx_inbound,
         tx_inbound,
         rx_interrupt,
@@ -3217,9 +3217,10 @@ async fn control_only_batch_executes_command_without_running_turn() {
     )]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -3249,7 +3250,7 @@ async fn control_only_batch_executes_command_without_running_turn() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -3333,9 +3334,10 @@ async fn manual_compression_note_travels_to_echo_and_summary_request() {
     )]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -3366,7 +3368,7 @@ async fn manual_compression_note_travels_to_echo_and_summary_request() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -3459,9 +3461,10 @@ async fn control_consumption_echoes_command_event_before_execution() {
     )]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
 
     let guide = empty_queue();
     let pending = empty_queue();
@@ -3497,7 +3500,7 @@ async fn control_consumption_echoes_command_event_before_execution() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -3540,7 +3543,7 @@ async fn control_consumption_echoes_command_event_before_execution() {
             assert_eq!(m.payload.client_message_id.as_deref(), Some("cmd-order"));
             assert_eq!(
                 m.base.session_id.as_deref(),
-                Some("test_session"),
+                Some(session.id.as_str()),
                 "回显应带 emitter 盖的 session 标签"
             );
         }
@@ -3588,9 +3591,10 @@ async fn interleaved_batch_processes_users_and_command_in_order() {
     ]));
 
     let store = temp_store().await;
-    let mut session = Session::new(None, None, Some("系统提示词".to_string()));
-    session.id = "test_session".to_string();
-    store.create(&session).await.unwrap();
+    let session = store
+        .create_session(None, None, Some("系统提示词".to_string()))
+        .await
+        .unwrap();
     // 预置一条既有消息：压缩至少需 2 条可见消息（生成摘要的硬门槛），
     // 保证命令执行时可见窗口 = [既有消息, A] 达标
     let mut existing = fuyao_api::Message::user("既有对话".to_string());
@@ -3622,7 +3626,7 @@ async fn interleaved_batch_processes_users_and_command_in_order() {
         providers,
         Arc::new(ToolRegistry::builder().build()),
         empty_hooks(),
-        Emitter::new(tx_event, "test_session".to_string()),
+        Emitter::new(tx_event, session.id.clone()),
         fuyao_api::AgentPaths::default(),
     )
     .guide(Arc::clone(&guide))
@@ -3682,7 +3686,7 @@ async fn interleaved_batch_processes_users_and_command_in_order() {
     assert!(pending.lock().unwrap().is_empty(), "pending 应保持空");
 
     // 全量历史：A 与 B 均落库，且压缩边界恰在两者之间（顺序忠实）
-    let full = store.load_full_history("test_session").await.unwrap();
+    let full = store.load_full_history(&session.id).await.unwrap();
     let pos = |needle: &str, kind: MessageKind| {
         full.iter()
             .position(|m| m.kind == kind && m.content.as_deref() == Some(needle))
@@ -3706,7 +3710,7 @@ async fn interleaved_batch_processes_users_and_command_in_order() {
     );
 
     // 可见窗口：B 在边界之后对 LLM 可见（A 已被摘要折叠，属压缩语义）
-    let visible = store.load_visible_messages("test_session").await.unwrap();
+    let visible = store.load_visible_messages(&session.id).await.unwrap();
     let visible_users: Vec<&str> = visible
         .iter()
         .filter(|m| matches!(m.role, MessageRole::User))
@@ -3892,7 +3896,7 @@ async fn title_generated_for_child_session() {
         fuyao_api::AgentPaths::default(),
         fuyao_api::AgentDefinition::default(),
         Arc::new(tokio::sync::Mutex::new(test_session_params())),
-        Emitter::new(tx_event, TEST_SESSION_ID.to_string()),
+        Emitter::new(tx_event, h.session_id.clone()),
         true,
     )
     .build();

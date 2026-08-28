@@ -11,8 +11,11 @@ fn current_timestamp() -> f64 {
         .unwrap()
         .as_secs_f64()
 }
-
-/// 会话
+/// 会话（纯数据结构）
+///
+/// 不含构造与变更逻辑——会话的创建 / 更新 / 删除统一由存储层
+/// `SessionStore` 的操作面承接（create_session / update_session / delete），
+/// 本类型只承载字段与查询结果。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     /// 会话唯一标识
@@ -39,12 +42,6 @@ pub struct Session {
     pub total_cost: f64,
     /// 开始时间戳
     pub started_at: f64,
-    /// 结束时间戳
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ended_at: Option<f64>,
-    /// 结束原因
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub end_reason: Option<String>,
     /// 被压缩过的次数（每次 mark_compaction +1，用于精度降级提示）
     pub compression_count: i32,
     /// 最近一次压缩边界消息的 seq（NULL = 从未压缩）
@@ -64,7 +61,7 @@ pub struct Session {
     ///
     /// 派生读数，不落库——由查询 SQL 的 COUNT 子查询实时计算，无子会话时为 0。
     /// 用途：会话列表行据此驱动「展开子会话列表」入口的显隐。子会话行恒为 0
-    /// （引擎禁止子会话内递归派生）。新建的内存会话（[`Session::new`]）尚无子会话，初值 0。
+    /// （引擎禁止子会话内递归派生）。非查询产出的内存会话尚无子会话，初值 0。
     #[serde(default)]
     pub child_count: i64,
     /// 工作目录绝对路径（创建会话时定死，不再变化）
@@ -81,62 +78,6 @@ pub struct Session {
     // 注：消息列表（messages）已从内存移除——每条消息产生即落 DB，
     // 需要时按 session_id 从数据库查询（见 SessionStore::load_visible_messages）。
     // 这样单个 session 内存占用恒定（不随历史增长），多 session 并发无内存压力。
-}
-
-impl Session {
-    /// 创建新会话，自动生成 8 位 id
-    ///
-    /// `workspace` 为工作目录绝对路径（创建时定死，来自引擎的 `agent_paths.workspace`），
-    /// 无工作目录时传 `None`。`last_active_at` 初始化为当前时间（等于 `started_at`）。
-    pub fn new(
-        workspace: Option<String>,
-        title: Option<String>,
-        system_prompt: Option<String>,
-    ) -> Self {
-        let now = current_timestamp();
-        Self {
-            id: generate_id(),
-            title: title.or_else(|| Some("新会话".to_string())),
-            system_prompt,
-            message_count: 0,
-            tool_call_count: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_reasoning_tokens: 0,
-            total_cached_tokens: 0,
-            total_cost: 0.0,
-            started_at: now,
-            last_active_at: now,
-            ended_at: None,
-            end_reason: None,
-            compression_count: 0,
-            last_compacted_seq: None,
-            parent_session_id: None,
-            child_count: 0,
-            workspace,
-        }
-    }
-
-    /// 重新生成 id（主键冲突重试专用）
-    ///
-    /// id 由随机生成，与既有行碰撞时（概率极低）由 store 层的 `create_with_retry`
-    /// 调本方法换一个新 id 重试落库。不改动其它字段。
-    pub fn regenerate_id(&mut self) {
-        self.id = generate_id();
-    }
-}
-
-/// 生成 8 位会话 id：取 UUID v4 第一段（8 个十六进制字符，32 bit 熵）
-///
-/// 个人单用户场景下碰撞概率可忽略；DB 主键约束兜底，碰撞时上层重试（见
-/// `SessionStore::create_with_retry`）。
-fn generate_id() -> String {
-    uuid::Uuid::new_v4()
-        .to_string()
-        .split('-')
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 /// 消息类型（区分普通消息与压缩边界消息）
@@ -392,38 +333,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_new_generates_8_char_id() {
-        let session = Session::new(None, None, None);
-        assert_eq!(session.id.len(), 8);
-        assert_eq!(session.title, Some("新会话".to_string()));
-    }
-
-    #[test]
-    fn regenerate_id_produces_new_8_char_id() {
-        // 重试专用：regenerate_id 应换一个新 id，长度仍为 8，其它字段不变
-        let mut session = Session::new(None, Some("标题".into()), None);
-        let old_id = session.id.clone();
-        session.regenerate_id();
-        assert_eq!(session.id.len(), 8);
-        assert_ne!(session.id, old_id, "regenerate_id 必须产生不同的 id");
-        assert_eq!(session.title.as_deref(), Some("标题"), "其它字段不应被改动");
-    }
-
-    #[test]
-    fn session_new_parent_session_id_defaults_none() {
-        // 用户会话（非派生）：parent_session_id 应为 None
-        let session = Session::new(None, None, None);
-        assert!(session.parent_session_id.is_none());
-    }
-
-    #[test]
-    fn session_new_child_count_defaults_zero() {
-        // 新建会话尚无子会话：child_count 初值为 0
-        let session = Session::new(None, None, None);
-        assert_eq!(session.child_count, 0);
-    }
-
-    #[test]
     fn session_child_count_deserializes_to_zero_when_absent() {
         // 缺失 child_count 的 JSON（旧载荷）反序列化时兜底为 0；
         // 载荷须带全其余无默认值的必填字段，缺失时报缺字段而非 child_count 兜底
@@ -442,31 +351,6 @@ mod tests {
         }"#;
         let session: Session = serde_json::from_str(json).unwrap();
         assert_eq!(session.child_count, 0);
-    }
-
-    #[test]
-    fn session_new_with_custom_title() {
-        let session = Session::new(
-            None,
-            Some("测试会话".to_string()),
-            Some("系统提示".to_string()),
-        );
-        assert_eq!(session.title, Some("测试会话".to_string()));
-        assert_eq!(session.system_prompt, Some("系统提示".to_string()));
-    }
-
-    #[test]
-    fn session_new_workspace_and_last_active_at() {
-        // workspace 创建时定死；last_active_at 初始化等于 started_at
-        let session = Session::new(Some("/home/u/proj".to_string()), None, None);
-        assert_eq!(session.workspace.as_deref(), Some("/home/u/proj"));
-        assert_eq!(session.started_at, session.last_active_at);
-    }
-
-    #[test]
-    fn session_new_workspace_none_when_absent() {
-        let session = Session::new(None, None, None);
-        assert!(session.workspace.is_none());
     }
 
     #[test]

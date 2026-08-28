@@ -8,8 +8,6 @@ use sqlx::FromRow;
 pub(super) struct SessionRow {
     pub(super) id: String,
     pub(super) started_at: f64,
-    pub(super) ended_at: Option<f64>,
-    pub(super) end_reason: Option<String>,
     pub(super) message_count: i64,
     pub(super) tool_call_count: i64,
     pub(super) total_prompt_tokens: i64,
@@ -42,8 +40,6 @@ impl From<SessionRow> for Session {
             total_cached_tokens: r.total_cached_tokens,
             total_cost: r.total_cost,
             started_at: r.started_at,
-            ended_at: r.ended_at,
-            end_reason: r.end_reason,
             compression_count: r.compression_count,
             last_compacted_seq: r.last_compacted_seq,
             parent_session_id: r.parent_session_id,

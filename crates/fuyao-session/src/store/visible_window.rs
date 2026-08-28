@@ -86,8 +86,7 @@ mod tests {
     #[tokio::test]
     async fn load_visible_returns_all_when_never_compacted() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "m1").await;
         insert_user(&store, &session.id, "m2").await;
 
@@ -99,8 +98,7 @@ mod tests {
     async fn load_visible_exposes_summary_and_newer_after_boundary() {
         // 压缩后:可见窗口 = [最新摘要] + 摘要后新消息,摘要前的旧消息不可见
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         for content in ["old1", "old2", "old3"] {
             insert_user(&store, &session.id, content).await;
@@ -125,8 +123,7 @@ mod tests {
     async fn load_visible_starts_from_latest_summary_only() {
         // 多次压缩:可见窗口只从最新摘要起,两次摘要之间的消息也已被最新摘要覆盖
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         insert_user(&store, &session.id, "v1-1").await;
         let seq1 = store

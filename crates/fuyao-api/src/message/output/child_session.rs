@@ -67,7 +67,7 @@ pub enum ChildSessionOrigin {
 pub enum ChildSessionState {
     /// 已启动（子 session 已创建，即将 / 已经开始执行）
     Started,
-    /// 已结束（子 session 已 end_session，不再产事件）
+    /// 已结束（子 session 已 destroy_session，不再产事件）
     Ended,
 }
 

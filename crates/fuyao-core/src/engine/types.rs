@@ -110,7 +110,7 @@ pub(crate) struct SessionHandle {
     pub shutdown_token: CancellationToken,
     /// 该 session 的插件实例集合（装配期由 assemble_session_hooks 生成）
     ///
-    /// 生命周期闭环：session 结束（end_session / shutdown）时由收尾 helper
+    /// 生命周期闭环：session 结束（destroy_session / shutdown）时由收尾 helper
     /// 逆序逐个 dispose（后注册的先销毁），插件资源不随 session 泄漏。
     /// hooks 已在 SessionCtx 内冻结共享，本字段只承载 dispose 义务。
     pub plugin_instances: Vec<NamedPluginInstance>,

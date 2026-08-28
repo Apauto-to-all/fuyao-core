@@ -57,7 +57,7 @@ impl super::SessionStore {
     /// 2. 更新 sessions.`last_compacted_seq` = 新 compaction 消息的 seq
     /// 3. sessions.`compression_count` += 1
     ///
-    /// 不创建新 session、不动 session_id、不重置统计字段、不动 end_reason/ended_at。
+    /// 不创建新 session、不动 session_id、不重置统计字段。
     ///
     /// # 参数
     /// - `session_id`:被压缩的会话(永不变)
@@ -147,8 +147,7 @@ mod tests {
     #[tokio::test]
     async fn mark_compaction_inserts_boundary_message() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let mut m1 = Message::user("hello".to_string());
         store.insert_message(&session.id, &mut m1).await.unwrap();
@@ -180,8 +179,7 @@ mod tests {
     #[tokio::test]
     async fn mark_compaction_updates_session_metadata() {
         let store = temp_store().await;
-        let session = fuyao_api::Session::new(None, None, None);
-        store.create(&session).await.unwrap();
+        let session = store.create_session(None, None, None).await.unwrap();
 
         let new_seq = store
             .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
@@ -192,8 +190,6 @@ mod tests {
         assert_eq!(loaded.last_compacted_seq, Some(new_seq));
         assert_eq!(loaded.compression_count, 1);
         assert_eq!(loaded.total_prompt_tokens, 0);
-        assert!(loaded.ended_at.is_none());
-        assert!(loaded.end_reason.is_none());
     }
 
     #[tokio::test]
@@ -215,8 +211,10 @@ mod tests {
         let store = temp_store().await;
 
         // 源 session:2 条普通消息
-        let parent = fuyao_api::Session::new(None, None, Some("父系统提示词".to_string()));
-        store.create(&parent).await.unwrap();
+        let parent = store
+            .create_session(None, None, Some("父系统提示词".to_string()))
+            .await
+            .unwrap();
         let mut m1 = Message::user("父消息1".to_string());
         store.insert_message(&parent.id, &mut m1).await.unwrap();
         let mut m2 = Message::assistant(Some("父回复".to_string()));
@@ -242,9 +240,10 @@ mod tests {
             .iter()
             .filter(|m| matches!(m.kind, MessageKind::Message))
             .count();
-        let mut child = fuyao_api::Session::new(None, None, parent.system_prompt.clone());
-        child.parent_session_id = Some(parent.id.clone());
-        store.create(&child).await.unwrap();
+        let child = store
+            .create_session(None, Some(parent.id.clone()), parent.system_prompt.clone())
+            .await
+            .unwrap();
 
         // 逐条复制可见消息
         for msg in &source_visible {

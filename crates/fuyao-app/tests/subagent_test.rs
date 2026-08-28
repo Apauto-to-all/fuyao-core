@@ -9,7 +9,7 @@
 //!
 //! 仅覆盖端到端主干路径：
 //! - 递归防护（`definitions_for(true)` 排除 subagent）已有单测（`tool_registry.rs`）
-//! - 子 session 一次性（end_session 后 rx 返 None）已有单测（`child_session_test.rs`）
+//! - 子 session 一次性（destroy_session 后 rx 返 None）已有单测（`child_session_test.rs`）
 
 mod common;
 

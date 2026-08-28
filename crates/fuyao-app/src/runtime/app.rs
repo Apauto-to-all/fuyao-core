@@ -71,7 +71,7 @@ pub struct App {
     fan_out_tx: mpsc::Sender<OutputEvent>,
     /// fan_out 接收端（[`App::recv`] 消费，跨 await 持锁用 Mutex 包，与原 Engine::rx_event 同型）
     fan_out_rx: Mutex<mpsc::Receiver<OutputEvent>>,
-    /// 每 session 一个 forwarder 句柄（shutdown / end_session 时收尾）
+    /// 每 session 一个 forwarder 句柄（shutdown / destroy_session 时收尾）
     forward_tasks: Mutex<HashMap<SessionId, JoinHandle<()>>>,
 }
 
@@ -188,7 +188,7 @@ impl App {
     /// 停止会话当前 turn（屏障语义，直接代理 [`Engine::stop_session`]）
     ///
     /// 返回即该 session 的 DB 已静默（在跑 turn 已完全终止、中断收尾落库完毕），
-    /// session 保持存活——与 [`end_session`](Self::end_session) 的销毁语义正交。
+    /// session 保持存活——与 [`destroy_session`](Self::destroy_session) 的销毁语义正交。
     /// 管理型同步方法，不走消息总线。
     ///
     /// 典型消费方是「先停后改库」的应用编排（如数据库回退）：本方法成功返回后，
@@ -224,21 +224,21 @@ impl App {
         self.fan_out_rx.lock().await.recv().await
     }
 
-    /// 销毁单个 session（调 [`Engine::end_session`] + 单独收尾该 session 的 forwarder）
+    /// 销毁单个 session（调 [`Engine::destroy_session`] + 单独收尾该 session 的 forwarder）
     ///
     /// 流程：
-    /// 1. `engine.end_session(id)`：cancel child_token → session task 退出 → tx_session drop
+    /// 1. `engine.destroy_session(id)`：cancel child_token → session task 退出 → tx_session drop
     /// 2. 从 `forward_tasks` 取出该 session 的 forwarder handle，超时 + abort 兜底收尾
     ///    （forwarder 此时 rx 返 None 几毫秒内退；超时 abort 兜底防卡死）
     ///
     /// 与 [`App::shutdown`] 对称但只针对一个 session：其他 session 不受影响。
     ///
     /// # 错误
-    /// 透传 [`Engine::end_session`] 的错误（`Shutdown` / `SessionNotFound` / `Storage`）。
+    /// 透传 [`Engine::destroy_session`] 的错误（`Shutdown` / `SessionNotFound`）。
     /// 出错时不收尾 forwarder（engine 层未实际销毁 session，forward_tasks 表不动）。
-    pub async fn end_session(&self, id: &SessionId, end_reason: &str) -> Result<(), EngineError> {
-        // 段 1：engine 收尾 session task（cancel + 超时 abort + 落库 ended_at/end_reason）
-        self.engine.end_session(id, end_reason).await?;
+    pub async fn destroy_session(&self, id: &SessionId, reason: &str) -> Result<(), EngineError> {
+        // 段 1：engine 收尾 session task（cancel + 超时 abort，task 退出即完成）
+        self.engine.destroy_session(id, reason).await?;
 
         // 段 2：单独收尾该 session 的 forwarder（task 退出后 forwarder rx 返 None 自然退；
         //       超时 abort 兜底，与 core::end_one_session 模式一致但 app 层独立实现）
@@ -294,7 +294,7 @@ impl App {
     /// 为指定 session spawn forwarder task，登记进 forward_tasks 表
     ///
     /// forwarder 把该 session 的 rx 转到共享 fan_out_tx（fan-in）。
-    /// JoinHandle 登记进 forward_tasks，shutdown / end_session 时收尾。
+    /// JoinHandle 登记进 forward_tasks，shutdown / destroy_session 时收尾。
     ///
     /// 理论上 session_id 唯一不冲突；若发现同 id 已存在（理论 bug），abort 旧 handle 防泄漏。
     async fn register_forwarder(

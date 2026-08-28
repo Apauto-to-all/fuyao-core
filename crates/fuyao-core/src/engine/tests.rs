@@ -1,7 +1,7 @@
 //! 子任务 session 创建与 stop_session 停止原语的语义单元测试
 //!
 //! 子任务部分覆盖 [`Engine::create_child_session`] 两种上下文模式（均走公开方法，
-//! 会 spawn idle session task，测试末尾用 end_session 收尾拆除）：
+//! 会 spawn idle session task，测试末尾用 destroy_session 收尾拆除）：
 //! - Fresh 模式：空上下文，parent = 父 id
 //! - Fork 模式：整窗复制源可见上下文，parent = 父 id（复制 SQL 与计数聚合语义
 //!   由 fuyao-session 存储层 fork_visible 模块的测试覆盖）
@@ -10,9 +10,7 @@
 //! 屏障语义（返回即 turn 已终止且中断收尾落库完毕）。
 
 use super::*;
-use fuyao_api::{
-    AgentConfig, AgentPaths, EngineParams, Message, ModelConfig, Session, SessionParams,
-};
+use fuyao_api::{AgentConfig, AgentPaths, EngineParams, Message, ModelConfig, SessionParams};
 use fuyao_hooks::PluginHost;
 use fuyao_provider::ProviderRegistry;
 
@@ -51,8 +49,11 @@ async fn make_engine_with(providers: ProviderRegistry) -> (Arc<Engine>, tempfile
 
 /// 在 store 里建一个带 2 条普通消息的源 session，返回其 id
 async fn seed_source_session(engine: &Engine) -> SessionId {
-    let source = Session::new(None, None, Some("源系统提示词".to_string()));
-    engine.store.create(&source).await.unwrap();
+    let source = engine
+        .store
+        .create_session(None, None, Some("源系统提示词".to_string()))
+        .await
+        .unwrap();
     let mut m1 = Message::user("源消息1".to_string());
     engine
         .store
@@ -106,7 +107,7 @@ async fn create_child_session_fork_copies_visible_context_and_sets_parent() {
     assert_eq!(visible[1].content.as_deref(), Some("源回复"));
 
     // 收尾：拆除 create_child_session spawn 出来的 idle session task
-    let _ = engine.end_session(&child_id, "测试结束").await;
+    let _ = engine.destroy_session(&child_id, "测试结束").await;
 }
 
 #[tokio::test]
@@ -128,7 +129,7 @@ async fn create_child_session_fork_missing_source_returns_not_found() {
     assert!(matches!(err, EngineError::SessionNotFound(_)));
 
     // 收尾：拆除父 session task
-    let _ = engine.end_session(&parent_id, "测试结束").await;
+    let _ = engine.destroy_session(&parent_id, "测试结束").await;
 }
 
 #[tokio::test]
@@ -179,7 +180,7 @@ async fn create_child_session_fresh_sets_parent() {
     );
 
     // 收尾：拆除 create_child_session spawn 出来的 idle session task
-    let _ = engine.end_session(&child_id, "测试结束").await;
+    let _ = engine.destroy_session(&child_id, "测试结束").await;
 }
 
 // ===== stop_session：停止原语的三段语义 =====
@@ -258,7 +259,7 @@ async fn stop_session_idle_session_returns_ok_idempotently() {
     engine.stop_session(&id, "再次停止").await.unwrap();
 
     // 收尾：拆除 session task
-    let _ = engine.end_session(&id, "测试结束").await;
+    let _ = engine.destroy_session(&id, "测试结束").await;
 }
 
 /// 屏障语义：turn 卡在流式阶段时 stop_session 返回，代表 turn 已完全终止且
@@ -312,7 +313,7 @@ async fn stop_session_returns_after_turn_finalization_persisted() {
     assert_eq!(visible[1].finish_reason.as_deref(), Some("interrupted"));
 
     // 收尾：拆除 session task
-    let _ = engine.end_session(&id, "测试结束").await;
+    let _ = engine.destroy_session(&id, "测试结束").await;
 }
 
 // ===== remove_queued_message：双队列按客户端标识删除 =====
@@ -412,7 +413,7 @@ async fn remove_queued_message_deletes_matches_across_both_queues() {
     assert_eq!(user_contents(&guide), vec!["保留".to_string()]);
     assert_eq!(user_contents(&pending), vec!["无标识".to_string()]);
 
-    let _ = engine.end_session(&id, "测试结束").await;
+    let _ = engine.destroy_session(&id, "测试结束").await;
 }
 
 /// 排队中未生效的控制命令可撤销：Control 条目按自身 client_message_id 匹配删除，
@@ -447,7 +448,7 @@ async fn remove_queued_message_deletes_queued_control_command() {
     );
     assert_eq!(user_contents(&guide), vec!["消息".to_string()]);
 
-    let _ = engine.end_session(&id, "测试结束").await;
+    let _ = engine.destroy_session(&id, "测试结束").await;
 }
 
 /// 队列中无匹配标识：返回 0，队列内容原样保留
@@ -474,7 +475,7 @@ async fn remove_queued_message_returns_zero_when_no_match() {
     assert_eq!(guide.lock().unwrap().len(), 1);
     assert_eq!(pending.lock().unwrap().len(), 1);
 
-    let _ = engine.end_session(&id, "测试结束").await;
+    let _ = engine.destroy_session(&id, "测试结束").await;
 }
 
 /// 已删除过的标识再次删除：幂等返回 0
@@ -498,7 +499,7 @@ async fn remove_queued_message_repeated_removal_returns_zero() {
         "已删空后再次删除应返回 0"
     );
 
-    let _ = engine.end_session(&id, "测试结束").await;
+    let _ = engine.destroy_session(&id, "测试结束").await;
 }
 
 /// session 不在调度表：SessionNotFound（要恢复走恢复动作）

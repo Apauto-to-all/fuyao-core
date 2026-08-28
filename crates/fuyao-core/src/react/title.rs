@@ -27,8 +27,8 @@ use std::sync::atomic::Ordering;
 /// - 能取到首条 user content（调用方从刚注入的批传入，不回读 DB）
 ///
 /// 执行模型：`tokio::spawn` 独立 task，不阻塞主 ReAct 循环。
-/// spawn 的 future 是 `'static` 的——标题直接走 `SessionStore::update_title`
-/// 单字段 SQL 落库，内存态不更新（下次 resume 时从 DB 自然读回）。
+/// spawn 的 future 是 `'static` 的——标题直接走 `SessionStore::update_session`
+/// 局部 SQL 落库，内存态不更新（下次 resume 时从 DB 自然读回）。
 ///
 /// 多 session 并发天然安全：clone `Arc<store>` / `Arc<providers>` / `emitter` /
 /// `hooks` / `agent_paths` 进 task，各 session task 独立，零共享零协调。
@@ -95,8 +95,8 @@ pub(super) async fn maybe_spawn_title(ctx: &SessionCtx, first_user_content: Opti
         .await
         {
             Some(title) => {
-                // 单字段落库（失败仅 warn，不影响主流程）
-                if let Err(e) = store.update_title(&session_id, &title).await {
+                // 局部 UPDATE 落库（失败仅 warn，不影响主流程）
+                if let Err(e) = store.update_session(&session_id, Some(&title), None).await {
                     tracing::warn!(session_id = %session_id, cause = %e, "标题落库失败");
                     return;
                 }

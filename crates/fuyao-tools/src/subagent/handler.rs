@@ -8,7 +8,7 @@
 //! 5. 消费 rx：全部事件经 `ctx.capabilities.event_forwarder` 转发到父 session
 //!    出站通道（前端实时看子代理进度）；`Assistant(finish_reason=stop)` 的
 //!    content 截留为工具返回值，事件本身照常转发
-//! 6. `end_session(child_id)`（一次性子 session，跑完即退）
+//! 6. `destroy_session(child_id)`（一次性子 session，跑完即退）
 //! 7. 排空通道滞留事件继续转发（子 task 收尾产物：Title / 中断终态等）
 //! 8. 发 `ChildSession(Ended)` 事件通知前端关闭渲染区
 //! 9. 返 content 作为工具结果回喂父 ReAct
@@ -38,7 +38,7 @@ use fuyao_api::{
 /// 子代理执行超时兜底
 ///
 /// 防子 session 卡死（LLM 无响应、工具死循环等）导致父 ReAct 永久阻塞。
-/// 触发后强制 end_session 退出。
+/// 触发后强制 destroy_session 退出。
 const SUBAGENT_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// 子代理工具执行入口
@@ -129,7 +129,7 @@ pub async fn subagent_handler(
     });
     if let Err(e) = ops.send(&child_id, msg).await {
         tracing::warn!(child_id = %child_id, cause = %e, "子代理任务发送失败");
-        let _ = ops.end_session(&child_id, "send 失败").await;
+        let _ = ops.destroy_session(&child_id, "send 失败").await;
         emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
         return ToolOutput::error(format!("子代理任务发送失败：{e}"));
     }
@@ -146,7 +146,7 @@ pub async fn subagent_handler(
 
             _ = cancel.cancelled() => {
                 tracing::info!(child_id = %child_id, "子代理被父取消");
-                let _ = ops.end_session(&child_id, "被父取消").await;
+                let _ = ops.destroy_session(&child_id, "被父取消").await;
                 drain_child_events(&ctx, &child_id, &mut child_rx);
                 emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
                 return ToolOutput::text("⚠️ 子代理被父取消");
@@ -158,7 +158,7 @@ pub async fn subagent_handler(
                     timeout_secs = SUBAGENT_TIMEOUT.as_secs(),
                     "子代理执行超时"
                 );
-                let _ = ops.end_session(&child_id, "超时").await;
+                let _ = ops.destroy_session(&child_id, "超时").await;
                 drain_child_events(&ctx, &child_id, &mut child_rx);
                 emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
                 return ToolOutput::error(format!(
@@ -169,7 +169,7 @@ pub async fn subagent_handler(
 
             ev = child_rx.recv() => {
                 let Some(ev) = ev else {
-                    // 子 session task 退出（被外部 end_session 或 panic）
+                    // 子 session task 退出（被外部 destroy_session 或 panic）
                     tracing::warn!(child_id = %child_id, "子 session 退出，rx 返 None");
                     break;
                 };
@@ -195,9 +195,9 @@ pub async fn subagent_handler(
         }
     }
 
-    // 8. end_session（一次性子 session）——task 退出后通道里滞留的收尾产物
+    // 8. destroy_session（一次性子 session）——task 退出后通道里滞留的收尾产物
     //    （Title 等）非阻塞排空转发，之后丢弃接收端
-    let _ = ops.end_session(&child_id, "子代理完成").await;
+    let _ = ops.destroy_session(&child_id, "子代理完成").await;
     drain_child_events(&ctx, &child_id, &mut child_rx);
     emit_child_session_event(&ctx, &child_id, ChildSessionState::Ended, description);
     tracing::info!(child_id = %child_id, got_final, "子代理结束");
@@ -265,7 +265,7 @@ fn forward_child_event(ctx: &ToolCallContext, child_id: &str, ev: OutputEvent) {
 
 /// 非阻塞排空子事件通道的滞留事件并逐条转发
 ///
-/// `end_session` 返回时子 task 已退出，其收尾产物（中断式终态、Title 等）仍滞留
+/// `destroy_session` 返回时子 task 已退出，其收尾产物（中断式终态、Title 等）仍滞留
 /// 通道缓冲——逐条转发后再丢弃接收端，保证转发的子事件流有始有终。用 try_recv
 /// 非阻塞排空：标题生成等旁路 task 仍持 sender 克隆，通道不会关闭，await 式
 /// 排空会挂住。
@@ -329,7 +329,7 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
-        fn end_session<'a>(
+        fn destroy_session<'a>(
             &'a self,
             _id: &'a str,
             _end_reason: &'a str,
@@ -548,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_path_drains_residual_interrupt() {
-        // 滞留通道的中断终态（end_session 后仍在缓冲）
+        // 滞留通道的中断终态（destroy_session 后仍在缓冲）
         let (child_tx, child_rx) = mpsc::unbounded_channel();
         child_tx.send(interrupt_event()).unwrap();
         drop(child_tx);

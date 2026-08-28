@@ -50,14 +50,14 @@ impl SubagentOps for Engine {
         })
     }
 
-    fn end_session<'a>(
+    fn destroy_session<'a>(
         &'a self,
         id: &'a str,
-        end_reason: &'a str,
+        reason: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         let id = id.to_string();
         Box::pin(async move {
-            Engine::end_session(self, &id, end_reason)
+            Engine::destroy_session(self, &id, reason)
                 .await
                 .map_err(|e| e.to_string())
         })

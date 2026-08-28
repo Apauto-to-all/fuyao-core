@@ -29,9 +29,7 @@ use fuyao_api::message::QueueEntry;
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
 };
-use fuyao_api::{
-    ChildSessionSource, EngineParams, InputEvent, OutputEvent, Session, SessionParams,
-};
+use fuyao_api::{ChildSessionSource, EngineParams, InputEvent, OutputEvent, SessionParams};
 use fuyao_hooks::{HooksRegistry, NamedPluginInstance, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_provider::ProviderRegistry;
