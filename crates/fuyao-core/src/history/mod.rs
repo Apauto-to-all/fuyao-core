@@ -156,7 +156,12 @@ fn event_to_message(
             // 不填 model_id——与「中断时模型未给用量」的语义一致
             if let Some(model_id) = bill_model {
                 msg.model_id = Some(model_id.to_string());
-                fuyao_session::fill_message_cost(&mut msg, model_id, agent_paths);
+                // 查价归调用方：注册表 miss 时零计费并告警——写错 model_id
+                // 静默记 $0 账比报错更难察觉
+                match fuyao_provider::get_model(model_id, agent_paths) {
+                    Some(model) => fuyao_session::fill_message_cost(&mut msg, &model.cost),
+                    None => tracing::warn!(model = model_id, "模型不在注册表，本条消息零计费"),
+                }
             }
             // 不变量：assistant 消息 content 与 tool_calls 不得同时为空——
             // OpenAI 协议要求二者至少其一存在，双空消息进入历史会让下轮请求

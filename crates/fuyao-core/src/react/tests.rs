@@ -2471,13 +2471,16 @@ async fn cost_accumulated_per_assistant_message() {
 
     // 构造带价格的测试模型并注册到全局缓存
     // 输入 2/M、输出 12/M、推理 6/M、缓存 0.4/M（与 cost.rs 单测一致）
+    fn d(v: &str) -> rust_decimal::Decimal {
+        v.parse().unwrap()
+    }
     let test_model = Model {
         name: "cost-test".to_string(),
         cost: ModelCost {
-            input: Some(2.0),
-            output: Some(12.0),
-            reasoning: Some(6.0),
-            cache: Some(0.4),
+            input: Some(d("2")),
+            output: Some(d("12")),
+            reasoning: Some(d("6")),
+            cache: Some(d("0.4")),
             tiers: vec![],
         },
         limit: ModelLimit::default(),

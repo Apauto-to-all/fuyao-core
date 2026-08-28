@@ -13,15 +13,20 @@ use common::temp_agent_paths;
 use fuyao_api::{Model, ModelCost, ModelLimit, ModelModalities, load_config};
 use fuyao_app::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 
+/// 构造 Decimal 价格字面量（字符串解析，测试内可读）
+fn d(v: &str) -> rust_decimal::Decimal {
+    v.parse().unwrap()
+}
+
 /// 构造最小合法模型（limit.context 必填正整数）
 fn sample_model() -> Model {
     Model {
         name: "deepseek-v4-flash".to_string(),
         cost: ModelCost {
-            input: Some(1.0),
-            output: Some(2.0),
+            input: Some(d("1")),
+            output: Some(d("2")),
             reasoning: None,
-            cache: Some(0.2),
+            cache: Some(d("0.2")),
             tiers: Vec::new(),
         },
         limit: ModelLimit {
@@ -93,9 +98,9 @@ fn create_provider_then_reload_matches_spec() {
     assert_eq!(model.limit.context, 128000);
     assert_eq!(model.limit.input, Some(120000));
     assert_eq!(model.limit.output, 8192);
-    assert_eq!(model.cost.input, Some(1.0));
-    assert_eq!(model.cost.output, Some(2.0));
-    assert_eq!(model.cost.cache, Some(0.2));
+    assert_eq!(model.cost.input, Some(d("1")));
+    assert_eq!(model.cost.output, Some(d("2")));
+    assert_eq!(model.cost.cache, Some(d("0.2")));
     assert_eq!(model.reasoning_efforts, vec!["low", "high"]);
 
     let env = std::fs::read_to_string(paths.fuyao_home.join(".env")).unwrap();
@@ -434,16 +439,16 @@ fn create_provider_with_tiers_model_round_trips() {
     let mut model = sample_model();
     model.name = "qwen3.6-plus".to_string();
     model.cost = ModelCost {
-        input: Some(2.0),
-        output: Some(12.0),
+        input: Some(d("2")),
+        output: Some(d("12")),
         reasoning: None,
-        cache: Some(0.4),
+        cache: Some(d("0.4")),
         tiers: vec![fuyao_api::PriceTier {
             max_tokens: 256000,
-            input: Some(2.0),
-            output: Some(12.0),
+            input: Some(d("2")),
+            output: Some(d("12")),
             reasoning: None,
-            cache: Some(0.4),
+            cache: Some(d("0.4")),
         }],
     };
     manager
@@ -463,9 +468,9 @@ fn create_provider_with_tiers_model_round_trips() {
     let loaded = &config.providers["aliyun"].models["qwen3.6-plus"];
     assert_eq!(loaded.cost.tiers.len(), 1);
     assert_eq!(loaded.cost.tiers[0].max_tokens, 256000);
-    assert_eq!(loaded.cost.tiers[0].input, Some(2.0));
-    assert_eq!(loaded.cost.tiers[0].cache, Some(0.4));
-    assert_eq!(loaded.cost.input, Some(2.0));
+    assert_eq!(loaded.cost.tiers[0].input, Some(d("2")));
+    assert_eq!(loaded.cost.tiers[0].cache, Some(d("0.4")));
+    assert_eq!(loaded.cost.input, Some(d("2")));
 }
 
 /// 带点号的模型 id 落盘自动引号键，读回命中同一 id

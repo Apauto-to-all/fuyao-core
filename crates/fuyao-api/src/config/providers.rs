@@ -1,8 +1,9 @@
 //! Provider 配置解析（数值容错 + 必填校验）
 //!
-//! - 数值容错：TOML 区分整数 (`2`) 与浮点数 (`2.0`)，serde 的 `f64` 只接受浮点字面量，
-//!   用户写 `input = 2` 时价格会被静默丢弃。`toml_number_as_f64` 同时处理两种类型，
-//!   避免此问题。因此 Provider 段单独走本模块解析，`FuyaoConfig` 的 `providers`
+//! - 数值容错：TOML 区分整数 (`2`) 与浮点数 (`2.0`)，价格目标类型 `Decimal`
+//!   需要同时接受两种字面量，`toml_number_as_decimal` 经最短十进制串转换
+//!   （`2` → `2`、`0.15` → `0.15`，精度无损），用户写 `input = 2` 不会丢价格。
+//!   因此 Provider 段单独走本模块解析，`FuyaoConfig` 的 `providers`
 //!   字段以 `#[serde(skip)]` 跳过 serde。
 //! - 必填校验：每个模型条目必须声明 `limit.context` 且为正整数——缺失 / 为 0 /
 //!   类型不符直接判为配置错误（fail-loud），错误信息带 `provider_id/model_id` 定位，
@@ -33,6 +34,9 @@
 //!   定位并列出全部合法取值。
 
 use std::collections::HashMap;
+use std::str::FromStr;
+
+use rust_decimal::Decimal;
 
 use crate::config::error::ConfigError;
 use crate::provider::{
@@ -40,34 +44,38 @@ use crate::provider::{
     PriceTier, Provider, ProviderOptions,
 };
 
-/// 将 TOML 数值转换为 f64（兼容整数和浮点）
+/// 将 TOML 数值转换为 Decimal（兼容整数和浮点）
 ///
-/// TOML 区分整数 (`2`) 和浮点数 (`2.0`)，`as_float()` 只匹配浮点类型。
-/// 此函数同时处理两种类型，避免用户写 `input = 2` 时价格被静默丢弃。
-fn toml_number_as_f64(v: &toml::Value) -> Option<f64> {
-    v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
+/// 浮点经最短十进制串还原：TOML 浮点字面量 `0.15` 的最短串即 `"0.15"`，
+/// 解析回 Decimal 精确无损，金额运算不经过二进制浮点近似。
+fn toml_number_as_decimal(v: &toml::Value) -> Option<Decimal> {
+    match v {
+        toml::Value::Integer(i) => Some(Decimal::from(*i)),
+        toml::Value::Float(_) => Decimal::from_str(&v.to_string()).ok(),
+        _ => None,
+    }
 }
 
 /// 解析 Model 价格信息
 ///
 /// 从 TOML table 解析价格字段：
 /// - input/output/reasoning/cache：单价格（价格/M tokens）
-/// - tiers：梯度价格区间（按 tokens 数量阶梯计价）
+/// - tiers：梯度价格区间（按 tokens 数量阶梯计价），解析后按 max_tokens 升序
 fn parse_cost(cost_data: &toml::Value) -> ModelCost {
     let mut cost = ModelCost::default();
 
     if let Some(table) = cost_data.as_table() {
         // 解析单价格字段
-        if let Some(input) = table.get("input").and_then(toml_number_as_f64) {
+        if let Some(input) = table.get("input").and_then(toml_number_as_decimal) {
             cost.input = Some(input);
         }
-        if let Some(output) = table.get("output").and_then(toml_number_as_f64) {
+        if let Some(output) = table.get("output").and_then(toml_number_as_decimal) {
             cost.output = Some(output);
         }
-        if let Some(reasoning) = table.get("reasoning").and_then(toml_number_as_f64) {
+        if let Some(reasoning) = table.get("reasoning").and_then(toml_number_as_decimal) {
             cost.reasoning = Some(reasoning);
         }
-        if let Some(cache) = table.get("cache").and_then(toml_number_as_f64) {
+        if let Some(cache) = table.get("cache").and_then(toml_number_as_decimal) {
             cost.cache = Some(cache);
         }
 
@@ -81,14 +89,16 @@ fn parse_cost(cost_data: &toml::Value) -> ModelCost {
                 {
                     let tier = PriceTier {
                         max_tokens: max_tokens as u32,
-                        input: tier_table.get("input").and_then(toml_number_as_f64),
-                        output: tier_table.get("output").and_then(toml_number_as_f64),
-                        reasoning: tier_table.get("reasoning").and_then(toml_number_as_f64),
-                        cache: tier_table.get("cache").and_then(toml_number_as_f64),
+                        input: tier_table.get("input").and_then(toml_number_as_decimal),
+                        output: tier_table.get("output").and_then(toml_number_as_decimal),
+                        reasoning: tier_table.get("reasoning").and_then(toml_number_as_decimal),
+                        cache: tier_table.get("cache").and_then(toml_number_as_decimal),
                     };
                     cost.tiers.push(tier);
                 }
             }
+            // 升序排序：梯度命中查询（partition_point）依赖有序
+            cost.tiers.sort_by_key(|t| t.max_tokens);
         }
     }
 
@@ -406,6 +416,11 @@ pub fn load_providers(
 mod tests {
     use super::*;
 
+    /// 构造 Decimal 价格字面量（字符串解析，测试内可读）
+    fn d(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
     #[test]
     fn parse_empty_providers() {
         let value = toml::Value::Table(toml::Table::new());
@@ -452,9 +467,9 @@ mod tests {
         let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["deepseek"].models["deepseek-v4-flash"];
-        assert_eq!(model.cost.input, Some(1.0));
-        assert_eq!(model.cost.output, Some(2.0));
-        assert_eq!(model.cost.cache, Some(0.2));
+        assert_eq!(model.cost.input, Some(d("1")));
+        assert_eq!(model.cost.output, Some(d("2")));
+        assert_eq!(model.cost.cache, Some(d("0.2")));
     }
 
     #[test]
@@ -479,9 +494,37 @@ mod tests {
         let model = &providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.tiers.len(), 1);
         assert_eq!(model.cost.tiers[0].max_tokens, 256000);
-        assert_eq!(model.cost.tiers[0].input, Some(2.0));
-        assert_eq!(model.cost.tiers[0].output, Some(12.0));
-        assert_eq!(model.cost.tiers[0].cache, Some(0.4));
+        assert_eq!(model.cost.tiers[0].input, Some(d("2")));
+        assert_eq!(model.cost.tiers[0].output, Some(d("12")));
+        assert_eq!(model.cost.tiers[0].cache, Some(d("0.4")));
+    }
+
+    #[test]
+    fn parse_tiers_sorts_by_max_tokens_ascending() {
+        // 配置乱序书写梯度：解析后按 max_tokens 升序，命中查询依赖有序
+        let toml_str = r#"
+            [providers.aliyun]
+            name = "阿里云百炼"
+            api_protocol = "openai-completions"
+            [providers.aliyun.models."qwen3.6-plus"]
+            name = "qwen3.6-plus"
+            limit = { context = 131072 }
+            [[providers.aliyun.models."qwen3.6-plus".cost.tiers]]
+            max_tokens = 256000
+            input = 3
+            [[providers.aliyun.models."qwen3.6-plus".cost.tiers]]
+            max_tokens = 100000
+            input = 2
+        "#;
+        let value: toml::Value = toml::from_str(toml_str).unwrap();
+        let providers_table = value.get("providers").unwrap();
+        let providers = load_providers(providers_table).unwrap();
+
+        let model = &providers["aliyun"].models["qwen3.6-plus"];
+        let bounds: Vec<u32> = model.cost.tiers.iter().map(|t| t.max_tokens).collect();
+        assert_eq!(bounds, vec![100000, 256000]);
+        // 150000 落在两梯度之间：命中升序后的第二梯度
+        assert_eq!(model.cost.unit_prices(150_000).input, Some(d("3")));
     }
 
     #[test]
@@ -547,10 +590,10 @@ mod tests {
         let providers = load_providers(providers_table).unwrap();
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
-        assert_eq!(model.cost.input, Some(2.0));
-        assert_eq!(model.cost.output, Some(12.0));
-        assert_eq!(model.cost.reasoning, Some(4.0));
-        assert_eq!(model.cost.cache, Some(0.4));
+        assert_eq!(model.cost.input, Some(d("2")));
+        assert_eq!(model.cost.output, Some(d("12")));
+        assert_eq!(model.cost.reasoning, Some(d("4")));
+        assert_eq!(model.cost.cache, Some(d("0.4")));
     }
 
     #[test]
@@ -574,20 +617,23 @@ mod tests {
 
         let model = &providers["aliyun"].models["qwen3.6-plus"];
         assert_eq!(model.cost.tiers.len(), 1);
-        assert_eq!(model.cost.tiers[0].input, Some(2.0));
-        assert_eq!(model.cost.tiers[0].output, Some(12.0));
-        assert_eq!(model.cost.tiers[0].cache, Some(0.4));
+        assert_eq!(model.cost.tiers[0].input, Some(d("2")));
+        assert_eq!(model.cost.tiers[0].output, Some(d("12")));
+        assert_eq!(model.cost.tiers[0].cache, Some(d("0.4")));
     }
 
     #[test]
-    fn toml_number_as_f64_handles_integer_and_float() {
+    fn toml_number_as_decimal_handles_integer_and_float() {
         let int_val: toml::Value = 42.into();
         let float_val: toml::Value = 2.5.into();
+        let precise_val: toml::Value = 0.15.into();
         let str_val: toml::Value = "hello".into();
 
-        assert_eq!(toml_number_as_f64(&int_val), Some(42.0));
-        assert_eq!(toml_number_as_f64(&float_val), Some(2.5));
-        assert_eq!(toml_number_as_f64(&str_val), None);
+        assert_eq!(toml_number_as_decimal(&int_val), Some(d("42")));
+        assert_eq!(toml_number_as_decimal(&float_val), Some(d("2.5")));
+        // 0.15 在 f64 中不可精确表示，但经最短十进制串还原为精确 Decimal
+        assert_eq!(toml_number_as_decimal(&precise_val), Some(d("0.15")));
+        assert_eq!(toml_number_as_decimal(&str_val), None);
     }
 
     #[test]

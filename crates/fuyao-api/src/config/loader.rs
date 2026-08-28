@@ -329,7 +329,7 @@ input = 2
             .unwrap()
             .unwrap();
         let model = &cfg.providers["aliyun"].models["qwen3.6-plus"];
-        assert_eq!(model.cost.input, Some(2.0));
+        assert_eq!(model.cost.input, Some("2".parse().unwrap()));
         assert_eq!(model.limit.context, 131_072);
 
         let _ = std::fs::remove_file(&global);

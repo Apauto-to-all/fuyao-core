@@ -2,6 +2,8 @@
 //!
 //! 定义 LLM 模型的配置信息，包括价格、限制和模态支持。
 
+use rust_decimal::Decimal;
+
 /// 价格梯度区间
 ///
 /// 定义不同 token 数量区间的价格。
@@ -11,35 +13,88 @@ pub struct PriceTier {
     pub max_tokens: u32,
 
     /// 输入 tokens 价格（价格/M）
-    pub input: Option<f64>,
+    pub input: Option<Decimal>,
 
     /// 输出 tokens 价格（价格/M）
-    pub output: Option<f64>,
+    pub output: Option<Decimal>,
 
     /// 推理 tokens 价格（价格/M）
-    pub reasoning: Option<f64>,
+    pub reasoning: Option<Decimal>,
 
     /// 缓存价格（价格/M）
-    pub cache: Option<f64>,
+    pub cache: Option<Decimal>,
 }
 
 /// 模型价格信息
+///
+/// 价格以 [`Decimal`] 承载：金额运算全程精确，f64 只出现在两个边界——
+/// 配置文件数值（加载时经最短十进制串转 Decimal，无损）与消息费用落库列
+/// （DB schema 为 REAL）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelCost {
     /// 输入 tokens 价格（价格/M）
-    pub input: Option<f64>,
+    pub input: Option<Decimal>,
 
     /// 输出 tokens 价格（价格/M）
-    pub output: Option<f64>,
+    pub output: Option<Decimal>,
 
     /// 推理 tokens 价格（价格/M）
-    pub reasoning: Option<f64>,
+    pub reasoning: Option<Decimal>,
 
     /// 缓存价格（价格/M）
-    pub cache: Option<f64>,
+    pub cache: Option<Decimal>,
 
-    /// 价格梯度区间列表
+    /// 价格梯度区间列表（按 max_tokens 升序，加载时排序）
+    ///
+    /// 非空时整体取代平价四字段：按单次请求的 prompt_tokens 命中一个梯度，
+    /// 梯度内缺价的桶免费，不回退平价。
     pub tiers: Vec<PriceTier>,
+}
+
+/// 某次请求规模下的有效单价（价格/M）
+///
+/// 价格表的查询结果：平价直接取四字段，梯度按 prompt_tokens 命中一个区间。
+/// 每个桶只有一份单价——计费侧对号入座，不关心价格来自平价还是梯度。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnitPrices {
+    /// 输入 tokens 单价
+    pub input: Option<Decimal>,
+
+    /// 输出 tokens 单价（覆盖全部 completion，reasoning 桶缺独立价时回退到此价）
+    pub output: Option<Decimal>,
+
+    /// 推理 tokens 单价
+    pub reasoning: Option<Decimal>,
+
+    /// 缓存命中 tokens 单价
+    pub cache: Option<Decimal>,
+}
+
+impl ModelCost {
+    /// 取某次请求规模（prompt_tokens）下的有效单价
+    ///
+    /// 梯度命中规则：取首个 `max_tokens >= prompt_tokens` 的区间，用量超出
+    /// 全部区间时取末区间兜底。
+    pub fn unit_prices(&self, prompt_tokens: i64) -> UnitPrices {
+        if self.tiers.is_empty() {
+            return UnitPrices {
+                input: self.input,
+                output: self.output,
+                reasoning: self.reasoning,
+                cache: self.cache,
+            };
+        }
+        let idx = self
+            .tiers
+            .partition_point(|t| i64::from(t.max_tokens) < prompt_tokens);
+        let tier = &self.tiers[idx.min(self.tiers.len() - 1)];
+        UnitPrices {
+            input: tier.input,
+            output: tier.output,
+            reasoning: tier.reasoning,
+            cache: tier.cache,
+        }
+    }
 }
 
 /// 模型限制信息
@@ -150,6 +205,63 @@ mod tests {
         assert!(cost.reasoning.is_none());
         assert!(cost.cache.is_none());
         assert!(cost.tiers.is_empty());
+    }
+
+    /// 构造 Decimal 价格（字符串解析，测试内可读）
+    fn price(v: &str) -> Option<Decimal> {
+        Some(v.parse().unwrap())
+    }
+
+    #[test]
+    fn unit_prices_uses_flat_fields_when_no_tiers() {
+        let cost = ModelCost {
+            input: price("2"),
+            output: price("12"),
+            reasoning: None,
+            cache: price("0.4"),
+            tiers: Vec::new(),
+        };
+        let units = cost.unit_prices(999999);
+        assert_eq!(units.input, price("2"));
+        assert_eq!(units.output, price("12"));
+        assert_eq!(units.reasoning, None);
+        assert_eq!(units.cache, price("0.4"));
+    }
+
+    #[test]
+    fn unit_prices_hits_tier_by_prompt_tokens() {
+        let cost = ModelCost {
+            input: price("1"),
+            output: price("2"),
+            reasoning: None,
+            cache: None,
+            tiers: vec![
+                PriceTier {
+                    max_tokens: 100_000,
+                    input: price("2"),
+                    output: price("12"),
+                    reasoning: None,
+                    cache: price("0.4"),
+                },
+                PriceTier {
+                    max_tokens: 256_000,
+                    input: price("3"),
+                    output: price("14"),
+                    reasoning: None,
+                    cache: None,
+                },
+            ],
+        };
+        // 用量 ≤ 区间上限即命中该区间（含边界相等）
+        let small = cost.unit_prices(100_000);
+        assert_eq!(small.input, price("2"));
+        assert_eq!(small.cache, price("0.4"));
+        let mid = cost.unit_prices(150_000);
+        assert_eq!(mid.input, price("3"));
+        assert_eq!(mid.cache, None);
+        // 超出全部区间：末区间兜底
+        let overflow = cost.unit_prices(1_000_000);
+        assert_eq!(overflow.input, price("3"));
     }
 
     #[test]

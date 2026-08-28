@@ -75,19 +75,23 @@ fn dirs_or_default() -> std::path::PathBuf {
 /// 用于 calculate_cost / fill_message_cost 的真实集成测试：
 /// register_model 注入此 Model 后，calculate_cost 应返回非零费用。
 pub fn priced_model(name: &str) -> Model {
+    // 价格 Decimal 字面量：整数 2/12 与小数 0.4
+    fn d(v: &str) -> rust_decimal::Decimal {
+        v.parse().unwrap()
+    }
     Model {
         name: name.to_string(),
         cost: ModelCost {
-            input: Some(2.0),
-            output: Some(12.0),
+            input: Some(d("2")),
+            output: Some(d("12")),
             reasoning: None,
-            cache: Some(0.4),
+            cache: Some(d("0.4")),
             tiers: vec![PriceTier {
                 max_tokens: 200_000,
-                input: Some(2.0),
-                output: Some(12.0),
+                input: Some(d("2")),
+                output: Some(d("12")),
                 reasoning: None,
-                cache: Some(0.4),
+                cache: Some(d("0.4")),
             }],
         },
         limit: fuyao_api::ModelLimit::default(),

@@ -6,9 +6,19 @@
 //! 列表）不写——读回路径按同一默认值补齐，写盘前后语义一致。
 
 use fuyao_api::{InputModality, Model, ModelModalities, OutputModality};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use toml_edit::{Array, InlineTable, Item, Table, Value, value};
 
 use super::spec::ProviderSpecData;
+
+/// Decimal 价格 → TOML 浮点值
+///
+/// 配置文件价格以浮点字面量书写（`input = 2.5`），写回保持浮点形态；
+/// 价格量级内 Decimal → f64 无损，读回经最短十进制串还原为同一 Decimal。
+fn price_value(price: Decimal) -> Value {
+    Value::from(price.to_f64().unwrap_or_default())
+}
 
 /// 供应商段写入：新建完整的 `[providers.<id>]` 表体（含 models 子表）
 ///
@@ -76,32 +86,32 @@ pub(crate) fn model_to_table(model: &Model) -> Table {
         // 纯标量价格：内联表（匹配手写示例 cost = { input = 2, output = 12 }）
         let mut inline = InlineTable::new();
         if let Some(v) = cost.input {
-            inline.insert("input", Value::from(v));
+            inline.insert("input", price_value(v));
         }
         if let Some(v) = cost.output {
-            inline.insert("output", Value::from(v));
+            inline.insert("output", price_value(v));
         }
         if let Some(v) = cost.reasoning {
-            inline.insert("reasoning", Value::from(v));
+            inline.insert("reasoning", price_value(v));
         }
         if let Some(v) = cost.cache {
-            inline.insert("cache", Value::from(v));
+            inline.insert("cache", price_value(v));
         }
         table.insert("cost", toml_edit::value(inline));
     } else if !cost.tiers.is_empty() {
         // 含梯度：表头 + 数组表（内联表装不下跨行的 tiers）
         let mut cost_table = Table::new();
         if let Some(v) = cost.input {
-            cost_table.insert("input", value(v));
+            cost_table.insert("input", value(price_value(v)));
         }
         if let Some(v) = cost.output {
-            cost_table.insert("output", value(v));
+            cost_table.insert("output", value(price_value(v)));
         }
         if let Some(v) = cost.reasoning {
-            cost_table.insert("reasoning", value(v));
+            cost_table.insert("reasoning", value(price_value(v)));
         }
         if let Some(v) = cost.cache {
-            cost_table.insert("cache", value(v));
+            cost_table.insert("cache", value(price_value(v)));
         }
         let mut tiers = toml_edit::ArrayOfTables::new();
         for tier in &cost.tiers {
@@ -110,16 +120,16 @@ pub(crate) fn model_to_table(model: &Model) -> Table {
             let mut row = Table::new();
             row.insert("max_tokens", value(tier.max_tokens as i64));
             if let Some(v) = tier.input {
-                row.insert("input", value(v));
+                row.insert("input", value(price_value(v)));
             }
             if let Some(v) = tier.output {
-                row.insert("output", value(v));
+                row.insert("output", value(price_value(v)));
             }
             if let Some(v) = tier.reasoning {
-                row.insert("reasoning", value(v));
+                row.insert("reasoning", value(price_value(v)));
             }
             if let Some(v) = tier.cache {
-                row.insert("cache", value(v));
+                row.insert("cache", value(price_value(v)));
             }
             tiers.push(row);
         }
@@ -178,14 +188,19 @@ mod tests {
     use super::*;
     use fuyao_api::{ModelCost, ModelLimit};
 
+    /// 构造 Decimal 价格字面量（字符串解析，测试内可读）
+    fn d(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
     fn sample_model() -> Model {
         Model {
             name: "deepseek-v4-flash".to_string(),
             cost: ModelCost {
-                input: Some(1.0),
-                output: Some(2.0),
+                input: Some(d("1")),
+                output: Some(d("2")),
                 reasoning: None,
-                cache: Some(0.2),
+                cache: Some(d("0.2")),
                 tiers: Vec::new(),
             },
             limit: ModelLimit {
@@ -240,16 +255,16 @@ mod tests {
     fn model_to_table_writes_tiers_as_array_of_tables() {
         let mut model = sample_model();
         model.cost = ModelCost {
-            input: Some(2.0),
+            input: Some(d("2")),
             output: None,
             reasoning: None,
             cache: None,
             tiers: vec![fuyao_api::PriceTier {
                 max_tokens: 256000,
-                input: Some(2.0),
-                output: Some(12.0),
+                input: Some(d("2")),
+                output: Some(d("12")),
                 reasoning: None,
-                cache: Some(0.4),
+                cache: Some(d("0.4")),
             }],
         };
         let table = model_to_table(&model);

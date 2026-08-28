@@ -7,234 +7,277 @@
 //! - [`calculate_cost`]：单条消息费用（Decimal 精确，按模型价格表算）
 //! - [`fill_message_cost`]：按 msg 已填的 token 字段算出 cost 并填入
 //!
-//! session 总计（total_* / total_cost）的累积不再由本模块负责——已下沉到
+//! 两者都是纯函数：价格表（[`ModelCost`]）由调用方查好传入——「查价格」归
+//! 调用方（注册表 / 事件流在其职责域），本模块只管「怎么算」。
+//!
+//! session 总计（total_* / total_cost）的累积不由本模块负责——在
 //! [`SessionStore::insert_message`] 的事务内（DB 唯一数据源，SQL 原子自增）。
 //! 需要精确总额时从 `messages.cost` 列 `SUM` 重算。
 
-use fuyao_api::{AgentPaths, Message, PriceTier};
-use fuyao_provider::get_model;
+use fuyao_api::{Message, ModelCost};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::ToPrimitive;
 
 /// 价格 / 百万 token
 const ONE_MILLION: Decimal = Decimal::from_parts(1000000, 0, 0, false, 0);
 
-/// Token 数量（内部计算用）
-struct TokenCounts {
-    prompt: i64,
-    completion: i64,
-    reasoning: i64,
-    cached: i64,
+/// 单条消息的 token 用量（计费输入）
+///
+/// 四个桶的语义：
+/// - `prompt`：输入总量（含 `cached` 命中部分）
+/// - `completion`：输出总量（含 `reasoning` 部分）
+/// - `reasoning`：其中推理 token 数
+/// - `cached`：其中缓存命中 token 数
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// 输入 token 数（含缓存命中）
+    pub prompt: i64,
+    /// 输出 token 数（含推理）
+    pub completion: i64,
+    /// 推理 token 数（completion 的子集）
+    pub reasoning: i64,
+    /// 缓存命中 token 数（prompt 的子集）
+    pub cached: i64,
 }
 
-/// 根据 prompt_tokens 判断使用哪个 tier
-fn get_tier(tiers: &[PriceTier], prompt_tokens: i64) -> &PriceTier {
-    let mut sorted: Vec<&PriceTier> = tiers.iter().collect();
-    sorted.sort_by_key(|t| t.max_tokens);
-    for tier in &sorted {
-        if prompt_tokens <= tier.max_tokens as i64 {
-            return tier;
+impl TokenUsage {
+    /// 从 assistant Message 的四个 token 字段提取
+    pub fn from_message(msg: &Message) -> Self {
+        Self {
+            prompt: msg.prompt_tokens,
+            completion: msg.completion_tokens,
+            reasoning: msg.reasoning_tokens,
+            cached: msg.cached_tokens,
         }
     }
-    sorted.last().unwrap()
 }
 
-/// 将 Option<f64> 转换为 Decimal
-fn to_decimal(val: Option<f64>) -> Option<Decimal> {
-    val.and_then(Decimal::from_f64)
-}
-
-/// 根据价格配置计算费用（Decimal 精确计算，返回 Decimal）
-fn calculate_amount(
-    input_price: Option<f64>,
-    output_price: Option<f64>,
-    reasoning_price: Option<f64>,
-    cache_price: Option<f64>,
-    tokens: &TokenCounts,
-) -> Decimal {
-    let input_dec = to_decimal(input_price);
-    let output_dec = to_decimal(output_price);
-    let reasoning_dec = to_decimal(reasoning_price);
-    let cache_dec = to_decimal(cache_price);
-
-    let mut amount = Decimal::ZERO;
-
-    // 1. 输入费用（排除缓存部分）
-    let non_cached_input = tokens.prompt - tokens.cached;
-    if let Some(input) = input_dec
-        && non_cached_input > 0
-    {
-        amount += Decimal::from(non_cached_input) * input / ONE_MILLION;
+/// token 桶 × 单价的行项费用
+///
+/// 桶非正（含负值钳制）或缺价记 0——缺价的桶免费是价格表的语义
+/// （如梯度内未配某字段）。
+fn line(tokens: i64, price: Option<Decimal>) -> Decimal {
+    match price {
+        Some(p) if tokens > 0 => Decimal::from(tokens) * p / ONE_MILLION,
+        _ => Decimal::ZERO,
     }
-
-    // 2. 输出费用
-    if let (Some(reasoning), true) = (reasoning_dec, tokens.reasoning > 0) {
-        if reasoning != output_dec.unwrap_or(Decimal::ZERO) {
-            // 分开计算 reasoning 和普通输出
-            let non_reasoning_tokens = tokens.completion - tokens.reasoning;
-            if let Some(output) = output_dec
-                && non_reasoning_tokens > 0
-            {
-                amount += Decimal::from(non_reasoning_tokens) * output / ONE_MILLION;
-            }
-            amount += Decimal::from(tokens.reasoning) * reasoning / ONE_MILLION;
-        } else if let Some(output) = output_dec
-            && tokens.completion > 0
-        {
-            amount += Decimal::from(tokens.completion) * output / ONE_MILLION;
-        }
-    } else if let Some(output) = output_dec
-        && tokens.completion > 0
-    {
-        amount += Decimal::from(tokens.completion) * output / ONE_MILLION;
-    }
-
-    // 3. 缓存费用
-    if let Some(cache) = cache_dec
-        && tokens.cached > 0
-    {
-        amount += Decimal::from(tokens.cached) * cache / ONE_MILLION;
-    }
-
-    amount
 }
 
 /// 计算单条消息费用
 ///
-/// 根据 model_id 查找价格配置，使用 Decimal 精确计算。
+/// 计价规则：四个互不重叠的 token 桶各乘单价后求和——
+/// 非缓存输入（prompt − cached）、普通输出（completion − reasoning）、
+/// 推理、缓存命中。推理桶缺独立价时回退输出价（多数供应商 reasoning 与
+/// output 同价或未单列）。
 ///
 /// # Arguments
-/// * `model_id` - 完整模型 ID（如 `provider/model` 形式）
-/// * `prompt_tokens` - 输入 token 数
-/// * `completion_tokens` - 输出 token 数
-/// * `reasoning_tokens` - 推理 token 数
-/// * `cached_tokens` - 缓存命中 token 数
-/// * `agent_paths` - Agent 三层目录身份证明（按此查模型注册表）
+/// * `cost` - 模型价格表（平价 + 梯度；梯度按 `usage.prompt` 命中）
+/// * `usage` - token 用量四桶
 ///
 /// # Returns
-/// 费用（Decimal），无价格配置时返回 `Decimal::ZERO`
-pub fn calculate_cost(
-    model_id: &str,
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    reasoning_tokens: i64,
-    cached_tokens: i64,
-    agent_paths: &AgentPaths,
-) -> Decimal {
-    let model = match get_model(model_id, agent_paths) {
-        Some(m) => m,
-        None => return Decimal::ZERO,
-    };
+/// 费用（Decimal）；全缺价 / 全零桶时返回 `Decimal::ZERO`
+pub fn calculate_cost(cost: &ModelCost, usage: TokenUsage) -> Decimal {
+    let prices = cost.unit_prices(usage.prompt);
 
-    let tokens = TokenCounts {
-        prompt: prompt_tokens,
-        completion: completion_tokens,
-        reasoning: reasoning_tokens,
-        cached: cached_tokens,
-    };
-
-    if !model.cost.tiers.is_empty() {
-        let tier = get_tier(&model.cost.tiers, prompt_tokens);
-        return calculate_amount(tier.input, tier.output, tier.reasoning, tier.cache, &tokens);
-    }
-
-    calculate_amount(
-        model.cost.input,
-        model.cost.output,
-        model.cost.reasoning,
-        model.cost.cache,
-        &tokens,
-    )
+    line(usage.prompt - usage.cached, prices.input)
+        + line((usage.completion - usage.reasoning).max(0), prices.output)
+        + line(usage.reasoning, prices.reasoning.or(prices.output))
+        + line(usage.cached, prices.cache)
 }
 
 /// 填 assistant Message 的 cost 字段（token 字段由调用方先行填好）
 ///
 /// 「何时计费」的知识归 history 模块（进历史统一入口）——本函数只负责
-/// 「怎么算」：读 msg 已填的四个 token 字段，按模型价格表算出 cost 并填入。
-/// token 字段不再经本函数转填：事件 payload 的 token 字段与 usage 同源
-///（拦截不改 usage），映射器直接从事件取值。
-///
-/// model_id 必填（会话级 ModelConfig.model_id 已是 String，跑 turn 时经 resolve_model
-/// 校验非空），故本函数收到的 model_id 恒非空——不再有「缺失跳过」的分支。
+/// 「怎么算」：读 msg 已填的四个 token 字段，按价格表算出 cost 并填入。
+/// token 字段不经本函数转填：事件 payload 的 token 字段与 usage 同源
+/// （拦截不改 usage），映射器直接从事件取值。
 ///
 /// 注：`msg.cost` 字段是 f64（DB schema 决定），Decimal → f64 转换在这一步发生。
 /// session 总计的累积由 `insert_message` 事务内 SQL 原子自增完成（DB 唯一数据源）；
 /// 需要精确总额时从 `messages.cost` 列 `SUM` 重算，避免 f64 多次相加漂移。
-pub fn fill_message_cost(msg: &mut Message, model_id: &str, agent_paths: &AgentPaths) {
-    // 算 cost 并填进 msg.cost（Decimal 精确算，落 f64 时损失在所难免——DB schema 决定）
-    let cost = calculate_cost(
-        model_id,
-        msg.prompt_tokens,
-        msg.completion_tokens,
-        msg.reasoning_tokens,
-        msg.cached_tokens,
-        agent_paths,
-    );
-    msg.cost = cost.to_f64().unwrap_or(0.0);
+pub fn fill_message_cost(msg: &mut Message, cost: &ModelCost) {
+    let amount = calculate_cost(cost, TokenUsage::from_message(msg));
+    msg.cost = amount.to_f64().unwrap_or(0.0);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuyao_api::PriceTier;
+
+    /// 构造 Decimal 价格字面量（字符串解析，测试内可读）
+    fn d(v: &str) -> Decimal {
+        v.parse().unwrap()
+    }
+
+    /// 平价表构造（价格/M）
+    fn flat_cost(
+        input: Option<Decimal>,
+        output: Option<Decimal>,
+        reasoning: Option<Decimal>,
+        cache: Option<Decimal>,
+    ) -> ModelCost {
+        ModelCost {
+            input,
+            output,
+            reasoning,
+            cache,
+            tiers: Vec::new(),
+        }
+    }
 
     #[test]
     fn calculate_simple_cost() {
-        // 测试简单计算：1000 输入 token，500 输出 token
-        let cost = calculate_amount(
-            Some(2.0),  // 输入价格 2/M
-            Some(12.0), // 输出价格 12/M
-            None,
-            None,
-            &TokenCounts {
+        // 1000 输入 + 500 输出：1000×2/M + 500×12/M = 0.002 + 0.006 = 0.008
+        let cost = calculate_cost(
+            &flat_cost(Some(d("2")), Some(d("12")), None, None),
+            TokenUsage {
                 prompt: 1000,
                 completion: 500,
-                reasoning: 0,
-                cached: 0,
+                ..TokenUsage::default()
             },
         );
-        // 1000 * 2/1000000 + 500 * 12/1000000 = 0.002 + 0.006 = 0.008
-        let expected = Decimal::from_f64(0.008).unwrap();
-        assert!((cost - expected).abs() < Decimal::from_f64(0.0001).unwrap());
+        assert_eq!(cost, d("0.008"));
     }
 
     #[test]
     fn calculate_with_cache() {
-        let cost = calculate_amount(
-            Some(2.0),  // 输入价格 2/M
-            Some(12.0), // 输出价格 12/M
-            None,
-            Some(0.4), // 缓存价格 0.4/M
-            &TokenCounts {
+        // (1000-400)×2/M + 500×12/M + 400×0.4/M = 0.0012 + 0.006 + 0.00016
+        let cost = calculate_cost(
+            &flat_cost(Some(d("2")), Some(d("12")), None, Some(d("0.4"))),
+            TokenUsage {
                 prompt: 1000,
                 completion: 500,
-                reasoning: 0,
                 cached: 400,
+                ..TokenUsage::default()
             },
         );
-        // (1000-400) * 2/1000000 + 500 * 12/1000000 + 400 * 0.4/1000000
-        // = 0.0012 + 0.006 + 0.00016 = 0.00736
-        let expected = Decimal::from_f64(0.00736).unwrap();
-        assert!((cost - expected).abs() < Decimal::from_f64(0.00001).unwrap());
+        assert_eq!(cost, d("0.00736"));
     }
 
     #[test]
-    fn calculate_zero_cost() {
-        let cost = calculate_amount(
-            None,
-            None,
-            None,
-            None,
-            &TokenCounts {
-                prompt: 0,
-                completion: 0,
-                reasoning: 0,
-                cached: 0,
+    fn calculate_zero_cost_when_no_prices() {
+        let cost = calculate_cost(
+            &flat_cost(None, None, None, None),
+            TokenUsage {
+                prompt: 1000,
+                completion: 500,
+                ..TokenUsage::default()
             },
         );
         assert_eq!(cost, Decimal::ZERO);
     }
 
-    // accumulate_session_total 已删除——session 总计的累积下沉到
-    // SessionStore::insert_message 事务内（DB 原子自增），不再有内存累积逻辑可测。
-    // 保留的精确性保证由 messages.cost 列 + SUM 重算提供（DB 真值源）。
+    #[test]
+    fn reasoning_without_own_price_bills_at_output_price() {
+        // reasoning 缺独立价：全部 completion（含 reasoning）按输出价计
+        // 600×12/M + 400×12/M = 1200×12/M = 0.0144
+        let cost = calculate_cost(
+            &flat_cost(None, Some(d("12")), None, None),
+            TokenUsage {
+                prompt: 0,
+                completion: 1200,
+                reasoning: 400,
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(cost, d("0.0144"));
+    }
+
+    #[test]
+    fn reasoning_at_output_price_equals_whole_completion() {
+        // reasoning 价 == output 价：拆桶求和与整体计价结果一致
+        let split = calculate_cost(
+            &flat_cost(None, Some(d("12")), Some(d("12")), None),
+            TokenUsage {
+                prompt: 0,
+                completion: 1200,
+                reasoning: 400,
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(split, d("0.0144"));
+    }
+
+    #[test]
+    fn reasoning_with_own_price_bills_separately() {
+        // reasoning 独立价 4/M：(1200-400)×12/M + 400×4/M = 0.0096 + 0.0016
+        let cost = calculate_cost(
+            &flat_cost(None, Some(d("12")), Some(d("4")), None),
+            TokenUsage {
+                prompt: 0,
+                completion: 1200,
+                reasoning: 400,
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(cost, d("0.0112"));
+    }
+
+    #[test]
+    fn negative_plain_output_bucket_clamps_to_zero() {
+        // usage 异常（reasoning > completion）：普通输出桶钳为 0，不产生负费用
+        let cost = calculate_cost(
+            &flat_cost(None, Some(d("12")), Some(d("4")), None),
+            TokenUsage {
+                prompt: 0,
+                completion: 100,
+                reasoning: 300,
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(cost, d("0.0012"));
+    }
+
+    #[test]
+    fn tiers_override_flat_prices_per_matched_tier() {
+        // 梯度非空时整体取代平价：命中梯度内缺价的桶免费，不回退平价
+        let cost = ModelCost {
+            input: Some(d("999")),
+            output: Some(d("999")),
+            reasoning: None,
+            cache: Some(d("999")),
+            tiers: vec![PriceTier {
+                max_tokens: 200_000,
+                input: Some(d("2")),
+                output: Some(d("12")),
+                reasoning: None,
+                cache: None,
+            }],
+        };
+        // 2000 prompt（全部未命中缓存）+ 500 输出：2000×2/M + 500×12/M = 0.01
+        let amount = calculate_cost(
+            &cost,
+            TokenUsage {
+                prompt: 2000,
+                completion: 500,
+                cached: 100,
+                ..TokenUsage::default()
+            },
+        );
+        // 梯度内无 cache 价：100 cached 不收费，且输入按非缓存口径 1900 计
+        // 1900×2/M + 500×12/M = 0.0098
+        assert_eq!(amount, d("0.0098"));
+    }
+
+    #[test]
+    fn fill_message_cost_writes_cost_only() {
+        // fill_message_cost 读四个 token 字段算 cost 填入，token 字段原样保留
+        let mut msg = Message::assistant(Some("resp".to_string()));
+        msg.prompt_tokens = 1000;
+        msg.completion_tokens = 500;
+        msg.reasoning_tokens = 0;
+        msg.cached_tokens = 0;
+
+        fill_message_cost(
+            &mut msg,
+            &flat_cost(Some(d("2")), Some(d("12")), None, None),
+        );
+
+        assert_eq!(msg.prompt_tokens, 1000);
+        assert_eq!(msg.completion_tokens, 500);
+        assert_eq!(msg.reasoning_tokens, 0);
+        assert_eq!(msg.cached_tokens, 0);
+        assert!((msg.cost - 0.008).abs() < 0.0000001);
+    }
 }
