@@ -38,6 +38,49 @@
 use crate::error::SessionError;
 use fuyao_api::MessageKind;
 
+/// 校验切割目标消息（事务内执行，复用调用方的事务连接）
+///
+/// 目标必须存在且为 user 消息（role 判定）或 compaction 消息（kind 判定）。
+/// assistant / tool 消息是中间态，切到它们语义不完整（assistant 的 tool_call 可能
+/// 无配对结果、tool 结果孤立存在会破坏配对），拒绝。
+///
+/// 回退与派生两条切割路径共用本校验，保证两个入口的目标约束永远同一套。
+///
+/// # 错误
+/// - [`SessionError::NotFound`]:目标 seq 在该 session 中无对应消息
+/// - [`SessionError::InvalidCutTarget`]:目标非 user 且非 compaction
+pub(super) async fn validate_cut_target(
+    conn: &mut sqlx::SqliteConnection,
+    session_id: &str,
+    target_seq: i64,
+) -> Result<(), SessionError> {
+    // 取目标消息的 role/kind 做合法性判定
+    let target_row: Option<(String, String)> =
+        sqlx::query_as("SELECT role, kind FROM messages WHERE session_id = ?1 AND seq = ?2")
+            .bind(session_id)
+            .bind(target_seq)
+            .fetch_optional(conn)
+            .await?;
+
+    let Some((role, kind)) = target_row else {
+        return Err(SessionError::NotFound(format!(
+            "session={session_id} 中无 seq={target_seq} 的消息"
+        )));
+    };
+
+    // 目标合法性判定：role 管对话角色，kind 管消息类型标记，两者正交。
+    // 合法切割目标 = user 消息（role 判定） 或 compaction 消息（kind 判定）。
+    // compaction 消息的 role 是 assistant（摘要由助手产出，以 assistant 身份
+    // 参与对话流），但它是压缩边界这一事实只由 kind 表达——故 compaction
+    // 一律靠 kind 识别，与 role 无关。
+    if role != "user" && kind != MessageKind::Compaction.as_str() {
+        return Err(SessionError::InvalidCutTarget(format!(
+            "seq={target_seq}（role={role}, kind={kind}）"
+        )));
+    }
+    Ok(())
+}
+
 impl super::SessionStore {
     /// 把会话回退到目标消息之前（删目标消息及其后的所有消息 + 重算 count 类与压缩元数据）
     ///
@@ -59,37 +102,15 @@ impl super::SessionStore {
     ///
     /// # 错误
     /// - [`SessionError::NotFound`]:session_id 不存在，或 target_seq 在该 session 中无对应消息
-    /// - [`SessionError::InvalidRollbackTarget`]:目标消息非 user 且非 compaction（assistant / tool 中间态）
+    /// - [`SessionError::InvalidCutTarget`]:目标消息非 user 且非 compaction（assistant / tool 中间态）
     pub async fn rollback_to(&self, session_id: &str, target_seq: i64) -> Result<(), SessionError> {
         let mut tx = self.pool.begin().await?;
 
         // 1. 校验 session 存在（避免给不存在的 session 操作）
         super::session::require_session(&mut tx, session_id).await?;
 
-        // 2. 取目标消息的 role/kind 做合法性判定
-        let target_row: Option<(String, String)> =
-            sqlx::query_as("SELECT role, kind FROM messages WHERE session_id = ?1 AND seq = ?2")
-                .bind(session_id)
-                .bind(target_seq)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        let Some((role, kind)) = target_row else {
-            return Err(SessionError::NotFound(format!(
-                "session={session_id} 中无 seq={target_seq} 的消息"
-            )));
-        };
-
-        // 目标合法性判定：role 管对话角色，kind 管消息类型标记，两者正交。
-        // 合法回退目标 = user 消息（role 判定） 或 compaction 消息（kind 判定）。
-        // compaction 消息的 role 是 assistant（摘要由助手产出，以 assistant 身份
-        // 参与对话流），但它是压缩边界这一事实只由 kind 表达——故 compaction
-        // 一律靠 kind 识别，与 role 无关。
-        if role != "user" && kind != MessageKind::Compaction.as_str() {
-            return Err(SessionError::InvalidRollbackTarget(format!(
-                "seq={target_seq}（role={role}, kind={kind}）"
-            )));
-        }
+        // 2. 校验回退目标：存在且为 user 消息或 compaction 消息
+        validate_cut_target(&mut tx, session_id, target_seq).await?;
 
         // 3. 删除目标消息及其后的所有消息，RETURNING 带回被删行的 (role, kind)——
         //    删除与删除计数一次往返完成。计数仅用于日志（INFO 重建故事）：
@@ -392,7 +413,7 @@ mod tests {
 
         let result = store.rollback_to(&session.id, a1).await;
         assert!(
-            matches!(result, Err(SessionError::InvalidRollbackTarget(_))),
+            matches!(result, Err(SessionError::InvalidCutTarget(_))),
             "assistant 中间态不可作为回退目标"
         );
 
@@ -411,7 +432,7 @@ mod tests {
 
         let result = store.rollback_to(&session.id, t_seq).await;
         assert!(
-            matches!(result, Err(SessionError::InvalidRollbackTarget(_))),
+            matches!(result, Err(SessionError::InvalidCutTarget(_))),
             "tool 孤儿消息不可作为回退目标"
         );
     }

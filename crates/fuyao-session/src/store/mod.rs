@@ -12,6 +12,8 @@
 //!   list_messages_before 游标分页浏览）
 //! - [`compaction`]：压缩边界写入（mark_compaction + CompressionReason，局部 UPDATE
 //!   sessions 的 compression_count / last_compacted_seq）
+//! - [`fork`]：对话派生（复制 seq < target 的消息到新独立会话，单事务：建行 +
+//!   复制 + 按复制结果重算元数据；目标必须是 user / compaction 消息）
 //! - [`visible_window`]：给 LLM 的可见窗口查询（压缩感知，最新摘要 + 摘要后新消息）。
 //!   与 [`message`] 的「给人看的」查询路径正交
 //! - [`rollback`]：对话回退（删目标 seq 之后消息 + 局部 UPDATE 重算 count 类与
@@ -19,6 +21,7 @@
 //! - [`todo`]：todos 表的读写 + 级联删除（任务列表 CRUD）
 
 pub(crate) mod compaction;
+mod fork;
 mod message;
 mod rollback;
 mod row;

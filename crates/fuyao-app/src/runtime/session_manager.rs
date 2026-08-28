@@ -6,7 +6,7 @@
 //!
 //! 两者共享同一份 [`fuyao_session::SessionStore`]（由装配层 [`crate::start`] 注入
 //! `Arc` 克隆），各取所需：Engine 写（LLM 流程落库、自动标题生成）、SessionManager
-//! 读查询 + 补引擎不做的「用户 / 应用手动编辑」写（如手改标题、回退）。
+//! 读查询 + 补引擎不做的「用户 / 应用手动编辑」写（如手改标题、回退、派生分支）。
 //! 通讯方式为直接异步方法调用——纯存储操作、不涉及 LLM、不需要流式产出，
 //! 与 `App::create_session` 返 `SessionId` 同属「管理型同步方法」，不走消息总线。
 //!
@@ -171,7 +171,7 @@ impl SessionManager {
     /// # 错误
     /// - [`fuyao_session::SessionError::NotFound`]：session_id 不存在，或 target_seq
     ///   在该 session 中无对应消息
-    /// - [`fuyao_session::SessionError::InvalidRollbackTarget`]：目标非 user 且非
+    /// - [`fuyao_session::SessionError::InvalidCutTarget`]：目标非 user 且非
     ///   compaction（assistant / tool 中间态）
     pub async fn rollback_session(
         &self,
@@ -179,6 +179,42 @@ impl SessionManager {
         target_seq: i64,
     ) -> Result<(), fuyao_session::SessionError> {
         self.store.rollback_to(session_id, target_seq).await
+    }
+
+    // ── 会话派生（fork）──────────────────────────────────────────
+
+    /// 把会话派生到目标消息之前（复制目标之前的全部消息到新独立会话，源会话不动）
+    ///
+    /// 复用存储层单事务原子执行体 [`SessionStore::fork_to`](fuyao_session::SessionStore::fork_to)
+    /// （建新会话行 + 复制 `seq < target` 的消息 + 按复制结果聚合重算分支元数据），
+    /// 返回新会话 id。分支的后续状态经既有读路径获取：`list_messages` 浏览分支消息，
+    /// `get_session` 看分支元数据；继续对话经运行时门面
+    /// [`App::resume_session`](crate::App::resume_session) 激活分支。
+    ///
+    /// # 切割语义
+    ///
+    /// 目标必须是 user 消息或 compaction 消息（assistant / tool 中间态拒绝）；
+    /// 分支 = 目标消息之前的全部消息（含压缩前旧消息与更早的压缩边界）。
+    /// 同一目标点上，回退删源会话的目标及其后消息，派生把目标之前的消息落成
+    /// 新分支、源会话原样不动——分支消息集即回退后源会话的剩余消息集，
+    /// 派生是回退的非破坏版本。
+    ///
+    /// # 运行态责任边界
+    ///
+    /// 派生无需先停 turn：消息 seq 单调递增且插入后不改，活跃 turn 的落库只发生
+    /// 在目标之后，分支快照（`seq < target`）不受影响。
+    ///
+    /// # 错误
+    /// - [`fuyao_session::SessionError::NotFound`]：session_id 不存在，或 target_seq
+    ///   在该 session 中无对应消息
+    /// - [`fuyao_session::SessionError::InvalidCutTarget`]：目标非 user 且非
+    ///   compaction（assistant / tool 中间态）
+    pub async fn fork_session(
+        &self,
+        session_id: &str,
+        target_seq: i64,
+    ) -> Result<String, fuyao_session::SessionError> {
+        self.store.fork_to(session_id, target_seq).await
     }
 
     // ── 消息查询 ───────────────────────────────────────────────
@@ -944,7 +980,7 @@ mod tests {
 
     #[tokio::test]
     async fn rollback_session_rejects_assistant_target_and_keeps_db() {
-        // 非法目标（assistant 中间态）→ Err(InvalidRollbackTarget)，DB 不变
+        // 非法目标（assistant 中间态）→ Err(InvalidCutTarget)，DB 不变
         let manager = temp_manager().await;
         let sid = seed_session(&manager, None).await;
         seed_user_message(&manager, &sid, "u1").await;
@@ -960,7 +996,7 @@ mod tests {
         let result = manager.rollback_session(&sid, 2).await;
         assert!(matches!(
             result,
-            Err(fuyao_session::SessionError::InvalidRollbackTarget(_))
+            Err(fuyao_session::SessionError::InvalidCutTarget(_))
         ));
 
         let after = manager
@@ -976,6 +1012,112 @@ mod tests {
     async fn rollback_session_missing_session_errors() {
         let manager = temp_manager().await;
         let result = manager.rollback_session("nonexistent", 1).await;
+        assert!(matches!(
+            result,
+            Err(fuyao_session::SessionError::NotFound(_))
+        ));
+    }
+
+    // ===== fork_session：透传存储层派生执行体 =====
+
+    #[tokio::test]
+    async fn fork_session_creates_branch_with_messages_before_target() {
+        // 场景：u1, a1, u2, a2 → fork 到 u2 → 新会话 id 返回，分支只剩 u1, a1，源原样
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        seed_user_message(&manager, &sid, "u1").await;
+        seed_assistant_message(&manager, &sid, "a1").await;
+        seed_user_message(&manager, &sid, "u2").await;
+        seed_assistant_message(&manager, &sid, "a2").await;
+
+        // fork 目标取 u2 的 seq（插入顺序 1/2/3/4，u2 = seq3）
+        let branch_id = manager.fork_session(&sid, 3).await.unwrap();
+        assert_ne!(branch_id, sid, "分支应是新会话");
+
+        // 分支：目标 u2 与其后的 a2 不进分支（seq 倒序，最新在前）
+        let branch = manager
+            .list_messages(&branch_id, None, Some(10))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(branch.len(), 2, "分支只剩目标之前的消息");
+        assert_eq!(branch[0].content.as_deref(), Some("a1"));
+        assert_eq!(branch[1].content.as_deref(), Some("u1"));
+
+        // 源会话原样不动
+        let source = manager
+            .list_messages(&sid, None, Some(10))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(source.len(), 4);
+
+        // 分支作为独立主会话出现在列表里
+        let list = manager.list_sessions(None, 100, 0).await.unwrap();
+        assert_eq!(list.total, 2, "源 + 分支各占一个列表位");
+        assert!(
+            list.items.iter().any(|s| s.id == branch_id),
+            "分支应出现在主列表"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_session_compaction_target_discards_compression_in_branch() {
+        // compaction 目标：压缩消息本体及之后不进分支，分支压缩元数据为空；源的元数据不动
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        seed_user_message(&manager, &sid, "u1").await;
+        let comp_seq = manager
+            .store
+            .mark_compaction(&sid, "摘要".to_string(), CompressionReason::Auto)
+            .await
+            .unwrap();
+        seed_user_message(&manager, &sid, "u2").await;
+
+        let branch_id = manager.fork_session(&sid, comp_seq).await.unwrap();
+
+        // 分支只剩 u1
+        let branch = manager
+            .list_messages(&branch_id, None, Some(10))
+            .await
+            .unwrap()
+            .items;
+        assert_eq!(branch.len(), 1, "压缩消息本体与其后的 u2 不进分支");
+
+        let branch_meta = manager.get_session(&branch_id).await.unwrap().unwrap();
+        assert_eq!(branch_meta.last_compacted_seq, None);
+        assert_eq!(branch_meta.compression_count, 0);
+
+        // 源会话原样不动
+        let source_meta = manager.get_session(&sid).await.unwrap().unwrap();
+        assert_eq!(source_meta.last_compacted_seq, Some(comp_seq));
+        assert_eq!(source_meta.compression_count, 1);
+    }
+
+    #[tokio::test]
+    async fn fork_session_rejects_assistant_target_and_keeps_db() {
+        // 非法目标（assistant 中间态）→ Err(InvalidCutTarget)，不新建会话
+        let manager = temp_manager().await;
+        let sid = seed_session(&manager, None).await;
+        seed_user_message(&manager, &sid, "u1").await;
+        seed_assistant_message(&manager, &sid, "a1").await;
+        let before = manager.list_sessions(None, 100, 0).await.unwrap().total;
+
+        // assistant 消息的 seq = 2
+        let result = manager.fork_session(&sid, 2).await;
+        assert!(matches!(
+            result,
+            Err(fuyao_session::SessionError::InvalidCutTarget(_))
+        ));
+
+        let after = manager.list_sessions(None, 100, 0).await.unwrap().total;
+        assert_eq!(before, after, "非法 fork 不应新建会话");
+    }
+
+    #[tokio::test]
+    async fn fork_session_missing_session_errors() {
+        let manager = temp_manager().await;
+        let result = manager.fork_session("nonexistent", 1).await;
         assert!(matches!(
             result,
             Err(fuyao_session::SessionError::NotFound(_))

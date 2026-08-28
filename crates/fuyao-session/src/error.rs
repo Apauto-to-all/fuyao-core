@@ -17,9 +17,10 @@ pub enum SessionError {
     #[error("会话未找到: {0}")]
     NotFound(String),
 
-    /// 无效的回退目标（目标消息不是 user 消息也不是 compaction 消息）
-    #[error("无效的回退目标（只能回退到用户消息或压缩消息）: {0}")]
-    InvalidRollbackTarget(String),
+    /// 无效的切割目标（目标消息不是 user 消息也不是 compaction 消息，
+    /// 回退与派生共用此判定）
+    #[error("无效的切割目标（只能切到用户消息或压缩消息）: {0}")]
+    InvalidCutTarget(String),
 }
 
 impl SessionError {

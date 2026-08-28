@@ -254,7 +254,7 @@ impl super::SessionStore {
     ///
     /// seq 由调用方分配(事务内取一次起点后连续递增),本函数只负责写行,
     /// 不触碰 sessions 统计——统计累加条件由调用方维护。
-    async fn insert_message_row(
+    pub(super) async fn insert_message_row(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         session_id: &str,
         msg: &Message,

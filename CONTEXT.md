@@ -33,7 +33,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 可见窗口 | `load_visible_messages` | 给 LLM 的压缩感知窗口（最新 compaction 摘要 + 其后新消息），与「给人看的」查询路径正交 |
 | 上下文压缩 | `compaction` / `run_compression` | 插一条 `kind='compaction'` 边界消息 + 更新元数据，旧消息物理保留；触发公式 `prompt_tokens >= threshold × (context_length - summary_max_tokens)` |
 | 回退 | `rollback_to` | 删目标（user 或 compaction 边界）及其后消息；计数类重算，费用不抹账（回退不抹账） |
-| 派生 | `fork_session` | 复制源会话可见上下文，parent=None |
+| 派生 | `fork_session` / `fork_to` | 复制源会话到新独立会话（parent=None），非破坏（源不动）。两个面：Engine/App 层复制完整可见上下文（活装配，可直接对话）；SessionManager/存储层按目标消息切割复制（`seq < target` 全部消息，纯存储分支，目标必须是 user / compaction 消息，与回退共用目标校验） |
 | 子会话 | `create_child_session` | 带父标记（`parent_session_id`），rx 不进 fan-in；`Fresh`（空上下文）/ `Fork`（复制）两源 |
 | 双队列 | guide / pending | 用户消息与控制命令消息共用的排队层：条目（`QueueEntry`）自带 mode 决定入队与生效时机——`Guide`（引导队列，工具批完成后即投递）/ `Pending`（排队队列，最终回复后才投递） |
 | 计费 | `calculate_cost` | 全部费用运算集中于此，Decimal 精确，按 `PriceTier` 分档；assistant 消息经 `emit_billed_to_history` 唯一计费时机 |

@@ -22,7 +22,7 @@ use fuyao_api::Session;
 /// session id 主键冲突时的最大重试次数（不含首次尝试）
 ///
 /// 32 bit 熵下连续碰撞到这个次数的概率近乎零，命中即视为不可恢复故障向上抛错。
-const ID_CONFLICT_MAX_RETRIES: usize = 3;
+pub(super) const ID_CONFLICT_MAX_RETRIES: usize = 3;
 
 /// 校验 session 存在（事务内执行，复用调用方的事务连接）
 ///
@@ -51,6 +51,22 @@ impl super::SessionStore {
     ///
     /// 消息产生时由调用方经 `insert_message` 单条落库,不在此处批量写。
     pub async fn create(&self, session: &Session) -> Result<(), SessionError> {
+        Self::insert_session_row(&self.pool, session).await
+    }
+
+    /// 在指定执行器上插入一条 session 元数据行(建行写入体)
+    ///
+    /// 只负责写行本身,不含 id 冲突重试——重试策略由调用方各自维护
+    /// (池上路径在 [`Self::create_with_retry`],事务内路径在
+    /// [`fork_to`](super::SessionStore::fork_to))。18 列全量对齐 schema,
+    /// 池连接与事务连接共用同一份 INSERT。
+    pub(super) async fn insert_session_row<'e, E>(
+        executor: E,
+        session: &Session,
+    ) -> Result<(), SessionError>
+    where
+        E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+    {
         sqlx::query(
             "INSERT INTO sessions (id, started_at, ended_at, end_reason,
                 message_count, tool_call_count, total_prompt_tokens, total_completion_tokens,
@@ -76,7 +92,7 @@ impl super::SessionStore {
         .bind(session.parent_session_id.as_deref())
         .bind(session.workspace.as_deref())
         .bind(session.last_active_at)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
 
         Ok(())
