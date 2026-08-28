@@ -6,7 +6,6 @@ members = [
     "crates/fuyao-provider",
     "crates/fuyao-session",
     "crates/fuyao-tools",
-    "crates/fuyao-skills",
     "crates/fuyao-mcp",
     "crates/fuyao-prompt",
     "crates/fuyao-hooks",

@@ -1,7 +1,14 @@
-//! Skills 读取门面：文件系统四层优先 + 内置兜底
+//! Skills 模块：Agent Skills 协议（发现 / 加载 / 解析）的完整实现
 //!
-//! 技能读取的统一出口，三个函数与 `fuyao_skills` 对应函数签名完全一致，
-//! 消费方只需换 import 即获得内置技能兜底：
+//! 符合 Agent Skills 官方规范 (<https://agentskills.io/specification>)
+//!
+//! 分层组织：
+//! - `finder`: 扫描四层目录发现 Skill（Tier 1：元数据）
+//! - `loader`: 按需加载 Skill 完整内容（Tier 2）和关联文件（Tier 3）
+//! - `helpers`: frontmatter 解析、关联文件扫描等纯函数
+//! - `error`: 错误类型 [`SkillsError`]
+//!
+//! 对外读取出口（本文件三个函数）：
 //! - [`list_skills`]：文件系统发现结果 + 内置技能条目追加（同名去重，内置最低优先级）
 //! - [`load_skill`]：文件系统优先，NotFound 时查内置表
 //! - [`load_skill_file`]：文件系统优先，NotFound 时查内置表
@@ -9,10 +16,16 @@
 //! 错误透传约定：仅 [`SkillsError::NotFound`] 触发内置兜底；其他错误（IO 等）
 //! 原样透传，不吞成内置兜底——文件系统层的真实故障不被内置版本掩盖。
 
+mod error;
+mod finder;
+mod helpers;
+mod loader;
+
+pub use self::error::SkillsError;
+
+use self::helpers::{find_first_non_heading, parse_skill_frontmatter, truncate_skill_fields};
 use crate::builtin::{BuiltinKind, builtin_entry, builtin_names, builtin_skill_file};
 use fuyao_api::{AgentPaths, LINKED_SUBDIRS, SkillDefinition, SkillMeta};
-use fuyao_skills::SkillsError;
-use fuyao_skills::{find_first_non_heading, parse_skill_frontmatter, truncate_skill_fields};
 use std::collections::{HashMap, HashSet};
 
 /// 列举全部可用技能（Tier 1：元数据）
@@ -23,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 /// name / description 必须带全——缺失即视为资产损坏，跳过并记 WARN，
 /// 不 panic、不拖垮整个列举。
 pub fn list_skills(ctx: &AgentPaths) -> Result<Vec<SkillMeta>, SkillsError> {
-    let mut skills = fuyao_skills::find_all_skills(ctx)?;
+    let mut skills = finder::find_all_skills(ctx)?;
     // 去重键持有所有权（String），避免与 skills 的后续 push 构成借用冲突
     let fs_names: HashSet<String> = skills.iter().map(|s| s.name.clone()).collect();
 
@@ -65,7 +78,7 @@ pub fn list_skills(ctx: &AgentPaths) -> Result<Vec<SkillMeta>, SkillsError> {
 /// （frontmatter → 条目名 / 正文首行非标题），`skill_dir` 恒为 `None`
 /// （编译期嵌入，无磁盘目录）。
 pub fn load_skill(name: &str, ctx: &AgentPaths) -> Result<SkillDefinition, SkillsError> {
-    match fuyao_skills::load_skill(name, ctx) {
+    match loader::load_skill(name, ctx) {
         Ok(def) => Ok(def),
         // 仅 NotFound 触发内置兜底
         Err(err @ SkillsError::NotFound(_)) => builtin_skill_definition(name).ok_or(err),
@@ -84,7 +97,7 @@ pub fn load_skill_file(
     file_path: &str,
     ctx: &AgentPaths,
 ) -> Result<String, SkillsError> {
-    match fuyao_skills::load_skill_file(name, file_path, ctx) {
+    match loader::load_skill_file(name, file_path, ctx) {
         Ok(content) => Ok(content),
         Err(err @ SkillsError::NotFound(_)) => {
             if file_path.trim().is_empty() || file_path.contains("..") {
@@ -171,6 +184,51 @@ fn builtin_linked_files(
     linked
 }
 
+/// Skills 单元测试共享 fixture
+///
+/// 构造可注入 fuyao_home / workspace / extra_dirs 的 AgentPaths，
+/// 以及在指定 skills 目录下创建 SKILL.md + 关联文件的辅助函数，
+/// 字段注入绕开环境变量，实现 per-test 隔离。
+#[cfg(test)]
+pub(crate) mod test_util {
+    use fuyao_api::AgentPaths;
+    use std::path::{Path, PathBuf};
+
+    /// 构造可注入路径的 AgentPaths，覆盖四层（global/agent/workspace）+ extra 组合
+    pub(crate) fn make_paths(
+        fuyao_home: PathBuf,
+        workspace: Option<PathBuf>,
+        extra_dirs: Vec<PathBuf>,
+    ) -> AgentPaths {
+        AgentPaths {
+            agent_id: None,
+            workspace,
+            extra_dirs,
+            fuyao_home,
+        }
+    }
+
+    /// 在 `skills_root` 下创建一个带 frontmatter 的 SKILL.md，返回 skill 目录路径。
+    ///
+    /// `body` 为正文（frontmatter 之后的 markdown）；若为 None 则只写 frontmatter。
+    pub(crate) fn write_skill_md(
+        skills_root: &Path,
+        name: &str,
+        frontmatter: &str,
+        body: Option<&str>,
+    ) -> PathBuf {
+        let skill_dir = skills_root.join(name);
+        std::fs::create_dir_all(&skill_dir).unwrap_or_else(|e| panic!("创建 skill 目录失败：{e}"));
+        let content = match body {
+            Some(b) => format!("---\n{frontmatter}\n---\n{b}"),
+            None => format!("---\n{frontmatter}\n---\n"),
+        };
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_md, content).unwrap_or_else(|e| panic!("写 SKILL.md 失败：{e}"));
+        skill_dir
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,7 +273,6 @@ mod tests {
             workspace: Some(ws),
             ..AgentPaths::default()
         };
-
         let skills = list_skills(&ctx).unwrap();
         let matches: Vec<_> = skills.iter().filter(|s| s.name == "fuyao-config").collect();
         assert_eq!(matches.len(), 1, "同名技能应去重为 1 条");

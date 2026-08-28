@@ -15,7 +15,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 ## 项目导航
 
-所有源码在 `crates/` 下，11 个 crate 依赖严格单向，禁止反向依赖。按职责分五类：
+所有源码在 `crates/` 下，10 个 crate 依赖严格单向，禁止反向依赖。按职责分五类：
 
 **基座**（公共类型）：
 
@@ -28,14 +28,13 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 **内核协作者**（被 core 直接依赖 + 被能力层复用，构成内核但不参与 ReAct 编排）：
 
 - `fuyao-session`：会话持久化（SQLite CRUD）+ 上下文压缩 + 费用计算 + 标题生成
-- `fuyao-prompt`：系统提示词分层构建（覆盖区 + 补充区）+ Agent 定义加载与注册表 + 内置资产统一模块（Agent 定义与 skills）。**被 fuyao-core 与 fuyao-tools 双重消费**（fuyao-tools 的 subagent/skill 工具调其定义加载与列表查询能力）
+- `fuyao-prompt`：系统提示词分层构建（覆盖区 + 补充区）+ Agent 定义模块（frontmatter 解析 / 四层加载 / 列举搜索）+ agent_id 注册表 + 内置资产统一模块（Agent 定义与 skills）+ Agent Skills 协议实现（发现 / 加载 / 解析，文件系统四层优先 + 内置兜底）。**被 fuyao-core 与 fuyao-tools 双重消费**（fuyao-tools 的 subagent/skill 工具调其定义加载、skills 读取与列表查询能力）
 - `fuyao-hooks`：钩子系统（拦截 + 观察）+ 插件两层模型（Plugin 工厂 / PluginInstance 实例）。**被 fuyao-core 与 fuyao-guard 双重消费**
 
 **能力实现**（引擎装配的能力，多数彼此独立、可增删替换；个别有跨层复用见各条说明）：
 
 - `fuyao-provider`：LLM 客户端（自建 HTTP，OpenAI 兼容）+ ProviderRegistry 多路由
 - `fuyao-mcp`：MCP Server 连接管理 + 工具发现 / 注册 / 调用
-- `fuyao-skills`：Agent Skills 协议（发现 / 加载 / 解析）
 - `fuyao-tools`：内置工具实现集合（file / terminal / web / todo / skill / subagent）。**依赖 fuyao-prompt（子代理定义加载与校验、Agent 定义查询、skills 读取门面）**
 - `fuyao-guard`：内置防护插件（循环检测，防重复执行 / 输出），基于 hooks 插件机制接入。**依赖 fuyao-hooks**
 

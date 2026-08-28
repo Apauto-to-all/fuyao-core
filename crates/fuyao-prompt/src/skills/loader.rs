@@ -2,9 +2,9 @@
 //!
 //! 按需加载 Skill 完整内容（Tier 2）和关联文件（Tier 3）。
 
-use crate::error::SkillsError;
-use crate::finder::find_skill_md_by_name;
-use crate::helpers::{
+use super::error::SkillsError;
+use super::finder::find_skill_md_by_name;
+use super::helpers::{
     find_first_non_heading, parse_skill_frontmatter, scan_linked_files, truncate_skill_fields,
 };
 use fuyao_api::AgentPaths;

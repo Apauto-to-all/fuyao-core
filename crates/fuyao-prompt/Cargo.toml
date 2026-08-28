@@ -6,16 +6,16 @@ publish.workspace = true
 
 [dependencies]
 fuyao-api = { path = "../fuyao-api" }
-fuyao-skills = { path = "../fuyao-skills" }
 serde = { workspace = true }
+serde_json.workspace = true
 serde_yaml.workspace = true
 thiserror.workspace = true
 toml = { workspace = true }
 regex.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+ignore.workspace = true
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 rstest = { workspace = true }

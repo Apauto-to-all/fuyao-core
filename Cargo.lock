@@ -1093,7 +1093,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "fuyao-api",
- "fuyao-skills",
+ "ignore",
  "regex",
  "rstest",
  "serde",
@@ -1144,20 +1144,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "fuyao-skills"
-version = "0.1.0"
-dependencies = [
- "fuyao-api",
- "ignore",
- "regex",
- "rstest",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror",
 ]
 
 [[package]]

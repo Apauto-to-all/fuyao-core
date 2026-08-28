@@ -3,8 +3,8 @@
 //! 扫描分层目录发现 Skill（含插件 extra），返回元数据列表（Tier 1）。
 //! 使用 ignore crate 进行高性能遍历，排除特定目录。
 
-use crate::error::SkillsError;
-use crate::helpers::{find_first_non_heading, parse_skill_frontmatter};
+use super::error::SkillsError;
+use super::helpers::{find_first_non_heading, parse_skill_frontmatter};
 use fuyao_api::AgentPaths;
 use fuyao_api::SkillMeta;
 use ignore::WalkBuilder;
@@ -161,6 +161,17 @@ fn walk_skill_mds(base: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::test_util::{make_paths, write_skill_md};
+
+    /// 构造指向 tempdir 下 home 的 skills 根目录路径
+    fn home_skills(home: &std::path::Path) -> std::path::PathBuf {
+        home.join("skills")
+    }
+
+    /// 构造 workspace 层的 skills 根目录（ws/.fuyao/skills）
+    fn ws_skills(ws: &std::path::Path) -> std::path::PathBuf {
+        ws.join(".fuyao").join("skills")
+    }
 
     #[test]
     fn walk_skill_mds_finds_skill_files() {
@@ -320,5 +331,178 @@ mod tests {
             "全中文内容，字符边界应是 3 的倍数：{end}"
         );
         let _ = truncated.to_string(); // 不 panic 即合法 UTF-8
+    }
+
+    // ---------------------------------------------------------------------------
+    // find_all_skills：分层发现与去重
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn find_all_skills_empty_returns_empty_vec() {
+        // 无任何 skills 目录 → Ok(空)
+        let temp = tempfile::tempdir().unwrap();
+        let paths = make_paths(temp.path().to_path_buf(), None, vec![]);
+        let skills = find_all_skills(&paths).unwrap();
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn find_all_skills_discovers_from_global_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_skill_md(
+            &home_skills(home),
+            "my-skill",
+            "name: my-skill\ndescription: 全局层 skill",
+            None,
+        );
+
+        let paths = make_paths(home.to_path_buf(), None, vec![]);
+        let skills = find_all_skills(&paths).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my-skill");
+        assert_eq!(skills[0].description, "全局层 skill");
+    }
+
+    #[test]
+    fn find_all_skills_dedup_keeps_higher_priority_layer() {
+        // 同名 skill 在 global 与 workspace 两层，应去重保留 workspace（高优先级）
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let ws = temp.path().join("project");
+        std::fs::create_dir_all(ws_skills(&ws)).unwrap();
+
+        write_skill_md(
+            &home_skills(home),
+            "dup",
+            "name: dup\ndescription: 全局层",
+            None,
+        );
+        write_skill_md(
+            &ws_skills(&ws),
+            "dup",
+            "name: dup\ndescription: workspace 层",
+            None,
+        );
+
+        let paths = make_paths(home.to_path_buf(), Some(ws), vec![]);
+        let skills = find_all_skills(&paths).unwrap();
+        assert_eq!(skills.len(), 1, "同名应去重");
+        assert_eq!(skills[0].description, "workspace 层", "应保留高优先级层");
+    }
+
+    #[test]
+    fn find_all_skills_extra_dirs_lowest_priority() {
+        // extra_dirs 提供的 skill 应被发现，但优先级最低
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let plugin_root = temp.path().join("my-plugin");
+        std::fs::create_dir_all(plugin_root.join("skills")).unwrap();
+
+        write_skill_md(
+            &plugin_root.join("skills"),
+            "plugin-skill",
+            "name: plugin-skill\ndescription: 来自插件",
+            None,
+        );
+
+        let paths = make_paths(home.to_path_buf(), None, vec![plugin_root]);
+        let skills = find_all_skills(&paths).unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "plugin-skill");
+    }
+
+    #[test]
+    fn find_all_skills_results_sorted_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_skill_md(
+            &home_skills(home),
+            "zebra",
+            "name: zebra\ndescription: z",
+            None,
+        );
+        write_skill_md(
+            &home_skills(home),
+            "apple",
+            "name: apple\ndescription: a",
+            None,
+        );
+        write_skill_md(
+            &home_skills(home),
+            "mango",
+            "name: mango\ndescription: m",
+            None,
+        );
+
+        let paths = make_paths(home.to_path_buf(), None, vec![]);
+        let skills = find_all_skills(&paths).unwrap();
+        let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["apple", "mango", "zebra"]);
+    }
+
+    #[test]
+    fn find_all_skills_truncates_overlong_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        // 构造一个超过 64 字符的 name
+        let long_name = "x".repeat(100);
+        let fm = format!("name: {long_name}\ndescription: d");
+        write_skill_md(&home_skills(home), &long_name, &fm, None);
+
+        let paths = make_paths(home.to_path_buf(), None, vec![]);
+        let skills = find_all_skills(&paths).unwrap();
+        assert_eq!(skills.len(), 1);
+        // SkillMeta::new 截断到 64 字符 + "..."
+        assert!(skills[0].name.len() <= 64 + 3, "超长 name 应被截断");
+        assert!(skills[0].name.ends_with("..."));
+    }
+
+    // ---------------------------------------------------------------------------
+    // find_skill_md_by_name：优先级与模糊匹配
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn find_skill_md_by_name_returns_none_when_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = make_paths(temp.path().to_path_buf(), None, vec![]);
+        let (dir, md) = find_skill_md_by_name("nonexistent", &paths);
+        assert!(dir.is_none());
+        assert!(md.is_none());
+    }
+
+    #[test]
+    fn find_skill_md_by_name_prefers_workspace_layer() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let ws = temp.path().join("project");
+        std::fs::create_dir_all(ws_skills(&ws)).unwrap();
+
+        // 两层都放同名 skill
+        write_skill_md(&home_skills(home), "shared", "name: shared", None);
+        write_skill_md(&ws_skills(&ws), "shared", "name: shared", None);
+
+        let paths = make_paths(home.to_path_buf(), Some(ws.clone()), vec![]);
+        let (dir, md) = find_skill_md_by_name("shared", &paths);
+        assert!(dir.is_some());
+        assert!(md.is_some());
+        // 命中的应是 workspace 层
+        assert!(dir.unwrap().starts_with(ws_skills(&ws)));
+        assert!(md.unwrap().exists());
+    }
+
+    #[test]
+    fn find_skill_md_by_name_matches_nested_directory() {
+        // 嵌套目录：skills/group/my-skill/SKILL.md，用 name="my-skill" 应能找到
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let nested = home_skills(home).join("group").join("my-skill");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), "name: my-skill").unwrap();
+
+        let paths = make_paths(home.to_path_buf(), None, vec![]);
+        let (dir, md) = find_skill_md_by_name("my-skill", &paths);
+        assert!(dir.is_some(), "嵌套目录应通过递归 walk 命中");
+        assert!(md.is_some());
     }
 }

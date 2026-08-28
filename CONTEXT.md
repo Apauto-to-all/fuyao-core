@@ -46,7 +46,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 术语 | 代码标识 | 含义 |
 | --- | --- | --- |
 | agent_id | `AgentPaths` | 独立 Agent 实体（**数据隔离单元**）：`global/{名}` / `workspace/{名}`（来源前缀必须显式），决定 sessions.db / 缓存 / 日志选址 |
-| Agent 定义 | `AgentDefinition` | 提示词人格（**一项能力**），终端用户称「智能体」；`agents/{name}.md`（frontmatter + 正文） |
+| Agent 定义 | `fuyao_prompt::definitions` | 提示词人格（**一项能力**），终端用户称「智能体」；`agents/{name}.md`（frontmatter + 正文），类型为 `AgentDefinition` |
 | 四层解析 | `LayeredPaths` | 同名定义查找链 workspace > agent > global > extra，最低优先级为内置表 |
 | 内置定义 | `builtin::builtin_agent_md` | 编译期 `include_str!` 嵌入的 `default` / `explore` / `executor`，经统一内置资产模块承载；`default` 是框架保证恒存在的出厂主定义 |
 | 定义模式 | `AgentMode` | `Primary`（主代理人格）/ `Subagent`（专职子代理），职责互斥 |
@@ -75,7 +75,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 工具结果 | `ToolOutput` | `Value`（JSON）/ `Text`（纯文本）/ `Err`（wire 上恒有 `"error"` 键）；`to_wire()` 单点序列化 |
 | 内置工具 | 10 个 | `read` / `write` / `glob` / `grep` / `edit` / `bash` / `skill` / `subagent` / `todowrite` / `webfetch` |
 | MCP 工具 | `mcp_{server}_{tool}` | 前缀命名；MCPConnection 长连接自动重连，实例级熔断 `CircuitBreaker` |
-| 技能 | Skills | Agent Skills 协议三层渐进披露：Tier 1 元数据发现 → Tier 2 完整内容 → Tier 3 关联文件按需加载 |
+| 技能 | `fuyao_prompt::skills` | Agent Skills 协议三层渐进披露：Tier 1 元数据发现 → Tier 2 完整内容 → Tier 3 关联文件按需加载；文件系统四层（workspace > agent > global > extra）优先，内置技能最低优先级兜底 |
 | 内置资产模块 | `fuyao_prompt::builtin` | 所有编译期内置资产的唯一上车道：资产目录与运行时目录约定同构（assets/agents/{name}.md、assets/skills/{name}/SKILL.md），单一静态表派生名字清单与查找（无第二份清单可漂移）；内置恒为解析链最低优先级兜底、四层文件系统同名覆盖、零落盘 |
 | 工具上下文 | `ToolCallContext` | 编排层注入（session_id / agent_paths / 能力聚合：`subagent_ops` 弱引用 / `event_forwarder` / `todo_store`） |
 | 并行调度 | `should_parallelize` | 智能判定（never_parallel / 路径重叠 / parallel_safe）→ JoinSet 并发或串行；「完成一个通知一个」 |
@@ -108,7 +108,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 4. **消息类型只认输出侧**——`InputEvent` 入口即转 `OutputEvent`，内核不引入输入侧类型
 5. **引擎是忠实执行器**——忠实触发外部一切命令，不做去重 / 合并 / 冷却等意图解释，那属于上层职责
 6. **新生命周期信号首选加事件变体**——而非给现有 payload 挂额外字段（消息驱动架构）
-7. **依赖严格单向**——11 个 crate 分五类（基座 → 内核 → 协作者 → 能力 → 装配），禁止反向依赖
+7. **依赖严格单向**——10 个 crate 分五类（基座 → 内核 → 协作者 → 能力 → 装配），禁止反向依赖
 8. **所有消息都可以被拦截**——命令消费的对外回显与执行产物照常过 dispatch 管道（可被拦截钩子修改或阻止）；回显被丢弃只影响对外可见性，命令本体忠实执行不受影响；引擎不为命令开拦截豁免、也不新增拦截扩展，后续有必要再附加
 
 ## 一条消息的旅程
