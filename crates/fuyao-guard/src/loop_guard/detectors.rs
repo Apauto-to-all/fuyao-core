@@ -111,14 +111,13 @@ fn ngrams(text: &str, n: usize) -> Vec<&str> {
         .collect()
 }
 
-/// 检测文本内容是否自相似（重复）
+/// 计算文本内容的自相似度得分（0.0~1.0）
 ///
 /// 使用 trigram Jaccard 相似度比对文本末尾两个窗口。
-pub fn detect_text_self_similarity(
-    text: &str,
-    threshold: f64,
-    window_ratio: f64,
-) -> Option<String> {
+/// 文本过短（不足 20 字符）或任一窗口无 trigram 时返回 None。
+/// 得分语义：短周期复读时两窗口各自含完整周期，得分趋近 1.0；
+/// 转写/改写导致的局部重叠通常落在 0.5~0.7 区间。
+pub fn text_self_similarity(text: &str, window_ratio: f64) -> Option<f64> {
     if text.is_empty() {
         return None;
     }
@@ -158,13 +157,7 @@ pub fn detect_text_self_similarity(
 
     let intersection = first_trigrams.intersection(&second_trigrams).count();
     let union = first_trigrams.union(&second_trigrams).count();
-    let similarity = intersection as f64 / union as f64;
-
-    if similarity >= threshold {
-        Some(format!("内容重复率 {:.0}%", similarity * 100.0))
-    } else {
-        None
-    }
+    Some(intersection as f64 / union as f64)
 }
 
 #[cfg(test)]
@@ -248,29 +241,28 @@ mod tests {
     }
 
     #[test]
-    fn detect_text_similarity_high() {
+    fn text_similarity_verbatim_loop_scores_high() {
         let text = "这是一段重复的内容这是一段重复的内容这是一段重复的内容这是一段重复的内容";
-        let result = detect_text_self_similarity(text, 0.6, 0.2);
-        assert!(result.is_some());
+        let score = text_self_similarity(text, 0.2).unwrap();
+        assert!(score >= 0.99, "短周期复读应趋近 1.0，实际 {score}");
     }
 
     #[test]
-    fn detect_text_similarity_low() {
+    fn text_similarity_distinct_halves_score_low() {
         let text = "第一段内容完全不同，第二段也是全新的描述，没有重复的trigram出现";
-        let result = detect_text_self_similarity(text, 0.6, 0.2);
-        assert!(result.is_none());
+        if let Some(score) = text_self_similarity(text, 0.2) {
+            assert!(score < 0.6, "无重叠文本得分应低于警告线，实际 {score}");
+        }
     }
 
     #[test]
-    fn detect_text_too_short() {
-        let result = detect_text_self_similarity("短文本", 0.6, 0.2);
-        assert!(result.is_none());
+    fn text_similarity_too_short() {
+        assert!(text_self_similarity("短文本", 0.2).is_none());
     }
 
     #[test]
-    fn detect_text_empty() {
-        let result = detect_text_self_similarity("", 0.6, 0.2);
-        assert!(result.is_none());
+    fn text_similarity_empty() {
+        assert!(text_self_similarity("", 0.2).is_none());
     }
 
     #[test]

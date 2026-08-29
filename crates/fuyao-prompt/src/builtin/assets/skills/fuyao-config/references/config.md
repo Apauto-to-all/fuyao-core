@@ -127,9 +127,11 @@ TOML 键为 `[guard.loop]`（Rust 字段名 `loop` 是保留字经 rename 映射
 | --- | --- | --- | --- |
 | `tool_repeat_threshold` | 整数 | `4` | 连续 N 次相同工具调用告警 |
 | `tool_alternate_threshold` | 整数 | `6` | A→B→A→B 交替检测窗口 |
-| `text_repeat_threshold` | 浮点 | `0.6` | 文本相似度阈值 |
-| `streaming_check_interval` | 整数 | `100` | 流式检查间隔（字符） |
-| `streaming_window_ratio` | 浮点 | `0.2` | 滑动窗口比例 |
+| `text_warn_threshold` | 浮点 | `0.6` | 文本重复警告线：末尾两窗口相似度超过即计入连续命中并发一次警告，回落即清零计数 |
+| `text_interrupt_threshold` | 浮点 | `0.85` | 文本重复中断线：命中达此线（逐字重合复读特征）且连续命中数达标才中断 |
+| `text_interrupt_hits` | 整数 | `3` | 中断要求的连续命中检查点数 |
+| `streaming_check_interval` | 整数 | `100` | 流式检查间隔（字节） |
+| `streaming_window_ratio` | 浮点 | `0.2` | 滑动窗口比例（比对累积文本末尾两个窗口） |
 
 ### `[llm]`
 

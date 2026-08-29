@@ -53,7 +53,7 @@ pub fn should_interrupt(severity: LoopSeverity) -> bool {
 
 /// 按检测通道与中断计数生成升级警告文案
 ///
-/// 阈值分段与历史行为一致：≥3 终止提示、==1 首次提示、其余多次提示。
+/// 分段策略：≥3 终止提示、==1 首次提示、其余多次提示。
 pub fn interrupt_warning(kind: DetectKind, effective_count: usize) -> String {
     match effective_count {
         c if c >= 3 => match kind {
@@ -62,7 +62,7 @@ pub fn interrupt_warning(kind: DetectKind, effective_count: usize) -> String {
         },
         1 => match kind {
             DetectKind::Tool => "[循环检测] 你在重复执行相同的工具操作。请检查工具参数，尝试不同的方法完成任务。",
-            DetectKind::Text => "[循环检测] 你的输出内容在重复。请直接给出结论，不要再展开细节。",
+            DetectKind::Text => "[循环检测] 你的输出内容在持续逐字重复。若是在誊写或引用既有材料，请收束本段并立即推进任务；若确在原地打转，请直接给出结论。",
         },
         _ => match kind {
             DetectKind::Tool => "[循环检测] 你已多次重复相同的工具操作。请立即停止当前工具，换用其他工具或方法。",
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn warning_first_text_at_count_1() {
         assert!(interrupt_warning(DetectKind::Tool, 1).contains("重复执行"));
-        assert!(interrupt_warning(DetectKind::Text, 1).contains("内容在重复"));
+        assert!(interrupt_warning(DetectKind::Text, 1).contains("推进任务"));
     }
 
     #[test]
