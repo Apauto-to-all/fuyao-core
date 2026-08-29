@@ -14,13 +14,6 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-/// 会话 ID
-///
-/// 当前直接用 `String`，与 session crate 的 `Session.id` 类型一致。
-/// 采用简单别名而非 newtype，避免与持久化层频繁转换；
-/// 后续若类型安全需求增强，可提升为 newtype。
-pub type SessionId = String;
-
 /// 共享队列（guide / pending 对等，同类型，可互倒）
 pub(crate) type SharedQueue = Arc<StdMutex<VecDeque<QueueEntry>>>;
 

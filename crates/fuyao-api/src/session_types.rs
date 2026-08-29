@@ -11,6 +11,14 @@ fn current_timestamp() -> f64 {
         .unwrap()
         .as_secs_f64()
 }
+
+/// 会话 ID
+///
+/// 直接用 `String` 的类型别名，与持久化层 `Session.id` 类型一致。
+/// 采用简单别名而非 newtype，避免与持久化层频繁转换；
+/// 后续若类型安全需求增强，可提升为 newtype。
+pub type SessionId = String;
+
 /// 会话（纯数据结构）
 ///
 /// 不含构造与变更逻辑——会话的创建 / 更新 / 删除统一由存储层

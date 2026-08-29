@@ -16,7 +16,6 @@ mod lifecycle;
 mod provider_ops;
 mod runtime;
 mod stop;
-mod subagent_ops;
 mod teardown;
 #[cfg(test)]
 mod tests;
@@ -25,22 +24,26 @@ use crate::engine::types::{SessionHandle, SharedQueue, TurnPhase};
 use crate::error::EngineError;
 use crate::react;
 use crate::tool_registry::ToolRegistry;
+pub use fuyao_api::SessionId;
 use fuyao_api::message::QueueEntry;
 use fuyao_api::message::output::{
     InterruptMessage as OutputInterruptMessage, UserMessage as OutputUserMessage,
 };
-use fuyao_api::{ChildSessionSource, EngineParams, InputEvent, OutputEvent, SessionParams};
+use fuyao_api::{
+    ChildSessionSource, EngineParams, InputEvent, OutputEvent, SessionParams, SubagentError,
+};
 use fuyao_hooks::{HooksRegistry, NamedPluginInstance, PluginHost, SessionSender, SharedHooks};
 use fuyao_prompt::build_system_prompt;
 use fuyao_provider::ProviderRegistry;
 use fuyao_session::SessionStore;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
-pub use types::SessionId;
 
 /// shutdown 等待所有 session task 退出的总超时阈值
 ///
@@ -178,7 +181,61 @@ impl Engine {
     /// [`SubagentOps`] 方法派生子 session。普通工具忽略此字段。
     pub(crate) fn subagent_ops_weak(&self) -> Weak<dyn fuyao_api::SubagentOps> {
         // unsized coerce: Weak<Engine> → Weak<dyn SubagentOps>
-        // （Engine impl SubagentOps 见 engine/subagent_ops.rs）
+        // （Engine impl SubagentOps 见本文件末尾）
         self.engine_weak.clone()
+    }
+}
+
+/// 引擎作为子 session 能力提供者：trait 方法直接转发同名固有方法
+///
+/// 签名一致（session 标识 `&SessionId`），转发零分配；错误按 [`From<EngineError>`]
+/// 的结构化映射转 [`SubagentError`]，字符串化留给工具边界。
+#[allow(clippy::type_complexity)]
+impl fuyao_api::SubagentOps for Engine {
+    fn create_child_session<'a>(
+        &'a self,
+        parent_session_id: &'a SessionId,
+        source: ChildSessionSource,
+        child_agent_config: fuyao_api::AgentConfig,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        (SessionId, mpsc::UnboundedReceiver<OutputEvent>),
+                        SubagentError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Engine::create_child_session(self, parent_session_id, source, child_agent_config)
+                .await
+                .map_err(SubagentError::from)
+        })
+    }
+
+    fn send<'a>(
+        &'a self,
+        id: &'a SessionId,
+        event: InputEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SubagentError>> + Send + 'a>> {
+        Box::pin(async move {
+            Engine::send(self, id, event)
+                .await
+                .map_err(SubagentError::from)
+        })
+    }
+
+    fn destroy_session<'a>(
+        &'a self,
+        id: &'a SessionId,
+        reason: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), SubagentError>> + Send + 'a>> {
+        Box::pin(async move {
+            Engine::destroy_session(self, id, reason)
+                .await
+                .map_err(SubagentError::from)
+        })
     }
 }

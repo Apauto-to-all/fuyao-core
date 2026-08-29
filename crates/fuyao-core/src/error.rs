@@ -54,3 +54,25 @@ pub enum EngineError {
         timeout_secs: u64,
     },
 }
+
+/// 引擎错误到子 session 操作错误的结构化映射
+///
+/// 供 `impl SubagentOps for Engine` 转发时转换错误类型：会话缺失 / 引擎关闭 /
+/// 存储 / 定义解析一一对应，其余变体归入内部错误兜底。
+impl From<EngineError> for fuyao_api::SubagentError {
+    fn from(e: EngineError) -> Self {
+        match e {
+            EngineError::SessionNotFound(id) => fuyao_api::SubagentError::SessionNotFound(id),
+            EngineError::Storage(err) => fuyao_api::SubagentError::Storage(err.to_string()),
+            EngineError::Prompt(err) => fuyao_api::SubagentError::Prompt(err.to_string()),
+            EngineError::Provider(msg) => fuyao_api::SubagentError::Internal(msg),
+            EngineError::Shutdown => fuyao_api::SubagentError::Shutdown,
+            EngineError::StopTimeout {
+                session_id,
+                timeout_secs,
+            } => fuyao_api::SubagentError::Internal(format!(
+                "会话停止超时（{timeout_secs}s）：session={session_id}"
+            )),
+        }
+    }
+}

@@ -24,7 +24,7 @@ pub use definition::{
 };
 pub use entry::{ToolEntry, insert_tool};
 pub use func::{ToolFn, parse_args, tool_handler};
-pub use ops::{ChildSessionSource, SubagentOps, TodoStoreOps};
+pub use ops::{ChildSessionSource, SubagentError, SubagentOps, TodoStoreOps};
 pub use output::{ToolError, ToolOutput};
 
 // 取消令牌：工具 handler 据此响应中断 / shutdown，优雅收尾长任务

@@ -82,7 +82,8 @@ pub async fn subagent_handler(
 
     // 4. 派生子 session（Fresh 模式：空上下文，子代理不继承父会话历史）
     //    subagent_type → definition，引擎按名加载 agents/{type}.md（含 mode 校验）
-    let parent_id = ctx.session_id.as_deref().unwrap_or("");
+    let empty_parent = String::new();
+    let parent_id = ctx.session_id.as_ref().unwrap_or(&empty_parent);
     // 子代理人格配置（definition）；model_config 由引擎从父 session 继承，此处不传
     let child_agent_config = AgentConfig {
         definition: subagent_type.clone(),
@@ -280,36 +281,42 @@ mod tests {
     impl SubagentOps for FakeSubagentOps {
         fn create_child_session<'a>(
             &'a self,
-            _parent_session_id: &'a str,
+            _parent_session_id: &'a fuyao_api::SessionId,
             _source: ChildSessionSource,
             _child_agent_config: AgentConfig,
         ) -> Pin<
             Box<
-                dyn Future<Output = Result<(String, mpsc::UnboundedReceiver<OutputEvent>), String>>
-                    + Send
+                dyn Future<
+                        Output = Result<
+                            (fuyao_api::SessionId, mpsc::UnboundedReceiver<OutputEvent>),
+                            fuyao_api::SubagentError,
+                        >,
+                    > + Send
                     + 'a,
             >,
         > {
             let rx = self.child_rx.lock().unwrap().take();
             Box::pin(async move {
                 rx.map(|rx| ("child-1".to_string(), rx))
-                    .ok_or_else(|| "测试 rx 未预置".to_string())
+                    .ok_or_else(|| fuyao_api::SubagentError::Internal("测试 rx 未预置".to_string()))
             })
         }
 
         fn send<'a>(
             &'a self,
-            _id: &'a str,
+            _id: &'a fuyao_api::SessionId,
             _event: InputEvent,
-        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(), fuyao_api::SubagentError>> + Send + 'a>>
+        {
             Box::pin(async { Ok(()) })
         }
 
         fn destroy_session<'a>(
             &'a self,
-            _id: &'a str,
+            _id: &'a fuyao_api::SessionId,
             _end_reason: &'a str,
-        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<(), fuyao_api::SubagentError>> + Send + 'a>>
+        {
             Box::pin(async { Ok(()) })
         }
     }

@@ -55,11 +55,13 @@ pub use provider::{
 pub use selection::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
 };
-pub use session_types::{ImageContent, Message, MessageKind, MessageRole, Session, TodoItem};
+pub use session_types::{
+    ImageContent, Message, MessageKind, MessageRole, Session, SessionId, TodoItem,
+};
 pub use skill_types::{LINKED_SUBDIRS, SkillDefinition, SkillMeta};
 pub use tool::{
-    CancellationToken, ChildSessionSource, SubagentOps, TodoStoreOps, ToolCallContext,
-    ToolCallData, ToolCapabilities, ToolDefinition, ToolDefinitionBuilder, ToolEntry, ToolError,
-    ToolFn, ToolOutput, ToolParameterProperty, ToolParameters, insert_tool, parse_args,
-    tool_handler,
+    CancellationToken, ChildSessionSource, SubagentError, SubagentOps, TodoStoreOps,
+    ToolCallContext, ToolCallData, ToolCapabilities, ToolDefinition, ToolDefinitionBuilder,
+    ToolEntry, ToolError, ToolFn, ToolOutput, ToolParameterProperty, ToolParameters, insert_tool,
+    parse_args, tool_handler,
 };
