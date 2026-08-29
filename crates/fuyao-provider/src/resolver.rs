@@ -57,7 +57,9 @@ pub fn get_base_url(provider_id: &str, agent_paths: &AgentPaths) -> Option<Strin
 /// 解析模型 ID
 ///
 /// 将 "provider_id/model_id" 格式拆分为 (provider_id, model_id) 元组。
-/// provider_id 会转为小写，model_id 保持原样。
+/// 首个 `/` 之前为 provider_id（trim 后转小写），之后整体为 model_id
+///（trim，允许再含 `/`）。provider_id 或 model_id 任一段为空
+///（如 "/model"、"provider/"）同样视为格式错误。
 ///
 /// # Arguments
 /// * `model_id` - 模型 ID（如 "aliyun/qwen3.6-plus"）
@@ -66,14 +68,15 @@ pub fn get_base_url(provider_id: &str, agent_paths: &AgentPaths) -> Option<Strin
 /// (provider_id, model_id) 元组；格式错误返回 [`ProviderError::InvalidModelId`]
 pub fn parse_model_id(model_id: &str) -> Result<(String, String), ProviderError> {
     let stripped = model_id.trim();
-    if stripped.contains('/') {
-        let parts: Vec<&str> = stripped.splitn(2, '/').collect();
-        let provider_id = parts[0].trim().to_lowercase();
-        let model_id = parts[1].trim();
-        Ok((provider_id, model_id.to_string()))
-    } else {
-        Err(ProviderError::InvalidModelId(model_id.to_string()))
+    let Some((provider, model)) = stripped.split_once('/') else {
+        return Err(ProviderError::InvalidModelId(model_id.to_string()));
+    };
+    let provider_id = provider.trim().to_lowercase();
+    let model = model.trim();
+    if provider_id.is_empty() || model.is_empty() {
+        return Err(ProviderError::InvalidModelId(model_id.to_string()));
     }
+    Ok((provider_id, model.to_string()))
 }
 
 #[cfg(test)]
@@ -255,5 +258,24 @@ mod tests {
             result.unwrap_err(),
             ProviderError::InvalidModelId(_)
         ));
+    }
+
+    /// provider 段或 model 段为空均视为格式错误
+    #[test]
+    fn parse_model_id_rejects_empty_parts() {
+        for bad in ["/model", "provider/", " /model", "provider/ "] {
+            assert!(
+                matches!(parse_model_id(bad), Err(ProviderError::InvalidModelId(_))),
+                "{bad} 应报格式错误"
+            );
+        }
+    }
+
+    /// model 段允许再含 `/`：首个 `/` 之后的整体作为 model_id
+    #[test]
+    fn parse_model_id_keeps_slashes_in_model_part() {
+        let (provider, model) = parse_model_id("Aliyun/Qwen3/Plus").unwrap();
+        assert_eq!(provider, "aliyun");
+        assert_eq!(model, "Qwen3/Plus");
     }
 }

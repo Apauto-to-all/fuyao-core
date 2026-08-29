@@ -57,13 +57,12 @@ impl AnthropicStreamDecoder {
     /// 喂入单条 SSE 行，返回该行产出的流事件
     ///
     /// 空行 / 注释行（`:` 开头）/ 非 `data:` 行无产出；`data:` 载荷 JSON
-    /// 解析失败的行跳过不报错（容错）。
+    /// 解析失败的坏行跳过并 WARN（容错降级：单行损坏不中断流）。
     pub fn feed_line(&mut self, line: &str) -> Result<Vec<StreamEvent>, StreamError> {
-        let Some(data) = data_payload(line) else {
+        let Some(data) = crate::sse::data_payload(line) else {
             return Ok(Vec::new());
         };
-        // 容错：解析失败的行跳过不报错
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+        let Some(event) = crate::sse::parse_data_json(data) else {
             return Ok(Vec::new());
         };
         self.dispatch(&event)
@@ -201,15 +200,6 @@ impl AnthropicStreamDecoder {
             finish_reason: self.finish_reason.clone(),
         }
     }
-}
-
-/// 提取 SSE 行的 data 载荷：空行 / 注释行（`:` 开头）/ 非 `data:` 行返回 None
-fn data_payload(line: &str) -> Option<&str> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with(':') {
-        return None;
-    }
-    line.strip_prefix("data:").map(str::trim)
 }
 
 /// u64 数值字段提取，缺失或非数值时为 0

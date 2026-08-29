@@ -8,16 +8,11 @@
 //!   消息都合并进同一条 user 消息，Anthropic 相邻同角色消息直接 400）
 //! - 每个历史 tool_use 必有配对 tool_result，孤儿场景合成中文占位 stub
 
+use crate::http::filter_valid_images;
 use crate::provider::{ChatMessage, ChatRequest, StreamOptions};
-use fuyao_api::{ImageContent, MessageRole, ThinkingType};
+use fuyao_api::{MessageRole, ThinkingType};
 use serde::Serialize;
 use std::collections::HashSet;
-
-/// Anthropic 协议支持的图片 MIME 白名单（仅图像：PNG / JPEG / WEBP / GIF）
-const SUPPORTED_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-
-/// 单图解码后字节上限（base64 长度 /4*3 估算解码字节数）
-const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 /// max_tokens 必填字段的恒定值
 const MAX_TOKENS: u32 = 16384;
@@ -160,30 +155,6 @@ struct MessagesRequestBody {
     /// 思考强度：与 thinking 开关正交，配置了就发
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<WireOutputConfig>,
-}
-
-/// 校验并过滤图片：MIME 白名单 + 协议字节上限，不合规的丢弃并告警
-///
-/// 校验失败只丢单张图、不中断整条消息——图像是辅助信息，文本对话照常。
-fn filter_valid_images(images: &[ImageContent]) -> Vec<&ImageContent> {
-    images
-        .iter()
-        .filter(|img| {
-            if !SUPPORTED_IMAGE_MIMES.contains(&img.mime_type.as_str()) {
-                tracing::warn!(mime_type = %img.mime_type, "图片 MIME 不在协议白名单，已丢弃");
-                return false;
-            }
-            if img.data.len() / 4 * 3 > MAX_IMAGE_BYTES {
-                tracing::warn!(
-                    mime_type = %img.mime_type,
-                    base64_len = img.data.len(),
-                    "图片超过 20MB 协议上限，已丢弃"
-                );
-                return false;
-            }
-            true
-        })
-        .collect()
 }
 
 /// user 消息 content 出方向形态：无图保持字符串，有图升级为 block 数组
@@ -409,7 +380,7 @@ fn convert_messages(messages: &[ChatMessage]) -> Vec<WireMessage> {
 ///
 /// 纯函数：不触碰 HTTP，仅做领域消息 → wire JSON 的翻译。
 /// 流式 / 非流式两路径共用，由 `stream` 形参区分是否注入 `stream` 字段。
-pub fn build_request_body(
+pub(crate) fn build_request_body(
     request: ChatRequest,
     model: &str,
     options: &StreamOptions,

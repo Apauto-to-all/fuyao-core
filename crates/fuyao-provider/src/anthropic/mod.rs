@@ -2,7 +2,9 @@
 //!
 //! 基于 reqwest 直接请求 `/v1/messages`。本模块只承担 HTTP 交互——
 //! 请求体编码（[`request`]）、流式线解码（[`sse`]）、HTTP 错误分类（[`classify`]）、
-//! 非流式响应解析（[`completion`]）均已拆为独立纯函数模块，各自可单测。
+//! 非流式响应解析（[`completion`]）均已拆为独立纯函数模块，各自可单测；
+//! 构造解析、POST 装配、发送链与带空闲超时的流读取共用 crate 根层共享骨架
+//!（[`crate::http`]），本侧只注入协议差异项（默认端点、鉴权头组、错误分类）。
 //!
 //! 协议交互要素：
 //! - 鉴权头 `x-api-key` + 固定版本头 `anthropic-version: 2023-06-01`
@@ -19,27 +21,17 @@ use crate::provider::{
 };
 use crate::sse::LineAssembler;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use fuyao_api::AgentPaths;
 use reqwest::Client;
-use std::time::Duration;
 
 /// 协议要求的固定版本头取值
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-
-/// SSE 流空闲超时：两次 chunk 到达之间的最长等待秒数
-///
-/// reqwest Client 的整体 `.timeout()` 对逐块消费的流式 body 不可靠——代理 /
-/// 负载均衡器掐断连接后 `bytes_stream.next().await` 可能永久挂起，静默连接
-/// 会让整个轮次卡死。每次取 chunk 用 `tokio::time::timeout` 单独包住，
-/// 窗口内无数据即中断，映射为可重试的 [`StreamError::Timeout`]。
-const SSE_IDLE_TIMEOUT_SECS: u64 = 90;
 
 /// Anthropic Messages 协议 Provider
 ///
 /// 通过 reqwest 直接发送 HTTP 请求到 Anthropic 兼容 API。
 /// 本结构只持有 HTTP 交互所需的客户端与鉴权信息；请求构造、流解码、错误分类
-/// 委托给同目录下的纯函数模块。
+/// 委托给同目录下的纯函数模块，发送链与流读取走 crate 共享骨架。
 pub struct AnthropicProvider {
     /// HTTP 客户端（复用连接池）
     client: Client,
@@ -67,33 +59,16 @@ impl AnthropicProvider {
 
     /// 从 provider_id 和 agent_paths 创建
     ///
-    /// 从注册表解析 api_key 和 base_url（默认官方端点），构建 reqwest Client。
-    /// HTTP 超时从全局配置 `get_config().llm` 读取。
+    /// 共享构造骨架解析 API Key、base_url（缺省回退 Anthropic 官方端点）与
+    /// reqwest Client（超时取全局配置 `llm`），失败路径 WARN 后返回 None。
     pub fn new(provider_id: &str, agent_paths: &AgentPaths) -> Option<Self> {
-        let api_key = match crate::resolver::resolve_api_key(provider_id, agent_paths) {
-            Some(key) => key,
-            None => {
-                tracing::warn!(provider = %provider_id, "Provider 创建失败：未解析到 API Key");
-                return None;
-            }
-        };
-        let base_url = crate::resolver::get_base_url(provider_id, agent_paths)
-            .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-
-        let llm = fuyao_api::get_config().llm.clone();
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(llm.request_timeout_secs))
-            .connect_timeout(Duration::from_secs(llm.connect_timeout_secs))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(provider = %provider_id, cause = %e, "Provider 创建失败：HTTP 客户端构建失败");
-                return None;
-            }
-        };
-
-        Some(Self::from_parts(api_key, base_url, client))
+        let parts =
+            crate::http::resolve_http_parts(provider_id, agent_paths, "https://api.anthropic.com")?;
+        Some(Self::from_parts(
+            parts.api_key,
+            parts.base_url,
+            parts.client,
+        ))
     }
 
     /// 从已有配置创建（用于测试）
@@ -108,40 +83,20 @@ impl AnthropicProvider {
 
     /// 构造已带 url + 鉴权头 + 版本头 + content-type 的 POST 请求构建器（未发送）
     ///
-    /// 非流式 [`Provider::chat`] 与流式 [`Provider::stream_chat`] 两条发送路径共用，
-    /// 避免请求头 / url 装配逻辑两处复制。返回 owned `RequestBuilder`——可在
+    /// 非流式 [`Provider::chat`] 与流式 [`Provider::stream_chat`] 两条发送路径共用。
+    /// 装配逻辑在共享骨架 [`crate::http::post_json`]，本侧只注入鉴权头组
+    ///（`x-api-key` + 固定版本头）。返回 owned `RequestBuilder`——可在
     /// `async_stream` 块**外**构造、块内再 send，无需跨越 yield 持有 `&self`。
     fn post_builder(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
-        self.client
-            .post(&self.messages_url)
-            .header("x-api-key", self.api_key.as_str())
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("Content-Type", "application/json")
-            .json(body)
-    }
-
-    /// 发送请求 + 错误分类（url / 请求头装配之后的完整发送链路）
-    ///
-    /// 接收 [`Self::post_builder`] 产出的构建器，执行 send → 网络错误映射（timeout /
-    /// connection）→ HTTP 状态码校验 → [`classify::classify_http_error`]。两条发送路径
-    /// 共用此方法，集中「send + timeout 映射 + status 校验 + classify」逻辑。
-    async fn execute(builder: reqwest::RequestBuilder) -> Result<reqwest::Response, StreamError> {
-        let response = builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                StreamError::Timeout
-            } else {
-                StreamError::Connection(e.to_string())
-            }
-        })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let status_code = status.as_u16();
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(classify::classify_http_error(status_code, &body_text));
-        }
-
-        Ok(response)
+        crate::http::post_json(
+            &self.client,
+            &self.messages_url,
+            &[
+                ("x-api-key", self.api_key.as_str()),
+                ("anthropic-version", ANTHROPIC_VERSION),
+            ],
+            body,
+        )
     }
 }
 
@@ -158,8 +113,8 @@ impl Provider for AnthropicProvider {
         let request_builder = self.post_builder(&body);
 
         let stream = async_stream::stream! {
-            // 发送 + 网络错误映射 + 状态码校验 + 错误分类（与 chat() 共用 execute）
-            let response = match Self::execute(request_builder).await {
+            // 发送 + 网络错误映射 + 状态码校验 + 错误分类（与 chat() 共用共享发送链）
+            let response = match crate::http::execute(request_builder, classify::classify_http_error).await {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(e);
@@ -177,16 +132,11 @@ impl Provider for AnthropicProvider {
             let mut decoder = sse::AnthropicStreamDecoder::new();
 
             loop {
-                // 每次取 chunk 限定空闲超时窗口，静默连接不再永久挂起
-                let item = match tokio::time::timeout(
-                    Duration::from_secs(SSE_IDLE_TIMEOUT_SECS),
-                    bytes_stream.next(),
-                )
-                .await
-                {
+                // 带空闲超时取下一块：静默连接不再永久挂起
+                let item = match crate::http::next_chunk(&mut bytes_stream).await {
                     Ok(item) => item,
-                    Err(_elapsed) => {
-                        yield Err(StreamError::Timeout);
+                    Err(e) => {
+                        yield Err(e);
                         return;
                     }
                 };
@@ -233,7 +183,8 @@ impl Provider for AnthropicProvider {
     ) -> Result<ChatResponse, StreamError> {
         let started = std::time::Instant::now();
         let body = request::build_request_body(request, model, &options, false);
-        let response = Self::execute(self.post_builder(&body)).await?;
+        let response =
+            crate::http::execute(self.post_builder(&body), classify::classify_http_error).await?;
 
         let response_text = response
             .text()
@@ -258,6 +209,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     #[test]
     fn messages_url_appends_path_to_official_base() {

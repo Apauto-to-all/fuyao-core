@@ -2,7 +2,9 @@
 //!
 //! 基于 reqwest 直接请求 `/chat/completions`。本模块只承担 HTTP 交互——
 //! 请求体编码（[`request`]）、SSE 线解码（[`sse`]）、HTTP 错误分类（[`classify`]）、
-//! 非流式响应模型（[`completion`]）均已拆为独立纯函数模块，各自可单测。
+//! 非流式响应模型（[`completion`]）均已拆为独立纯函数模块，各自可单测；
+//! 构造解析、POST 装配、发送链与带空闲超时的流读取共用 crate 根层共享骨架
+//!（[`crate::http`]），本侧只注入协议差异项（默认端点、Bearer 鉴权头、错误分类）。
 //!
 //! 支持所有 OpenAI 兼容供应商（DeepSeek、Qwen、Moonshot 等）：
 //! - 流式/非流式对话
@@ -22,16 +24,14 @@ use crate::provider::{
 };
 use crate::sse::LineAssembler;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use fuyao_api::{AgentPaths, ToolCallData};
 use reqwest::Client;
-use std::time::Duration;
 
 /// OpenAI 兼容 Provider
 ///
 /// 通过 reqwest 直接发送 HTTP 请求到 OpenAI 兼容 API。
 /// 本结构只持有 HTTP 交互所需的客户端与鉴权信息；请求构造、流解码、错误分类
-/// 委托给同目录下的纯函数模块。
+/// 委托给同目录下的纯函数模块，发送链与流读取走 crate 共享骨架。
 pub struct OpenAIProvider {
     /// HTTP 客户端（复用连接池）
     client: Client,
@@ -59,35 +59,14 @@ impl OpenAIProvider {
 
     /// 从 provider_id 和 agent_paths 创建
     ///
-    /// 从注册表解析 api_key 和 base_url，构建 reqwest Client。
-    /// HTTP 超时从全局配置 `get_config().llm` 读取。
+    /// 共享构造骨架解析 API Key、base_url（缺省回退 OpenAI 官方端点）与
+    /// reqwest Client（超时取全局配置 `llm`），失败路径 WARN 后返回 None。
     pub fn new(provider_id: &str, agent_paths: &AgentPaths) -> Option<Self> {
-        let api_key = match crate::resolver::resolve_api_key(provider_id, agent_paths) {
-            Some(key) => key,
-            None => {
-                tracing::warn!(provider = %provider_id, "Provider 创建失败：未解析到 API Key");
-                return None;
-            }
-        };
-        let base_url = crate::resolver::get_base_url(provider_id, agent_paths)
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
-
-        let llm = fuyao_api::get_config().llm.clone();
-        let client = match Client::builder()
-            .timeout(Duration::from_secs(llm.request_timeout_secs))
-            .connect_timeout(Duration::from_secs(llm.connect_timeout_secs))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(provider = %provider_id, cause = %e, "Provider 创建失败：HTTP 客户端构建失败");
-                return None;
-            }
-        };
-
-        let (chat_url, auth_header) = Self::build_request_parts(&api_key, &base_url);
+        let parts =
+            crate::http::resolve_http_parts(provider_id, agent_paths, "https://api.openai.com/v1")?;
+        let (chat_url, auth_header) = Self::build_request_parts(&parts.api_key, &parts.base_url);
         Some(Self {
-            client,
+            client: parts.client,
             chat_url,
             auth_header,
         })
@@ -105,40 +84,17 @@ impl OpenAIProvider {
 
     /// 构造已带 url + auth + content-type 的 POST 请求构建器（未发送）
     ///
-    /// 非流式 [`Provider::chat`] 与流式 [`Provider::stream_chat`] 两条发送路径共用，
-    /// 避免 auth header / content-type / url 装配逻辑两处复制。返回 owned
-    /// `RequestBuilder`——可在 `async_stream` 块**外**构造、块内再 send，无需跨越
-    /// yield 持有 `&self`（这正是 stream_chat 不能直接调 `&self` 异步方法的原因）。
+    /// 非流式 [`Provider::chat`] 与流式 [`Provider::stream_chat`] 两条发送路径共用。
+    /// 装配逻辑在共享骨架 [`crate::http::post_json`]，本侧只注入 Bearer 鉴权头。
+    /// 返回 owned `RequestBuilder`——可在 `async_stream` 块**外**构造、块内再 send，
+    /// 无需跨越 yield 持有 `&self`（这正是 stream_chat 不能直接调 `&self` 异步方法的原因）。
     fn post_builder(&self, body: &serde_json::Value) -> reqwest::RequestBuilder {
-        self.client
-            .post(&self.chat_url)
-            .header("Authorization", self.auth_header.as_str())
-            .header("Content-Type", "application/json")
-            .json(body)
-    }
-
-    /// 发送请求 + 错误分类（url/auth 装配之后的完整发送链路）
-    ///
-    /// 接收 [`Self::post_builder`] 产出的构建器，执行 send → 网络错误映射（timeout /
-    /// connection）→ HTTP 状态码校验 → [`classify::classify_http_error`]。两条发送路径
-    /// 共用此方法，集中「send + timeout 映射 + status 校验 + classify」逻辑。
-    async fn execute(builder: reqwest::RequestBuilder) -> Result<reqwest::Response, StreamError> {
-        let response = builder.send().await.map_err(|e| {
-            if e.is_timeout() {
-                StreamError::Timeout
-            } else {
-                StreamError::Connection(e.to_string())
-            }
-        })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let status_code = status.as_u16();
-            let body_text = response.text().await.unwrap_or_default();
-            return Err(classify::classify_http_error(status_code, &body_text));
-        }
-
-        Ok(response)
+        crate::http::post_json(
+            &self.client,
+            &self.chat_url,
+            &[("Authorization", self.auth_header.as_str())],
+            body,
+        )
     }
 }
 
@@ -155,8 +111,8 @@ impl Provider for OpenAIProvider {
         let request_builder = self.post_builder(&body);
 
         let stream = async_stream::stream! {
-            // 发送 + 网络错误映射 + 状态码校验 + 错误分类（与 chat() 共用 execute）
-            let response = match Self::execute(request_builder).await {
+            // 发送 + 网络错误映射 + 状态码校验 + 错误分类（与 chat() 共用共享发送链）
+            let response = match crate::http::execute(request_builder, classify::classify_http_error).await {
                 Ok(r) => r,
                 Err(e) => {
                     yield Err(e);
@@ -164,13 +120,25 @@ impl Provider for OpenAIProvider {
                 }
             };
 
-            // 逐 chunk 消费 SSE 字节流
+            // 逐 chunk 消费 SSE 字节流，每次取 chunk 限定空闲超时窗口
             let mut bytes_stream = response.bytes_stream();
             // SSE 行组装器：字节上按 \n 切行，跨 chunk 的半行 / 半个多字节
             // 字符滞留其内部缓冲等续包，行内非法 UTF-8 以替换字符顶替
             let mut assembler = LineAssembler::new();
 
-            while let Some(item) = bytes_stream.next().await {
+            loop {
+                // 带空闲超时取下一块：静默连接不再永久挂起
+                let item = match crate::http::next_chunk(&mut bytes_stream).await {
+                    Ok(item) => item,
+                    Err(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                };
+                let Some(item) = item else {
+                    // 字节流结束（服务端关闭连接）
+                    break;
+                };
                 let bytes = match item {
                     Ok(b) => b,
                     Err(e) => {
@@ -181,18 +149,12 @@ impl Provider for OpenAIProvider {
                     }
                 };
 
-                // 切出本 chunk 内所有完整行并逐行线解码
+                // 切出本 chunk 内所有完整行并逐行线解码；坏行（JSON 解析失败）
+                // 跳过不中断，后续行照常解码
                 for line in assembler.push(&bytes) {
-                    match sse::parse_sse_line(&line) {
-                        Ok(Some(chunk)) => {
-                            for event in sse::extract_stream_events(&chunk) {
-                                yield Ok(event);
-                            }
-                        }
-                        Ok(None) => {} // 空行或 [DONE]
-                        Err(e) => {
-                            yield Err(e);
-                            return;
+                    if let Some(chunk) = sse::parse_sse_line(&line) {
+                        for event in sse::extract_stream_events(&chunk) {
+                            yield Ok(event);
                         }
                     }
                 }
@@ -210,7 +172,8 @@ impl Provider for OpenAIProvider {
     ) -> Result<ChatResponse, StreamError> {
         let started = std::time::Instant::now();
         let body = request::build_request_body(request, model, &options, false);
-        let response = Self::execute(self.post_builder(&body)).await?;
+        let response =
+            crate::http::execute(self.post_builder(&body), classify::classify_http_error).await?;
 
         let response_text = response
             .text()
@@ -292,6 +255,7 @@ impl Provider for OpenAIProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
 
     #[test]
     fn chat_url_appends_path() {
@@ -324,6 +288,52 @@ mod tests {
     fn auth_header_prebuilt() {
         let provider = test_provider_with_base("https://api.test.com/v1");
         assert_eq!(provider.auth_header, "Bearer test-key");
+    }
+
+    /// 静默连接（响应头已到、body 永不到达）触发逐块空闲超时，
+    /// 映射为可重试的 Timeout 错误后流终止
+    #[tokio::test(start_paused = true)]
+    async fn stream_chat_idle_timeout_yields_retryable_timeout() {
+        // 自造静默服务器：回 200 响应头后不再发送任何字节
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            // 读完请求（头 + body），避免客户端写侧阻塞
+            let mut buf = [0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            // 持有连接但不发送任何数据：模拟代理掐断后的静默连接
+            futures_util::future::pending::<()>().await;
+        });
+
+        let provider = OpenAIProvider::from_parts(
+            "test-key".to_string(),
+            format!("http://{addr}/v1"),
+            Client::new(),
+        );
+        let mut stream = provider.stream_chat(
+            ChatRequest::default(),
+            "test-model",
+            ProviderStreamOptions::default(),
+        );
+
+        let first = stream.next().await.expect("空闲超时应产出错误事件");
+        assert!(
+            matches!(first, Err(StreamError::Timeout)),
+            "静默连接应映射为可重试超时：{first:?}"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "超时后流应终止，不再产出事件"
+        );
     }
 
     fn test_provider_with_base(base_url: &str) -> OpenAIProvider {

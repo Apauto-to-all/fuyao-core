@@ -18,7 +18,7 @@ use crate::StreamError;
 /// - 429 → 限流（无头信息可提取，退避走既有指数策略）
 /// - 其余（含 500/502/503/504/529，529 为该协议过载错误码）→ 带状态码的
 ///   API 错误，可重试性由 [`StreamError::is_retryable`] 判定
-pub fn classify_http_error(status_code: u16, body: &str) -> StreamError {
+pub(crate) fn classify_http_error(status_code: u16, body: &str) -> StreamError {
     match status_code {
         401 | 403 => StreamError::AuthError(body.to_string()),
         413 => StreamError::ContextOverflow,

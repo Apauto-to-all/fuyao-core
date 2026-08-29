@@ -1,8 +1,9 @@
-//! SSE 字节流增量组装底座（协议无关，纯函数）
+//! SSE 流式解码底座（协议无关，纯函数）
 //!
-//! 吃原始网络 chunk，吐完整 SSE 行。wire 协议模块共用本组装器完成
-//! 「字节 → 行」的切分；「行 → 事件」的语义解析归各协议模块自行实现
-//! （openai 侧认 `data:` 前缀与 `[DONE]` 终止标记）。
+//! 两段职责：字节 → 完整行（[`LineAssembler`] 增量组装，跨 chunk 半行缓冲）；
+//! 行 → data 载荷 → JSON（[`data_payload`] / [`parse_data_json`]，坏行跳过并
+//! WARN 的统一容错策略）。「JSON 载荷 → 事件」的语义解析归各协议模块自行
+//! 实现（openai 侧认 `[DONE]` 终止标记，anthropic 侧按 JSON `type` 字段分发）。
 
 /// SSE 字节流增量组装器：吃原始网络 chunk，吐完整 SSE 行
 ///
@@ -40,6 +41,29 @@ impl LineAssembler {
 impl Default for LineAssembler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 提取 SSE 行的 data 载荷：空行 / 注释行（`:` 开头）/ 非 `data:` 行返回 None
+pub(crate) fn data_payload(line: &str) -> Option<&str> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return None;
+    }
+    line.strip_prefix("data:").map(str::trim)
+}
+
+/// data 载荷解析为 JSON：解析失败的坏行跳过并 WARN
+///
+/// 容错降级：单行损坏（代理注入垃圾 / 传输截断）只丢一行并留痕，
+/// 不中断整条流——后续行照常解码。
+pub(crate) fn parse_data_json(data: &str) -> Option<serde_json::Value> {
+    match serde_json::from_str(data) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!(cause = %e, "SSE data 行 JSON 解析失败，跳过该行");
+            None
+        }
     }
 }
 
@@ -122,5 +146,25 @@ mod tests {
         assert!(a.push(b"data: {\"a\"").is_empty());
         assert!(a.push(b"").is_empty());
         assert_eq!(a.push(b":1}\n"), vec!["data: {\"a\":1}".to_string()]);
+    }
+
+    /// data 载荷提取：空行 / 注释 / 非 data 行无载荷；data 行去前缀去空白
+    #[test]
+    fn data_payload_extracts_stripped_payload() {
+        assert_eq!(data_payload(""), None);
+        assert_eq!(data_payload(": keep-alive"), None);
+        assert_eq!(data_payload("event: ping"), None);
+        assert_eq!(data_payload("data: {\"a\":1}"), Some("{\"a\":1}"));
+        assert_eq!(data_payload("data:no-space"), Some("no-space"));
+        assert_eq!(data_payload("data: tail\r"), Some("tail"));
+    }
+
+    /// 坏行策略：JSON 解析失败的载荷跳过返回 None，合法载荷照常解析
+    #[test]
+    fn parse_data_json_skips_bad_line_and_parses_good() {
+        assert!(parse_data_json("{invalid}").is_none());
+        assert!(parse_data_json("not json").is_none());
+        let value = parse_data_json(r#"{"type":"ping"}"#).unwrap();
+        assert_eq!(value["type"], "ping");
     }
 }

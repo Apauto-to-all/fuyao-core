@@ -8,35 +8,22 @@
 //! usage 累加 / OutputEvent 组装由 [`crate::stream_decoder`] 的累加器负责，
 //! 两者职责正交。
 
-use crate::StreamError;
 use crate::provider::{FinishReason as ProviderFinishReason, StreamEvent, StreamUsage};
 
 /// 解析 SSE 行，返回反序列化后的 chunk
 ///
-/// SSE 格式：`data: {json}\n` 或 `data: [DONE]\n`
-pub(crate) fn parse_sse_line(line: &str) -> Result<Option<serde_json::Value>, StreamError> {
-    let line = line.trim();
-
-    // 空行或注释行
-    if line.is_empty() || line.starts_with(':') {
-        return Ok(None);
-    }
-
-    // 提取 data 前缀后的内容
-    let data = match line.strip_prefix("data:") {
-        Some(d) => d.trim(),
-        None => return Ok(None),
-    };
+/// SSE 格式：`data: {json}\n` 或 `data: [DONE]\n`。空行 / 注释行 / 非 `data:`
+/// 行 / `[DONE]` 标记返回 None；JSON 解析失败的坏行跳过并 WARN（容错降级：
+/// 单行损坏不中断流，后续行照常解码）。
+pub(crate) fn parse_sse_line(line: &str) -> Option<serde_json::Value> {
+    let data = crate::sse::data_payload(line)?;
 
     // 流结束标记
     if data == "[DONE]" {
-        return Ok(None);
+        return None;
     }
 
-    // 反序列化 JSON
-    serde_json::from_str(data)
-        .map(Some)
-        .map_err(|e| StreamError::StreamParseError(format!("SSE JSON 解析失败: {e}")))
+    crate::sse::parse_data_json(data)
 }
 
 /// 从 SSE chunk 中提取流式事件
@@ -197,20 +184,22 @@ mod tests {
 
     #[test]
     fn parse_sse_line_skips_empty_and_comments() {
-        assert!(parse_sse_line("").unwrap().is_none());
-        assert!(parse_sse_line(": comment").unwrap().is_none());
-        assert!(parse_sse_line("data: [DONE]").unwrap().is_none());
+        assert!(parse_sse_line("").is_none());
+        assert!(parse_sse_line(": comment").is_none());
+        assert!(parse_sse_line("data: [DONE]").is_none());
     }
 
     #[test]
     fn parse_sse_line_parses_json() {
-        let chunk = parse_sse_line(r#"data: {"choices":[]}"#).unwrap().unwrap();
+        let chunk = parse_sse_line(r#"data: {"choices":[]}"#).unwrap();
         assert!(chunk.get("choices").unwrap().as_array().unwrap().is_empty());
     }
 
+    /// 坏行跳过：JSON 解析失败的行返回 None（不报错不断流，后续行照常解码）
     #[test]
-    fn parse_sse_line_rejects_invalid_json() {
-        assert!(parse_sse_line("data: {invalid}").is_err());
+    fn parse_sse_line_skips_invalid_json() {
+        assert!(parse_sse_line("data: {invalid}").is_none());
+        assert!(parse_sse_line("data: not json").is_none());
     }
 
     #[test]

@@ -396,3 +396,46 @@ async fn from_parts_trims_trailing_slash_from_base_url() {
     assert_eq!(response.content.as_deref(), Some("ok"));
     mock.assert_async().await; // 证明请求命中了正确 URL
 }
+
+// ---------------------------------------------------------------------------
+// 坏行容错：JSON 解析失败的 SSE 行跳过不断流
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stream_chat_skips_bad_sse_lines_and_continues() {
+    // 坏行（JSON 解析失败）只丢该行，前后好行的事件照常产出
+    let mut server = Server::new_async().await;
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"前\"}}]}\n\n",
+        "data: {invalid json}\n\n",
+        "data: not-json\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"后\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n",
+    );
+    server
+        .mock("POST", "/v1/chat/completions")
+        .with_status(200)
+        .with_body(sse_body)
+        .create_async()
+        .await;
+
+    let provider = mock_provider(&server);
+    let events = collect_stream_events(provider, simple_request("hi"))
+        .await
+        .expect("坏行不应导致整条流失败");
+
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            StreamEvent::TextDelta { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "前后", "坏行前后的文本增量都应到达");
+
+    assert!(
+        events.iter().any(|e| matches!(e, StreamEvent::Done { .. })),
+        "坏行不应阻断 Done 事件"
+    );
+}

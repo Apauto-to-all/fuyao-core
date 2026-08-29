@@ -131,9 +131,11 @@ pub(crate) fn resolve_context_length(model_id: &str, agent_paths: &AgentPaths) -
 
 /// 从 ModelConfig 解析本轮模型信息
 ///
-/// model_id 必须是 `"provider_id/model_id"` 格式的非空串——空串或缺少 `/` 视为
-/// 未指定 / 格式错误，返回 `Err`（fail-loud：引擎不提供任何隐式兜底模型）。
-/// 这与 provider_id 路由契约一致（ProviderRegistry 按 provider_id 查实例）。
+/// model_id 必须是 `"provider_id/model_id"` 格式的非空串——空串视为未指定；
+/// 缺少 `/` 或任一段为空视为格式错误，均返回 `Err`（fail-loud：引擎不提供任何
+/// 隐式兜底模型）。拆分走 [`fuyao_provider::parse_model_id`]，与 provider 侧
+/// 共用同一套解析规则（trim / 小写化 / 空段拒绝），这与 provider_id 路由契约
+/// 一致（ProviderRegistry 按 provider_id 查实例）。
 ///
 /// 思考参数（thinking_type / reasoning_effort）直接取自 session 的 ModelConfig，
 /// 与 model_id 同束传递——thinking 即便 None 也算数（= 该模型自身默认行为）。
@@ -162,15 +164,9 @@ pub(crate) fn resolve_model(
         return Err("未指定模型：ModelConfig.model_id 为空".to_string());
     }
 
-    // 拆 "provider_id/model_id" 格式
-    let (provider_id, model) = match model_id.split_once('/') {
-        Some((p, m)) if !p.is_empty() && !m.is_empty() => (p.to_lowercase(), m.to_string()),
-        _ => {
-            return Err(format!(
-                "model_id 格式错误（应为 provider_id/model_id）: {model_id}"
-            ));
-        }
-    };
+    // 拆 "provider_id/model_id" 格式：解析规则单点在 provider 侧
+    let (provider_id, model) =
+        fuyao_provider::parse_model_id(model_id).map_err(|e| e.to_string())?;
 
     // 思考参数直接取自 session 的 ModelConfig（thinking 即便 None 也算数 = 模型自身默认）
     let thinking_type = model_config.thinking_type.clone();

@@ -3,38 +3,9 @@
 //! 把内部 [`ChatRequest`] 翻译为 OpenAI 兼容的 `/chat/completions` 请求体 JSON。
 //! 与传输层解耦：输入是领域消息结构，输出是 `serde_json::Value`，可独立单测。
 
+use crate::http::filter_valid_images;
 use crate::provider::{ChatRequest, StreamOptions};
-use fuyao_api::{ImageContent, MessageRole, ThinkingType};
-
-/// OpenAI 协议支持的图片 MIME 白名单（仅图像：PNG / JPEG / WEBP / 非动画 GIF）
-const SUPPORTED_IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-
-/// 单图解码后字节上限（OpenAI 协议约束；base64 长度 /4*3 估算解码字节数）
-pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-
-/// 校验并过滤图片：MIME 白名单 + 协议字节上限，不合规的丢弃并告警
-///
-/// 校验失败只丢单张图、不中断整条消息——图像是辅助信息，文本对话照常。
-fn filter_valid_images(images: &[ImageContent]) -> Vec<&ImageContent> {
-    images
-        .iter()
-        .filter(|img| {
-            if !SUPPORTED_IMAGE_MIMES.contains(&img.mime_type.as_str()) {
-                tracing::warn!(mime_type = %img.mime_type, "图片 MIME 不在协议白名单，已丢弃");
-                return false;
-            }
-            if img.data.len() / 4 * 3 > MAX_IMAGE_BYTES {
-                tracing::warn!(
-                    mime_type = %img.mime_type,
-                    base64_len = img.data.len(),
-                    "图片超过 20MB 协议上限，已丢弃"
-                );
-                return false;
-            }
-            true
-        })
-        .collect()
-}
+use fuyao_api::{MessageRole, ThinkingType};
 
 /// 将内部 ChatRequest 转换为 OpenAI API 请求体
 ///
@@ -277,7 +248,7 @@ mod tests {
     #[test]
     fn build_request_body_drops_oversized_image() {
         // 超过 20MB 协议上限的图片被丢弃（base64 长度 = 解码字节 × 4/3）
-        let oversized = "A".repeat(MAX_IMAGE_BYTES / 3 * 4 + 100);
+        let oversized = "A".repeat(crate::http::MAX_IMAGE_BYTES / 3 * 4 + 100);
         let request = ChatRequest {
             messages: vec![ChatMessage {
                 role: MessageRole::User,

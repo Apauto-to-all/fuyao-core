@@ -8,6 +8,7 @@ pub mod admin;
 mod anthropic;
 mod error;
 mod factory;
+mod http;
 mod openai;
 mod provider;
 mod registry;
