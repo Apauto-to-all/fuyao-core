@@ -35,53 +35,40 @@ pub(crate) fn classify_http_error(status_code: u16, body: &str) -> StreamError {
     }
 }
 
-/// 从错误消息中提取 retry-after-ms 值
+/// 按标签从错误消息中提取无符号整数值
 ///
-/// 支持两种格式：`retry-after-ms:5000` 或 `retry-after-ms: 5000`
-fn extract_retry_after_ms(msg: &str) -> Option<u64> {
+/// 标签形如 `"retry-after-ms:"` / `"retry-after:"`（含冒号，小写匹配）。
+/// 支持两种格式：`标签:值`（值与标签同 token）或 `标签: 值`（冒号后空格，
+/// 值单独成 token），值尾部逗号容忍。标签互不为前缀，互不误匹配。
+fn extract_tagged_u64(msg: &str, tag: &str) -> Option<u64> {
     let lower = msg.to_lowercase();
     for part in lower.split_whitespace() {
-        if let Some(val) = part.strip_prefix("retry-after-ms:")
+        if let Some(val) = part.strip_prefix(tag)
             && !val.is_empty()
-            && let Ok(ms) = val.trim_end_matches(',').parse()
+            && let Ok(v) = val.trim_end_matches(',').parse()
         {
-            return Some(ms);
+            return Some(v);
         }
     }
-    // 尝试匹配 "retry-after-ms: <value>" 格式（冒号后有空格，value 单独一个 token）
     let tokens: Vec<&str> = lower.split_whitespace().collect();
     for i in 0..tokens.len().saturating_sub(1) {
-        if tokens[i] == "retry-after-ms:"
-            && let Ok(ms) = tokens[i + 1].trim_end_matches(',').parse()
+        if tokens[i] == tag
+            && let Ok(v) = tokens[i + 1].trim_end_matches(',').parse()
         {
-            return Some(ms);
+            return Some(v);
         }
     }
     None
 }
 
-/// 从错误消息中提取 retry-after 秒数
-///
-/// 支持两种格式：`retry-after:10` 或 `retry-after: 10`
+/// 从错误消息中提取 retry-after 毫秒值（单位：毫秒，原值直传不换算）
+fn extract_retry_after_ms(msg: &str) -> Option<u64> {
+    extract_tagged_u64(msg, "retry-after-ms:")
+}
+
+/// 从错误消息中提取 retry-after 秒数（单位：秒，原值直传不换算）
 fn extract_retry_after_secs(msg: &str) -> Option<u64> {
-    let lower = msg.to_lowercase();
-    for part in lower.split_whitespace() {
-        if let Some(val) = part.strip_prefix("retry-after:")
-            && !val.is_empty()
-            && let Ok(secs) = val.trim_end_matches(',').parse()
-        {
-            return Some(secs);
-        }
-    }
-    let tokens: Vec<&str> = lower.split_whitespace().collect();
-    for i in 0..tokens.len().saturating_sub(1) {
-        if tokens[i] == "retry-after:"
-            && let Ok(secs) = tokens[i + 1].trim_end_matches(',').parse()
-        {
-            return Some(secs);
-        }
-    }
-    None
+    extract_tagged_u64(msg, "retry-after:")
 }
 
 #[cfg(test)]
