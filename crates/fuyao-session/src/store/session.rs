@@ -87,6 +87,34 @@ pub(super) async fn require_session(
     Ok(())
 }
 
+/// 事务内落库新会话行，主键冲突时重新生成 id 重试
+///
+/// 仅重试主键冲突——其它错误（磁盘满、连接断等）重试无意义且掩盖真实故障。
+/// 成功后 `session.id` 即最终落库值。fork 类事务内路径（`fork_to` /
+/// `fork_visible`）共用本入口完成「建行 + 冲突重试」一步。
+pub(super) async fn insert_session_row_with_retry(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    session: &mut Session,
+) -> Result<(), SessionError> {
+    for attempt in 0..=ID_CONFLICT_MAX_RETRIES {
+        match super::SessionStore::insert_session_row(&mut **tx, session).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.is_primary_key_conflict() && attempt < ID_CONFLICT_MAX_RETRIES => {
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    session_id = %session.id,
+                    cause = "session id 主键冲突，重新生成 id 重试",
+                );
+                session.id = generate_id();
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // 循环边界保证不会走到这里，循环条件 attempt < MAX 已在上一次迭代返回；
+    // 此行仅为让编译器确认返回路径完备。
+    unreachable!("重试循环已在边界内返回 Ok 或 Err")
+}
+
 impl super::SessionStore {
     // ── 生命周期写操作（整行建 / 删）──────────────────────
 

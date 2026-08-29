@@ -10,6 +10,8 @@
 //!   id 冲突重试一条龙）/ 删除（delete 会话组级联）/ 元数据更新（update_session）
 //! - [`session_query`]：sessions 表的只读查询面——get / list_all /
 //!   list_child_sessions / count_with_filter
+//! - [`sql`]：store 层共享 SQL 片段单点——messages 列清单 / fork 复制投影 /
+//!   fork 聚合重算列段 / 可见窗口谓词，各路径同源引用
 //! - [`message`]：messages 表的全部操作——写入（insert，事务内同时累加 sessions
 //!   计数 / 费用）/ 计数（count_user_messages）/ 查询（load_full_history 全量审计 /
 //!   list_messages_before 游标分页浏览）
@@ -33,6 +35,7 @@ mod rollback;
 mod row;
 mod session;
 mod session_query;
+mod sql;
 mod todo;
 mod visible_window;
 

@@ -13,6 +13,7 @@
 use super::row::MessageRow;
 use crate::error::SessionError;
 use fuyao_api::Message;
+use sqlx::AssertSqlSafe;
 
 impl super::SessionStore {
     /// 加载模型可见窗口消息(压缩感知)
@@ -41,18 +42,18 @@ impl super::SessionStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<Message>, SessionError> {
-        // 单边界查询:seq >= 最新摘要的 seq(无摘要则 COALESCE 退化成 0,即全量)。
+        // 单边界查询:窗口下界取共享可见窗口谓词(seq >= 最新摘要的 seq,无摘要则
+        // COALESCE 退化成 0,即全量),与 fork_visible 的整窗复制物理同源。
         // 摘要行本身的 seq 在结果集内最小、ORDER BY seq 后排最前,天然有序。
-        let rows: Vec<MessageRow> = sqlx::query_as::<_, MessageRow>(
+        let rows: Vec<MessageRow> = sqlx::query_as::<_, MessageRow>(AssertSqlSafe(format!(
             "SELECT id, session_id, model_id, role, content, images, tool_call_id,
                     tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
                     reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind
             FROM messages
-            WHERE session_id = ?1
-              AND seq >= COALESCE((SELECT MAX(seq) FROM messages
-                                   WHERE session_id = ?1 AND kind = 'compaction'), 0)
+            WHERE session_id = ?1 {}
             ORDER BY seq",
-        )
+            super::sql::VISIBLE_WINDOW_PREDICATE
+        )))
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;

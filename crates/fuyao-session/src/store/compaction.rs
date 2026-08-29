@@ -14,6 +14,7 @@
 //! 给人看的全量历史见 [`super::message::SessionStore::load_full_history`]。
 
 use crate::error::SessionError;
+use sqlx::AssertSqlSafe;
 
 /// 压缩触发原因(写入 compaction 消息时附带,便于审计)
 #[derive(Debug, Clone, Copy)]
@@ -89,15 +90,14 @@ impl super::SessionStore {
         // 以 assistant 身份参与对话流;kind='compaction' 才是真正的类型标记)。
         // seq 分配折叠进 INSERT 的 VALUES 槽位(标量子查询 COALESCE(MAX(seq), 0) + 1,
         // 事务内保证并发安全),RETURNING 取回实际分配值,省掉一次独立的 MAX(seq)
-        // 预查询往返。
-        let (next_seq,): (i64,) = sqlx::query_as(
-            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+        // 预查询往返。目标列清单取共享列清单常量,与 VALUES 占位符按序对位
+        let insert_columns = super::sql::message_columns_sql();
+        let (next_seq,): (i64,) = sqlx::query_as(AssertSqlSafe(format!(
+            "INSERT INTO messages ({insert_columns})
              VALUES (?1, NULL, 'assistant', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL,
                 (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), 'compaction')
              RETURNING seq",
-        )
+        )))
         .bind(session_id)
         .bind(&summary)
         .bind(reason.as_str())

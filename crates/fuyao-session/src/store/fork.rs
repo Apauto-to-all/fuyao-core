@@ -42,6 +42,7 @@
 //! （`seq < target`）不受源会话并发写影响，派生无需先停 turn。
 
 use crate::error::SessionError;
+use sqlx::AssertSqlSafe;
 
 impl super::SessionStore {
     /// 把会话派生到目标消息之前（复制 seq < target 的全部消息到新独立 session）
@@ -86,49 +87,29 @@ impl super::SessionStore {
         super::rollback::validate_cut_target(&mut tx, session_id, target_seq).await?;
 
         // 3. 构造新 session 行并落库：独立主会话（parent=None），计数字段从 0 起算
-        //    （第 5 步按复制结果重算到位）。随机 id 主键冲突时重新生成重试，
-        //    仅重试主键冲突——其它错误（磁盘满、连接断等）重试无意义且掩盖真实故障
+        //    （第 5 步按复制结果重算到位）。随机 id 主键冲突时经共享重试入口
+        //    重新生成重试，仅重试主键冲突
         let mut new_session = super::session::new_session(workspace, None, system_prompt);
         // 分支标题 = `fork {源标题}`，在列表中与源会话区分；源标题为 NULL 时退回默认「新会话」
         new_session.title = Some(format!(
             "fork {}",
             source_title.as_deref().unwrap_or("新会话")
         ));
-        for attempt in 0..=super::session::ID_CONFLICT_MAX_RETRIES {
-            match Self::insert_session_row(&mut *tx, &new_session).await {
-                Ok(()) => break,
-                Err(e) => {
-                    if e.is_primary_key_conflict()
-                        && attempt < super::session::ID_CONFLICT_MAX_RETRIES
-                    {
-                        tracing::warn!(
-                            attempt = attempt + 1,
-                            session_id = %new_session.id,
-                            cause = "session id 主键冲突，重新生成 id 重试",
-                        );
-                        new_session.id = super::session::generate_id();
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
+        super::session::insert_session_row_with_retry(&mut tx, &mut new_session).await?;
 
         // 4. 引擎侧整批复制 seq < target 的全部消息到新会话（含压缩前旧消息与更早的
         //    compaction 边界）：一条 INSERT ... SELECT 完成，与逐行「读进 Rust 再写回」
         //    相比，N 条消息从 2N 次行数据穿越 + N 次语句执行降为 1 次语句执行。
         //    ROW_NUMBER() 按 seq 升序从 1 连续重分配（源 seq 单调唯一，序号即新 seq；
-        //    新会话无既有消息，UNIQUE 约束必满足）
-        sqlx::query(
-            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
-             SELECT ?3, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning,
-                ROW_NUMBER() OVER (ORDER BY seq), kind
+        //    新会话无既有消息，UNIQUE 约束必满足）。INSERT 目标列清单与 SELECT 投影
+        //    同源于共享列清单常量，两侧对位由构造保证
+        let copy_columns = super::sql::message_columns_sql();
+        let copy_projection = super::sql::fork_copy_projection_sql("?3");
+        sqlx::query(AssertSqlSafe(format!(
+            "INSERT INTO messages ({copy_columns})
+             SELECT {copy_projection}
              FROM messages WHERE session_id = ?1 AND seq < ?2",
-        )
+        )))
         .bind(session_id)
         .bind(target_seq)
         .bind(&new_session.id)
@@ -136,11 +117,9 @@ impl super::SessionStore {
         .await?;
 
         // 5. 按复制结果聚合重算新会话的全部派生字段（新会话行从 0 起算，聚合即终值）：
-        //    message_count 只数 kind='message' 的普通消息，tool_call_count 数其中
-        //    role=tool 的 tool 结果；消费类（token 四项 / cost）只计普通消息各自
-        //    携带的值（user/tool 消息恒为 0）；压缩元数据按复制进来的 compaction
-        //    边界在新 seq 空间下重新统计（MAX 落到分支里最新一条 compaction 的
-        //    **新** seq，无则置空）
+        //    count 类与消费类七列取共享聚合段；压缩元数据两列为本路径追加——按复制
+        //    进来的 compaction 边界在新 seq 空间下重新统计（MAX 落到分支里最新一条
+        //    compaction 的**新** seq，无则置空）
         let (
             message_count,
             tool_call_count,
@@ -151,32 +130,25 @@ impl super::SessionStore {
             cost_sum,
             last_compacted_seq,
             compression_count,
-        ): (i64, i64, i64, i64, i64, i64, f64, Option<i64>, i32) = sqlx::query_as(
-            "SELECT
-                COUNT(*) FILTER (WHERE kind = 'message'),
-                COUNT(*) FILTER (WHERE role = 'tool'),
-                COALESCE(SUM(prompt_tokens) FILTER (WHERE kind = 'message'), 0),
-                COALESCE(SUM(completion_tokens) FILTER (WHERE kind = 'message'), 0),
-                COALESCE(SUM(reasoning_tokens) FILTER (WHERE kind = 'message'), 0),
-                COALESCE(SUM(cached_tokens) FILTER (WHERE kind = 'message'), 0),
-                COALESCE(SUM(cost) FILTER (WHERE kind = 'message'), 0.0),
-                MAX(seq) FILTER (WHERE kind = 'compaction'),
-                COUNT(*) FILTER (WHERE kind = 'compaction')
-             FROM messages WHERE session_id = ?1",
-        )
-        .bind(&new_session.id)
-        .fetch_one(&mut *tx)
-        .await?;
+        ): (i64, i64, i64, i64, i64, i64, f64, Option<i64>, i32) =
+            sqlx::query_as(AssertSqlSafe(format!(
+                "SELECT {},
+                    MAX(seq) FILTER (WHERE kind = 'compaction'),
+                    COUNT(*) FILTER (WHERE kind = 'compaction')
+                 FROM messages WHERE session_id = ?1",
+                super::sql::FORK_RECOUNT_AGGREGATES
+            )))
+            .bind(&new_session.id)
+            .fetch_one(&mut *tx)
+            .await?;
 
-        sqlx::query(
-            "UPDATE sessions SET
-                message_count = ?2, tool_call_count = ?3,
-                total_prompt_tokens = ?4, total_completion_tokens = ?5,
-                total_reasoning_tokens = ?6, total_cached_tokens = ?7,
-                total_cost = ?8, compression_count = ?9, last_compacted_seq = ?10,
+        sqlx::query(AssertSqlSafe(format!(
+            "UPDATE sessions SET {},
+                compression_count = ?9, last_compacted_seq = ?10,
                 last_active_at = unixepoch()
              WHERE id = ?1",
-        )
+            super::sql::FORK_RECOUNT_SET
+        )))
         .bind(&new_session.id)
         .bind(message_count)
         .bind(tool_call_count)

@@ -25,6 +25,7 @@
 use super::row::MessageRow;
 use crate::error::SessionError;
 use fuyao_api::Message;
+use sqlx::AssertSqlSafe;
 
 impl super::SessionStore {
     // ── 写入 ───────────────────────────────────────────────────
@@ -74,15 +75,15 @@ impl super::SessionStore {
 
         // 1. INSERT 消息行:seq 分配折叠进 VALUES 的标量子查询
         //    (`COALESCE(MAX(seq), 0) + 1`,并发安全),`RETURNING seq`
-        //    把实际分配值带回,省掉一次独立的 MAX(seq) 预查询往返
-        let (next_seq,): (i64,) = sqlx::query_as(
-            "INSERT INTO messages (session_id, model_id, role, content, images, tool_call_id,
-                tool_calls, tool_name, timestamp, prompt_tokens, completion_tokens,
-                reasoning_tokens, cached_tokens, cost, finish_reason, reasoning, seq, kind)
+        //    把实际分配值带回,省掉一次独立的 MAX(seq) 预查询往返。
+        //    目标列清单取共享列清单常量,与 VALUES 占位符 ?1..?17 按序对位
+        let insert_columns = super::sql::message_columns_sql();
+        let (next_seq,): (i64,) = sqlx::query_as(AssertSqlSafe(format!(
+            "INSERT INTO messages ({insert_columns})
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                 (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), ?17)
              RETURNING seq",
-        )
+        )))
         .bind(session_id)
         .bind(msg.model_id.as_deref())
         .bind(msg.role.as_str())
