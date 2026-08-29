@@ -3,14 +3,11 @@
 //! 一个 turn = 处理一批已注入的 user messages，驱动"想 → 调工具 → 再想"循环，
 //! 直到 AI 不再调工具（最终回复）且 guide/pending 都空才结束。
 //!
-//! 两个消费时机（批次处理统一走 `consume_batch`：连续 User 段注入、Control 执行）：
-//! - **一批工具全部执行完成后、发回 AI 前**：只看 guide（还在调工具，pending 不动）。
-//!   guide 全取处理 → continue；guide 空 → continue（只带工具结果）。
-//! - **AI 不调用工具（最终回复，一轮 ReAct 结束）**：固定顺序
-//!   ① pending 全部倒进 guide ② guide 全部取出处理；
-//!   注入过 User 消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环），
-//!   双队列都空才结束 turn。批内 Control 条目就地执行——执行后按批次是否
-//!   注入过消息自然走向（有则继续 ReAct，无则 turn 结束）。
+//! turn 内两个消费时机（工具批完成后 / 最终回复后）的取队规则与消费许可由
+//! [`crate::react::queue::ConsumeGate`] 权威定义，本文件只在对应场合向它取件；
+//! 取出的批次统一走 `consume_batch`（连续 User 段注入、Control 就地执行）——
+//! 注入过 User 消息则回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环），
+//! 双队列都空才结束 turn。
 //!
 //! turn 运行期间的入站条目：两段 select! 监听 `rx_inbound`（外部 User / Control 条目
 //! 与插件注入的 User 条目，经 `handle_inbound_item` 纯入队）——不打断流式 / 工具执行，
@@ -37,7 +34,7 @@ use super::builders::{
 use super::consume_batch;
 use super::handle_inbound_item;
 use crate::interrupt::{self, SharedTurnState, TurnState};
-use crate::react::queue;
+use crate::react::queue::{ConsumeGate, ConsumeTiming};
 use crate::stream::StreamResult;
 use crate::tool_exec;
 use fuyao_api::ModelConfig;
@@ -50,25 +47,13 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 
-/// run_turn 退出原因——自带主循环的消费许可状态机
+/// run_turn 退出原因
 ///
 /// 只传决策，不传消息：错误 / 中断的具体内容已通过 `OutputEvent`（Error / Interrupt）
-/// 流给上层，本枚举只表达「主循环要不要继续消费 guide/pending」这一决策。
-///
-/// # 消费许可状态机（唯一权威定义，主循环是无策略驱动器）
-///
-/// - `Completed`（双队列跑空、AI 给最终回复）：[`may_consume`](Self::may_consume) 为真，
-///   主循环继续 consume（本就空）或落 select! 等待
-/// - 非 `Completed`（中断 / 失败）：`may_consume` 为假 → 主循环跳过 consume，
-///   guide/pending 剩余**原样保留**（引擎不清队列），落 select! 等待
-/// - **恢复迁移**：idle select! 的 inbound 分支收到新条目时调
-///   [`resume_on_new_intent`](Self::resume_on_new_intent) 重置为 `Completed`——新条目 =
-///   新意图，回顶部 consume 把「旧剩余 + 新条目」一起跑（忠实消费）
-/// - **空闲解禁**：task 空闲（无活跃 turn）时 pending 的「等链结束」解禁条件已满足，
-///   主循环顶部先倒 pending 再消费（否则只发 pending 会死信）——这是主循环侧的固定
-///   动作，不属于本类型，但依赖 `may_consume` 为真才执行
-///
-/// 状态机的全部许可判定与迁移都经本类型的方法发生；修改消费语义只需动这里。
+/// 流给上层，本枚举只表达「turn 为何结束」。主循环把退出原因喂给
+/// [`ConsumeGate::on_turn_end`](crate::react::queue::ConsumeGate::on_turn_end)
+/// 迁移消费许可——`Completed` 开放许可继续消费，中断 / 失败暂停消费并保留
+/// 队列剩余；消费时机的权威定义在 [`crate::react::queue`] 模块。
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TurnOutcome {
     /// 正常完成：双队列跑空，AI 给了最终回复
@@ -79,25 +64,6 @@ pub(crate) enum TurnOutcome {
     Failed,
 }
 
-impl TurnOutcome {
-    /// 消费许可：仅 `Completed` 允许主循环消费 guide/pending
-    ///
-    /// 非 `Completed` 的退出（中断 / 失败）都意味着「队列剩余不该继续跑」，
-    /// 返回假让主循环跳过 consume、保留剩余等待恢复。
-    pub(crate) fn may_consume(&self) -> bool {
-        matches!(self, Self::Completed)
-    }
-
-    /// 新条目入队：恢复消费许可
-    ///
-    /// 新条目（用户消息 / 控制命令 / 插件注入）= 新意图，重置为 `Completed`，
-    /// 主循环回顶部把「旧剩余 + 新条目」一起消费（忠实消费，引擎不清队列）。
-    /// 由 idle select! 的 inbound 分支调用。
-    pub(crate) fn resume_on_new_intent(&mut self) {
-        *self = Self::Completed;
-    }
-}
-
 /// 运行一轮 ReAct（user messages 已由 run_session 主循环经批次处理注入 DB）
 ///
 /// `model_config` 取自 session 的 SessionParams 快照（决定 model/options），turn 内多轮复用。
@@ -106,14 +72,18 @@ impl TurnOutcome {
 /// （不打断 turn），由消费时机接管——保证 turn 运行期间到达的条目能赶上前面的
 /// 消费点，而不是滞留通道等到 turn 结束。
 /// `rx_interrupt` 为中断通道接收端，两段 select! 监听它。
+/// `gate` 为双队列消费门：turn 内两个消费时机（工具批完成后 / 最终回复后）
+/// 经它取件，取队规则的权威定义见 [`crate::react::queue`] 模块。
 ///
-/// 返回 [`TurnOutcome`]：主循环据此决定是否继续消费队列。非 `Completed` 的退出都意味着
-/// 「队列剩余不该继续跑」，主循环应跳过 consume 落 select! 等用户新消息恢复。
+/// 返回 [`TurnOutcome`]：主循环经
+/// [`ConsumeGate::on_turn_end`](crate::react::queue::ConsumeGate::on_turn_end)
+/// 迁移消费许可——非 `Completed` 的退出意味着「队列剩余不该继续跑」。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     rx_inbound: &mut Receiver<QueueEntry>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     model_config: ModelConfig,
+    gate: &ConsumeGate,
 ) -> TurnOutcome {
     // 解析本轮 model_id + 从 registry 查 Provider 实例
     // 任一失败：发 Error 事件 + 结束本轮（配置错误，永久不可恢复）
@@ -214,18 +184,24 @@ pub(crate) async fn run_turn(
         match stream_result {
             Ok(result) => {
                 if result.tool_calls.is_empty() {
-                    // 无工具调用：最终回复。消费时机②：pending 倒 guide 后全取处理，
+                    // 无工具调用：最终回复。消费时机②取件（规则见 queue 模块），
                     // 注入过消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环）；
                     // 双队列都空 → turn 正常结束
-                    if !handle_final_reply(ctx, &result, &model_config).await {
+                    if !handle_final_reply(ctx, gate, &result, &model_config).await {
                         return TurnOutcome::Completed;
                     }
                 } else {
                     // 有工具调用：发 AssistantMessage → 执行整批工具 → 消费时机①
                     // 返回 true 表示执行期间被 shutdown / interrupt 打断（已落库），需退出 turn
-                    let halted =
-                        handle_tool_calls(ctx, rx_inbound, rx_interrupt, &result, &model_config)
-                            .await;
+                    let halted = handle_tool_calls(
+                        ctx,
+                        gate,
+                        rx_inbound,
+                        rx_interrupt,
+                        &result,
+                        &model_config,
+                    )
+                    .await;
                     if halted {
                         return TurnOutcome::Interrupted;
                     }
@@ -264,8 +240,9 @@ async fn emit_unrecoverable_error(ctx: &SessionCtx, message: &str) {
 
 /// 处理最终回复（AI 不调用工具，一轮 ReAct 结束）
 ///
-/// 固定顺序：① pending 全部倒进 guide（追加在 guide 现有内容之后）② guide 全部
-/// 取出经 [`consume_batch`] 处理（连续 User 段注入历史、Control 就地执行）。
+/// 消费时机②：经消费门取件（pending 倒灌 guide 后全取，取队规则由
+/// [`ConsumeTiming::FinalReply`] 内定），取出条目经 [`consume_batch`] 处理
+/// （连续 User 段注入历史、Control 就地执行）。
 ///
 /// 返回值表达 turn 是否还有后续：
 /// - `false`：guide 和 pending 都空（未注入任何 User），turn 正常结束
@@ -274,6 +251,7 @@ async fn emit_unrecoverable_error(ctx: &SessionCtx, message: &str) {
 ///   让 AI 真正回应这批消息（触发下一轮 ReAct 循环），而不是注入后无人应答
 async fn handle_final_reply(
     ctx: &SessionCtx,
+    gate: &ConsumeGate,
     result: &StreamResult,
     model_config: &ModelConfig,
 ) -> bool {
@@ -288,9 +266,8 @@ async fn handle_final_reply(
     crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
     // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
-    // 消费时机②：① pending 全倒 guide ② guide 全取批次处理
-    queue::drain_pending_to_guide(&ctx.guide, &ctx.pending);
-    let entries = queue::consume_all_guide(&ctx.guide);
+    // 消费时机②：经消费门取件（pending 倒灌 guide 后全取）
+    let entries = gate.take(ConsumeTiming::FinalReply, &ctx.guide, &ctx.pending);
     consume_batch(ctx, entries).await
 }
 
@@ -313,6 +290,7 @@ async fn handle_final_reply(
 /// 或插件注入的 User）即时纯入队（见循环内注释）。
 async fn handle_tool_calls(
     ctx: &SessionCtx,
+    gate: &ConsumeGate,
     rx_inbound: &mut Receiver<QueueEntry>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
@@ -352,9 +330,9 @@ async fn handle_tool_calls(
     // 拦截 Block：消息不进历史、不计费——插件的责任
 
     // 若全部工具调用被拦截（effective 为空）或 AssistantMessage 被 Block，无需执行
-    // 工具批——直接走消费时机①（guide 批次处理）后回 ReAct 顶部
+    // 工具批——直接走消费时机①（经消费门取件）后回 ReAct 顶部
     if effective_result.tool_calls.is_empty() {
-        let entries = queue::consume_all_guide(&ctx.guide);
+        let entries = gate.take(ConsumeTiming::AfterToolBatch, &ctx.guide, &ctx.pending);
         consume_batch(ctx, entries).await;
         return false;
     }
@@ -448,10 +426,11 @@ async fn handle_tool_calls(
         }
     }
 
-    // 步骤4：消费时机①——一批工具全部完成后、发回 AI 前，只看 guide（pending 不动）
-    // 批次处理（User 段注入 + Control 执行）；返回值此处不参与决策——工具结果已就绪，
+    // 步骤4：消费时机①——一批工具全部完成后、发回 AI 前，经消费门取件
+    // （只解禁 guide，规则见 [`ConsumeTiming::AfterToolBatch`]）；批次处理
+    // （User 段注入 + Control 执行）；返回值此处不参与决策——工具结果已就绪，
     // 恒回 ReAct 顶部带 guide 消息（若有）+ 工具结果再调 LLM
-    let entries = queue::consume_all_guide(&ctx.guide);
+    let entries = gate.take(ConsumeTiming::AfterToolBatch, &ctx.guide, &ctx.pending);
     consume_batch(ctx, entries).await;
     false
 }

@@ -3,8 +3,9 @@
 //! 测试组织：MockProvider 驱动 + TestHarness 聚合共享依赖 + 临时 DB 隔离。
 //! 覆盖面：run_turn 基本 ReAct 行为 / 双队列条目（User / Control）三消费时机
 //! （含 turn 内入站通道入队路径、最终回复后触发下一轮、批内交错忠实处理）/
-//! 中断与 shutdown 收尾 / TurnOutcome 消费许可状态机 / run_session 主循环
+//! 中断与 shutdown 收尾 / run_session 主循环
 //! （pending 空闲解禁、停止后重启、连发消息同 turn 批量消费、纯命令批次不跑 turn）。
+//! 消费门的许可迁移与三时机取件规则另由 queue 模块单测单点钉住。
 
 use super::*;
 use async_trait::async_trait;
@@ -373,6 +374,12 @@ fn empty_queue() -> SharedQueue {
     Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
+/// 构造许可开放的消费门（测试直调 run_turn 用；许可迁移与三时机取件规则的
+/// 单点断言在 queue 模块的单测）
+fn open_gate() -> queue::ConsumeGate {
+    queue::ConsumeGate::default()
+}
+
 /// 构造空 SharedHooks（无拦截/观察钩子，管道纯透传）
 fn empty_hooks() -> fuyao_hooks::SharedHooks {
     Arc::new(fuyao_hooks::HooksRegistry::default())
@@ -548,6 +555,7 @@ async fn single_turn_no_tools() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -581,6 +589,7 @@ async fn react_loop_with_tool() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -610,6 +619,7 @@ async fn tool_result_in_messages() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -636,6 +646,7 @@ async fn llm_error_emits_error_event() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -669,6 +680,7 @@ async fn guide_all_consumed_on_tool_complete() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -724,6 +736,7 @@ async fn pending_before_guide_on_final_reply() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -768,6 +781,7 @@ async fn both_empty_turn_ends() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -809,11 +823,13 @@ async fn guide_via_channel_consumed_after_tool_batch() {
     preload_user(&h, "原始问题").await;
 
     let tx_inbound = h.tx_inbound.clone();
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let driver = async {
@@ -895,11 +911,13 @@ async fn plugin_msg_via_channel_consumed_after_tool_batch() {
     preload_user(&h, "原始问题").await;
 
     let tx_inbound = h.tx_inbound.clone();
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let driver = async {
@@ -974,6 +992,7 @@ async fn guide_via_channel_batched_in_one_turn() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -1033,11 +1052,13 @@ async fn inbound_during_streaming_consumed_at_final_reply() {
     // 独占批 0 的发送端（pop 取走所有权）：喂完 Done 后 drop 关闭通道，
     // 流读到关闭即结束——clone 会留下第二个发送端，通道不关流不结束
     let tx0 = txs.pop().unwrap();
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let driver = async {
@@ -1114,11 +1135,13 @@ async fn interrupt_after_inbound_preserves_guide_queue() {
 
     let tx_inbound = h.tx_inbound.clone();
     let tx_interrupt = h.tx_interrupt.clone();
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let driver = async {
@@ -1208,6 +1231,7 @@ async fn pending_via_channel_consumed_at_final_reply_not_tool_batch() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -1229,30 +1253,6 @@ async fn pending_via_channel_consumed_at_final_reply_not_tool_batch() {
     );
     assert!(h.ctx.pending.lock().unwrap().is_empty());
     assert!(h.ctx.guide.lock().unwrap().is_empty());
-}
-
-/// TurnOutcome 消费许可状态机：三态许可判定 + 任意非 Completed 态经新条目恢复
-///
-/// 守护主循环「停消费 / 恢复消费」的全部语义迁移——历史上最贵的队列死信 bug
-/// 都藏在这些迁移上，语义表在此钉死。
-#[test]
-fn turn_outcome_consumption_state_machine() {
-    // 许可判定：仅 Completed 允许消费 guide/pending
-    assert!(turn::TurnOutcome::Completed.may_consume());
-    assert!(!turn::TurnOutcome::Interrupted.may_consume());
-    assert!(!turn::TurnOutcome::Failed.may_consume());
-
-    // 恢复迁移：任意非 Completed 态经新条目恢复为可消费
-    for outcome in [turn::TurnOutcome::Interrupted, turn::TurnOutcome::Failed] {
-        let mut o = outcome;
-        o.resume_on_new_intent();
-        assert!(o.may_consume(), "{outcome:?} 恢复后应允许消费");
-    }
-
-    // Completed 自恢复无变化
-    let mut completed = turn::TurnOutcome::Completed;
-    completed.resume_on_new_intent();
-    assert!(completed.may_consume());
 }
 
 /// 中断通道关闭不影响 turn 正常执行（Some 模式：关闭 = 分支禁用，不当作事件）
@@ -1289,6 +1289,7 @@ async fn closed_interrupt_channel_does_not_disturb_turn() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
     assert!(
@@ -1815,11 +1816,13 @@ async fn interrupt_during_streaming() {
 
     // run_turn 与"发中断"并发：run_turn 先消费 TextDelta，然后挂起在第二个事件上；
     // yield_now 让出调度让 run_turn 进入挂起态，再发中断。
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let interrupter = async {
@@ -1906,11 +1909,13 @@ async fn interrupt_during_streaming_reasoning_only() {
         }))
         .unwrap();
 
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let interrupter = async {
@@ -1988,11 +1993,13 @@ async fn interrupt_during_tool_execution() {
 
     let tx_interrupt = h.tx_interrupt.clone();
 
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let interrupter = async {
@@ -2095,11 +2102,13 @@ async fn interrupt_during_tool_execution_only_completes_unfinished() {
 
     let tx_interrupt = h.tx_interrupt.clone();
 
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let interrupter = async {
@@ -2185,11 +2194,13 @@ async fn shutdown_during_streaming() {
         }))
         .unwrap();
 
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let canceller = async {
@@ -2275,11 +2286,13 @@ async fn shutdown_during_tool_execution() {
 
     let shutdown_token = h.ctx.shutdown_token.clone();
 
+    let gate = open_gate();
     let turn_fut = turn::run_turn(
         &h.ctx,
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &gate,
     );
     tokio::pin!(turn_fut);
     let canceller = async {
@@ -2348,6 +2361,7 @@ async fn messages_persisted_to_db() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -2424,6 +2438,7 @@ async fn usage_flows_to_final_assistant_message() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -2520,7 +2535,14 @@ async fn cost_accumulated_per_assistant_message() {
     let mut params = test_params();
     params.model_id = "test/cost-model".to_string();
 
-    turn::run_turn(&h.ctx, &mut h.rx_inbound, &mut h.rx_interrupt, params).await;
+    turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        params,
+        &open_gate(),
+    )
+    .await;
 
     // 清理全局缓存（避免污染后续测试）
     fuyao_provider::clear_cache(&agent_paths);
@@ -2651,6 +2673,7 @@ async fn intercept_modifies_final_assistant_in_history_and_next_request() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -2708,6 +2731,7 @@ async fn intercept_block_skips_final_assistant_in_history() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -3746,6 +3770,7 @@ async fn run_turn_returns_completed_on_final_reply() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 
@@ -3772,6 +3797,7 @@ async fn run_turn_returns_failed_on_llm_error() {
         &mut h.rx_inbound,
         &mut h.rx_interrupt,
         test_params(),
+        &open_gate(),
     )
     .await;
 

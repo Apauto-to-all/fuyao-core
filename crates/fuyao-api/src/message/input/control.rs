@@ -48,6 +48,26 @@ pub struct ControlPayload {
     pub note: Option<String>,
 }
 
+impl ControlMessage {
+    /// 入口转化：input 侧控制消息 → output 侧同构消息
+    ///
+    /// base 与 payload 四字段（command / mode / client_message_id / note）
+    /// 逐字段搬运、无增删改——控制命令与用户消息同型排队，内核链路（入站通道、
+    /// 双队列、消费）全程只认 output 侧类型。payload 整体搬运，不逐变体解构，
+    /// [`ControlCommand`] 加变体不需要动本方法。
+    pub fn into_output(self) -> crate::message::output::ControlMessage {
+        crate::message::output::ControlMessage {
+            base: self.base,
+            payload: crate::message::output::ControlPayload {
+                command: self.payload.command,
+                mode: self.payload.mode,
+                client_message_id: self.payload.client_message_id,
+                note: self.payload.note,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,5 +139,31 @@ mod tests {
         assert_eq!(de.payload.command, ControlCommand::Compress);
         assert_eq!(de.payload.mode, UserMessageMode::Guide);
         assert_eq!(de.payload.client_message_id, None);
+    }
+
+    /// 入口转化：base 与 payload 四字段逐字段搬运，转化前后逐一相等
+    #[test]
+    fn control_message_into_output_maps_every_field() {
+        let msg = ControlMessage {
+            base: EventBase {
+                seq: Some(7),
+                timestamp: 123.456,
+                session_id: Some("sess-1".to_string()),
+            },
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Pending,
+                client_message_id: Some("cmd-7".to_string()),
+                note: Some("侧重未完成的任务".to_string()),
+            },
+        };
+        let outbound = msg.into_output();
+        assert_eq!(outbound.base.seq, Some(7));
+        assert_eq!(outbound.base.timestamp, 123.456);
+        assert_eq!(outbound.base.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(outbound.payload.command, ControlCommand::Compress);
+        assert_eq!(outbound.payload.mode, UserMessageMode::Pending);
+        assert_eq!(outbound.payload.client_message_id.as_deref(), Some("cmd-7"));
+        assert_eq!(outbound.payload.note.as_deref(), Some("侧重未完成的任务"));
     }
 }

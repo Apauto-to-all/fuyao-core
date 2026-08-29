@@ -46,6 +46,18 @@ pub struct ControlPayload {
     pub note: Option<String>,
 }
 
+impl ControlMessage {
+    /// 消费回显事件：命令条目被消费时，先把消息本体以 `Control` 变体对外广播
+    ///
+    /// 前端据此得知该命令已被消费并即将生效，client_message_id 随回显原样携带
+    /// （供排队项配对）。回显照常过 dispatch 管道——可被拦截钩子改写或阻止，
+    /// 但那只影响本次回显的对外可见性，命令本体不受影响。消息整体包进事件，
+    /// [`ControlCommand`](crate::message::control::ControlCommand) 加变体不需要动本方法。
+    pub fn into_echo_event(self) -> crate::message::OutputEvent {
+        crate::message::OutputEvent::Control(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +127,35 @@ mod tests {
         let de: ControlMessage = serde_json::from_str(&json).expect("反序列化失败");
         assert_eq!(de.payload.command, ControlCommand::Compress);
         assert_eq!(de.payload.mode, UserMessageMode::Pending);
+    }
+
+    /// 回显事件构造：消息本体（base + payload 全字段）原样包进 Control 变体
+    #[test]
+    fn output_control_message_into_echo_event_wraps_whole_message() {
+        let msg = ControlMessage {
+            base: EventBase {
+                seq: Some(9),
+                timestamp: 42.0,
+                session_id: Some("sess-9".to_string()),
+            },
+            payload: ControlPayload {
+                command: ControlCommand::Compress,
+                mode: UserMessageMode::Guide,
+                client_message_id: Some("cmd-9".to_string()),
+                note: Some("侧重错误堆栈".to_string()),
+            },
+        };
+        match msg.into_echo_event() {
+            crate::message::OutputEvent::Control(m) => {
+                assert_eq!(m.base.seq, Some(9));
+                assert_eq!(m.base.timestamp, 42.0);
+                assert_eq!(m.base.session_id.as_deref(), Some("sess-9"));
+                assert_eq!(m.payload.command, ControlCommand::Compress);
+                assert_eq!(m.payload.mode, UserMessageMode::Guide);
+                assert_eq!(m.payload.client_message_id.as_deref(), Some("cmd-9"));
+                assert_eq!(m.payload.note.as_deref(), Some("侧重错误堆栈"));
+            }
+            _ => panic!("回显事件应为 Control 变体"),
+        }
     }
 }

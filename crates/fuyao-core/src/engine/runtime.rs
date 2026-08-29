@@ -79,24 +79,15 @@ impl Engine {
                     OutboundAction::Inbound(handle.tx_inbound.clone(), QueueEntry::User(outbound))
                 }
                 InputEvent::Control(ctrl_msg) => {
-                    // input 侧 ControlMessage 字段照搬转化为 output 侧 ControlMessage
-                    // （command / mode / client_message_id / note），包成 Control 条目走
-                    // 与用户消息相同的入站通道——同一通道承载保证两类消息的总序。
-                    // 命令本体（如手动压缩跳过阈值，reason=manual）由消费点的
-                    // handle_control 先回显后执行，client_message_id 供排队中
-                    // 撤销与消费回显配对，note（附言）随回显原样携带。
-                    let outbound = fuyao_api::message::output::ControlMessage {
-                        base: ctrl_msg.base,
-                        payload: fuyao_api::message::output::ControlPayload {
-                            command: ctrl_msg.payload.command,
-                            mode: ctrl_msg.payload.mode,
-                            client_message_id: ctrl_msg.payload.client_message_id,
-                            note: ctrl_msg.payload.note,
-                        },
-                    };
+                    // 入口转化由类型方法承载（input → output 侧同构消息，逐字段
+                    // 搬运）；包成 Control 条目走与用户消息相同的入站通道——
+                    // 同一通道承载保证两类消息的总序。命令本体（如手动压缩跳过
+                    // 阈值，reason=manual）由消费点的 handle_control 先回显后执行，
+                    // client_message_id 供排队中撤销与消费回显配对，note（附言）
+                    // 随回显原样携带。
                     OutboundAction::Inbound(
                         handle.tx_inbound.clone(),
-                        QueueEntry::Control(outbound),
+                        QueueEntry::Control(ctrl_msg.into_output()),
                     )
                 }
                 InputEvent::Interrupt(interrupt_msg) => {
