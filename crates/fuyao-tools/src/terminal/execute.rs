@@ -254,7 +254,7 @@ pub fn format_result(result: TerminalResult) -> ToolOutput {
             .map(|ms| (ms * 10.0).round() / 10.0),
         exit_code_meaning: result.exit_code_meaning,
     };
-    ToolOutput::ok(serde_json::to_value(&output).unwrap_or_default())
+    crate::common::to_ok_output(&output)
 }
 
 #[cfg(test)]

@@ -6,7 +6,8 @@
 //! - 传 name + file_path → 加载关联文件
 
 use super::types::{SkillArgs, SkillFileResult, SkillListResult, SkillMetaItem, SkillViewResult};
-use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
+use crate::common::{parse_tool_args, to_ok_output};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
 use fuyao_prompt::{list_skills, load_skill, load_skill_file};
 use serde_json::Value;
 
@@ -68,7 +69,7 @@ fn skill_list_handler(ctx: &ToolCallContext) -> ToolOutput {
             message: Some("未找到 Skills".to_string()),
             hint: None,
         };
-        return ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default());
+        return to_ok_output(&result);
     }
 
     let skills: Vec<SkillMetaItem> = all_skills.iter().map(SkillMetaItem::from).collect();
@@ -81,7 +82,7 @@ fn skill_list_handler(ctx: &ToolCallContext) -> ToolOutput {
         hint: Some("使用 skill(name) 查看完整内容".to_string()),
     };
 
-    ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 /// 加载 Skill 完整内容或关联文件
@@ -96,7 +97,7 @@ fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext
         match load_skill_file(name, file_path, agent_paths) {
             Ok(content) => {
                 let result = SkillFileResult { content };
-                ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
+                to_ok_output(&result)
             }
             Err(_) => ToolOutput::error(format_file_not_found(name, file_path, agent_paths)),
         }
@@ -136,7 +137,7 @@ fn skill_view_handler(name: &str, file_path: Option<&str>, ctx: &ToolCallContext
                     usage_hint,
                     skill_dir: skill.skill_dir,
                 };
-                ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
+                to_ok_output(&result)
             }
             Err(_) => ToolOutput::error(format_skill_not_found(name, agent_paths)),
         }
@@ -153,9 +154,9 @@ pub async fn skill_handler(
     ctx: ToolCallContext,
     _cancel: CancellationToken,
 ) -> ToolOutput {
-    let SkillArgs { name, file_path } = match parse_args(args) {
+    let SkillArgs { name, file_path } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let file_path = file_path.filter(|s| !s.trim().is_empty());
 

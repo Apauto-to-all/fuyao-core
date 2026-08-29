@@ -7,14 +7,12 @@
 //!
 //! 全部使用默认配置（不调 set_config），走 get_config 未 set 返回 default 的兜底。
 
-mod common;
-
-use common::{make_chunk, make_tool_call, make_tool_result};
 use fuyao_api::message::input::UserMessageSource;
 use fuyao_api::message::output::UserMessage as OutputUserMessage;
 use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_guard::LoopGuardPlugin;
-use fuyao_hooks::{HooksRegistry, Plugin, SessionSender, SharedHooks};
+use fuyao_guard::test_util::{make_chunk, make_sender, make_tool_call, make_tool_result};
+use fuyao_hooks::{HooksRegistry, Plugin, SharedHooks};
 use std::sync::Arc;
 
 use fuyao_api::message::UserMessageMode;
@@ -29,17 +27,7 @@ fn assembled_guard() -> SharedHooks {
     let mut registry = HooksRegistry::new();
     let instance = plugin.create_instance();
 
-    // 构造 SessionSender（dummy 通道，测试不验证投递侧）
-    let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let (tx_inbound, _rx_inbound) = tokio::sync::mpsc::channel(16);
-    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
-    let sender = SessionSender::new(
-        "loop_guard",
-        "test-session",
-        tx_inbound,
-        tx_interrupt,
-        tx_event,
-    );
+    let (sender, _rx_inbound, _rx_interrupt, _rx_event) = make_sender("loop_guard", "test-session");
     instance.register(&mut registry, &sender);
 
     registry.finalize();
@@ -72,16 +60,7 @@ fn plugin_registers_hooks() {
 
     let mut registry = HooksRegistry::new();
     let instance = plugin.create_instance();
-    let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let (tx_inbound, _rx_inbound) = tokio::sync::mpsc::channel(16);
-    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
-    let sender = SessionSender::new(
-        "loop_guard",
-        "test-session",
-        tx_inbound,
-        tx_interrupt,
-        tx_event,
-    );
+    let (sender, _rx_inbound, _rx_interrupt, _rx_event) = make_sender("loop_guard", "test-session");
     instance.register(&mut registry, &sender);
     // register 完成（不 panic）即说明钩子注册 + sender 保存成功
 }

@@ -8,12 +8,11 @@
 //! - 编辑前检测外部编辑并发出警告
 //! - 编辑后更新追踪器时间戳
 
-use crate::common::resolve_path;
+use crate::common::{empty_path_error, parse_tool_args, resolve_ctx_path, to_ok_output};
 use crate::file::edit::backend::apply_replace;
 use crate::file::edit::types::EditArgs;
-use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput};
 use serde_json::Value;
-use std::path::Path;
 
 /// edit 工具入口，执行查找替换
 ///
@@ -29,20 +28,17 @@ pub async fn edit_impl(
         old_string,
         new_string,
         replace_all,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let task_id = ctx.task_id().to_string();
-    let workspace = ctx.workspace().map(Path::to_path_buf);
 
     if path.is_empty() {
-        return ToolOutput::Err(
-            ToolError::new("path 参数必填").with("suggestion", "请提供要修改的文件路径"),
-        );
+        return empty_path_error();
     }
 
-    let file_path = resolve_path(&path, workspace.as_deref());
+    let file_path = resolve_ctx_path(&ctx, &path);
 
     let result = match apply_replace(
         &file_path,
@@ -70,12 +66,27 @@ pub async fn edit_impl(
         }
     };
 
-    ToolOutput::ok(serde_json::to_value(&result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::file::edit::types::EditReplaceResult;
+
+    /// 空路径：统一文案与 suggestion（与 write 的空路径信封一致）
+    #[tokio::test]
+    async fn edit_rejects_empty_path() {
+        let result = edit_impl(
+            serde_json::json!({ "path": "", "old_string": "a", "new_string": "b" }),
+            fuyao_api::ToolCallContext::default(),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        assert!(result.contains("路径参数不能为空"), "实际：{result}");
+        assert!(result.contains("请提供有效的文件路径"), "实际：{result}");
+    }
 
     #[test]
     fn edit_replace_result_serializes_all_fields() {

@@ -12,14 +12,11 @@ use super::instance::PluginInstance;
 use super::sender::SessionSender;
 use super::simple::simple_plugin;
 use crate::HooksRegistry;
+use crate::test_util::{empty_chunk_event, make_sender};
 use fuyao_api::InterruptSource;
 use fuyao_api::UserMessageMode;
-use fuyao_api::message::EventBase;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::QueueEntry;
-use fuyao_api::message::output::ChunkMessage;
-use fuyao_api::message::output::ChunkPayload;
-use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -364,29 +361,10 @@ fn plugin_instance_default_dispose_noop() {
 // SessionSender：两通道分流 + 身份绑定
 // ---------------------------------------------------------------------------
 
-/// 构造测试用 SessionSender + 两条接收端
-fn make_sender() -> (
-    SessionSender,
-    tokio::sync::mpsc::Receiver<QueueEntry>,
-    tokio::sync::mpsc::Receiver<OutputInterruptMessage>,
-) {
-    let (tx_inbound, rx_inbound) = tokio::sync::mpsc::channel(16);
-    let (tx_interrupt, rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
-    let sender = SessionSender::new(
-        "test_plugin",
-        "test-session",
-        tx_inbound,
-        tx_interrupt,
-        tx_event,
-    );
-    (sender, rx_inbound, rx_interrupt)
-}
-
 /// send_user 指定 Guide 模式
 #[tokio::test]
 async fn sender_send_user_guide_mode() {
-    let (sender, mut rx_inbound, _rx_int) = make_sender();
+    let (sender, mut rx_inbound, _rx_int, _rx_event) = make_sender("test_plugin", "test-session");
     sender.send_user("hello", UserMessageMode::Guide);
     let received = rx_inbound.recv().await.expect("应收到入站条目");
     let QueueEntry::User(m) = received else {
@@ -399,7 +377,7 @@ async fn sender_send_user_guide_mode() {
 /// send_user 指定 Pending 模式
 #[tokio::test]
 async fn sender_send_user_pending_mode() {
-    let (sender, mut rx_inbound, _rx_int) = make_sender();
+    let (sender, mut rx_inbound, _rx_int, _rx_event) = make_sender("test_plugin", "test-session");
     sender.send_user("排队", UserMessageMode::Pending);
     let received = rx_inbound.recv().await.expect("应收到入站条目");
     let QueueEntry::User(m) = received else {
@@ -412,7 +390,7 @@ async fn sender_send_user_pending_mode() {
 /// send_user 自动填 source = Plugin（绑插件名）
 #[tokio::test]
 async fn sender_send_user_fills_plugin_source() {
-    let (sender, mut rx_inbound, _rx_int) = make_sender();
+    let (sender, mut rx_inbound, _rx_int, _rx_event) = make_sender("test_plugin", "test-session");
     sender.send_user("来源校验", UserMessageMode::Guide);
     let received = rx_inbound.recv().await.expect("应收到入站条目");
     let QueueEntry::User(m) = received else {
@@ -427,7 +405,7 @@ async fn sender_send_user_fills_plugin_source() {
 /// send_interrupt 投递到 Interrupt 通道，source = Hook
 #[tokio::test]
 async fn sender_send_interrupt_routes_to_interrupt_channel() {
-    let (sender, _rx_inbound, mut rx_int) = make_sender();
+    let (sender, _rx_inbound, mut rx_int, _rx_event) = make_sender("test_plugin", "test-session");
     sender.send_interrupt("循环检测");
     let received = rx_int.recv().await.expect("应收到 Interrupt 消息");
     assert_eq!(received.payload.reason, "循环检测");
@@ -437,7 +415,8 @@ async fn sender_send_interrupt_routes_to_interrupt_channel() {
 /// 入站与中断通道完全隔离：发 User 不影响 Interrupt 通道
 #[tokio::test]
 async fn sender_two_channels_are_independent() {
-    let (sender, mut rx_inbound, mut rx_int) = make_sender();
+    let (sender, mut rx_inbound, mut rx_int, _rx_event) =
+        make_sender("test_plugin", "test-session");
     sender.send_user("只发 User", UserMessageMode::Guide);
     // Interrupt 通道应无消息
     assert!(rx_int.try_recv().is_err(), "Interrupt 通道不应有消息");
@@ -452,14 +431,14 @@ async fn sender_two_channels_are_independent() {
 /// name() 只读访问
 #[test]
 fn sender_name_is_readable() {
-    let (sender, _rx_inbound, _rx_int) = make_sender();
+    let (sender, _rx_inbound, _rx_int, _rx_event) = make_sender("test_plugin", "test-session");
     assert_eq!(sender.name(), "test_plugin");
 }
 
 /// SessionSender 是 Clone（每插件实例持有自己的克隆）
 #[test]
 fn sender_is_cloneable() {
-    let (sender, _rx_inbound, _rx_int) = make_sender();
+    let (sender, _rx_inbound, _rx_int, _rx_event) = make_sender("test_plugin", "test-session");
     let cloned = sender.clone();
     assert_eq!(cloned.name(), "test_plugin");
 }
@@ -467,25 +446,6 @@ fn sender_is_cloneable() {
 // ---------------------------------------------------------------------------
 // simple_plugin：无状态插件快捷构造
 // ---------------------------------------------------------------------------
-
-/// 构造测试用 Chunk 事件
-fn make_chunk() -> OutputEvent {
-    OutputEvent::Chunk(ChunkMessage {
-        base: EventBase::default(),
-        payload: ChunkPayload {
-            content: None,
-            reasoning: None,
-        },
-    })
-}
-
-/// 构造测试用 SessionSender（绑定指定插件名 + 两条丢弃接收端）
-fn make_sender_named(name: &str) -> SessionSender {
-    let (tx_inbound, _rx_inbound) = tokio::sync::mpsc::channel(16);
-    let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-    let (tx_event, _rx_event) = tokio::sync::mpsc::unbounded_channel::<OutputEvent>();
-    SessionSender::new(name, "test-session", tx_inbound, tx_interrupt, tx_event)
-}
 
 /// simple_plugin：name 正确，注册的观察钩子真实生效
 #[tokio::test]
@@ -512,10 +472,15 @@ async fn simple_plugin_registers_effective_observe_hook() {
 
     let instance = plugin.create_instance();
     let mut hooks = HooksRegistry::new();
-    instance.register(&mut hooks, &make_sender_named("simple_observer"));
+    instance.register(
+        &mut hooks,
+        &make_sender("simple_observer", "test-session").0,
+    );
     hooks.finalize();
 
-    hooks.hook_output_observe(Arc::new(make_chunk())).await;
+    hooks
+        .hook_output_observe(Arc::new(empty_chunk_event()))
+        .await;
     assert_eq!(
         observed.load(Ordering::SeqCst),
         1,
@@ -540,10 +505,13 @@ fn simple_plugin_registers_effective_intercept_hook() {
 
     let instance = plugin.create_instance();
     let mut hooks = HooksRegistry::new();
-    instance.register(&mut hooks, &make_sender_named("simple_intercept"));
+    instance.register(
+        &mut hooks,
+        &make_sender("simple_intercept", "test-session").0,
+    );
     hooks.finalize();
 
-    let mut ev = make_chunk();
+    let mut ev = empty_chunk_event();
     assert!(hooks.hook_output_intercept(&mut ev).is_none());
     let content = match ev {
         OutputEvent::Chunk(msg) => msg.payload.content,
@@ -579,9 +547,11 @@ async fn simple_plugin_create_instance_per_session() {
     for _ in 0..2 {
         let instance = plugin.create_instance();
         let mut hooks = HooksRegistry::new();
-        instance.register(&mut hooks, &make_sender_named("multi_session"));
+        instance.register(&mut hooks, &make_sender("multi_session", "test-session").0);
         hooks.finalize();
-        hooks.hook_output_observe(Arc::new(make_chunk())).await;
+        hooks
+            .hook_output_observe(Arc::new(empty_chunk_event()))
+            .await;
     }
 
     // 2 次注册调用（各 +1）+ 2 次钩子执行（各 +10）

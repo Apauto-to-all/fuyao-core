@@ -53,11 +53,15 @@ async fn full_assembly_registers_and_invokes_observe() {
     let (hooks, _log) = single_plugin_assemble(cfg);
 
     hooks
-        .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk("hello"))))
+        .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk(
+            Some("hello"),
+            None,
+        ))))
         .await;
 
     // 仅注册了 observe，intercept 为空应原样放行
-    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("hello")));
+    let result =
+        hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("hello"), None)));
     assert!(result.is_none());
 }
 
@@ -68,9 +72,12 @@ async fn empty_registry_handles_events_without_panic() {
     let hooks = assemble(vec![], tx_inbound, tx_interrupt);
 
     hooks
-        .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk("x"))))
+        .hook_output_observe(std::sync::Arc::new(OutputEvent::Chunk(make_chunk(
+            Some("x"),
+            None,
+        ))))
         .await;
-    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("x")));
+    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("x"), None)));
     assert!(result.is_none());
 }
 
@@ -116,7 +123,7 @@ async fn multiple_plugins_register_and_observe_in_registration_order() {
     let hooks = assemble(instances, tx_inbound, tx_interrupt);
 
     hooks
-        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk(Some("e"), None))))
         .await;
 
     let recorded = log.lock().unwrap().clone();
@@ -179,7 +186,7 @@ async fn create_instance_panic_skipped_others_proceed() {
     let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
     let hooks = assemble(instances, tx_inbound, tx_interrupt);
     hooks
-        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk(Some("e"), None))))
         .await;
 
     let recorded = log.lock().unwrap().clone();
@@ -228,7 +235,7 @@ async fn register_panic_isolated_others_proceed() {
     let (tx_inbound, _rx_inbound, tx_interrupt, _rx_interrupt) = make_channels();
     let hooks = assemble(instances, tx_inbound, tx_interrupt);
     hooks
-        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk("e"))))
+        .hook_output_observe(Arc::new(OutputEvent::Chunk(make_chunk(Some("e"), None))))
         .await;
 
     let recorded = log.lock().unwrap().clone();
@@ -331,9 +338,10 @@ async fn observe_intercept_and_sender_coexist_on_single_plugin() {
     assert_eq!(received.payload.content, "combo_msg");
 
     // 喂一个事件：observe + intercept 都应记录
-    let event = OutputEvent::Chunk(make_chunk("payload"));
+    let event = OutputEvent::Chunk(make_chunk(Some("payload"), None));
     hooks.hook_output_observe(Arc::new(event)).await;
-    let result = hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("payload")));
+    let result =
+        hooks.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("payload"), None)));
     assert!(result.is_none());
 
     let recorded = log.lock().unwrap().clone();

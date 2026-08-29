@@ -9,8 +9,9 @@
 //! 不再自建连接池。
 
 use super::types::{TodoSummary, TodoWriteArgs, TodoWriteResult};
+use crate::common::{parse_tool_args, to_ok_output};
 use crate::config::TODO_MAX_ITEMS;
-use fuyao_api::{CancellationToken, TodoItem, ToolCallContext, ToolError, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, TodoItem, ToolCallContext, ToolError, ToolOutput};
 use serde_json::Value;
 
 /// 合法的 status 值
@@ -56,9 +57,9 @@ pub async fn todo_handler(
     ctx: ToolCallContext,
     _cancel: CancellationToken,
 ) -> ToolOutput {
-    let TodoWriteArgs { todos } = match parse_args(args) {
+    let TodoWriteArgs { todos } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
 
     let session_id = match &ctx.session_id {
@@ -154,7 +155,7 @@ pub async fn todo_handler(
         todos,
     };
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 #[cfg(test)]

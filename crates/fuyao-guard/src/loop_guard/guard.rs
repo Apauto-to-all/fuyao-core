@@ -316,42 +316,18 @@ pub fn make_output_intercept(state: Arc<Mutex<LoopGuardState>>) -> fuyao_hooks::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::{make_chunk, make_sender, make_tool_call, make_tool_result};
     use fuyao_api::message::EventBase;
     use fuyao_api::message::QueueEntry;
     use fuyao_api::message::input::PluginSource;
     use fuyao_api::message::output::{
-        ChunkPayload, InterruptMessage as OutputInterruptMessage, ToolCallPayload,
-        ToolResultPayload, UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
+        UserMessage as OutputUserMessage, UserPayload as OutputUserPayload,
     };
-    use fuyao_hooks::SessionSender;
     use tokio::sync::mpsc;
 
     /// 锁并恢复 poison（与实现一致的 idiom）
     fn lock(state: &Arc<Mutex<LoopGuardState>>) -> std::sync::MutexGuard<'_, LoopGuardState> {
         state.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// 构造 SessionSender + 三条通道接收端（入站 / interrupt / notice 出站）
-    ///
-    /// 测试辅助：插件名统一为 `loop_guard`，通道容量 16。
-    /// 测试按需解构对应 rx 验证消息流向。
-    fn make_sender() -> (
-        SessionSender,
-        mpsc::Receiver<OutputInterruptMessage>,
-        mpsc::Receiver<QueueEntry>,
-        mpsc::UnboundedReceiver<OutputEvent>,
-    ) {
-        let (tx_interrupt, rx_interrupt) = mpsc::channel(16);
-        let (tx_inbound, rx_inbound) = mpsc::channel(16);
-        let (tx_event, rx_event) = mpsc::unbounded_channel::<OutputEvent>();
-        let sender = SessionSender::new(
-            "loop_guard",
-            "test-session",
-            tx_inbound,
-            tx_interrupt,
-            tx_event,
-        );
-        (sender, rx_interrupt, rx_inbound, rx_event)
     }
 
     /// 从出站通道取一条通知事件（同步 try_recv，发送全为非阻塞无需 await）
@@ -361,38 +337,6 @@ mod tests {
         match rx.try_recv() {
             Ok(OutputEvent::PluginNotice(m)) => m,
             other => panic!("应是 PluginNotice 事件，实际 {other:?}"),
-        }
-    }
-
-    fn make_chunk(content: Option<&str>, reasoning: Option<&str>) -> ChunkMessage {
-        ChunkMessage {
-            base: EventBase::default(),
-            payload: ChunkPayload {
-                content: content.map(|s| s.to_string()),
-                reasoning: reasoning.map(|s| s.to_string()),
-            },
-        }
-    }
-
-    fn make_tool_call(name: &str, args: &str) -> ToolCallMessage {
-        ToolCallMessage {
-            base: EventBase::default(),
-            payload: ToolCallPayload {
-                tool_call_id: "call_1".to_string(),
-                tool_name: name.to_string(),
-                tool_args: serde_json::from_str(args).unwrap_or(serde_json::Value::Null),
-            },
-        }
-    }
-
-    fn make_tool_result(name: &str, content: &str) -> ToolResultMessage {
-        ToolResultMessage {
-            base: EventBase::default(),
-            payload: ToolResultPayload {
-                tool_call_id: "call_1".to_string(),
-                tool_name: name.to_string(),
-                content: content.to_string(),
-            },
         }
     }
 
@@ -563,7 +507,8 @@ mod tests {
     #[tokio::test]
     async fn send_interrupt_sends_input_event() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, mut rx_interrupt, _rx_inbound, _rx_event) = make_sender();
+        let (sender, _rx_inbound, mut rx_interrupt, _rx_event) =
+            make_sender("loop_guard", "test-session");
         state.set_sender(sender);
         state.send_interrupt("循环检测".to_string());
         let msg = rx_interrupt.recv().await.unwrap();
@@ -577,7 +522,8 @@ mod tests {
     #[tokio::test]
     async fn send_inject_message_sends_user_event() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, _rx_interrupt, mut rx_inbound, _rx_event) = make_sender();
+        let (sender, mut rx_inbound, _rx_interrupt, _rx_event) =
+            make_sender("loop_guard", "test-session");
         state.set_sender(sender);
         state.send_inject_message("请调整策略".to_string());
         let msg = rx_inbound.recv().await.unwrap();
@@ -595,7 +541,8 @@ mod tests {
     #[test]
     fn apply_severe_sends_error_notices() {
         let mut state = LoopGuardState::new(LoopGuardConfig::default());
-        let (sender, _rx_interrupt, _rx_inbound, mut rx_event) = make_sender();
+        let (sender, _rx_inbound, _rx_interrupt, mut rx_event) =
+            make_sender("loop_guard", "test-session");
         state.set_sender(sender);
 
         // Interrupt（工具）：第 1 次干预
@@ -628,7 +575,8 @@ mod tests {
             tool_repeat_threshold: 4,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_inbound, mut rx_event) = make_sender();
+        let (sender, _rx_inbound, _rx_interrupt, mut rx_event) =
+            make_sender("loop_guard", "test-session");
         state.set_sender(sender);
 
         // 前 3 次不触发：无通知
@@ -663,7 +611,8 @@ mod tests {
             streaming_check_interval: 10,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_inbound, mut rx_event) = make_sender();
+        let (sender, _rx_inbound, _rx_interrupt, mut rx_event) =
+            make_sender("loop_guard", "test-session");
         state.set_sender(sender);
 
         let text = "这是一段重复的内容".repeat(4);
@@ -680,7 +629,8 @@ mod tests {
             tool_repeat_threshold: 4,
             ..Default::default()
         });
-        let (sender, _rx_interrupt, _rx_inbound, _rx_event) = make_sender();
+        let (sender, _rx_inbound, _rx_interrupt, _rx_event) =
+            make_sender("loop_guard", "test-session");
         state.set_sender(sender);
 
         // 1-3 次相同调用：不触发
@@ -791,7 +741,8 @@ mod tests {
         })));
         {
             let mut guard = lock(&state);
-            let (sender, _rx_interrupt, _rx_inbound, _rx_event) = make_sender();
+            let (sender, _rx_inbound, _rx_interrupt, _rx_event) =
+                make_sender("loop_guard", "test-session");
             guard.set_sender(sender);
         }
 

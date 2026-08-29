@@ -158,23 +158,13 @@ impl SessionSender {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 构造测试用 SessionSender + 出站通道接收端
-    fn make_sender() -> (
-        SessionSender,
-        tokio::sync::mpsc::UnboundedReceiver<OutputEvent>,
-    ) {
-        let (tx_user, _rx_user) = tokio::sync::mpsc::channel(16);
-        let (tx_interrupt, _rx_interrupt) = tokio::sync::mpsc::channel(16);
-        let (tx_event, rx_event) = tokio::sync::mpsc::unbounded_channel();
-        let sender = SessionSender::new("test_plugin", "sess-1", tx_user, tx_interrupt, tx_event);
-        (sender, rx_event)
-    }
+    use crate::test_util::make_sender;
 
     /// send_notice：事件到达出站通道，session_id 已盖标签，source 填插件名，级别透传
     #[tokio::test]
     async fn send_notice_stamps_session_id_and_source() {
-        let (sender, mut rx_event) = make_sender();
+        let (sender, _rx_inbound, _rx_interrupt, mut rx_event) =
+            make_sender("test_plugin", "sess-1");
         sender.send_notice("检测到循环", NoticeLevel::Info);
         let event = rx_event.recv().await.expect("应收到通知事件");
         let OutputEvent::PluginNotice(m) = event else {
@@ -189,7 +179,8 @@ mod tests {
     /// send_notice：Error 级别透传
     #[tokio::test]
     async fn send_notice_passes_level() {
-        let (sender, mut rx_event) = make_sender();
+        let (sender, _rx_inbound, _rx_interrupt, mut rx_event) =
+            make_sender("test_plugin", "sess-1");
         sender.send_notice("已终止", NoticeLevel::Error);
         let OutputEvent::PluginNotice(m) = rx_event.recv().await.expect("应收到通知事件")
         else {

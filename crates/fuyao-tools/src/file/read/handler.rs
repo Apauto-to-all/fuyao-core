@@ -19,14 +19,14 @@
 //! 列出目录下的文件和子目录，按修改时间排序（目录优先）。
 //! 自动跳过排除目录（.venv、node_modules、__pycache__ 等）。
 
-use crate::common::resolve_path;
+use crate::common::{parse_tool_args, resolve_ctx_path, to_ok_output};
 use crate::config::{MAX_READ_CHARS, SEARCH_EXCLUDE_DIRS};
 use crate::file::helpers::suggest_similar_files;
 use crate::file::read::types::{DirectoryEntry, DirectoryResult, ReadArgs, ReadResult};
 use crate::file::safety::{has_binary_extension, is_blocked_device, is_internal_path};
 use crate::file::tracker::record_read;
 use crate::redact::redact_sensitive_text;
-use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput};
 use serde_json::Value;
 use std::io::BufRead;
 use std::path::Path;
@@ -124,7 +124,7 @@ fn list_directory(dir_path: &Path, original_path: &str, offset: usize, limit: us
         },
     };
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 /// 读取文件内容的核心实现
@@ -147,17 +147,16 @@ pub async fn read_file_impl(
         path,
         offset,
         limit,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let offset = offset.max(1) as usize;
     // 行数不再设上限：内存与上下文均由收集期的字符预算兜底，此处只防零/负数
     let limit = limit.max(1) as usize;
     let task_id = ctx.task_id().to_string();
-    let workspace = ctx.workspace().map(Path::to_path_buf);
 
-    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
+    let resolved_path_obj = resolve_ctx_path(&ctx, &path);
     let resolved_path = resolved_path_obj.to_string_lossy().to_string();
 
     if is_blocked_device(&path) {
@@ -315,7 +314,7 @@ pub async fn read_file_impl(
         },
     };
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 /// 将字符串按字节预算截断到 UTF-8 字符边界

@@ -9,16 +9,14 @@
 //! 自动跳过隐藏文件和 .gitignore 排除的文件。
 //! 搜索结果按修改时间排序（最新优先），结果数受配置硬上限约束，超出自动截断。
 
-use crate::common::resolve_path;
+use crate::common::{parse_tool_args, resolve_ctx_path, run_search_with_timeout, to_ok_output};
 use crate::file::glob::types::{GlobArgs, GlobMatch, GlobResult};
-use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
 use glob::Pattern;
 use ignore::WalkBuilder;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 /// 搜索文件的核心实现
 ///
@@ -142,9 +140,9 @@ pub async fn glob_impl(
         pattern,
         path,
         limit,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let limit = clamp_limit(limit);
 
@@ -152,41 +150,30 @@ pub async fn glob_impl(
         return ToolOutput::error("搜索模式不能为空");
     }
 
-    let workspace = ctx.workspace().map(Path::to_path_buf);
-    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
+    let resolved_path_obj = resolve_ctx_path(&ctx, &path);
     let resolved_path = resolved_path_obj.to_string_lossy().to_string();
 
-    let pattern_owned = pattern.to_string();
-    let resolved_path_clone = resolved_path.clone();
-
     let timeout_secs = fuyao_api::get_config().tools.limits.search_timeout_secs;
-    // 协作式取消令牌：超时后通知阻塞任务在下一文件处退出（spawn_blocking 无法强制中断线程）
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_clone = cancel.clone();
-    let join = tokio::task::spawn_blocking(move || {
-        search_files(&pattern_owned, &resolved_path_clone, limit, &cancel_clone)
-    });
-    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), join).await {
-        Ok(Ok(r)) => match r {
-            Ok(g) => g,
-            Err(e) => return ToolOutput::error(e),
+    let mut result = match run_search_with_timeout(
+        timeout_secs,
+        "请缩小搜索范围或使用更具体的 pattern",
+        {
+            let pattern = pattern.clone();
+            let resolved_path = resolved_path.clone();
+            move |cancel| search_files(&pattern, &resolved_path, limit, cancel)
         },
-        Ok(Err(e)) => return ToolOutput::error(format!("搜索任务失败: {e}")),
-        Err(_elapsed) => {
-            // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
-            cancel.store(true, Ordering::Release);
-            return ToolOutput::error(format!(
-                "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围或使用更具体的 pattern"
-            ));
-        }
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e,
     };
 
-    let mut result = result;
     if result.truncated {
         result.hint = Some("结果已截断。请使用更具体的 pattern 缩小搜索范围。".to_string());
     }
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 #[cfg(test)]

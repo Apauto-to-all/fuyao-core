@@ -11,20 +11,18 @@
 //! 支持 context 参数显示匹配行的上下文。
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
-use crate::common::resolve_path;
+use crate::common::{parse_tool_args, resolve_ctx_path, run_search_with_timeout, to_ok_output};
 use crate::config::GREP_MAX_LINE_CHARS;
 use crate::file::grep::types::{GrepArgs, GrepMatch, GrepResult};
 use crate::redact::redact_sensitive_text;
-use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::SearcherBuilder;
 use grep_searcher::sinks::UTF8;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 /// 脱敏搜索结果中的敏感信息
 ///
@@ -198,9 +196,9 @@ pub async fn grep_impl(
         glob,
         limit,
         context,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     // limit 硬上限由配置 search_max_results 驱动（usize → i64 防御性转换，防溢出；
     // 上限钳到至少 1，避免配置为 0 时 clamp 区间非法 panic）
@@ -213,44 +211,34 @@ pub async fn grep_impl(
         return ToolOutput::error("搜索模式不能为空");
     }
 
-    let workspace = ctx.workspace().map(std::path::Path::to_path_buf);
-    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
+    let resolved_path_obj = resolve_ctx_path(&ctx, &path);
     let resolved_path = resolved_path_obj.to_string_lossy().to_string();
 
     let timeout_secs = fuyao_api::get_config().tools.limits.search_timeout_secs;
-    // 协作式取消令牌：超时后通知阻塞任务在下一文件处退出（spawn_blocking 无法强制中断线程）
-    let cancel = Arc::new(AtomicBool::new(false));
-    let cancel_clone = cancel.clone();
-    let join = tokio::task::spawn_blocking({
-        let pattern = pattern.clone();
-        let resolved_path = resolved_path.clone();
-        move || {
-            search_content(
-                &pattern,
-                &resolved_path,
-                glob.as_deref(),
-                limit,
-                context_lines,
-                &cancel_clone,
-            )
-        }
-    });
-    let result = match tokio::time::timeout(Duration::from_secs(timeout_secs), join).await {
-        Ok(Ok(r)) => match r {
-            Ok(g) => g,
-            Err(e) => return ToolOutput::error(e),
+    let mut result = match run_search_with_timeout(
+        timeout_secs,
+        "请缩小搜索范围、使用更具体的 pattern，或通过 glob 参数限定文件类型",
+        {
+            let pattern = pattern.clone();
+            let resolved_path = resolved_path.clone();
+            move |cancel| {
+                search_content(
+                    &pattern,
+                    &resolved_path,
+                    glob.as_deref(),
+                    limit,
+                    context_lines,
+                    cancel,
+                )
+            }
         },
-        Ok(Err(e)) => return ToolOutput::error(format!("搜索任务失败: {e}")),
-        Err(_elapsed) => {
-            // 通知阻塞任务取消；它会在下一文件迭代处观察到并 break
-            cancel.store(true, Ordering::Release);
-            return ToolOutput::error(format!(
-                "搜索超时（超过 {timeout_secs} 秒），请缩小搜索范围、使用更具体的 pattern，或通过 glob 参数限定文件类型"
-            ));
-        }
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return e,
     };
 
-    let mut result = result;
     redact_content_in_result(&mut result.matches);
 
     if result.truncated {
@@ -258,7 +246,7 @@ pub async fn grep_impl(
             Some("结果已截断。请使用更具体的 pattern 或 glob 参数缩小搜索范围。".to_string());
     }
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 #[cfg(test)]

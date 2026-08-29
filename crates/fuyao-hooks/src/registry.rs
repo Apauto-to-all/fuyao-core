@@ -160,20 +160,8 @@ impl HooksRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fuyao_api::message::EventBase;
-    use fuyao_api::message::output::{ChunkMessage, ChunkPayload};
+    use crate::test_util::empty_chunk_event;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// 构造测试用 Chunk 事件
-    fn make_chunk() -> OutputEvent {
-        OutputEvent::Chunk(ChunkMessage {
-            base: EventBase::default(),
-            payload: ChunkPayload {
-                content: None,
-                reasoning: None,
-            },
-        })
-    }
 
     /// 同优先级观察钩子按注册顺序串行执行
     #[tokio::test]
@@ -195,7 +183,7 @@ mod tests {
         }
         reg.finalize();
 
-        reg.hook_output_observe(Arc::new(make_chunk())).await;
+        reg.hook_output_observe(Arc::new(empty_chunk_event())).await;
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec![0, 1, 2], "同优先级观察钩子应按注册顺序串行执行");
@@ -222,7 +210,7 @@ mod tests {
         }
         reg.finalize();
 
-        reg.hook_output_observe(Arc::new(make_chunk())).await;
+        reg.hook_output_observe(Arc::new(empty_chunk_event())).await;
 
         let log = log.lock().unwrap();
         assert_eq!(*log, vec!["high", "low"], "高优先级观察钩子应先执行");
@@ -270,7 +258,7 @@ mod tests {
         );
         reg.finalize();
 
-        reg.hook_output_observe(Arc::new(make_chunk())).await;
+        reg.hook_output_observe(Arc::new(empty_chunk_event())).await;
 
         // panic 防护：A 和 C 都执行了（B panic 不阻塞）
         assert_eq!(executed.load(Ordering::SeqCst), 2);
@@ -308,7 +296,7 @@ mod tests {
 
         // 应在 ~50ms 内返回（不是 10s）
         let start = std::time::Instant::now();
-        reg.hook_output_observe(Arc::new(make_chunk())).await;
+        reg.hook_output_observe(Arc::new(empty_chunk_event())).await;
         let elapsed = start.elapsed();
 
         // 慢 hook 超时被跳过，正常 hook 仍执行
@@ -339,7 +327,7 @@ mod tests {
         }
         reg.finalize();
 
-        let mut ev = make_chunk();
+        let mut ev = empty_chunk_event();
         let result = reg.hook_output_intercept(&mut ev);
 
         assert!(result.is_none(), "未阻止时应返回 None");
@@ -374,7 +362,7 @@ mod tests {
         );
         reg.finalize();
 
-        let mut ev = make_chunk();
+        let mut ev = empty_chunk_event();
         assert!(reg.hook_output_intercept(&mut ev).is_none());
         let content = match ev {
             OutputEvent::Chunk(msg) => msg.payload.content,
@@ -405,7 +393,7 @@ mod tests {
         );
         reg.finalize();
 
-        let mut ev = make_chunk();
+        let mut ev = empty_chunk_event();
         let result = reg.hook_output_intercept(&mut ev);
 
         assert_eq!(result, Some("被高优先级钩子阻止".to_string()));
@@ -439,7 +427,7 @@ mod tests {
         );
         reg.finalize();
 
-        let mut ev = make_chunk();
+        let mut ev = empty_chunk_event();
         assert!(reg.hook_output_intercept(&mut ev).is_none());
         let content = match ev {
             OutputEvent::Chunk(msg) => msg.payload.content,

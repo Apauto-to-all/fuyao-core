@@ -37,6 +37,12 @@ pub use plugin::{
 pub use registry::HooksRegistry;
 pub use types::{OutputInterceptFn, OutputObserveFn};
 
+/// 测试共享 fixture（事件构造器 + SessionSender 通道夹具）
+///
+/// 面向单元测试、集成测试与下游 crate 的测试；doc(hidden) 表明不属于公开 API 契约。
+#[doc(hidden)]
+pub mod test_util;
+
 /// 共享钩子注册表
 ///
 /// 引擎在每个 session 装配时新建一份（装配期注册 + finalize 冻结），

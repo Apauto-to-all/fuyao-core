@@ -10,5 +10,3 @@ fuyao-hooks = { path = "../fuyao-hooks" }
 tokio = { workspace = true }
 tracing.workspace = true
 
-[dev-dependencies]
-serde_json = { workspace = true }

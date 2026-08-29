@@ -24,15 +24,14 @@ use super::types::{SubagentArgs, validate_subagent_type};
 
 use tokio::sync::mpsc;
 
+use crate::common::parse_tool_args;
 use fuyao_api::message::OutputEvent;
 use fuyao_api::message::input::{UserMessage, UserPayload};
 use fuyao_api::message::output::{
     ChildSessionMessage, ChildSessionOrigin, ChildSessionPayload, ChildSessionState,
 };
 use fuyao_api::message::{EventBase, InputEvent};
-use fuyao_api::{
-    AgentConfig, CancellationToken, ChildSessionSource, ToolCallContext, ToolOutput, parse_args,
-};
+use fuyao_api::{AgentConfig, CancellationToken, ChildSessionSource, ToolCallContext, ToolOutput};
 
 /// 子代理工具执行入口
 ///
@@ -49,9 +48,9 @@ pub async fn subagent_handler(
         subagent_type,
         description,
         prompt,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     if subagent_type.trim().is_empty() {
         return ToolOutput::error("子代理工具的 subagent_type 不能为空");

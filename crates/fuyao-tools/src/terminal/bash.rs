@@ -2,12 +2,13 @@
 //!
 //! 提供命令执行的完整功能。
 
+use crate::common::parse_tool_args;
 use crate::redact::redact_sensitive_text;
 use crate::terminal::execute::{execute_command, format_result};
 use crate::terminal::safety::{check_command_safety, validate_workdir};
 use crate::terminal::shell::find_shell;
 use crate::terminal::types::BashArgs;
-use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,9 +24,9 @@ pub(crate) async fn bash_impl(
         command,
         timeout,
         workdir,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let raw_command = command.trim().to_string();
 

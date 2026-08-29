@@ -84,7 +84,7 @@ fn intercept_runs_in_priority_descending_after_finalize() {
     record_intercept(&mut reg, 5, &log, "mid"); // priority=5
 
     reg.finalize();
-    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("e")));
+    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("e"), None)));
 
     let recorded = log.lock().unwrap().clone();
     assert_eq!(
@@ -109,7 +109,7 @@ fn intercept_without_finalize_runs_in_registration_order() {
     record_intercept(&mut reg, 10, &log, "high"); // 注册第 2
 
     // 关键：不调 finalize，直接 intercept
-    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("e")));
+    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("e"), None)));
 
     let recorded = log.lock().unwrap().clone();
     assert_eq!(
@@ -130,13 +130,13 @@ fn finalize_sorts_once_subsequent_intercept_respects_priority() {
     reg.finalize(); // 排序：high, low
 
     // 第一次 intercept 走排序后顺序
-    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("e1")));
+    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("e1"), None)));
     let first = log.lock().unwrap().clone();
     assert_eq!(first, vec!["high", "low"]);
 
     // 第二次 intercept 应保持同样的排序顺序（冻结后不重排）
     log.lock().unwrap().clear();
-    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("e2")));
+    reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("e2"), None)));
     let second = log.lock().unwrap().clone();
     assert_eq!(
         second,
@@ -161,7 +161,7 @@ fn intercept_block_short_circuits_remaining_handlers() {
 
     reg.finalize(); // 排序：high_pass, mid_block, low_never
 
-    let result = reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("e")));
+    let result = reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("e"), None)));
 
     match result {
         Some(reason) => assert_eq!(reason, "被阻止"),
@@ -211,7 +211,7 @@ fn intercept_chain_mutates_event_in_place_in_sequence() {
 
     reg.finalize(); // 排序：priority 2 先，1 后
 
-    let mut ev = OutputEvent::Chunk(make_chunk("base"));
+    let mut ev = OutputEvent::Chunk(make_chunk(Some("base"), None));
     let result = reg.hook_output_intercept(&mut ev);
 
     // priority 2 先执行，此时 content 还没被 priority 1 追加
@@ -241,7 +241,7 @@ fn intercept_panic_does_not_block_subsequent_handlers() {
     reg.finalize(); // 排序：boom, survivor
 
     // panic 被恢复，不应传播；survivor 仍执行
-    let result = reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk("e")));
+    let result = reg.hook_output_intercept(&mut OutputEvent::Chunk(make_chunk(Some("e"), None)));
     assert!(result.is_none(), "panic 恢复后应放行到 None");
 
     let recorded = log.lock().unwrap().clone();
@@ -262,7 +262,7 @@ fn intercept_all_panic_leaves_event_untouched() {
 
     reg.finalize();
 
-    let mut ev = OutputEvent::Chunk(make_chunk("untouched"));
+    let mut ev = OutputEvent::Chunk(make_chunk(Some("untouched"), None));
     let result = reg.hook_output_intercept(&mut ev);
     assert!(result.is_none(), "全 panic 时应放行");
     if let OutputEvent::Chunk(c) = ev {
@@ -293,7 +293,7 @@ async fn observe_does_not_affect_intercept_result() {
     );
     record_intercept(&mut reg, 0, &Arc::new(Mutex::new(vec![])), "noop");
 
-    let mut event = OutputEvent::Chunk(make_chunk("payload"));
+    let mut event = OutputEvent::Chunk(make_chunk(Some("payload"), None));
     reg.hook_output_observe(Arc::new(event.clone())).await;
     let result = reg.hook_output_intercept(&mut event);
 

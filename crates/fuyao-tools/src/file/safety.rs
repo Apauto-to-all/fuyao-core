@@ -181,7 +181,7 @@ pub fn check_sensitive_path(filepath: &str, action: &str) -> Option<String> {
     }
 
     // 检查用户主目录下的敏感文件
-    if let Some(home) = dirs_home()
+    if let Some(home) = crate::common::dirs_home()
         && let Ok(rel) = Path::new(&normalized).strip_prefix(&home)
     {
         let rel_normalized = rel.to_string_lossy().replace('\\', "/");
@@ -221,13 +221,6 @@ fn check_safe_root(filepath: &str) -> Option<String> {
         return None;
     }
     Some(format!("拒绝写入：路径不在安全目录范围内 ({safe_root})"))
-}
-
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-        .map(std::path::PathBuf::from)
 }
 
 /// 检查是否为框架内部路径

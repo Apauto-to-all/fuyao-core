@@ -10,13 +10,12 @@
 //! - 外部编辑检测（文件被其他进程修改时发出警告）
 //! - 写入后更新追踪器时间戳
 
-use crate::common::resolve_path;
+use crate::common::{empty_path_error, parse_tool_args, resolve_ctx_path, to_ok_output};
 use crate::file::safety::check_sensitive_path;
 use crate::file::tracker::{check_file_staleness, update_read_timestamp};
 use crate::file::write::types::{WriteArgs, WriteResult};
-use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolError, ToolOutput};
 use serde_json::Value;
-use std::path::Path;
 
 /// 写入文件的核心实现
 ///
@@ -31,20 +30,17 @@ pub async fn write_file_impl(
     ctx: ToolCallContext,
     _cancel: CancellationToken,
 ) -> ToolOutput {
-    let WriteArgs { path, content } = match parse_args(args) {
+    let WriteArgs { path, content } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let task_id = ctx.task_id().to_string();
-    let workspace = ctx.workspace().map(Path::to_path_buf);
 
     if path.is_empty() {
-        return ToolOutput::Err(
-            ToolError::new("路径参数不能为空").with("suggestion", "请提供有效的文件路径"),
-        );
+        return empty_path_error();
     }
 
-    let resolved_path_obj = resolve_path(&path, workspace.as_deref());
+    let resolved_path_obj = resolve_ctx_path(&ctx, &path);
 
     if let Some(err) = check_sensitive_path(&path, "写入") {
         tracing::warn!(path = %path, action = "写入", reason = %err, "拒绝操作敏感路径");
@@ -94,7 +90,7 @@ pub async fn write_file_impl(
         warning: stale_warning,
     };
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 #[cfg(test)]

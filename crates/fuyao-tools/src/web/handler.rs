@@ -15,8 +15,9 @@ use super::pagination::{apply_pagination, validate_pagination};
 use super::redirect::{get_redirect_url, is_same_domain_redirect};
 use super::safety::check_url_safety;
 use super::types::{WebFetchArgs, WebFetchRedirect, WebFetchResult};
+use crate::common::{parse_tool_args, to_ok_output};
 use crate::config::WEBFETCH_USER_AGENT;
-use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput, parse_args};
+use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
 use serde_json::Value;
 use std::sync::LazyLock;
 use std::time::Instant;
@@ -59,9 +60,9 @@ pub async fn webfetch_handler(
         timeout,
         offset,
         limit,
-    } = match parse_args(args) {
+    } = match parse_tool_args(args) {
         Ok(a) => a,
-        Err(e) => return ToolOutput::Err(e),
+        Err(e) => return e,
     };
     let url = url.trim().to_string();
     let output_format = output_format.unwrap_or_else(|| "markdown".to_string());
@@ -108,7 +109,7 @@ pub async fn webfetch_handler(
             redirect_url: None,
         };
 
-        return ToolOutput::ok(serde_json::to_value(result).unwrap_or_default());
+        return to_ok_output(&result);
     }
 
     // 4. HTTP 抓取（缓存未命中），共享客户端 + 请求粒度超时
@@ -161,7 +162,7 @@ pub async fn webfetch_handler(
                 ),
             };
 
-            return ToolOutput::ok(serde_json::to_value(result).unwrap_or_default());
+            return to_ok_output(&result);
         }
 
         // 同域名重定向：继续抓取
@@ -247,7 +248,7 @@ pub async fn webfetch_handler(
         redirect_url: None,
     };
 
-    ToolOutput::ok(serde_json::to_value(result).unwrap_or_default())
+    to_ok_output(&result)
 }
 
 /// 构建请求头

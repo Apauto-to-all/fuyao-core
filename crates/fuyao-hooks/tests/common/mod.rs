@@ -1,7 +1,7 @@
 //! fuyao-hooks 集成测试共享 fixture
 //!
 //! 提供三类构造能力：
-//! - 事件构造器（构造 OutputEvent 驱动钩子链路）
+//! - 事件构造器（经 fuyao_hooks::test_util 复用，构造 OutputEvent 驱动钩子链路）
 //! - 通道夹具（构造 session 双通道，验证消息落点）
 //! - 可配置 FakePlugin / FakeInstance（手写 fake：trait 返回 boxed future，automock 不适用；
 //!   仿 src/plugin/tests.rs 的 CountingPlugin 风格，但参数化以驱动多种跨模块协作场景）
@@ -15,52 +15,16 @@
 use std::sync::{Arc, Mutex};
 
 use fuyao_api::UserMessageMode;
+use fuyao_api::message::OutputEvent;
 use fuyao_api::message::QueueEntry;
-use fuyao_api::message::output::{
-    ChunkMessage, ChunkPayload, InterruptMessage as OutputInterruptMessage, ToolCallMessage,
-    ToolCallPayload, ToolResultMessage, ToolResultPayload,
-};
-use fuyao_api::message::{EventBase, OutputEvent};
+use fuyao_api::message::output::InterruptMessage as OutputInterruptMessage;
 use fuyao_hooks::{HooksRegistry, NamedPluginInstance, Plugin, PluginInstance, SessionSender};
 
 // ============================================================================
 // 事件构造器
 // ============================================================================
 
-/// 构造流式文本块事件（content 用于 intercept 串联修改的可观测字段）
-pub fn make_chunk(content: &str) -> ChunkMessage {
-    ChunkMessage {
-        base: EventBase::default(),
-        payload: ChunkPayload {
-            content: Some(content.to_string()),
-            reasoning: None,
-        },
-    }
-}
-
-/// 构造工具调用事件（tool_args 解析失败兜底为 Null）
-pub fn make_tool_call(name: &str, args: &str) -> ToolCallMessage {
-    ToolCallMessage {
-        base: EventBase::default(),
-        payload: ToolCallPayload {
-            tool_call_id: "call_1".to_string(),
-            tool_name: name.to_string(),
-            tool_args: serde_json::from_str(args).unwrap_or(serde_json::Value::Null),
-        },
-    }
-}
-
-/// 构造工具结果事件
-pub fn make_tool_result(name: &str, content: &str) -> ToolResultMessage {
-    ToolResultMessage {
-        base: EventBase::default(),
-        payload: ToolResultPayload {
-            tool_call_id: "call_1".to_string(),
-            tool_name: name.to_string(),
-            content: content.to_string(),
-        },
-    }
-}
+pub use fuyao_hooks::test_util::make_chunk;
 
 // ============================================================================
 // 通道夹具
