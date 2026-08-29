@@ -117,6 +117,10 @@ impl Default for ToolRunnerConfig {
 ///
 /// `shell` 为字符串而非枚举：未知值在 serde 层放行（避免配置文件因一个字段整体解析失败），
 /// 由引擎启动校验统一拦截报错（fail loud，见 fuyao-tools 的 shell 启动校验）。
+///
+/// 消费走字段链 `get_config().tools.terminal.shell`（shell 检测与启动期校验两处），
+/// 调用方无需按名导入本类型——全仓按名引用为零是字段链消费的预期形态，
+/// 不构成死代码判据。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TerminalConfig {

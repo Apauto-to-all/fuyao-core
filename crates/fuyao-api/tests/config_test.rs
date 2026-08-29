@@ -94,7 +94,7 @@ request_timeout_secs = 100
     assert_eq!(config.logging.level, "info");
     assert!(config.logging.console);
     assert_eq!(config.logging.rotation, LogRotation::Daily);
-    assert_eq!(config.engine.input_channel_capacity, 64);
+    assert_eq!(config.engine.inbound_channel_capacity, 32);
     assert_eq!(config.hooks.timeout_secs, 5);
 }
 

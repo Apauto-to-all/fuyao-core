@@ -68,9 +68,15 @@ pub use loader::{load_config, load_merged_config};
 /// 对应 `fuyao.toml` 顶层结构。所有子段 `#[serde(default)]`，缺失时走各自 `Default`，
 /// 与原硬编码值一致。
 ///
+/// 各子段类型即使当前只有单一 crate 消费（如 `plugins` / `logging` / `mcp`），
+/// 也必须留驻本 crate：聚合结构的字段类型不可外迁到消费方 crate（会形成反向依赖），
+/// 且消费方经 `get_config().<段>.<字段>` 字段链读取、不按名导入——单一消费 crate
+/// 不构成「类型放错位置」判据。
+///
 /// `providers` 字段 `#[serde(skip)]`：由 `providers::load_providers` 单独解析
 /// （serde 不支持 TOML 整数→f64 价格自动转换；模型 `limit.context` 必填校验也在该层），
-/// 由加载流程回填。
+/// 由加载流程回填。providers 的解析逻辑属于配置系统单一真相源（types + loader +
+/// handle 同处本模块树）的选址范围，不是放错位置的解析代码。
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct FuyaoConfig {
@@ -102,7 +108,7 @@ pub struct FuyaoConfig {
     /// MCP 全局 fallback
     pub mcp: McpGlobalConfig,
 
-    /// 引擎通道容量
+    /// 引擎通道容量（统一入站 / 中断 / fan-out 汇聚三条有界通道）
     pub engine: EngineConfig,
 
     /// Hooks 配置（超时等）
@@ -170,7 +176,7 @@ mod tests {
         assert_eq!(c.image.max_pixels, 2000);
         assert_eq!(c.session.compression.threshold, 0.85);
         assert_eq!(c.mcp.tool_timeout_secs, 120);
-        assert_eq!(c.engine.output_channel_capacity, 256);
+        assert_eq!(c.engine.inbound_channel_capacity, 32);
         assert_eq!(c.hooks.timeout_secs, 5);
         assert!(c.plugins.enabled.is_empty());
         assert_eq!(c.logging.level, "info");
@@ -186,7 +192,7 @@ mod tests {
     fn get_config_without_set_returns_default_no_panic() {
         let c = get_config();
         assert_eq!(c.llm.request_timeout_secs, 300);
-        assert_eq!(c.engine.output_channel_capacity, 256);
+        assert_eq!(c.engine.fan_out_capacity, 512);
         assert!(c.providers.is_empty());
         assert_eq!(c.logging.level, "info");
     }

@@ -22,17 +22,6 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::bootstrap::LogGuard;
 
-/// fan_out 通道容量（app 层消费缓冲）
-///
-/// 两级缓冲：per-session 出站为无界通道，吸收单 session 的瞬时突发（流式 chunk 等）；
-/// fan_out 是所有 session 共享的有界汇聚缓冲，给 [`App::recv`] 的消费方留出平滑余量。
-///
-/// 有界而非无界：消费方长期不消费时（UI 卡死等）事件不无限堆积占内存；背压只落在
-/// forwarder（阻塞 send），不回传导 session task（per-session 无界仍在接）。
-///
-/// 容量为经验默认，覆盖多 session 并发流式输出下的消费抖动；实测不够再调。
-const FAN_OUT_CAPACITY: usize = 512;
-
 /// shutdown 等 forwarder task 退出的总超时阈值
 ///
 /// 与 `core::engine::SHUTDOWN_TASK_TIMEOUT` 一致——forwarder 在 session task 退出后
@@ -85,7 +74,14 @@ impl App {
         mcp_manager: Option<Arc<MCPManager>>,
         log_guard: LogGuard,
     ) -> Self {
-        let (fan_out_tx, fan_out_rx) = mpsc::channel::<OutputEvent>(FAN_OUT_CAPACITY);
+        // fan_out 通道（进程级消费缓冲），容量取自全局 [engine].fan_out_capacity。
+        // 两级缓冲：per-session 出站为无界通道，吸收单 session 的瞬时突发（流式 chunk 等）；
+        // fan_out 是所有 session 共享的有界汇聚缓冲，给 [`App::recv`] 的消费方留出平滑余量。
+        // 有界而非无界：消费方长期不消费时（UI 卡死等）事件不无限堆积占内存；背压只落在
+        // forwarder（阻塞 send），不回传导 session task（per-session 无界仍在接）。
+        // 默认 512 为经验值，覆盖多 session 并发流式输出下的消费抖动；实测不够经配置调大。
+        let (fan_out_tx, fan_out_rx) =
+            mpsc::channel::<OutputEvent>(fuyao_api::get_config().engine.fan_out_capacity);
         Self {
             engine,
             mcp_manager,

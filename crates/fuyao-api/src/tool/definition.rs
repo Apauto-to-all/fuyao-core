@@ -121,6 +121,10 @@ impl ToolDefinition {
 /// 作用于**最近追加**的那个参数。
 ///
 /// 构造器契约：修饰方法必须在某个参数方法之后调用，否则 panic（编程错误，立即暴露）。
+///
+/// 唯一入口是 [`ToolDefinition::builder`](ToolDefinition::builder)，内置工具与二次开发的
+/// 自定义工具共用；链式调用经类型推断衔接，调用方无需按名导入本类型——
+/// 全仓按名引用为零是预期形态，不构成死代码判据。
 pub struct ToolDefinitionBuilder {
     def: ToolDefinition,
     /// 最近追加的参数名，供修饰方法定位目标参数

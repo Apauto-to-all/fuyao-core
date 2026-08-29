@@ -193,11 +193,15 @@ MCP 全局 fallback（单个 server 配置未写时取这里的值）：
 
 ### `[engine]`
 
+引擎运行时通道容量，三个字段与实际创建通道一一对应：
+
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `input_channel_capacity` | 整数 | `64` | 输入通道容量 |
-| `output_channel_capacity` | 整数 | `256` | 输出通道容量 |
-| `command_channel_capacity` | 整数 | `64` | 命令通道容量 |
+| `inbound_channel_capacity` | 整数 | `32` | session 级统一入站通道容量（User / Control / 插件注入条目共用，保证总序） |
+| `interrupt_channel_capacity` | 整数 | `8` | session 级中断通道容量（中断信号量小且瞬时） |
+| `fan_out_capacity` | 整数 | `512` | 进程级 fan-out 汇聚通道容量：全部 session 事件汇聚单出口的缓冲上限，是引擎唯一的背压点 |
+
+修改容量只影响之后创建的通道。per-session 出站通道刻意无界（不设容量字段）：事件入通道前已落库，无界保证不因上层消费慢而反压 ReAct 推进——背压统一放在 fan-out。
 
 ### `[hooks]`
 

@@ -271,8 +271,12 @@ impl Engine {
         //   外部入站（Engine::send）与插件注入（SessionSender）共用同一条通道，
         //   发送顺序即排队顺序
         // - 中断通道：与队列正交的中断信号
-        let (tx_inbound, rx_inbound) = mpsc::channel::<QueueEntry>(32);
-        let (tx_interrupt, rx_interrupt) = mpsc::channel::<OutputInterruptMessage>(8);
+        // 两条通道容量取自全局 [engine] 配置
+        let engine_cfg = fuyao_api::get_config().engine.clone();
+        let (tx_inbound, rx_inbound) =
+            mpsc::channel::<QueueEntry>(engine_cfg.inbound_channel_capacity);
+        let (tx_interrupt, rx_interrupt) =
+            mpsc::channel::<OutputInterruptMessage>(engine_cfg.interrupt_channel_capacity);
 
         // 该 session 的 per-session 出站通道（无界——事件入 channel 前已落库，
         // 不让 emit 阻塞反压到 ReAct turn 推进）

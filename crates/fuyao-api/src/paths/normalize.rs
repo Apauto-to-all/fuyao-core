@@ -29,9 +29,10 @@ pub fn normalize_workspace(workspace: &Option<PathBuf>) -> Option<String> {
 /// 与 [`normalize_workspace`] 同一归一逻辑，面向字符串入参的消费方。内部委托
 /// [`normalize_workspace`]，保证两个入口永不漂移。
 ///
-/// 消费方是经 path 依赖消费本 crate 的下游终端产品——它们在 IPC / 配置等边界
-/// 拿到的是裸字符串，经本入口归一。因此本仓库 workspace 内 grep 不到调用点
-/// 属预期：「仓内零调用」不构成死代码判据，本函数是跨仓库 SDK 公开表面的一部分。
+/// 消费方是外部二次开发应用（经 path 依赖消费本 crate 的下游终端产品）——它们在
+/// IPC / 配置等边界拿到的是裸字符串，经本入口归一。因此本仓库 workspace 内 grep
+/// 不到调用点属预期：「仓内零调用」不构成死代码判据，本函数是跨仓库 SDK 公开
+/// 表面的一部分。
 ///
 /// 空入参返空串——调用方负责非空校验（写入侧应做边界校验，空路径不应到达此处）。
 pub fn normalize_workspace_str(workspace: &str) -> String {

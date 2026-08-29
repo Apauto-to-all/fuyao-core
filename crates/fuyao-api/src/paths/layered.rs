@@ -7,6 +7,11 @@ use std::path::{Path, PathBuf};
 /// 分层路径结构（带标签区分来源）
 ///
 /// 用于返回多层路径，每个路径都有明确的标签标识其来源层级。
+///
+/// 是 [`crate::AgentPaths`] 八个公开方法的返回类型（`config_paths` / `skills_paths` /
+/// `agents_def_paths` 等）——四层解析的公开原语，消费方持有方法返回值调
+/// [`all`](Self::all) / [`merge_exists`](Self::merge_exists) 遍历，不按名导入本类型
+/// （全仓按名引用为零是预期形态）。类型必须保持公开，不可降为 crate 私有。
 #[derive(Debug, Clone, Default)]
 pub struct LayeredPaths {
     /// 全局层路径（~/.fuyao/ 下）
