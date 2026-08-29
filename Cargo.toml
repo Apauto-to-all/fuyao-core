@@ -80,3 +80,13 @@ rstest = "0.26"
 tempfile = "3"
 pretty_assertions = "1"
 mockito = "1"
+
+# 开发构建瘦身：保留行号级调试信息（panic 栈可定位），不生成变量级信息
+[profile.dev]
+debug = "line-tables-only"
+
+# 依赖不生成 debuginfo（体积大头），O1 让测试运行更快、编译时间几乎不变
+# 需要完整调试信息时用环境变量临时覆盖：CARGO_PROFILE_DEV_DEBUG=2
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
