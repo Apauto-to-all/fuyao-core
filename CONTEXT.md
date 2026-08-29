@@ -97,7 +97,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 三层合并 | `load_merged_config` | `fuyao.toml`：global（`~/.fuyao/`）→ agent 目录 → workspace，递归深合并（嵌套字段级，数组整体覆盖） |
 | 供应商单点 | `[providers]` | 只允许出现在 global 层（单一事实源），他层出现即加载报错；分层的是「选择」，单点的是「定义」 |
 | 全局句柄 | `set_config` / `get_config` | `OnceLock<Arc<FuyaoConfig>>` 进程级只读配置 |
-| 装配门面 | `FuyaoApp` | 一键装配（init → 收集工具 → 装插件 → 启动引擎），两门面：`app`（运行时）/ `sessions`（会话管理）；Agent 定义列举由 fuyao-prompt 直接提供（传 `AgentPaths` 调用）；供应商管理（`ProviderManager`）为独立构造的管理入口（纯文件读写，不依赖引擎） |
+| 装配门面 | `FuyaoApp` | 一键装配（init → 收集工具 → 装插件 → 启动引擎），三门面：`app`（运行时）/ `sessions`（会话管理）/ `discovery`（选择支持）；供应商管理（`ProviderManager`）为独立构造的管理入口（纯文件读写，不依赖引擎） |
 | fan-in 汇聚 | `App::recv` | 主 session 的 per-session rx 汇聚进单一 fan_out 通道（容量 512），上层 UI 单一出口消费 |
 
 ## 关键不变量

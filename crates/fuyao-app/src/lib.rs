@@ -10,6 +10,11 @@
 //!
 //! 工具注入时机：新架构无事后注册的 EngineHandle，工具必须在 `Engine::new` 前收集成
 //! `ToolRegistry` 一次性注入（启动引擎时装配）。
+//!
+//! 导出面契约：本 crate 是外部二次开发应用（cli / tui 等）的唯一依赖，大量 pub 项
+//! （三门面、透出类型、分步装配函数）的消费者在仓库之外——其存在性由外部使用决定，
+//! 不以仓库内有无调用方为准。仓库内零调用方的导出属于对外便利面，禁止以「内部无人用」
+//! 为由删除或收敛。
 
 mod bootstrap;
 mod manager;
@@ -26,12 +31,14 @@ pub use bootstrap::{
 };
 pub use manager::list_agent_ids;
 pub use manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
-pub use runtime::{App, SessionManager};
+pub use runtime::{App, Discovery, SessionManager};
 // SessionManager 各方法的错误类型：二次开发方对变体分类处理（如映射应用层提示）时
 // 需按名引用该类型，随门面一并透出，免于直赖 fuyao-session
 pub use fuyao_session::SessionError;
 // 透出 fuyao-api 的列举选项类型，二次开发只依赖 fuyao-app 即可消费列举结果
-pub use fuyao_api::{AgentIdOption, AgentIdSource, ProviderModelOption, ProviderOption};
+pub use fuyao_api::{
+    AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,
+};
 
 /// 装配错误
 #[derive(Debug, thiserror::Error)]
@@ -45,21 +52,23 @@ pub enum SetupError {
     Storage(String),
 }
 
-/// 装配产物：运行时交互入口 + 会话管理入口
+/// 装配产物：运行时交互入口 + 会话管理入口 + 选择支持入口
 ///
-/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到两个正交门面：
+/// [`start`] 一键装配后返回本聚合体，上层（cli / tui）同时拿到三个正交门面：
 /// - [`app`](self::FuyaoApp::app)：运行时交互（create / send / recv / 对话生命周期）
 /// - [`sessions`](self::FuyaoApp::sessions)：会话管理查询（列会话 / 查历史）
+/// - [`discovery`](self::FuyaoApp::discovery)：选择支持（列 agent_id / Agent 定义）
 ///
-/// 两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
-/// 各持一份 `Arc` 克隆，零拷贝共享连接池）。Agent 定义列举能力由 fuyao-prompt
-/// 直接提供（`list_primary_definitions` / `list_subagent_definitions`，
-/// 传 [`fuyao_api::AgentPaths`] 调用），不经装配门面。
+/// 前两者共享同一份 `SessionStore`（store 所有权归装配层，Engine 与 SessionManager
+/// 各持一份 `Arc` 克隆，零拷贝共享连接池）；[`discovery`] 仅凭路径构造，
+/// 不依赖引擎运行时。
 pub struct FuyaoApp {
     /// 运行时交互门面（对话的进行）
     pub app: App,
     /// 会话管理门面（会话的检索与浏览）
     pub sessions: SessionManager,
+    /// 选择支持门面（列举 agent_id / Agent 定义）
+    pub discovery: Discovery,
 }
 
 /// 一键启动：init_engine → build_tool_registry → 创建 store → Engine::new → 装配
@@ -99,15 +108,20 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
             .map_err(|e| SetupError::Storage(e.to_string()))?,
     );
 
-    // 5. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
+    // 5. 构造选择支持门面（持有启动时的完整路径身份，含 agent_id）
+    //    在 Engine::new 消费 params 前 clone 出 agent_paths，供其零参数查询复用。
+    let discovery = Discovery::new(params.agent_paths.clone());
+
+    // 6. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
     let engine = Engine::new(params, provider, tools, plugin_host, store.clone()).await;
 
     tracing::info!("引擎启动完成");
 
-    // 6. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）
+    // 7. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）+ 选择支持门面
     Ok(FuyaoApp {
         app: App::new(engine, mcp_manager, log_guard),
         sessions: SessionManager::new(store),
+        discovery,
     })
 }
