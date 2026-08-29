@@ -218,7 +218,12 @@ mod tests {
         insert_user(&store, &session.id, "u1").await; // seq 1（压缩前，不可见）
         insert_assistant(&store, &session.id, "a1").await; // seq 2（压缩前，不可见）
         store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 3
         insert_user(&store, &session.id, "u2").await; // seq 4

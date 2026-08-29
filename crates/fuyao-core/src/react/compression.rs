@@ -342,12 +342,16 @@ async fn run_compression(
     let _ = (&mut delta_consumer).await;
 
     // 落地层：写 compaction 边界消息（可见窗口 = 最新摘要 + 摘要后消息，读取侧动态拼接）
-    // reason 透传给 mark_compaction，保证 DB 审计列（tool_name）与 Started/Ended 事件 reason 一致
+    // reason 透传给 mark_compaction，保证 DB 审计列（tool_name）与 Started/Ended 事件
+    // reason 一致；思考全文随边界消息落库（reasoning 列）——空思考（非推理模型）落
+    // NULL，Ended 事件同构携带同一份值（落库与事件共用，前端两路呈现一致）
+    let reasoning = (!summary.reasoning.is_empty()).then(|| summary.reasoning.clone());
     match ctx
         .store
         .mark_compaction(
             ctx.emitter.session_id(),
             summary.content.clone(),
+            reasoning.clone(),
             reason.into(),
         )
         .await
@@ -396,6 +400,7 @@ async fn run_compression(
                     payload: CompressionPayload::Ended(CompressionEndedPayload {
                         reason,
                         content: summary.content.clone(),
+                        reasoning,
                         new_seq,
                     }),
                 }),

@@ -3016,6 +3016,8 @@ async fn manual_compression_skips_threshold_and_marks_manual() {
     let ended = ended.expect("应有 Compression Ended 事件");
     assert_eq!(ended.reason, CompressionReason::Manual);
     assert_eq!(ended.content, "压缩摘要");
+    // 纯文本 mock（无 ReasoningDelta）：Ended 不携带思考
+    assert_eq!(ended.reasoning, None);
 }
 
 /// 压缩 LLM 调用失败：Started 之后必须以 Failed 收尾（终态保证）

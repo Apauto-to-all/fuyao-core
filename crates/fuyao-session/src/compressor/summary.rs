@@ -104,8 +104,10 @@ pub enum CompressionError {
 /// 摘要生成结果
 #[derive(Debug, Clone)]
 pub struct SummaryResult {
-    /// 摘要正文（content 全文，不含 reasoning——reasoning 不进落库边界）
+    /// 摘要正文（content 全文）
     pub content: String,
+    /// 思考全文（ReasoningDelta 累积；随结果返回供落库与 Ended 事件携带）
+    pub reasoning: String,
 }
 
 /// 把 fuyao_api::Message 原样转成 provider 的 ChatMessage
@@ -182,6 +184,7 @@ pub async fn generate_summary(
         provider.stream_chat(request, model, options);
 
     let mut content = String::new();
+    let mut reasoning = String::new();
     while let Some(result) = stream.next().await {
         match result? {
             StreamEvent::TextDelta { content: delta } => {
@@ -189,6 +192,7 @@ pub async fn generate_summary(
                 on_delta(Some(&delta), None);
             }
             StreamEvent::ReasoningDelta { content: delta } => {
+                reasoning.push_str(&delta);
                 on_delta(None, Some(&delta));
             }
             StreamEvent::Done { .. } => break,
@@ -204,6 +208,7 @@ pub async fn generate_summary(
 
     Ok(SummaryResult {
         content: content.to_string(),
+        reasoning,
     })
 }
 
@@ -214,10 +219,12 @@ mod tests {
     use fuyao_provider::{ChatResponse, FinishReason, StreamUsage};
     use std::sync::Arc;
 
-    /// 流式 mock provider：把构造时给的字符串切片，逐个作为 TextDelta 推送
+    /// 流式 mock provider：把构造时给的字符串切片推送为流式事件
     struct StreamingProvider {
         /// 文本片段序列（每个元素变一条 TextDelta 事件）
         chunks: Vec<String>,
+        /// 思考片段序列（每个元素变一条 ReasoningDelta 事件，先于文本片段推送）
+        reasoning_chunks: Vec<String>,
         /// 捕获每次收到的请求（供断言发给 LLM 的消息构造）
         captured: std::sync::Mutex<Vec<ChatRequest>>,
     }
@@ -226,8 +233,15 @@ mod tests {
         fn new(chunks: Vec<String>) -> Self {
             Self {
                 chunks,
+                reasoning_chunks: Vec::new(),
                 captured: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// 附加思考片段（先于文本片段推送）
+        fn with_reasoning(mut self, chunks: Vec<String>) -> Self {
+            self.reasoning_chunks = chunks;
+            self
         }
 
         /// 最近一次捕获的请求
@@ -253,7 +267,11 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(request);
             let chunks = self.chunks.clone();
+            let reasoning_chunks = self.reasoning_chunks.clone();
             let stream = async_stream::stream! {
+                for chunk in reasoning_chunks {
+                    yield Ok(StreamEvent::ReasoningDelta { content: chunk });
+                }
                 for chunk in chunks {
                     yield Ok(StreamEvent::TextDelta { content: chunk });
                 }
@@ -315,6 +333,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.content, "## 目标\n- 测试");
+        assert_eq!(result.reasoning, "");
+    }
+
+    #[tokio::test]
+    async fn generate_summary_accumulates_reasoning() {
+        let provider: Arc<dyn Provider> = Arc::new(
+            StreamingProvider::new(vec!["摘要".into()])
+                .with_reasoning(vec!["先权衡取舍，".into(), "再定摘要结构".into()]),
+        );
+        let msgs = make_messages(10);
+
+        let mut cb = noop_delta();
+        let result = generate_summary(
+            Some("你是助手"),
+            &msgs,
+            &provider,
+            "model",
+            None,
+            StreamOptions::default(),
+            &mut cb,
+        )
+        .await
+        .unwrap();
+        // 思考增量累积为全文随结果返回（正文与思考互不混入）
+        assert_eq!(result.content, "摘要");
+        assert_eq!(result.reasoning, "先权衡取舍，再定摘要结构");
     }
 
     #[tokio::test]

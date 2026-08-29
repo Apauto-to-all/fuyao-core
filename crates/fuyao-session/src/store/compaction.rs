@@ -54,7 +54,7 @@ impl super::SessionStore {
     ///
     /// 事务内做三件事:
     /// 1. 给 messages 表插入一条 `kind='compaction'` 的边界消息(content=summary,
-    ///    seq 分配内联在 INSERT 的标量子查询中)
+    ///    reasoning=思考全文, seq 分配内联在 INSERT 的标量子查询中)
     /// 2. 更新 sessions.`last_compacted_seq` = 新 compaction 消息的 seq
     /// 3. sessions.`compression_count` += 1
     ///
@@ -63,6 +63,8 @@ impl super::SessionStore {
     /// # 参数
     /// - `session_id`:被压缩的会话(永不变)
     /// - `summary`:摘要正文(Markdown),存入 compaction 消息的 content
+    /// - `reasoning`:压缩思考全文,存入 compaction 消息的 reasoning 列
+    ///   (历史回放据此还原压缩时的思考;非推理模型压缩传 None 落 NULL)
     /// - `reason`:压缩触发原因
     ///
     /// # 返回
@@ -74,6 +76,7 @@ impl super::SessionStore {
         &self,
         session_id: &str,
         summary: String,
+        reasoning: Option<String>,
         reason: CompressionReason,
     ) -> Result<i64, SessionError> {
         let mut tx = self.pool.begin().await?;
@@ -94,7 +97,7 @@ impl super::SessionStore {
         let insert_columns = super::sql::message_columns_sql();
         let (next_seq,): (i64,) = sqlx::query_as(AssertSqlSafe(format!(
             "INSERT INTO messages ({insert_columns})
-             VALUES (?1, NULL, 'assistant', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, NULL,
+             VALUES (?1, NULL, 'assistant', ?2, NULL, NULL, NULL, ?3, ?4, 0, 0, 0, 0, 0, NULL, ?5,
                 (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1), 'compaction')
              RETURNING seq",
         )))
@@ -102,6 +105,7 @@ impl super::SessionStore {
         .bind(&summary)
         .bind(reason.as_str())
         .bind(now)
+        .bind(reasoning)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -158,6 +162,7 @@ mod tests {
             .mark_compaction(
                 &session.id,
                 "## 目标\n- 测试".to_string(),
+                None,
                 CompressionReason::Auto,
             )
             .await
@@ -174,6 +179,27 @@ mod tests {
         assert_eq!(boundary.kind, MessageKind::Compaction);
         assert_eq!(boundary.role, MessageRole::Assistant);
         assert_eq!(boundary.content.as_deref(), Some("## 目标\n- 测试"));
+        assert_eq!(boundary.reasoning, None);
+    }
+
+    #[tokio::test]
+    async fn mark_compaction_persists_reasoning() {
+        let store = temp_store().await;
+        let session = store.create_session(None, None, None).await.unwrap();
+
+        store
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                Some("压缩时的思考全文".to_string()),
+                CompressionReason::Auto,
+            )
+            .await
+            .unwrap();
+
+        // 思考全文落进边界消息的 reasoning 列，历史读取侧原样还原
+        let full = store.load_full_history(&session.id).await.unwrap();
+        assert_eq!(full[0].reasoning.as_deref(), Some("压缩时的思考全文"));
     }
 
     #[tokio::test]
@@ -182,7 +208,12 @@ mod tests {
         let session = store.create_session(None, None, None).await.unwrap();
 
         let new_seq = store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
 
@@ -196,7 +227,12 @@ mod tests {
     async fn mark_compaction_returns_not_found_for_missing_session() {
         let store = temp_store().await;
         let result = store
-            .mark_compaction("nonexistent", "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                "nonexistent",
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await;
         assert!(matches!(result, Err(SessionError::NotFound(_))));
     }
@@ -222,7 +258,12 @@ mod tests {
 
         // 加一次压缩,让源 session 的可见窗口含 compaction 边界
         store
-            .mark_compaction(&parent.id, "父摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &parent.id,
+                "父摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
         let mut m3 = Message::user("压缩后消息".to_string());

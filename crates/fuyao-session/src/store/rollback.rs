@@ -306,7 +306,12 @@ mod tests {
         insert_user(&store, &session.id, "u1").await; // seq 1
         insert_assistant(&store, &session.id, "a1").await; // seq 2
         let comp_seq = store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 3
         insert_user(&store, &session.id, "u2").await; // seq 4
@@ -342,12 +347,22 @@ mod tests {
 
         insert_user(&store, &session.id, "u1").await; // seq 1
         let c1 = store
-            .mark_compaction(&session.id, "摘要1".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要1".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 2
         let u2 = insert_user(&store, &session.id, "u2").await; // seq 3
         let c2 = store
-            .mark_compaction(&session.id, "摘要2".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要2".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 4
         insert_user(&store, &session.id, "u3").await; // seq 5
@@ -375,11 +390,21 @@ mod tests {
 
         let u1 = insert_user(&store, &session.id, "u1").await; // seq 1
         store
-            .mark_compaction(&session.id, "摘要1".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要1".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 2
         store
-            .mark_compaction(&session.id, "摘要2".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要2".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 3
         insert_user(&store, &session.id, "u2").await; // seq 4

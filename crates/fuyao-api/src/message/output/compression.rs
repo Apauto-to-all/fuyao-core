@@ -75,8 +75,12 @@ pub struct CompressionDeltaPayload {
 pub struct CompressionEndedPayload {
     /// 触发原因（与 Started 一致）
     pub reason: CompressionReason,
-    /// 完整摘要正文（content 全文，不含 reasoning——reasoning 不进落库边界）
+    /// 完整摘要正文（content 全文）
     pub content: String,
+    /// 压缩思考全文（ReasoningDelta 累积；随 compaction 边界消息落库于 reasoning 列，
+    /// 实时 Ended 与历史回放同构携带；非推理模型压缩时缺省）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// 新 compaction 边界消息的 seq（前端定位压缩在对话流中的位置）
     pub new_seq: i64,
 }
@@ -137,10 +141,12 @@ mod tests {
         let payload = CompressionEndedPayload {
             reason: CompressionReason::Manual,
             content: "完整摘要".into(),
+            reasoning: Some("压缩思考全文".into()),
             new_seq: 42,
         };
         assert_eq!(payload.reason, CompressionReason::Manual);
         assert_eq!(payload.content, "完整摘要");
+        assert_eq!(payload.reasoning.as_deref(), Some("压缩思考全文"));
         assert_eq!(payload.new_seq, 42);
     }
 
@@ -185,6 +191,7 @@ mod tests {
             payload: CompressionPayload::Ended(CompressionEndedPayload {
                 reason: CompressionReason::Auto,
                 content: "完整".into(),
+                reasoning: None,
                 new_seq: 1,
             }),
         };

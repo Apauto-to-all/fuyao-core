@@ -313,7 +313,12 @@ mod tests {
 
         insert_user(&store, &session.id, "追问").await;
         store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -335,7 +340,12 @@ mod tests {
         store.insert_message(&session.id, &mut m2).await.unwrap();
 
         store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
 
@@ -422,7 +432,12 @@ mod tests {
         let session = store.create_session(None, None, None).await.unwrap();
         insert_user(&store, &session.id, "old1").await; // seq 1
         store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap(); // seq 2
         insert_user(&store, &session.id, "new1").await; // seq 3

@@ -277,6 +277,7 @@ fn message_to_event(msg: Message) -> Option<OutputEvent> {
             payload: CompressionPayload::Ended(CompressionEndedPayload {
                 reason: parse_compaction_reason(msg.tool_name.as_deref()),
                 content: msg.content.unwrap_or_default(),
+                reasoning: msg.reasoning,
                 new_seq: msg.seq,
             }),
         }));
@@ -629,10 +630,11 @@ mod tests {
     #[test]
     fn compaction_message_projects_to_compression_ended() {
         // 落库形态：role=assistant + kind=compaction + content=摘要 +
-        // 审计列（tool_name）存 reason 的 serde 表示
+        // reasoning=压缩思考 + 审计列（tool_name）存 reason 的 serde 表示
         let msg = make_msg(MessageRole::Assistant, 7, &|m| {
             m.kind = MessageKind::Compaction;
             m.content = Some("## 摘要\n- 要点".into());
+            m.reasoning = Some("压缩时的思考全文".into());
             m.tool_name = Some("manual".into());
         });
 
@@ -644,8 +646,10 @@ mod tests {
         let CompressionPayload::Ended(p) = &payload else {
             panic!("载荷应为 Ended 阶段，实际：{payload:?}")
         };
-        // 字段映射：content=摘要正文、reason 自审计列还原、new_seq=消息自身 seq
+        // 字段映射：content=摘要正文、reasoning=思考全文、reason 自审计列还原、
+        // new_seq=消息自身 seq——历史回放与实时 Ended 同构，思考在两条路径一致可见
         assert_eq!(p.content, "## 摘要\n- 要点");
+        assert_eq!(p.reasoning.as_deref(), Some("压缩时的思考全文"));
         assert_eq!(p.reason, CompressionReason::Manual);
         assert_eq!(p.new_seq, 7);
         // base.seq 同为消息 seq：历史回放的 Compression 事件与实时 Ended 同构

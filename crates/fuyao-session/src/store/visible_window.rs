@@ -106,7 +106,12 @@ mod tests {
         }
         // 标记压缩:此时 seq=4 是 compaction 边界
         store
-            .mark_compaction(&session.id, "摘要".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
         insert_user(&store, &session.id, "new1").await;
@@ -128,12 +133,22 @@ mod tests {
 
         insert_user(&store, &session.id, "v1-1").await;
         let seq1 = store
-            .mark_compaction(&session.id, "摘要1".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要1".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
         insert_user(&store, &session.id, "v2-1").await;
         let seq2 = store
-            .mark_compaction(&session.id, "摘要2".to_string(), CompressionReason::Auto)
+            .mark_compaction(
+                &session.id,
+                "摘要2".to_string(),
+                None,
+                CompressionReason::Auto,
+            )
             .await
             .unwrap();
         assert!(seq2 > seq1);
