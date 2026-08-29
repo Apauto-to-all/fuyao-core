@@ -27,6 +27,9 @@ pub use bootstrap::{
 pub use manager::list_agent_ids;
 pub use manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 pub use runtime::{App, Discovery, SessionManager};
+// SessionManager 各方法的错误类型：二次开发方对变体分类处理（如映射应用层提示）时
+// 需按名引用该类型，随门面一并透出，免于直赖 fuyao-session
+pub use fuyao_session::SessionError;
 // 透出 fuyao-api 的列举选项类型，二次开发只依赖 fuyao-app 即可消费列举结果
 pub use fuyao_api::{
     AgentIdOption, AgentIdSource, DefinitionOption, ProviderModelOption, ProviderOption,

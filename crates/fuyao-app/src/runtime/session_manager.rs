@@ -121,19 +121,36 @@ impl SessionManager {
     /// 自动标题生成（`react/turn.rs` fire-and-forget spawn）正交：引擎只产出默认标题，
     /// 本方法供应用 / 用户覆盖；两者最终都落同一个局部 UPDATE，最后一个写生效，单字段原子。
     ///
-    /// 透传 [`SessionStore::update_session`](fuyao_session::SessionStore::update_session)：
-    /// EXISTS 校验后局部 UPDATE title，不动其他字段、不动 messages 表。
+    /// # 标题实体不变量
+    ///
+    /// 标题合法性是 Session 实体的不变量，入口校验并规范化后落库：
+    /// - trim 后非空（纯空白标题拒绝，杜绝空白串原样入库）
+    /// - trim 后按字符数计（多字节安全，与自动标题生成同口径）不超过
+    ///   `[session.title] max_len`
+    ///
+    /// 上限读全局配置 [`fuyao_api::get_config`](fuyao_api::get_config) 的
+    /// `session.title.max_len`——与自动标题生成的截断上限是同一份配置来源，天然单源；
+    /// 错误变体携带 max_len 真值供调用方展示。引擎内部的自动标题（占位 / LLM 生成）
+    /// 不经过本方法（直写存储层，自带截断），不受本校验影响。校验先于存储访问：
+    /// 非法标题不触碰 DB。
     ///
     /// # 返回
-    /// - `Ok(())`：标题已更新
+    /// - `Ok(())`：标题已更新（落库的是 trim 后的规范化标题）
+    /// - `Err(SessionError::InvalidTitle { max_len })`：标题 trim 后为空或超过 max_len
     /// - `Err(SessionError::NotFound)`：session_id 在数据库中不存在
     pub async fn update_title(
         &self,
         session_id: &str,
         new_title: &str,
     ) -> Result<(), fuyao_session::SessionError> {
+        // 实体不变量：规范化（trim）后判空、按字符数判长，上限与自动标题生成同源
+        let title = new_title.trim();
+        let max_len = fuyao_api::get_config().session.title.max_len;
+        if title.is_empty() || title.chars().count() > max_len {
+            return Err(fuyao_session::SessionError::InvalidTitle { max_len });
+        }
         self.store
-            .update_session(session_id, Some(new_title), None)
+            .update_session(session_id, Some(title), None)
             .await
     }
 
@@ -309,5 +326,115 @@ impl SessionManager {
             has_more: page.has_more,
             next_cursor: page.next_cursor,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fuyao_session::SessionError;
+    use rstest::rstest;
+
+    /// 构造临时 SQLite 上的 SessionManager + 一个已建会话
+    ///
+    /// std::mem::forget(dir) 放弃 TempDir 自动清理——async 测试跨 await 持有路径，
+    /// TempDir 提前 drop 会删掉 db 文件；临时目录由系统重启时清理。
+    /// 未调 set_config，get_config 返回 default（max_len = 80）。
+    async fn manager_with_session() -> (SessionManager, String) {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let store = Arc::new(
+            SessionStore::new(dir.path().join("test.db"))
+                .await
+                .expect("构造 SessionStore 失败"),
+        );
+        std::mem::forget(dir);
+        let session = store
+            .create_session(None, None, None)
+            .await
+            .expect("建会话失败");
+        (SessionManager::new(store), session.id)
+    }
+
+    /// 空串与纯空白标题被拒，错误携带配置的 max_len 真值
+    #[rstest]
+    #[case::empty("")]
+    #[case::spaces("   ")]
+    #[case::mixed_whitespace(" \t\r\n ")]
+    #[tokio::test]
+    async fn update_title_rejects_blank(#[case] title: &str) {
+        let (manager, session_id) = manager_with_session().await;
+        let err = manager
+            .update_title(&session_id, title)
+            .await
+            .expect_err("空白标题应被拒");
+        assert!(
+            matches!(err, SessionError::InvalidTitle { max_len: 80 }),
+            "实际错误：{err:?}"
+        );
+    }
+
+    /// 超过 max_len 的标题被拒（按字符数计，多字节字符各计 1），恰好等于 max_len 的边界通过
+    #[rstest]
+    #[case::ascii_over("a", 81)]
+    #[case::multibyte_over("话", 81)]
+    #[tokio::test]
+    async fn update_title_rejects_over_max_len(#[case] ch: &str, #[case] len: usize) {
+        let (manager, session_id) = manager_with_session().await;
+        let over = ch.repeat(len);
+        let err = manager
+            .update_title(&session_id, &over)
+            .await
+            .expect_err("超长标题应被拒");
+        assert!(
+            matches!(err, SessionError::InvalidTitle { max_len: 80 }),
+            "实际错误：{err:?}"
+        );
+    }
+
+    /// 恰好等于 max_len 的边界标题通过且原样落库（默认 max_len = 80，多字节各计 1）
+    #[tokio::test]
+    async fn update_title_accepts_exactly_max_len() {
+        let (manager, session_id) = manager_with_session().await;
+        let exact = "话".repeat(80);
+        manager
+            .update_title(&session_id, &exact)
+            .await
+            .expect("恰好 max_len 的标题应通过");
+        let stored = manager
+            .get_session(&session_id)
+            .await
+            .expect("读会话失败")
+            .expect("会话应存在");
+        assert_eq!(stored.title.as_deref(), Some(exact.as_str()));
+    }
+
+    /// 合法标题通过且落库的是 trim 后的规范化值
+    #[tokio::test]
+    async fn update_title_stores_trimmed_title() {
+        let (manager, session_id) = manager_with_session().await;
+        manager
+            .update_title(&session_id, "  新标题  ")
+            .await
+            .expect("合法标题应通过");
+        let stored = manager
+            .get_session(&session_id)
+            .await
+            .expect("读会话失败")
+            .expect("会话应存在");
+        assert_eq!(stored.title.as_deref(), Some("新标题"));
+    }
+
+    /// 非法标题在校验即被拒，不产生存储访问——不存在的会话 id 同样报标题错误
+    #[tokio::test]
+    async fn update_title_validates_before_store_access() {
+        let (manager, _session_id) = manager_with_session().await;
+        let err = manager
+            .update_title("no-such-session", "   ")
+            .await
+            .expect_err("空白标题应在校验层被拒");
+        assert!(
+            matches!(err, SessionError::InvalidTitle { max_len: 80 }),
+            "实际错误：{err:?}"
+        );
     }
 }

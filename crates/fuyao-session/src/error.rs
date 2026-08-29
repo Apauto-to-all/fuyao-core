@@ -21,6 +21,11 @@ pub enum SessionError {
     /// 回退与派生共用此判定）
     #[error("无效的切割目标（只能切到用户消息或压缩消息）: {0}")]
     InvalidCutTarget(String),
+
+    /// 无效的会话标题（trim 后为空白，或按字符数超过 `[session.title] max_len`）。
+    /// 携带 max_len 真值，调用方可直接取用构造面向用户的提示
+    #[error("无效的会话标题（空白或超过 {max_len} 字符）")]
+    InvalidTitle { max_len: usize },
 }
 
 impl SessionError {

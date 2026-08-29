@@ -1013,6 +1013,7 @@ dependencies = [
  "fuyao-provider",
  "fuyao-session",
  "fuyao-tools",
+ "rstest",
  "rust_decimal",
  "serde_json",
  "tempfile",
