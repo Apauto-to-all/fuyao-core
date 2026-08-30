@@ -127,7 +127,12 @@ pub fn apply_replace(
 /// 2. 生成后压缩公共前导缩进——深嵌套代码的 diff 保留大量公共缩进会浪费 token。
 ///
 /// diff 仅用于展示改动，不影响磁盘文件（磁盘写入走行尾保真 + BOM 还原）。
-fn generate_unified_diff(old: &str, new: &str, from_file: &str, to_file: &str) -> String {
+pub(crate) fn generate_unified_diff(
+    old: &str,
+    new: &str,
+    from_file: &str,
+    to_file: &str,
+) -> String {
     let old_norm = normalize_line_endings(old);
     let new_norm = normalize_line_endings(new);
     let diff = TextDiff::from_lines(&old_norm, &new_norm);

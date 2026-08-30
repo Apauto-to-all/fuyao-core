@@ -14,7 +14,7 @@
 
 | 层 | 机制 | 位置 |
 | --- | --- | --- |
-| 文件路径 | 敏感路径前缀 / 设备文件 / 二进制扩展 / 写根限制（`FUYAO_WRITE_SAFE_ROOT`）/ 框架内部路径 | fuyao-tools `file/safety.rs` |
+| 文件路径 | 敏感路径前缀 / 设备文件 / 二进制扩展 / 框架内部路径 | fuyao-tools `file/safety.rs` |
 | 命令 | 危险命令分级检测 / 工作目录校验 / 环境变量屏蔽 | fuyao-tools `terminal/safety.rs` |
 | 输出 | API key / token / PEM / JWT 正则脱敏 | fuyao-tools `redact.rs` |
 | 行为 | 循环检测 + 四级处置（Warn/Inject/Interrupt/Abort） | fuyao-guard 插件 |

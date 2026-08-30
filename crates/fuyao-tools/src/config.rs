@@ -13,6 +13,19 @@ pub const MAX_READ_CHARS: usize = 100_000;
 /// 读取时间戳缓存大小
 pub const READ_TIMESTAMPS_CAP: usize = 1000;
 
+/// write 工具覆写 diff 直出的字节预算
+///
+/// 旧内容与新内容的 unified diff 未超此预算时整体直出（增删两侧完整可见）；
+/// 超出则进入账本模式：新增侧折叠（新内容与写入参数一致，模型侧零信息损失），
+/// 删除侧完整保留——旧内容在覆写落盘后仅存于 diff，是恢复的唯一依据
+pub const WRITE_DIFF_INLINE_MAX_BYTES: usize = 12_000;
+
+/// write 工具旧内容账本的字节预算
+///
+/// 账本模式下删除侧超出此预算时中段截断（对齐行边界）并标注省略行数；
+/// 被截断的旧内容无法从本结果恢复，需依赖上下文中此前的读取记录或 git 历史
+pub const WRITE_DIFF_LEDGER_MAX_BYTES: usize = 30_000;
+
 /// 是否脱敏敏感信息
 pub const REDACT_SECRETS: bool = true;
 

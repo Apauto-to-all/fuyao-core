@@ -5,14 +5,13 @@
 //!
 //! ## 检查层级
 //!
-//! 1. **安全写入根目录**: 环境变量 `FUYAO_WRITE_SAFE_ROOT` 指定允许写入的目录范围
-//! 2. **敏感路径前缀**: /etc/、/boot/、C:\Windows\ 等系统目录
-//! 3. **敏感系统文件**: /etc/passwd、/etc/shadow 等关键配置
-//! 4. **用户敏感文件**: ~/.ssh/id_rsa、~/.bashrc 等（主目录下检查）
-//! 5. **特殊文件名**: .env、.htpasswd、authorized_keys（任意位置）
-//! 6. **设备文件**: /dev/zero、/dev/random 等无限输出设备
-//! 7. **二进制文件**: .exe、.png、.pdf 等不可读文本的文件
-//! 8. **框架内部路径**: .fuyao/.env（防止 Agent 读取框架敏感数据）
+//! 1. **敏感路径前缀**: /etc/、/boot/、C:\Windows\ 等系统目录
+//! 2. **敏感系统文件**: /etc/passwd、/etc/shadow 等关键配置
+//! 3. **用户敏感文件**: ~/.ssh/id_rsa、~/.bashrc 等（主目录下检查）
+//! 4. **特殊文件名**: .env、.htpasswd、authorized_keys（任意位置）
+//! 5. **设备文件**: /dev/zero、/dev/random 等无限输出设备
+//! 6. **二进制文件**: .exe、.png、.pdf 等不可读文本的文件
+//! 7. **框架内部路径**: .fuyao/.env（防止 Agent 读取框架敏感数据）
 
 use std::path::Path;
 
@@ -146,7 +145,7 @@ fn normalize_path(filepath: &str) -> String {
 
 /// 检查是否为敏感系统路径
 ///
-/// 依次检查：安全写入根目录 → 敏感路径前缀 → 敏感系统文件 → 用户敏感文件 → 特殊文件名。
+/// 依次检查：敏感路径前缀 → 敏感系统文件 → 用户敏感文件 → 特殊文件名。
 /// Windows 路径不区分大小写比较。
 ///
 /// # 参数
@@ -160,11 +159,6 @@ fn normalize_path(filepath: &str) -> String {
 pub fn check_sensitive_path(filepath: &str, action: &str) -> Option<String> {
     let normalized = normalize_path(filepath);
     let normalized_lower = normalized.to_lowercase();
-
-    // 检查安全写入根目录
-    if let Some(err) = check_safe_root(filepath) {
-        return Some(err);
-    }
 
     for prefix in SENSITIVE_PATH_PREFIXES {
         let prefix_check = prefix.to_lowercase();
@@ -206,21 +200,6 @@ pub fn check_sensitive_path(filepath: &str, action: &str) -> Option<String> {
     }
 
     None
-}
-
-fn check_safe_root(filepath: &str) -> Option<String> {
-    let root = std::env::var("FUYAO_WRITE_SAFE_ROOT").ok()?;
-    if root.is_empty() {
-        return None;
-    }
-    let safe_root = normalize_path(&root);
-    let resolved = normalize_path(filepath);
-    if resolved == safe_root
-        || resolved.starts_with(&format!("{safe_root}{}", std::path::MAIN_SEPARATOR))
-    {
-        return None;
-    }
-    Some(format!("拒绝写入：路径不在安全目录范围内 ({safe_root})"))
 }
 
 /// 检查是否为框架内部路径
