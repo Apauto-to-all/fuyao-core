@@ -1,7 +1,7 @@
 //! 路径安全检查
 //!
 //! 提供文件路径安全检查功能，包含敏感路径保护、设备文件检测、二进制文件检测、
-//! 框架内部路径保护。
+//! 框架内部路径保护、写入范围限制。
 //!
 //! ## 检查层级
 //!
@@ -12,8 +12,11 @@
 //! 5. **设备文件**: /dev/zero、/dev/random 等无限输出设备
 //! 6. **二进制文件**: .exe、.png、.pdf 等不可读文本的文件
 //! 7. **框架内部路径**: .fuyao/.env（防止 Agent 读取框架敏感数据）
+//! 8. **写入范围限制**: write / edit 仅允许落在工作目录与 fuyao 数据目录内的路径
 
 use std::path::Path;
+
+use fuyao_api::ToolCallContext;
 
 /// 二进制文件扩展名，不建议直接访问
 const BINARY_EXTENSIONS: &[&str] = &[
@@ -202,6 +205,80 @@ pub fn check_sensitive_path(filepath: &str, action: &str) -> Option<String> {
     None
 }
 
+/// 判定 child 路径是否位于 root 目录内（含 root 本身）
+///
+/// 按路径组件逐一比较（各自小写化后比对字符串）：
+/// - 组件级比较天然带分隔符边界——`E:\ws2` 不会误命中根 `E:\ws`
+/// - 小写化实现大小写不敏感（Windows 路径语义），Unix 下亦无副作用
+/// - 正反斜杠混写由 `components` 的分隔符归一化吸收
+fn is_within(child: &Path, root: &Path) -> bool {
+    let mut child_components = child.components();
+    for root_component in root.components() {
+        match child_components.next() {
+            Some(child_component) => {
+                let child_name = child_component.as_os_str().to_string_lossy().to_lowercase();
+                let root_name = root_component.as_os_str().to_string_lossy().to_lowercase();
+                if child_name != root_name {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
+/// 检查写入路径是否落在允许清单内（write / edit 共用的写入范围判定）
+///
+/// 允许清单两条，命中任一即放行：
+/// 1. `workspace` 工作目录（含其子树；workspace 层 agent 数据在
+///    `{workspace}/.fuyao/` 内部，天然被本条覆盖）
+/// 2. `fuyao_home` 整个子树（含其下 fuyao-agents、logs 等全部数据目录）
+///
+/// # 返回
+///
+/// `None` 表示放行，`Some(错误信息)` 表示拒绝（信息含被拒路径，可直接进错误信封）。
+pub fn check_write_scope(
+    resolved: &Path,
+    workspace: Option<&Path>,
+    fuyao_home: Option<&Path>,
+) -> Option<String> {
+    if let Some(ws) = workspace
+        && is_within(resolved, ws)
+    {
+        return None;
+    }
+
+    if let Some(home) = fuyao_home
+        && is_within(resolved, home)
+    {
+        return None;
+    }
+
+    Some(format!(
+        "写入被限制在工作目录内，拒绝写入: {}",
+        resolved.display()
+    ))
+}
+
+/// 基于调用上下文判定写入范围（handler 入口共用前奏）
+///
+/// 组装 [`check_write_scope`] 的两个入参：
+/// - workspace：`ctx.agent_paths.workspace`，缺省回退进程当前目录
+/// - fuyao_home：`ctx.agent_paths.fuyao_home`，agent_paths 缺失时取全局默认
+pub(crate) fn check_write_scope_ctx(ctx: &ToolCallContext, resolved: &Path) -> Option<String> {
+    let workspace = ctx
+        .workspace()
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+    let fuyao_home = ctx
+        .agent_paths
+        .as_ref()
+        .map(|ap| ap.fuyao_home.clone())
+        .unwrap_or_else(fuyao_api::get_fuyao_home);
+    check_write_scope(resolved, workspace.as_deref(), Some(&fuyao_home))
+}
+
 /// 检查是否为框架内部路径
 ///
 /// 防止 Agent 读取框架内部的缓存、配置、会话等文件，避免 prompt injection 攻击。
@@ -321,5 +398,121 @@ mod tests {
     fn internal_path_detection() {
         assert!(is_internal_path("/home/user/.fuyao/.env"));
         assert!(!is_internal_path("/home/user/project/.env"));
+    }
+
+    // ── check_write_scope ───────────────────────────────────────
+
+    /// workspace 子树内放行；workspace 本身视作在内；子树外拒绝
+    #[test]
+    fn write_scope_workspace_boundary() {
+        let ws = Path::new("/tmp/project");
+        assert!(check_write_scope(Path::new("/tmp/project/main.rs"), Some(ws), None).is_none());
+        assert!(check_write_scope(Path::new("/tmp/project"), Some(ws), None).is_none());
+        assert!(check_write_scope(Path::new("/tmp/project2/main.rs"), Some(ws), None).is_some());
+        assert!(check_write_scope(Path::new("/other/main.rs"), Some(ws), None).is_some());
+    }
+
+    /// fuyao_home 整个子树放行：fuyao-agents、logs、根文件均在允许范围；子树外拒绝
+    #[test]
+    fn write_scope_fuyao_home_subtree() {
+        let home = Path::new("/tmp/home");
+        // fuyao-agents 数据目录
+        assert!(
+            check_write_scope(
+                Path::new("/tmp/home/fuyao-agents/coder/notes.md"),
+                None,
+                Some(home)
+            )
+            .is_none()
+        );
+        // 非 fuyao-agents 的数据目录（如 logs）同样放行
+        assert!(check_write_scope(Path::new("/tmp/home/logs/a.log"), None, Some(home)).is_none());
+        // fuyao_home 根下的文件与 home 本身视作在子树内
+        assert!(check_write_scope(Path::new("/tmp/home/fuyao.toml"), None, Some(home)).is_none());
+        assert!(check_write_scope(Path::new("/tmp/home"), None, Some(home)).is_none());
+        // 子树外拒绝
+        assert!(
+            check_write_scope(Path::new("/tmp/home2/fuyao-agents/a.md"), None, Some(home))
+                .is_some()
+        );
+        assert!(check_write_scope(Path::new("/tmp/elsewhere/a.txt"), None, Some(home)).is_some());
+    }
+
+    /// 前缀边界：`E:\ws2` 不能误命中 `E:\ws` 前缀（组件级比较自带分隔符边界）
+    #[test]
+    fn write_scope_prefix_boundary() {
+        let ws = Path::new("E:\\ws");
+        assert!(check_write_scope(Path::new("E:\\ws\\a.txt"), Some(ws), None).is_none());
+        assert!(check_write_scope(Path::new("E:\\ws2\\a.txt"), Some(ws), None).is_some());
+    }
+
+    /// 大小写不敏感：盘符与目录名大小写不同仍命中（Windows 路径语义）
+    #[test]
+    fn write_scope_case_insensitive() {
+        let ws = Path::new("E:\\WS");
+        assert!(check_write_scope(Path::new("e:\\ws\\a.txt"), Some(ws), None).is_none());
+    }
+
+    /// workspace 为 None 时不做工作目录判定，仅剩 fuyao_home 子树通道
+    #[test]
+    fn write_scope_without_workspace_uses_home_channel() {
+        let home = Path::new("/tmp/home");
+        assert!(
+            check_write_scope(Path::new("/tmp/home/fuyao-agents/a.md"), None, Some(home)).is_none()
+        );
+        assert!(check_write_scope(Path::new("/tmp/elsewhere/a.txt"), None, Some(home)).is_some());
+    }
+
+    // ── check_write_scope_ctx ───────────────────────────────────
+
+    /// 默认 ctx（无 agent_paths）：workspace 回退进程当前目录，cwd 下路径放行
+    #[test]
+    fn write_scope_ctx_falls_back_to_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let inside = cwd.join("fuyao_scope_inside_cwd.txt");
+        assert!(check_write_scope_ctx(&ToolCallContext::default(), &inside).is_none());
+        // cwd 之外且不被任何清单覆盖的路径拒绝
+        let outside = std::env::temp_dir().join("fuyao_scope_outside_cwd.txt");
+        assert!(check_write_scope_ctx(&ToolCallContext::default(), &outside).is_some());
+    }
+
+    /// 注入 agent_paths：按注入的 workspace 与 fuyao_home 判定，不受进程全局状态影响
+    #[test]
+    fn write_scope_ctx_uses_injected_agent_paths() {
+        let temp = std::env::temp_dir().join("fuyao_test_scope_ctx");
+        std::fs::create_dir_all(&temp).unwrap();
+        let ctx = ToolCallContext {
+            agent_paths: Some(fuyao_api::AgentPaths {
+                workspace: Some(temp.join("ws")),
+                fuyao_home: temp.join("home"),
+                ..fuyao_api::AgentPaths::default()
+            }),
+            ..ToolCallContext::default()
+        };
+        // workspace 子树内放行
+        assert!(
+            check_write_scope_ctx(&ctx, &temp.join("ws").join("src").join("main.rs")).is_none()
+        );
+        // fuyao_home 子树整体放行：fuyao-agents 数据与根下文件均在内
+        assert!(
+            check_write_scope_ctx(
+                &ctx,
+                &temp
+                    .join("home")
+                    .join("fuyao-agents")
+                    .join("a")
+                    .join("data.db")
+            )
+            .is_none()
+        );
+        assert!(check_write_scope_ctx(&ctx, &temp.join("home").join("fuyao.toml")).is_none());
+        assert!(
+            check_write_scope_ctx(&ctx, &temp.join("home").join("logs").join("a.log")).is_none()
+        );
+        // 两清单之外拒绝：同盘前缀不误命中
+        assert!(check_write_scope_ctx(&ctx, &temp.join("ws2").join("x.txt")).is_some());
+        assert!(check_write_scope_ctx(&ctx, &temp.join("home2").join("y.txt")).is_some());
+
+        std::fs::remove_dir_all(&temp).ok();
     }
 }

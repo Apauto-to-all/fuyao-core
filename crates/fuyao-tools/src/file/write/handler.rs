@@ -1,6 +1,7 @@
 //! 文件写入处理逻辑
 //!
-//! 提供文件写入功能，支持创建、覆盖文件，包含敏感路径保护、覆写差异账本。
+//! 提供文件写入功能，支持创建、覆盖文件，包含敏感路径保护、写入范围限制、
+//! 覆写差异账本。
 //!
 //! ## 功能
 //!
@@ -8,12 +9,13 @@
 //! - 文件存在则完全覆盖（非追加），不设任何前置读取要求：
 //!   覆写结果携带旧内容差异，模型据此知道覆写掉了什么、可据此恢复
 //! - 敏感路径保护（SSH 密钥、系统配置等拒绝写入）
+//! - 写入范围限制：路径必须落在工作目录或 fuyao_home 子树内，清单外硬拒绝
 //! - 新内容与原文件一致时跳过落盘，磁盘字节保持原样
 //! - 写入后更新追踪器时间戳（与 read 同源的 resolve 后绝对路径）
 
 use crate::common::{empty_path_error, parse_tool_args, resolve_ctx_path, to_ok_output};
 use crate::file::edit::textutil::{normalize_line_endings, split_bom};
-use crate::file::safety::check_sensitive_path;
+use crate::file::safety::{check_sensitive_path, check_write_scope_ctx};
 use crate::file::tracker::update_read_timestamp;
 use crate::file::write::diff::render_overwrite_diff;
 use crate::file::write::types::{WriteArgs, WriteResult};
@@ -22,8 +24,8 @@ use serde_json::Value;
 
 /// 写入文件的核心实现
 ///
-/// 处理完整的写入流程：参数解析 → 路径解析 → 安全检查 → 一致性比对 →
-/// 创建父目录 → 写入 → 差异账本 → 更新追踪器。
+/// 处理完整的写入流程：参数解析 → 路径解析 → 安全检查（敏感路径 + 写入范围）→
+/// 一致性比对 → 创建父目录 → 写入 → 差异账本 → 更新追踪器。
 ///
 /// # 返回
 ///
@@ -54,6 +56,14 @@ pub async fn write_file_impl(
                 .with("path", path.as_str())
                 .with("suggestion", "请选择非敏感路径，或使用项目目录下的文件"),
         );
+    }
+
+    if let Some(err) = check_write_scope_ctx(&ctx, &resolved_path_obj) {
+        tracing::warn!(path = %resolved_path, action = "写入", reason = %err, "拒绝清单外写入");
+        return ToolOutput::Err(ToolError::new(err).with("path", path.as_str()).with(
+            "suggestion",
+            "请使用工作目录，如确需修改此文件，请将文件路径与修改内容告知用户",
+        ));
     }
 
     let existed = resolved_path_obj.exists();
@@ -113,15 +123,20 @@ pub async fn write_file_impl(
     let bytes_written = content.len();
     update_read_timestamp(&resolved_path, &task_id);
 
-    // 覆写差异账本：旧内容已从磁盘消失，diff 的删除侧是其唯一留存副本；
-    // 旧内容不可读（非 UTF-8 / 权限）时如实说明账本缺失
-    let diff = match &old_content {
-        Some(old) => Some(render_overwrite_diff(old, &content, &path)),
-        None => Some(
-            "原文件内容无法读取（非 UTF-8 或权限不足），无法生成覆写差异；\
+    // 覆写差异账本：旧内容已从磁盘消失，diff 的删除侧是其唯一留存副本。
+    // 新建文件无旧内容，不产 diff；已存在但旧内容不可读（非 UTF-8 / 权限）
+    // 时如实说明账本缺失
+    let diff = if existed {
+        match &old_content {
+            Some(old) => Some(render_overwrite_diff(old, &content, &path)),
+            None => Some(
+                "原文件内容无法读取（非 UTF-8 或权限不足），无法生成覆写差异；\
 旧内容已不可从本结果恢复"
-                .to_string(),
-        ),
+                    .to_string(),
+            ),
+        }
+    } else {
+        None
     };
 
     let result = WriteResult {
@@ -139,6 +154,19 @@ pub async fn write_file_impl(
 mod tests {
     use super::*;
 
+    /// 构造以指定目录为 workspace 的调用上下文（fuyao_home 指向同目录下子目录，
+    /// 与进程真实 home 隔离）
+    fn ctx_with_workspace(ws: &std::path::Path) -> ToolCallContext {
+        ToolCallContext {
+            agent_paths: Some(fuyao_api::AgentPaths {
+                workspace: Some(ws.to_path_buf()),
+                fuyao_home: ws.join("fuyao-home"),
+                ..fuyao_api::AgentPaths::default()
+            }),
+            ..ToolCallContext::default()
+        }
+    }
+
     #[tokio::test]
     async fn write_new_file() {
         let dir = std::env::temp_dir().join("fuyao_test_write_full");
@@ -152,12 +180,15 @@ mod tests {
         });
         let result = write_file_impl(
             args,
-            fuyao_api::ToolCallContext::default(),
+            ctx_with_workspace(&dir),
             fuyao_api::CancellationToken::new(),
         )
         .await
         .to_wire();
         assert!(result.contains("\"created\":true"));
+        // 新建文件无旧内容，不携带 diff 字段
+        assert!(!result.contains("\"diff\""), "实际结果: {result}");
+        assert!(!result.contains("无法生成覆写差异"), "实际结果: {result}");
 
         let content = std::fs::read_to_string(&file_path).unwrap();
         assert_eq!(content, "hello world");
@@ -180,7 +211,7 @@ mod tests {
         });
         let result = write_file_impl(
             args,
-            fuyao_api::ToolCallContext::default(),
+            ctx_with_workspace(&dir),
             fuyao_api::CancellationToken::new(),
         )
         .await
@@ -210,7 +241,7 @@ mod tests {
         });
         let result = write_file_impl(
             args,
-            fuyao_api::ToolCallContext::default(),
+            ctx_with_workspace(&dir),
             fuyao_api::CancellationToken::new(),
         )
         .await
@@ -237,7 +268,7 @@ mod tests {
         });
         let result = write_file_impl(
             args,
-            fuyao_api::ToolCallContext::default(),
+            ctx_with_workspace(&dir),
             fuyao_api::CancellationToken::new(),
         )
         .await
@@ -262,7 +293,7 @@ mod tests {
         });
         let result = write_file_impl(
             args,
-            fuyao_api::ToolCallContext::default(),
+            ctx_with_workspace(&dir),
             fuyao_api::CancellationToken::new(),
         )
         .await
@@ -307,5 +338,88 @@ mod tests {
         .await
         .to_wire();
         assert!(result.contains("拒绝"));
+    }
+
+    /// 清单外拒绝：workspace 之外的路径返回限制错误且磁盘未被写入
+    #[tokio::test]
+    async fn reject_out_of_write_scope() {
+        let base = std::env::temp_dir().join("fuyao_test_write_scope");
+        std::fs::remove_dir_all(&base).ok();
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file_path = outside.join("evil.txt");
+
+        let args = serde_json::json!({
+            "path": file_path.to_string_lossy().to_string(),
+            "content": "hacked"
+        });
+        let result = write_file_impl(
+            args,
+            ctx_with_workspace(&ws),
+            fuyao_api::CancellationToken::new(),
+        )
+        .await
+        .to_wire();
+        assert!(
+            result.contains("写入被限制在工作目录内"),
+            "实际结果: {result}"
+        );
+        assert!(
+            result.contains("请将文件路径与修改内容告知用户"),
+            "suggestion 应指引交由用户操作: {result}"
+        );
+        assert!(!file_path.exists(), "清单外文件不应被写入");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 清单内放行：fuyao_home 子树内的路径（含 fuyao-agents 与 logs 等数据目录）允许写入
+    #[tokio::test]
+    async fn allow_fuyao_home_subtree() {
+        let base = std::env::temp_dir().join("fuyao_test_write_scope_home");
+        std::fs::remove_dir_all(&base).ok();
+        let ws = base.join("ws");
+        let agents_dir = base.join("home").join("fuyao-agents").join("coder");
+        let logs_dir = base.join("home").join("logs");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let ctx = ToolCallContext {
+            agent_paths: Some(fuyao_api::AgentPaths {
+                workspace: Some(ws),
+                fuyao_home: base.join("home"),
+                ..fuyao_api::AgentPaths::default()
+            }),
+            ..ToolCallContext::default()
+        };
+
+        // fuyao-agents 数据目录内写入
+        let agents_file = agents_dir.join("notes.md");
+        let args = serde_json::json!({
+            "path": agents_file.to_string_lossy().to_string(),
+            "content": "agent 数据"
+        });
+        let result = write_file_impl(args, ctx.clone(), fuyao_api::CancellationToken::new())
+            .await
+            .to_wire();
+        assert!(result.contains("\"created\":true"), "实际结果: {result}");
+        assert_eq!(std::fs::read_to_string(&agents_file).unwrap(), "agent 数据");
+
+        // 非 fuyao-agents 的数据目录（logs）内写入
+        let log_file = logs_dir.join("a.log");
+        let args = serde_json::json!({
+            "path": log_file.to_string_lossy().to_string(),
+            "content": "日志数据"
+        });
+        let result = write_file_impl(args, ctx, fuyao_api::CancellationToken::new())
+            .await
+            .to_wire();
+        assert!(result.contains("\"created\":true"), "实际结果: {result}");
+        assert_eq!(std::fs::read_to_string(&log_file).unwrap(), "日志数据");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
