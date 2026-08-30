@@ -9,6 +9,7 @@
 //! - 绝对路径 → 直接返回
 //! - 相对路径 → 基于 workspace 解析（无 workspace 则基于 cwd）
 //! - `~` 前缀 → 展开为用户主目录
+//! - 解析结果统一词法归一：统一为平台分隔符、消除 `.` 段（如 `E:/a/.` → `E:\a`）
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,25 +104,33 @@ where
 /// - 无 path 且有 workspace → 返回 workspace
 /// - 绝对路径 → 直接返回
 /// - 相对路径 → 基于 workspace 解析（无 workspace 则基于 cwd）
+/// - 结果经 [`normalize_lexical`] 词法归一后返回
 pub fn resolve_path(path: &str, workspace: Option<&Path>) -> PathBuf {
-    if path.is_empty() {
-        if let Some(ws) = workspace {
-            return ws.to_path_buf();
-        }
-        return std::env::current_dir().unwrap_or_default();
-    }
-
-    let expanded = expand_tilde(path);
-
-    if expanded.is_absolute() {
-        return expanded;
-    }
-
-    if let Some(ws) = workspace {
-        ws.join(&expanded)
+    let resolved = if path.is_empty() {
+        workspace
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
     } else {
-        std::env::current_dir().unwrap_or_default().join(&expanded)
-    }
+        let expanded = expand_tilde(path);
+        if expanded.is_absolute() {
+            expanded
+        } else if let Some(ws) = workspace {
+            ws.join(&expanded)
+        } else {
+            std::env::current_dir().unwrap_or_default().join(&expanded)
+        }
+    };
+    normalize_lexical(resolved)
+}
+
+/// 词法归一路径：统一为平台分隔符、消除 `.` 段、相对路径补全为绝对路径
+///
+/// `std::path::absolute` 的纯词法语义：不访问文件系统、不解析符号链接、
+/// 不产生 Windows verbatim 前缀（`\\?\`）、保留 `..` 段。
+/// join 只追加不清洗，解析出口统一归一，避免 `E:/a\.` 这类混合形态外泄。
+/// 归一失败（如空路径）时原样返回。
+fn normalize_lexical(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// 展开 ~ 为用户主目录
@@ -155,8 +164,10 @@ mod tests {
     #[test]
     fn resolve_empty_path_returns_workspace() {
         let ws = PathBuf::from("/tmp/project");
+        // Windows 下无盘符的根路径按当前盘符补全为绝对路径
+        let expected = std::path::absolute(&ws).unwrap();
         let result = resolve_path("", Some(&ws));
-        assert_eq!(result, ws);
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -174,16 +185,42 @@ mod tests {
     fn resolve_relative_path_with_workspace() {
         let ws = PathBuf::from("/tmp/project");
         let result = resolve_path("src/main.rs", Some(&ws));
-        assert_eq!(result, PathBuf::from("/tmp/project/src/main.rs"));
+        let expected = std::path::absolute("/tmp/project/src/main.rs").unwrap();
+        assert_eq!(result, expected);
     }
 
     #[test]
     fn resolve_relative_path_without_workspace() {
         let result = resolve_path("src/main.rs", None);
-        let expected = std::env::current_dir()
-            .unwrap_or_default()
-            .join("src/main.rs");
+        let expected = std::path::absolute(
+            std::env::current_dir()
+                .unwrap_or_default()
+                .join("src/main.rs"),
+        )
+        .unwrap();
         assert_eq!(result, expected);
+    }
+
+    /// 归一化消除 join 产生的 `\.` 残段与混合分隔符——默认 path "." 配正斜杠
+    /// workspace 的场景，解析出口得到统一平台分隔符的干净路径
+    #[test]
+    fn resolve_path_normalizes_dot_segment_and_mixed_separators() {
+        if cfg!(windows) {
+            let ws = PathBuf::from("E:/novel/饵城");
+            assert_eq!(
+                resolve_path(".", Some(&ws)),
+                PathBuf::from(r"E:\novel\饵城")
+            );
+            assert_eq!(
+                resolve_path("E:/novel/饵城/.", None),
+                PathBuf::from(r"E:\novel\饵城")
+            );
+        } else {
+            assert_eq!(
+                resolve_path("./a/./b", Some(Path::new("/tmp/p"))),
+                PathBuf::from("/tmp/p/a/b")
+            );
+        }
     }
 
     #[test]
@@ -226,15 +263,18 @@ mod tests {
         };
         assert_eq!(
             resolve_ctx_path(&ctx, "src/main.rs"),
-            PathBuf::from("/tmp/project/src/main.rs")
+            std::path::absolute("/tmp/project/src/main.rs").unwrap()
         );
 
         let fallback = resolve_ctx_path(&ToolCallContext::default(), "src/main.rs");
         assert_eq!(
             fallback,
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join("src/main.rs")
+            std::path::absolute(
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join("src/main.rs")
+            )
+            .unwrap()
         );
     }
 

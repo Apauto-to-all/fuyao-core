@@ -25,8 +25,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 ///
 /// # 参数
 ///
-/// - `pattern`: glob 模式（如 `*.rs`、`*.{ts,tsx}`）
-/// - `path`: 搜索根路径
+/// - `pattern`: glob 模式（如 `*.rs`、`*.{ts,tsx}`）；含路径分隔符时匹配
+///   相对搜索根的路径（如 `src/*.rs`），无需感知盘符等根前缀
+/// - `path`: 搜索根路径（已由调用方解析归一）
 /// - `limit`: 最大返回数量
 ///
 /// 内部错误（路径不存在、模式无效等）经 `Err(String)` 返回，由调用方折成
@@ -37,7 +38,7 @@ fn search_files(
     limit: usize,
     cancel: &AtomicBool,
 ) -> Result<GlobResult, String> {
-    let search_path = crate::common::expand_tilde(path);
+    let search_path = PathBuf::from(path);
 
     if !search_path.exists() {
         return Err(format!("路径不存在: {path}"));
@@ -71,8 +72,12 @@ fn search_files(
         }
 
         let match_target = if pattern.contains('/') || pattern.contains('\\') {
-            // 模式包含路径分隔符，匹配完整路径
-            entry.path().to_string_lossy().to_string()
+            // 模式含路径分隔符：匹配相对搜索根的路径，模式不必对齐盘符等根前缀
+            match entry.path().strip_prefix(&search_path) {
+                Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().to_string(),
+                // 搜索根本身是文件时无相对部分，退回完整路径参与匹配
+                _ => entry.path().to_string_lossy().to_string(),
+            }
         } else {
             // 模式只有文件名，只匹配文件名
             entry.file_name().to_string_lossy().to_string()
@@ -258,5 +263,56 @@ mod tests {
         assert_eq!(clamp_limit(i64::MIN), 1);
         assert_eq!(clamp_limit(0), 1);
         assert_eq!(clamp_limit(50), 50);
+    }
+
+    /// 含分隔符模式相对搜索根匹配：`sub/*.md` 直接命中，无需 `**/` 对齐
+    /// 盘符等根前缀；结果路径已归一——无 `\.` 残段，匹配项位于回显根之下
+    #[tokio::test]
+    async fn glob_separator_pattern_matches_relative_to_root() {
+        let dir = std::env::temp_dir().join("fuyao_test_glob_rel_pattern");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub").join("笔记.md"), "内容").unwrap();
+        std::fs::write(dir.join("sub").join("草稿.txt"), "内容").unwrap();
+
+        // workspace 以正斜杠书写，复现混合分隔符输入场景
+        let ctx_for = || ToolCallContext {
+            agent_paths: Some(fuyao_api::AgentPaths {
+                workspace: Some(PathBuf::from(dir.to_string_lossy().replace('\\', "/"))),
+                ..fuyao_api::AgentPaths::default()
+            }),
+            ..ToolCallContext::default()
+        };
+
+        let args = serde_json::json!({ "pattern": "sub/*.md", "path": "." });
+        let output = glob_impl(args, ctx_for(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        assert_eq!(json["total_count"], serde_json::json!(1));
+        let root = json["path"].as_str().unwrap().to_string();
+        assert!(!root.contains(r"\."), "实际：{root}");
+        let matched = json["matches"][0]["path"].as_str().unwrap().to_string();
+        assert!(
+            matched.starts_with(&root),
+            "匹配项应位于搜索根之下：{matched} vs {root}"
+        );
+        assert!(
+            matched.replace('/', "\\").ends_with(r"sub\笔记.md"),
+            "实际：{matched}"
+        );
+
+        // `**/` 前缀跨目录匹配保持可用
+        let args = serde_json::json!({ "pattern": "**/草稿.txt", "path": "." });
+        let output = glob_impl(args, ctx_for(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+        assert_eq!(json["total_count"], serde_json::json!(1));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

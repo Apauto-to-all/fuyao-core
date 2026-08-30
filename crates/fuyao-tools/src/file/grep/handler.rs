@@ -8,7 +8,6 @@
 //! 使用 `grep-regex` 构建正则匹配器，`grep-searcher` 逐行搜索，
 //! `ignore::WalkBuilder` 遍历目录树（自动遵守 .gitignore）。
 //! 支持 glob 参数以 glob 语法过滤文件（如 *.py、*.{ts,tsx}，`!` 前缀排除）。
-//! 支持 context 参数显示匹配行的上下文。
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
 use crate::common::{parse_tool_args, resolve_ctx_path, run_search_with_timeout, to_ok_output};
@@ -22,17 +21,15 @@ use grep_searcher::sinks::UTF8;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 脱敏搜索结果中的敏感信息
 ///
-/// 遍历 matches 数组，对每个 match 的 content 和 context 字段执行脱敏。
+/// 遍历 matches 数组，对每个 match 的 content 字段执行脱敏。
 fn redact_content_in_result(matches: &mut [GrepMatch]) {
     for match_item in matches.iter_mut() {
         match_item.content = redact_sensitive_text(&match_item.content);
-        if let Some(ref mut context) = match_item.context {
-            *context = redact_sensitive_text(context);
-        }
     }
 }
 
@@ -61,10 +58,9 @@ fn truncate_line(line: &str) -> String {
 /// # 参数
 ///
 /// - `pattern`: 正则表达式
-/// - `path`: 搜索根路径
+/// - `path`: 搜索根路径（已由调用方解析归一）
 /// - `glob`: glob 过滤模式（如 `*.py`、`*.{ts,tsx}`，`!` 前缀排除）
 /// - `limit`: 最大返回数量
-/// - `context`: 匹配行的上下文行数
 ///
 /// 内部错误（正则/路径/glob 无效等）经 `Err(String)` 返回，由调用方折成
 /// `ToolOutput::Err`——结果信封不携带错误字段。
@@ -73,7 +69,6 @@ fn search_content(
     path: &str,
     glob: Option<&str>,
     limit: usize,
-    context: usize,
     cancel: &AtomicBool,
 ) -> Result<GrepResult, String> {
     let matcher = match RegexMatcherBuilder::new()
@@ -85,16 +80,12 @@ fn search_content(
         Err(e) => return Err(format!("正则表达式无效: {e}")),
     };
 
-    let search_path = crate::common::expand_tilde(path);
+    let search_path = PathBuf::from(path);
     if !search_path.exists() {
         return Err(format!("路径不存在: {path}"));
     }
 
-    let mut searcher = SearcherBuilder::new()
-        .line_number(true)
-        .before_context(context)
-        .after_context(context)
-        .build();
+    let mut searcher = SearcherBuilder::new().line_number(true).build();
 
     let mut walker = WalkBuilder::new(&search_path);
     walker
@@ -150,13 +141,7 @@ fn search_content(
                     matches.push(GrepMatch {
                         file: file_path_str.clone(),
                         line: line_num,
-                        // 超长行截断：content 与 context 共用同一条截断逻辑
                         content: truncate_line(line.trim_end()),
-                        context: if context > 0 {
-                            Some(truncate_line(line.trim_end()))
-                        } else {
-                            None
-                        },
                     });
                     Ok(true)
                 } else {
@@ -195,7 +180,6 @@ pub async fn grep_impl(
         path,
         glob,
         limit,
-        context,
     } = match parse_tool_args(args) {
         Ok(a) => a,
         Err(e) => return e,
@@ -205,7 +189,6 @@ pub async fn grep_impl(
     let config_limit =
         i64::try_from(fuyao_api::get_config().tools.limits.search_max_results).unwrap_or(i64::MAX);
     let limit = limit.clamp(1, config_limit.max(1)) as usize;
-    let context_lines = context.max(0) as usize;
 
     if pattern.is_empty() {
         return ToolOutput::error("搜索模式不能为空");
@@ -221,16 +204,7 @@ pub async fn grep_impl(
         {
             let pattern = pattern.clone();
             let resolved_path = resolved_path.clone();
-            move |cancel| {
-                search_content(
-                    &pattern,
-                    &resolved_path,
-                    glob.as_deref(),
-                    limit,
-                    context_lines,
-                    cancel,
-                )
-            }
+            move |cancel| search_content(&pattern, &resolved_path, glob.as_deref(), limit, cancel)
         },
     )
     .await
@@ -259,25 +233,11 @@ mod tests {
             file: "src/main.rs".to_string(),
             line: 42,
             content: "fn main() {}".to_string(),
-            context: None,
         };
         let json = serde_json::to_value(&m).unwrap();
         assert_eq!(json["file"], "src/main.rs");
         assert_eq!(json["line"], 42);
         assert_eq!(json["content"], "fn main() {}");
-        assert!(json.get("context").is_none());
-    }
-
-    #[test]
-    fn grep_match_serializes_context_when_some() {
-        let m = GrepMatch {
-            file: "src/main.rs".to_string(),
-            line: 42,
-            content: "fn main() {}".to_string(),
-            context: Some("上下文".to_string()),
-        };
-        let json = serde_json::to_value(&m).unwrap();
-        assert_eq!(json["context"], "上下文");
     }
 
     #[test]
@@ -286,7 +246,6 @@ mod tests {
             file: "test.rs".to_string(),
             line: 1,
             content: "fn main() {}".to_string(),
-            context: None,
         }];
         redact_content_in_result(&mut matches);
         assert_eq!(matches[0].content, "fn main() {}");
@@ -438,8 +397,7 @@ mod tests {
         let args = serde_json::json!({
             "pattern": "needle",
             "path": file_path.to_string_lossy().to_string(),
-            "limit": 10,
-            "context": 1
+            "limit": 10
         });
         let output = grep_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
         let json = match output {
@@ -450,10 +408,6 @@ mod tests {
         let content = json["matches"][0]["content"].as_str().unwrap();
         assert!(content.ends_with('…'), "实际：{content:?}");
         assert_eq!(content.chars().count(), GREP_MAX_LINE_CHARS + 1);
-
-        let context_line = json["matches"][0]["context"].as_str().unwrap();
-        assert!(context_line.ends_with('…'), "实际：{context_line:?}");
-        assert_eq!(context_line.chars().count(), GREP_MAX_LINE_CHARS + 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

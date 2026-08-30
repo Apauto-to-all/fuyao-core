@@ -17,12 +17,9 @@ pub struct GrepArgs {
     pub path: String,
     /// glob 过滤模式（如 *.rs、*.{ts,tsx}，`!` 前缀排除；无斜杠模式跨目录匹配）
     pub glob: Option<String>,
-    /// 最大结果数
+    /// 最大结果数（钳制到配置硬上限内）
     #[serde(default = "default_limit")]
     pub limit: i64,
-    /// 显示匹配行的上下文行数
-    #[serde(default)]
-    pub context: i64,
 }
 
 fn default_path() -> String {
@@ -58,7 +55,4 @@ pub struct GrepMatch {
     pub line: u64,
     /// 匹配内容（超长行按字符截断，尾部以省略标记 `…` 示意）
     pub content: String,
-    /// 上下文（超长行按字符截断，尾部以省略标记 `…` 示意）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<String>,
 }

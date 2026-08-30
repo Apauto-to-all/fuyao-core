@@ -8,7 +8,6 @@
 //! 使用 `grep-regex` 构建正则匹配器，`grep-searcher` 逐行搜索，
 //! `ignore::WalkBuilder` 遍历目录树（自动遵守 .gitignore）。
 //! 支持 glob 参数以 glob 语法过滤文件（如 *.py、*.{ts,tsx}，`!` 前缀排除）。
-//! 支持 context 参数显示匹配行的上下文。
 //! 搜索结果自动脱敏 API Key 等敏感信息。
 
 mod handler;
@@ -39,8 +38,6 @@ pub fn register(map: &mut HashMap<String, ToolEntry>) {
                 format!("最大结果数（默认 {DEFAULT_LIMIT}，有硬上限，超出自动截断）"),
             )
             .default(json!(DEFAULT_LIMIT))
-            .integer("context", "显示匹配行的上下文行数")
-            .default(json!(0))
             .build(),
             tool_handler(grep_impl),
             false,
