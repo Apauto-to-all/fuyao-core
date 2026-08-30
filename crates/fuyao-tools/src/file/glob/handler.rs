@@ -1,32 +1,37 @@
 //! 文件名搜索处理逻辑
 //!
-//! 使用标准 glob 语法搜索文件名。
+//! 按 gitignore 语义的 glob 模式搜索文件名。
 //! 基于 ignore crate（ripgrep 的目录遍历组件）实现，自动遵守 .gitignore 规则。
 //!
 //! ## 实现
 //!
-//! 使用 `ignore::WalkBuilder` 遍历目录树，`glob::Pattern` 匹配文件名。
+//! 使用 `ignore::WalkBuilder` 遍历目录树，`ignore::overrides::OverrideBuilder`
+//! 编译模式并对遍历结果逐项判定：Whitelist / None 收录，Ignore 跳过。
 //! 自动跳过隐藏文件和 .gitignore 排除的文件。
 //! 搜索结果按修改时间排序（最新优先），结果数受配置硬上限约束，超出自动截断。
 
 use crate::common::{parse_tool_args, resolve_ctx_path, run_search_with_timeout, to_ok_output};
 use crate::file::glob::types::{GlobArgs, GlobMatch, GlobResult};
 use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
-use glob::Pattern;
+use ignore::Match;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 搜索文件的核心实现
 ///
-/// 使用 `ignore::WalkBuilder` 遍历目录树，`glob::Pattern` 匹配文件名。
+/// 使用 `ignore::WalkBuilder` 遍历目录树，`ignore::overrides` 覆盖规则逐项判定。
 /// 结果按修改时间排序（最新优先），超过 limit 的部分自动截断。
+///
+/// 模式为 gitignore 语义：无分隔符匹配任意层级的文件名，含 `/` 锚定搜索根
+/// （如 `src/*.rs`），`!` 前缀排除（如 `!*.log`），`{a,b}` 花括号展开
+/// （如 `*.{md,txt}`）——与 grep 工具的 glob 参数同一套模式语言。
 ///
 /// # 参数
 ///
-/// - `pattern`: glob 模式（如 `*.rs`、`*.{ts,tsx}`）；含路径分隔符时匹配
-///   相对搜索根的路径（如 `src/*.rs`），无需感知盘符等根前缀
+/// - `pattern`: glob 模式
 /// - `path`: 搜索根路径（已由调用方解析归一）
 /// - `limit`: 最大返回数量
 ///
@@ -44,8 +49,14 @@ fn search_files(
         return Err(format!("路径不存在: {path}"));
     }
 
-    let glob_pattern = match Pattern::new(pattern) {
-        Ok(p) => p,
+    // 模式编译为覆盖规则，编译失败直接报错（替代静默失配——
+    // 无效模式对调用方可见，可据此修正）
+    let mut override_builder = OverrideBuilder::new(&search_path);
+    if let Err(e) = override_builder.add(pattern) {
+        return Err(format!("glob 模式无效: {e}"));
+    }
+    let overrides = match override_builder.build() {
+        Ok(o) => o,
         Err(e) => return Err(format!("glob 模式无效: {e}")),
     };
 
@@ -71,18 +82,14 @@ fn search_files(
             continue;
         }
 
-        let match_target = if pattern.contains('/') || pattern.contains('\\') {
-            // 模式含路径分隔符：匹配相对搜索根的路径，模式不必对齐盘符等根前缀
-            match entry.path().strip_prefix(&search_path) {
-                Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().to_string(),
-                // 搜索根本身是文件时无相对部分，退回完整路径参与匹配
-                _ => entry.path().to_string_lossy().to_string(),
-            }
-        } else {
-            // 模式只有文件名，只匹配文件名
-            entry.file_name().to_string_lossy().to_string()
+        // 匹配目标：相对搜索根的路径；搜索根本身是文件时退回文件名
+        let match_target = match entry.path().strip_prefix(&search_path) {
+            Ok(rel) if !rel.as_os_str().is_empty() => rel,
+            _ => Path::new(entry.file_name()),
         };
-        if !glob_pattern.matches(&match_target) {
+        // Whitelist 命中收录；纯排除模式下无规则命中（None）同样收录，
+        // Ignore 才跳过——白名单模式下未命中会直接判为 Ignore
+        if matches!(overrides.matched(match_target, false), Match::Ignore(_)) {
             continue;
         }
 
@@ -312,6 +319,97 @@ mod tests {
             other => panic!("期望 Value 结果: {other:?}"),
         };
         assert_eq!(json["total_count"], serde_json::json!(1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `!` 前缀排除：命中排除规则的文件不出现在结果中，其余照常收录
+    #[tokio::test]
+    async fn glob_bang_prefix_excludes_matches() {
+        let dir = std::env::temp_dir().join("fuyao_test_glob_bang_exclude");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("笔记.md"), "内容").unwrap();
+        std::fs::write(dir.join("调试.log"), "内容").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "!*.log",
+            "path": dir.to_string_lossy().to_string(),
+        });
+        let output = glob_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        assert_eq!(json["total_count"], serde_json::json!(1));
+        let matched = json["matches"][0]["path"].as_str().unwrap();
+        assert!(matched.ends_with("笔记.md"), "实际：{matched}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 花括号展开：`*.{md,txt}` 同时命中两种扩展名
+    #[tokio::test]
+    async fn glob_brace_expansion_matches_alternatives() {
+        let dir = std::env::temp_dir().join("fuyao_test_glob_brace");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.md"), "内容").unwrap();
+        std::fs::write(dir.join("b.txt"), "内容").unwrap();
+        std::fs::write(dir.join("c.py"), "内容").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "*.{md,txt}",
+            "path": dir.to_string_lossy().to_string(),
+        });
+        let output = glob_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+
+        assert_eq!(json["total_count"], serde_json::json!(2));
+        let matches_str = json["matches"].to_string();
+        assert!(matches_str.contains("a.md"), "实际：{matches_str}");
+        assert!(matches_str.contains("b.txt"), "实际：{matches_str}");
+        assert!(!matches_str.contains("c.py"), "实际：{matches_str}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 搜索根是文件时：按文件名匹配，模式不命中则零结果
+    #[tokio::test]
+    async fn glob_file_root_matches_by_file_name() {
+        let dir = std::env::temp_dir().join("fuyao_test_glob_file_root");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("笔记.md");
+        std::fs::write(&file_path, "内容").unwrap();
+
+        // 模式命中文件名
+        let args = serde_json::json!({
+            "pattern": "*.md",
+            "path": file_path.to_string_lossy().to_string(),
+        });
+        let output = glob_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+        assert_eq!(json["total_count"], serde_json::json!(1));
+
+        // 模式不命中文件名：零结果而非误收录
+        let args = serde_json::json!({
+            "pattern": "*.txt",
+            "path": file_path.to_string_lossy().to_string(),
+        });
+        let output = glob_impl(args, ToolCallContext::default(), CancellationToken::new()).await;
+        let json = match output {
+            ToolOutput::Value(v) => v,
+            other => panic!("期望 Value 结果: {other:?}"),
+        };
+        assert_eq!(json["total_count"], serde_json::json!(0));
 
         std::fs::remove_dir_all(&dir).ok();
     }

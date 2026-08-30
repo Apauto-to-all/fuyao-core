@@ -10,7 +10,7 @@ pub const DEFAULT_LIMIT: i64 = 100;
 /// glob 工具参数（类型化解析）
 #[derive(Debug, serde::Deserialize)]
 pub struct GlobArgs {
-    /// 标准 glob 模式
+    /// glob 模式（gitignore 语义：`!` 排除、`{a,b}` 展开、含 `/` 锚定搜索根）
     pub pattern: String,
     /// 搜索路径
     #[serde(default = "default_path")]

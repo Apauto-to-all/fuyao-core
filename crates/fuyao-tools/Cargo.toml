@@ -13,7 +13,6 @@ regex = { workspace = true }
 fancy-regex = { workspace = true }
 similar = { workspace = true }
 strsim = { workspace = true }
-glob = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 ignore = { workspace = true }

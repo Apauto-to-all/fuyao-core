@@ -183,6 +183,27 @@ async fn glob_no_match_returns_empty() {
     let _ = result_str;
 }
 
+#[tokio::test]
+async fn glob_bang_prefix_excludes_matches() {
+    let ws = TempDir::new().unwrap();
+    fs::write(ws.path().join("a.md"), "x").unwrap();
+    fs::write(ws.path().join("b.log"), "x").unwrap();
+    let ctx = make_ctx(ws.path().to_path_buf());
+
+    let entry = get_tool("glob").unwrap();
+    let result = call_tool(&entry.handler, json!({"pattern": "!*.log"}), &ctx).await;
+
+    let result_str = result.to_string();
+    assert!(
+        result_str.contains("a.md"),
+        "应保留非排除文件，实际：{result_str}"
+    );
+    assert!(
+        !result_str.contains("b.log"),
+        "排除文件不应出现，实际：{result_str}"
+    );
+}
+
 // ============================================================================
 // grep：真实内容搜索
 // ============================================================================

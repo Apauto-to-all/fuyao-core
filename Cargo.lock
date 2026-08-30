@@ -1155,7 +1155,6 @@ dependencies = [
  "fuyao-api",
  "fuyao-prompt",
  "fuyao-session",
- "glob",
  "grep-regex",
  "grep-searcher",
  "htmd",
