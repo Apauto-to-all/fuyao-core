@@ -15,6 +15,7 @@ pub(crate) mod types;
 mod lifecycle;
 mod provider_ops;
 mod runtime;
+mod snapshot_gc;
 mod stop;
 mod teardown;
 #[cfg(test)]
@@ -124,6 +125,13 @@ pub struct Engine {
     /// 供子代理类工具派生子 session 时 upgrade 后调用。
     /// 强引用循环避免：Engine → ToolRegistry → handler → ctx → Weak<Engine> 不成强环。
     engine_weak: Weak<Engine>,
+
+    /// 文件快照器（引擎级共享，装配层构造注入）
+    ///
+    /// 引擎级单一句柄：assemble_session 时 clone 进每个 session 的 SessionCtx
+    /// （工具批边界采集用）。同进程多会话经句柄内部的互斥锁串行共享同一影子仓。
+    /// 禁用态（配置关闭 / git 缺失）下所有操作静默跳过。
+    file_snapshot: fuyao_snapshot::FileSnapshot,
 }
 
 impl Engine {
@@ -151,6 +159,11 @@ impl Engine {
     /// （如 [`SessionManager`](../../fuyao_app/session_manager/struct.SessionManager.html)）
     /// 共享同一份 store。注入的 `Arc` 与其他消费者共享同一连接池。
     ///
+    /// `file_snapshot` 是文件快照器（影子 git 仓句柄），由装配方构造探测后注入：
+    /// 引擎持有引擎级共享句柄，每个 session 的工具批边界经它做基线采集；
+    /// 装配层同步保留一份 clone 给回退门面（SessionManager），两边共享同一影子仓。
+    /// 构造后启动影子仓 gc 后台任务（启动跑一次 + 每 24h 一次，随 shutdown 退出）。
+    ///
     /// **不建立出口通道**——per-session 出站通道在 [`Engine::assemble_session`]
     /// 时按 session 独立创建，rx 随创建方法返回给调用方。
     pub async fn new(
@@ -159,7 +172,13 @@ impl Engine {
         tools: ToolRegistry,
         plugin_host: PluginHost,
         store: Arc<SessionStore>,
+        file_snapshot: fuyao_snapshot::FileSnapshot,
     ) -> Arc<Self> {
+        // 引擎级关闭信号先行创建：gc 后台任务挂其 child（shutdown 时 cancel root
+        // → child 同步退出），随后同一条信号进 Engine 字段供 session 派生使用
+        let shutdown_token = CancellationToken::new();
+        // 影子仓 gc 后台任务：不阻塞装配，退出信号挂引擎级 shutdown_token
+        snapshot_gc::spawn_snapshot_gc(file_snapshot.clone(), shutdown_token.child_token());
         // Arc::new_cyclic：构造 Engine 时拿到自身的 Weak 引用，
         // 存入 engine_weak 字段供后续注入工具 ctx（子代理工具用）
         Arc::new_cyclic(|weak| Engine {
@@ -170,8 +189,9 @@ impl Engine {
             sessions: Mutex::new(std::collections::HashMap::new()),
             params,
             shutdown: Arc::new(AtomicBool::new(false)),
-            shutdown_token: CancellationToken::new(),
+            shutdown_token,
             engine_weak: weak.clone(),
+            file_snapshot,
         })
     }
 

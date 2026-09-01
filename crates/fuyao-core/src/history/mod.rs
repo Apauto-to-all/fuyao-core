@@ -56,8 +56,9 @@ use fuyao_api::{AgentPaths, Message, MessageKind, MessageRole, ToolCallData};
 ///
 /// 管道：拦截 → [`event_to_message`] 投影落 DB（seq 回填）→ 发送 → 观察。
 /// Block 时：不落库、不发（插件的责任，消息不进历史、UI 看不到）。
-pub(crate) async fn emit_to_history(ctx: &SessionCtx, event: OutputEvent) {
-    emit_inner(ctx, event, None).await;
+/// 返回落库后的 seq（Block / 非历史事件 / 落库失败为 `None`）。
+pub(crate) async fn emit_to_history(ctx: &SessionCtx, event: OutputEvent) -> Option<i64> {
+    emit_inner(ctx, event, None).await
 }
 
 /// 进历史统一入口（计费路径）：assistant 正常产出专用
@@ -65,21 +66,26 @@ pub(crate) async fn emit_to_history(ctx: &SessionCtx, event: OutputEvent) {
 /// `model_id` 是计费归属模型（turn 发起时的快照）——费用按「实际跑的模型」算，
 /// 并写入 `Message.model_id` 供归属查询。映射、计费、落库、seq 回填全部内化，
 /// 调用方不可能漏计费。
-pub(crate) async fn emit_billed_to_history(ctx: &SessionCtx, event: OutputEvent, model_id: &str) {
-    emit_inner(ctx, event, Some(model_id)).await;
+/// 返回落库后的 seq（Block / 落库失败为 `None`）——工具批边界的文件快照行以
+/// assistant 消息 seq 为锚点，Block 或落库失败即无锚点、跳过采集。
+pub(crate) async fn emit_billed_to_history(
+    ctx: &SessionCtx,
+    event: OutputEvent,
+    model_id: &str,
+) -> Option<i64> {
+    emit_inner(ctx, event, Some(model_id)).await
 }
 
-/// 管道主体：拦截 → 映射落库（seq 回填）→ 发送 → 观察
-async fn emit_inner(ctx: &SessionCtx, event: OutputEvent, bill_model: Option<&str>) {
+/// 管道主体：拦截 → 映射落库（seq 回填）→ 发送 → 观察；返回落库 seq
+async fn emit_inner(ctx: &SessionCtx, event: OutputEvent, bill_model: Option<&str>) -> Option<i64> {
     // 1. 拦截（同步原地修改；Block：不落库、不发——插件的责任，消息不进历史、UI 看不到）
-    let Some(mut intercepted) = dispatch::intercept(&ctx.hooks, event) else {
-        return;
-    };
+    let mut intercepted = dispatch::intercept(&ctx.hooks, event)?;
 
     // 2. 用拦截后事件投影成 Message 后落 DB。
     //    sessions 表的计数 / 费用累加由 insert_message 事务内原子完成（单一数据源）。
     //    失败仅 warn——保证拦截→发送→观察管道不被 DB 写失败阻塞；
     //    调用方继续推进（消息可能丢失但 turn 流程不卡死，对齐 fail-loud 但不崩原则）
+    let mut persisted_seq = None;
     if let Some(mut msg) = event_to_message(&intercepted, bill_model, &ctx.agent_paths) {
         if let Err(e) = ctx
             .store
@@ -96,11 +102,13 @@ async fn emit_inner(ctx: &SessionCtx, event: OutputEvent, bill_model: Option<&st
             // 落库成功：seq 已回填到 msg，反写进事件 base，使实时事件与历史回放同构。
             // 前端游标分页据此连续定位，实时 / 历史 id 不再分裂。
             intercepted.base_mut().seq = Some(msg.seq);
+            persisted_seq = Some(msg.seq);
         }
     }
 
     // 3. 发送事件给 UI + 4. 观察钩子（deliver 按值消费事件）
     dispatch::deliver(&ctx.emitter, &ctx.hooks, intercepted).await;
+    persisted_seq
 }
 
 /// 事件 → Message 投影（正向映射的全部知识）

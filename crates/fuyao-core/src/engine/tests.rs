@@ -42,6 +42,7 @@ async fn make_engine_with(providers: ProviderRegistry) -> (Arc<Engine>, tempfile
         ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
     (engine, dir)

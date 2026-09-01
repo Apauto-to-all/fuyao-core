@@ -129,6 +129,7 @@ async fn remove_queued_message_end_to_end_flow() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         std::sync::Arc::clone(&store),
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 

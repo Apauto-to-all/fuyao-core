@@ -188,6 +188,14 @@ impl FileSnapshot {
         }
     }
 
+    /// 直接构造禁用态（配置总开关关闭用）
+    ///
+    /// `[snapshot] enabled = false` 时装配层用本构造器跳过探测，全程等同
+    /// 「快照不可用」降级：track 静默跳过、回退降级为仅消息回退、gc 跳过成功。
+    pub fn disabled() -> FileSnapshot {
+        FileSnapshot { repo: None }
+    }
+
     /// 是否处于可用态（构造探测通过）
     pub fn is_enabled(&self) -> bool {
         self.repo.is_some()
@@ -545,6 +553,15 @@ mod tests {
         assert!(!snap.is_enabled());
         let outcome = snap.track(None).await.unwrap();
         assert!(outcome.is_none());
+    }
+
+    /// 直接构造的禁用态与探测失败降级同形：全程静默跳过，不创建任何目录
+    #[tokio::test]
+    async fn disabled_constructor_skips_everything() {
+        let snap = FileSnapshot::disabled();
+        assert!(!snap.is_enabled());
+        assert!(snap.track(None).await.unwrap().is_none());
+        assert!(snap.gc().await.is_ok());
     }
 
     /// 影子仓初始化失败（快照根被普通文件占据）→ 禁用态

@@ -179,6 +179,7 @@ mod tests {
             ToolRegistry::builder().build(),
             PluginHost::new(),
             store,
+            fuyao_snapshot::FileSnapshot::disabled(),
         )
         .await
     }

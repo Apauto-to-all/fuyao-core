@@ -75,6 +75,7 @@ async fn shutdown_blocks_send_with_shutdown_error() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -109,6 +110,7 @@ async fn shutdown_returns_none_for_recv() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -146,6 +148,7 @@ async fn shutdown_terminates_active_session_and_persists() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -226,6 +229,7 @@ async fn shutdown_unblocks_task_in_retry_backoff() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -314,6 +318,7 @@ async fn shutdown_terminates_concurrent_sessions_in_parallel() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -423,6 +428,7 @@ async fn shutdown_disposes_plugin_instances_then_factories() {
         fuyao_core::ToolRegistry::builder().build(),
         host,
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -464,6 +470,7 @@ async fn shutdown_disposes_factories_even_without_sessions() {
         fuyao_core::ToolRegistry::builder().build(),
         host,
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 

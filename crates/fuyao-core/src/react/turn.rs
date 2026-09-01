@@ -316,6 +316,8 @@ async fn handle_tool_calls(
     // 步骤2：用 effective_tool_calls 构造 effective_result → AssistantMessage 事件
     // 经计费入口：拦截整个 AssistantMessage（同步 content/reasoning）→ 投影落 DB → 发送
     // （tool_calls 落库取自拦截后事件 payload，与第一层 ToolCall 拦截结果同源）
+    // 返回落库 seq：工具批的文件快照行以 assistant 消息 seq 为锚点，
+    // Block / 落库失败返回 None（无锚点即跳过采集）
     let effective_result = StreamResult {
         text: result.text.clone(),
         reasoning: result.reasoning.clone(),
@@ -326,8 +328,9 @@ async fn handle_tool_calls(
         base: EventBase::default(),
         payload: assistant_payload(&effective_result),
     });
-    crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
-    // 拦截 Block：消息不进历史、不计费——插件的责任
+    let assistant_seq =
+        crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
+    // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
     // 若全部工具调用被拦截（effective 为空）或 AssistantMessage 被 Block，无需执行
     // 工具批——直接走消费时机①（经消费门取件）后回 ReAct 顶部
@@ -336,6 +339,11 @@ async fn handle_tool_calls(
         consume_batch(ctx, entries).await;
         return false;
     }
+
+    // 步骤2.5：文件快照采集——此刻本批 assistant 消息已落库（seq 已知）、工具尚未
+    // 执行，工作区状态即「本批工具执行前」的基线。纯对话轮不进本函数，零快照成本；
+    // 采集失败 WARN 不中断（fail-open：该批无快照行，工具照常执行）
+    track_before_tool_batch(ctx, assistant_seq).await;
 
     // 步骤3：中断点②——工具执行期间（含 shutdown）
     // execute_tools 通过 result_tx 通知完成（一个一个通知）；本循环边收边走统一历史入口
@@ -469,5 +477,74 @@ async fn drain_finished_results(
 ) {
     while let Ok(r) = result_rx.try_recv() {
         record_tool_result(ctx, answered, r).await;
+    }
+}
+
+/// 工具批执行前的文件快照采集（全局唯一触发点）
+///
+/// 每个「即将执行工具」的批边界做一次全工作区采集并落一行 file_snapshots：
+/// - 基线树 = 影子仓 write-tree 结果（本批工具执行前的工作区现场）
+/// - 变更集 = 对比本会话上一条快照行的基线树（首拍为空集）
+/// - `msg_seq` = 本批 assistant 消息的落库 seq（行与消息以同一 `seq >= target`
+///   谓词同生共死，回退联动据此取行）
+///
+/// 降级路径全部 fail-open（WARN、不中断 turn）：
+/// - `msg_seq` 为 None：assistant 消息未落库（拦截 Block / 落库失败），无锚点跳过
+/// - 快照禁用态（配置关闭 / git 缺失）：零成本跳过
+/// - prev_tree 查询 / 采集 / 落行任一失败：该批无快照行，工具照常执行
+async fn track_before_tool_batch(ctx: &SessionCtx, msg_seq: Option<i64>) {
+    // 无锚点不采集：快照行必须关联到一条已落库的 assistant 消息
+    let Some(msg_seq) = msg_seq else {
+        return;
+    };
+    // 禁用态零成本跳过（不查 prev_tree、不碰影子仓）
+    if !ctx.file_snapshot.is_enabled() {
+        return;
+    }
+    // prev_tree：本会话最新快照行的基线树（None = 首拍，变更集为空）
+    let prev_tree = match ctx
+        .store
+        .latest_file_snapshot_tree(ctx.emitter.session_id())
+        .await
+    {
+        Ok(tree) => tree,
+        Err(cause) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %cause,
+                "查询上一快照基线树失败，本批跳过文件快照（不影响工具执行）"
+            );
+            return;
+        }
+    };
+    // 采集：add -A → write-tree → diff-tree（影子仓内部互斥，同进程多会话串行）
+    let outcome = match ctx.file_snapshot.track(prev_tree.as_deref()).await {
+        Ok(Some(outcome)) => outcome,
+        Ok(None) => return, // 可用态探测与禁用判定间的兜底分支：静默跳过
+        Err(cause) => {
+            tracing::warn!(
+                session_id = ctx.emitter.session_id(),
+                cause = %cause,
+                "文件快照采集失败，本批无快照行（不影响工具执行）"
+            );
+            return;
+        }
+    };
+    // 落行：失败同样 fail-open（该批触碰集缺失由后续批次的增量 diff 自然覆盖）
+    if let Err(cause) = ctx
+        .store
+        .insert_file_snapshot(
+            ctx.emitter.session_id(),
+            msg_seq,
+            &outcome.tree_hash,
+            &outcome.files,
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = ctx.emitter.session_id(),
+            cause = %cause,
+            "文件快照行落库失败，本批无快照行（不影响工具执行）"
+        );
     }
 }

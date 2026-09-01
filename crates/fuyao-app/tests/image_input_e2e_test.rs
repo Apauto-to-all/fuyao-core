@@ -73,7 +73,15 @@ async fn image_input_described_by_real_llm() {
             .await
             .expect("创建会话存储失败"),
     );
-    let engine = Engine::new(engine_params, provider, empty_tools, plugin_host, store).await;
+    let engine = Engine::new(
+        engine_params,
+        provider,
+        empty_tools,
+        plugin_host,
+        store,
+        fuyao_snapshot::FileSnapshot::disabled(),
+    )
+    .await;
     let app = App::new(engine, None, log_guard);
 
     // 2. 读本地图片 → base64 → ImageContent（mime 按扩展名推断）

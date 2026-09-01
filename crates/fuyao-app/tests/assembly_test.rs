@@ -72,6 +72,7 @@ async fn shutdown_with_no_mcp_manager_does_not_panic() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 

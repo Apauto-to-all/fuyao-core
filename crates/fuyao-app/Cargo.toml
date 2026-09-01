@@ -13,6 +13,7 @@ fuyao-mcp = { path = "../fuyao-mcp" }
 fuyao-prompt = { path = "../fuyao-prompt" }
 fuyao-provider = { path = "../fuyao-provider" }
 fuyao-session = { path = "../fuyao-session" }
+fuyao-snapshot = { path = "../fuyao-snapshot" }
 fuyao-tools = { path = "../fuyao-tools" }
 serde_json.workspace = true
 thiserror.workspace = true

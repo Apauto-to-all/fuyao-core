@@ -89,6 +89,24 @@ pub(super) async fn validate_cut_target(
 }
 
 impl super::SessionStore {
+    /// 校验切割目标（池上只读路径，无任何写副作用）
+    ///
+    /// 回退的预览与执行共用本校验：预览方先调它确认目标合法再读影响面，
+    /// 执行方（[`rollback_to`](Self::rollback_to)）在事务内走同一判定函数——
+    /// 两个入口的目标约束永远同一套，同一状态下结论一致。
+    ///
+    /// # 错误
+    /// - [`SessionError::NotFound`]:session_id 不存在，或 target_seq 在该 session 中无对应消息
+    /// - [`SessionError::InvalidCutTarget`]:目标非 user 且非 compaction
+    pub async fn validate_cut_target(
+        &self,
+        session_id: &str,
+        target_seq: i64,
+    ) -> Result<(), SessionError> {
+        let mut conn = self.pool.acquire().await?;
+        validate_cut_target(&mut conn, session_id, target_seq).await
+    }
+
     /// 把会话回退到目标消息之前（删目标消息及其后的所有消息与同谓词快照行 + 重算
     /// count 类与压缩元数据）
     ///
@@ -468,6 +486,39 @@ mod tests {
             matches!(result, Err(SessionError::InvalidCutTarget(_))),
             "tool 孤儿消息不可作为回退目标"
         );
+    }
+
+    // ===== 池上只读校验（预览与执行共用） =====
+
+    /// 只读校验与 rollback_to 同一套判定：合法目标通过，中间态与缺失目标拒绝，
+    /// 且校验本身不改动 DB
+    #[tokio::test]
+    async fn validate_cut_target_readonly_matches_rollback_rules() {
+        let store = temp_store().await;
+        let session = store.create_session(None, None, None).await.unwrap();
+        insert_user(&store, &session.id, "u1").await; // seq 1
+        let a1 = insert_assistant(&store, &session.id, "a1").await; // seq 2
+
+        // user 目标：通过
+        assert!(store.validate_cut_target(&session.id, 1).await.is_ok());
+
+        // assistant 中间态：拒绝（与 rollback_to 同变体）
+        let err = store
+            .validate_cut_target(&session.id, a1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::InvalidCutTarget(_)));
+
+        // 缺失 seq：NotFound
+        let err = store
+            .validate_cut_target(&session.id, 99)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SessionError::NotFound(_)));
+
+        // 校验无写副作用：消息原封
+        let full = store.load_full_history(&session.id).await.unwrap();
+        assert_eq!(full.len(), 2);
     }
 
     // ===== 目标 / session 不存在 =====

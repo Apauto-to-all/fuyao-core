@@ -116,6 +116,28 @@ impl super::SessionStore {
             .collect()
     }
 
+    /// 查询本会话最新一条快照行的基线树
+    ///
+    /// 快照触发方（ReAct 循环的工具批边界）做增量拍时取 prev_tree 用：只取
+    /// tree_hash 单列（不解析各行 files JSON），是 [`Self::list_file_snapshots_from`]
+    /// 的轻量尾部查询。会话无快照行返回 `None`（增量拍的「首拍」语义）。
+    ///
+    /// # 错误
+    /// - [`SessionError::SqlxError`]:SQL 执行失败
+    pub async fn latest_file_snapshot_tree(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, SessionError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT tree_hash FROM file_snapshots WHERE session_id = ?1
+             ORDER BY msg_seq DESC, id DESC LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(tree_hash,)| tree_hash))
+    }
+
     /// 删除 `msg_seq >= from_seq` 的快照行，返回删到的行数
     ///
     /// 独立删除入口（池上路径）；`rollback_to` 的单事务联动走
@@ -321,6 +343,55 @@ mod tests {
         assert!(
             matches!(result, Err(SessionError::SnapshotFilesJson(_))),
             "脏 files JSON 应按错误上抛，不静默丢弃"
+        );
+    }
+
+    /// 尾部轻量查询：取本会话最新快照行的基线树（增量拍 prev_tree）
+    #[tokio::test]
+    async fn latest_file_snapshot_tree_returns_tail_and_none() {
+        let store = temp_store().await;
+        let session = store.create_session(None, None, None).await.unwrap();
+
+        // 无快照行：None（首拍语义）
+        assert_eq!(
+            store.latest_file_snapshot_tree(&session.id).await.unwrap(),
+            None
+        );
+
+        insert_snap(&store, &session.id, 2, "tree_a").await;
+        insert_snap(&store, &session.id, 4, "tree_b").await;
+
+        // 多行时取 msg_seq 最大者
+        assert_eq!(
+            store.latest_file_snapshot_tree(&session.id).await.unwrap(),
+            Some("tree_b".to_string())
+        );
+
+        // 会话间隔离：他会话不串
+        let other = store.create_session(None, None, None).await.unwrap();
+        assert_eq!(
+            store.latest_file_snapshot_tree(&other.id).await.unwrap(),
+            None
+        );
+    }
+
+    /// 同 msg_seq 多行时按 id 取最新插入的一行
+    #[tokio::test]
+    async fn latest_file_snapshot_tree_breaks_ties_by_id() {
+        let store = temp_store().await;
+        let session = store.create_session(None, None, None).await.unwrap();
+        // 直接落两行同 msg_seq 的快照（seq 复用场景之外的重复行）
+        store
+            .insert_file_snapshot(&session.id, 3, "tree_first", &[])
+            .await
+            .unwrap();
+        store
+            .insert_file_snapshot(&session.id, 3, "tree_second", &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.latest_file_snapshot_tree(&session.id).await.unwrap(),
+            Some("tree_second".to_string())
         );
     }
 

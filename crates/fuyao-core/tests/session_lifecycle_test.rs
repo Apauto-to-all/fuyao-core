@@ -73,6 +73,7 @@ async fn destroy_session_removes_from_schedule() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -125,6 +126,7 @@ async fn destroy_session_does_not_affect_other_sessions() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -206,6 +208,7 @@ async fn child_session_has_independent_channel_from_parent() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -251,6 +254,7 @@ async fn child_session_has_independent_channel_from_parent() {
                 OutputEvent::Title(m) => m.base.session_id.as_deref(),
                 OutputEvent::Retry(m) => m.base.session_id.as_deref(),
                 OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
+                OutputEvent::FilesRestored(m) => m.base.session_id.as_deref(),
             }
             .unwrap_or("");
             assert_eq!(
@@ -298,6 +302,7 @@ async fn child_session_rx_returns_none_after_session_exits() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -388,6 +393,7 @@ async fn destroy_session_disposes_plugin_instances_in_reverse_order() {
         fuyao_core::ToolRegistry::builder().build(),
         host,
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 

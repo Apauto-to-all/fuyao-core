@@ -25,6 +25,7 @@ use std::sync::Arc;
 use fuyao_api::EngineParams;
 use fuyao_core::Engine;
 use fuyao_session::SessionStore;
+use fuyao_snapshot::FileSnapshot;
 
 pub use bootstrap::{
     InitError, InitResult, LogGuard, build_plugin_host, build_tool_registry, init_engine,
@@ -32,6 +33,9 @@ pub use bootstrap::{
 pub use manager::list_agent_ids;
 pub use manager::{ProviderAdminError, ProviderManager, ProviderModelSpec, ProviderSpec};
 pub use runtime::{App, Discovery, SessionManager};
+// 回退门面的配套类型（执行结论 / 预览报告 / 错误）：二次开发方消费 rollback_session
+// 与 preview_rollback 时按名引用，随门面一并透出
+pub use runtime::{FileRollbackOutcome, FilesPreview, RollbackError, RollbackPreview};
 // SessionManager 各方法的错误类型：二次开发方对变体分类处理（如映射应用层提示）时
 // 需按名引用该类型，随门面一并透出，免于直赖 fuyao-session
 pub use fuyao_session::SessionError;
@@ -71,16 +75,21 @@ pub struct FuyaoApp {
     pub discovery: Discovery,
 }
 
-/// 一键启动：init_engine → build_tool_registry → 创建 store → Engine::new → 装配
+/// 一键启动：init_engine → build_tool_registry → 创建 store → 构造快照器 →
+/// Engine::new → 装配
 ///
 /// 这是绝大多数应用推荐的入口：一行完成配置/日志/Provider 准备 +
-/// 工具收集（内置 + MCP）+ 会话存储创建 + 引擎启动 + 装配，返回可直接使用的 [`FuyaoApp`]。
+/// 工具收集（内置 + MCP）+ 会话存储创建 + 文件快照器构造 + 引擎启动 + 装配，
+/// 返回可直接使用的 [`FuyaoApp`]。
 ///
 /// 与早期只返单个 [`App`] 的差异：store 所有权上移到装配层——Engine 不再内部创建 store，
 /// 而是由本函数创建后注入 Engine 与 [`SessionManager`]，两者共享同一份连接池。
+/// 文件快照器同构：本函数按 `[snapshot]` 配置构造后同时注入 Engine（工具批采集）
+/// 与 [`SessionManager`]（回退恢复），两边共享同一影子仓。
 ///
 /// 需要在中间介入（如动态追加工具）时，改用 [`init_engine`] + [`build_tool_registry`]
-/// 分步装配，再自行创建 store、调 `Engine::new` + [`App::new`] + [`SessionManager::new`]。
+/// 分步装配，再自行创建 store、构造快照器、调 `Engine::new` + [`App::new`] +
+/// [`SessionManager::new`]。
 pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
     // 1. 配置 / 日志 / Provider 准备（init_engine 内部取出 agent_paths 供子流程定位路径）
     let InitResult {
@@ -108,20 +117,49 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
             .map_err(|e| SetupError::Storage(e.to_string()))?,
     );
 
-    // 5. 构造选择支持门面（持有启动时的完整路径身份，含 agent_id）
+    // 5. 构造文件快照器（影子仓）：worktree 取 workspace，缺省回退进程当前目录
+    //    （与工具层的工作目录解析口径一致）；影子仓选址按数据目录惯例
+    //    （agent 层 / 全局层下的 snapshots/{hash(worktree)}/）。
+    //    [snapshot] enabled = false 时直接构造禁用态（全程跳过，等同快照不可用降级）；
+    //    git 缺失由构造探测内部降级（WARN + 禁用态），不阻断启动。
+    let snapshot_cfg = fuyao_api::get_config().snapshot.clone();
+    let worktree = params
+        .agent_paths
+        .workspace
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let snapshot_root = params.agent_paths.snapshot_root(&worktree);
+    let snapshot = if snapshot_cfg.enabled {
+        FileSnapshot::new(&worktree, &snapshot_root, snapshot_cfg.max_untracked_mb).await
+    } else {
+        FileSnapshot::disabled()
+    };
+
+    // 6. 构造选择支持门面（持有启动时的完整路径身份，含 agent_id）
     //    在 Engine::new 消费 params 前 clone 出 agent_paths，供其零参数查询复用。
     let discovery = Discovery::new(params.agent_paths.clone());
 
-    // 6. 启动引擎（store 注入，工具 + 插件工厂构造时注入）
+    // 7. 启动引擎（store + 快照器注入，工具 + 插件工厂构造时注入）
     //    重试在 session 内由 RetryRunner 驱动（per-session，发 OutputEvent::Retry）
-    let engine = Engine::new(params, provider, tools, plugin_host, store.clone()).await;
+    let engine = Engine::new(
+        params,
+        provider,
+        tools,
+        plugin_host,
+        store.clone(),
+        snapshot.clone(),
+    )
+    .await;
 
     tracing::info!("引擎启动完成");
 
-    // 7. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store）+ 选择支持门面
+    // 8. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store 与快照器，
+    //    事件出口接 app 级单一出口）+ 选择支持门面
+    let app = App::new(engine, mcp_manager, log_guard);
+    let sessions = SessionManager::new(store, snapshot, app.event_sink());
     Ok(FuyaoApp {
-        app: App::new(engine, mcp_manager, log_guard),
-        sessions: SessionManager::new(store),
+        app,
+        sessions,
         discovery,
     })
 }

@@ -308,6 +308,36 @@ terminal_default_timeout_secs = 240
         let _ = std::fs::remove_file(&workspace);
     }
 
+    /// snapshot 段的三层深合并：workspace 层覆盖 global 层，未覆盖字段保留
+    #[test]
+    fn snapshot_section_merges_across_layers() {
+        let global = temp_config_path(
+            "snapshot_global",
+            r#"
+[snapshot]
+enabled = true
+max_untracked_mb = 4
+"#,
+        );
+        let workspace = temp_config_path(
+            "snapshot_ws",
+            r#"
+[snapshot]
+max_untracked_mb = 16
+"#,
+        );
+
+        let cfg = load_merged_config(Some(&global), None, Some(&workspace))
+            .unwrap()
+            .unwrap();
+        // workspace 覆盖 max_untracked_mb，global 的 enabled 保留
+        assert!(cfg.snapshot.enabled);
+        assert_eq!(cfg.snapshot.max_untracked_mb, 16);
+
+        let _ = std::fs::remove_file(&global);
+        let _ = std::fs::remove_file(&workspace);
+    }
+
     /// providers 数值容错解析（整数价格不被丢弃），limit.context 必填校验
     #[test]
     fn providers_parsing_via_loader_enforces_limit_context() {

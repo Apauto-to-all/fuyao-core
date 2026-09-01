@@ -209,6 +209,7 @@ async fn assemble_engine(paths: &AgentPaths) -> Arc<Engine> {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await
 }

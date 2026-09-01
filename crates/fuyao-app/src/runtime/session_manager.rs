@@ -1,4 +1,4 @@
-//! 会话管理门面：会话检索 / 浏览 / 元数据编辑的接口
+//! 会话管理门面：会话检索 / 浏览 / 元数据编辑 / 回退编排的接口
 //!
 //! 与 [`crate::App`]（运行时交互门面）平级正交：
 //! - [`crate::App`] 管对话的进行（create / send / recv）
@@ -10,6 +10,17 @@
 //! 通讯方式为直接异步方法调用——纯存储操作、不涉及 LLM、不需要流式产出，
 //! 与 `App::create_session` 返 `SessionId` 同属「管理型同步方法」，不走消息总线。
 //!
+//! # 回退的文件侧联动
+//!
+//! [`SessionManager::rollback_session`] 是回退的编排入口：消息侧走存储层
+//! `rollback_to` 单事务，文件侧经共享的 [`fuyao_snapshot::FileSnapshot`]（与 Engine
+//! 内 ReAct 采集共用同一影子仓句柄）先恢复文件后动 DB——顺序承重不可倒置，
+//! 保证失败时消息 / 快照行原封、恢复幂等可安全重试。文件回退结果经
+//! [`OutputEvent::FilesRestored`] 纯事件送进 app 级单一出口（事件通道由装配层
+//! 从 [`App::event_sink`](crate::App::event_sink) 注入，与本门面的存储职责解耦）。
+//! [`SessionManager::preview_rollback`] 提供只读双轴预览，与执行共用同一套目标
+//! 校验与影响计算——同一状态下两者结论一致；预览是建议、执行是权威。
+//!
 //! # 写能力边界
 //!
 //! 本门面只暴露**适合外部编辑**的字段。引擎内核的自动写（create / 压缩后重建
@@ -19,32 +30,55 @@
 
 use std::sync::Arc;
 
+use fuyao_api::Message;
+use fuyao_api::message::output::{FilesRestoredMessage, FilesRestoredPayload};
+use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_session::SessionStore;
+use fuyao_snapshot::FileSnapshot;
+use tokio::sync::mpsc;
 
-/// 会话管理器：持有会话存储句柄，对外提供会话检索 / 浏览 / 元数据编辑接口
+/// 会话管理器：持有会话存储与文件快照句柄，对外提供会话检索 / 浏览 / 元数据编辑 /
+/// 回退编排接口
 ///
 /// 与 [`App`](crate::App) 平级正交：
 /// - [`App`](crate::App) 管「对话的进行」（create / send / recv）
 /// - `SessionManager` 管「会话的检索 / 浏览 / 手动编辑」（列会话 / 查历史 / 改标题）
 ///
-/// 两者共享同一份 `SessionStore`（Arc 克隆，零拷贝共享连接池）。
+/// 与 Engine 共享同一份 `SessionStore` 与同一个 `FileSnapshot`（Arc 级克隆，
+/// 零拷贝共享连接池与影子仓）。
 ///
-/// `Clone` 廉价：唯一字段是 `Arc<SessionStore>`，clone 仅增引用计数、零拷贝，
-/// 两个 clone 共享同一份存储与连接池。供消费方（如适配层在锁内 clone 出 owned
-/// 句柄以消除借用穿透 await）按需取用。
+/// `Clone` 廉价：三个字段全是共享句柄，clone 仅增引用计数、零拷贝。
+/// 供消费方（如适配层在锁内 clone 出 owned 句柄以消除借用穿透 await）按需取用。
 #[derive(Clone)]
 pub struct SessionManager {
     /// 会话存储句柄（与 Engine 共享同一份，Arc 克隆）
     store: Arc<SessionStore>,
+    /// 文件快照器（与 Engine 内 ReAct 采集共享同一影子仓句柄）
+    snapshot: FileSnapshot,
+    /// app 级单一出口的发送端（文件回退结果事件由此投递；与 forwarder 共用通道）
+    event_tx: mpsc::Sender<OutputEvent>,
 }
 
 impl SessionManager {
-    /// 由装配层（[`crate::start`]）注入 store 句柄构造
+    /// 由装配层（[`crate::start`]）注入共享句柄构造
     ///
-    /// 与 Engine 共享同一份 `SessionStore`——传入的是 `Arc` 克隆，仅增引用计数、零拷贝，
-    /// 两者指向同一份内存、同一个 `SqlitePool` 连接池。
-    pub fn new(store: Arc<SessionStore>) -> Self {
-        Self { store }
+    /// - `store` 与 Engine 共享同一份 `SessionStore`——Arc 克隆仅增引用计数，
+    ///   两者指向同一个 `SqlitePool` 连接池
+    /// - `snapshot` 与 Engine 共享同一影子仓句柄——回退恢复与 ReAct 采集操作同一份
+    ///   快照对象库，经句柄内部互斥串行
+    /// - `event_tx` 是 app 级事件出口的发送端（通常取自
+    ///   [`App::event_sink`](crate::App::event_sink)）——回退的文件结果事件由此
+    ///   进入单一出口，供 UI 消费
+    pub fn new(
+        store: Arc<SessionStore>,
+        snapshot: FileSnapshot,
+        event_tx: mpsc::Sender<OutputEvent>,
+    ) -> Self {
+        Self {
+            store,
+            snapshot,
+            event_tx,
+        }
     }
 
     // ── 会话查询 ───────────────────────────────────────────────
@@ -171,33 +205,229 @@ impl SessionManager {
         self.store.delete(session_id).await
     }
 
-    // ── 会话回退 ───────────────────────────────────────────────
+    // ── 会话回退（消息 + 文件联动编排）────────────────────────
 
-    /// 把会话回退到目标消息之前（删目标消息及其后的所有消息 + 重算 count 类与压缩元数据）
+    /// 回退的目标校验 + 文件侧影响计算（预览与执行共用的内部函数）
     ///
-    /// 复用存储层单事务原子执行体 [`SessionStore::rollback_to`](fuyao_session::SessionStore::rollback_to)
-    /// （删消息 + 重算 + 局部 UPDATE），执行成功返回 `Ok(())`，无返回载荷——回退后的
-    /// 会话状态经既有读路径获取：`list_messages` 看剩余消息流，`get_session` 看重算后的
-    /// session 行；目标用户消息的本体内容调用方本就持有（回退点由调用方选定）。
+    /// 三步：
+    /// 1. 池上只读校验目标（与 `rollback_to` 事务内同一判定函数）——两个入口的
+    ///    目标约束永远同一套
+    /// 2. 快照禁用态直接返回 [`FileImpact::Unavailable`]（不查行）
+    /// 3. 查 `msg_seq >= target_seq` 的快照行：空返回 [`FileImpact::Empty`]；
+    ///    非空取首行 `tree_hash` 为基线树、各行 `files` 并集为触碰集
+    async fn resolve_file_impact(
+        &self,
+        session_id: &str,
+        target_seq: i64,
+    ) -> Result<FileImpact, RollbackError> {
+        // 目标校验先行：非法目标在预览与执行两个入口报同一错误
+        self.store
+            .validate_cut_target(session_id, target_seq)
+            .await
+            .map_err(RollbackError::Store)?;
+        if !self.snapshot.is_enabled() {
+            return Ok(FileImpact::Unavailable);
+        }
+        let rows = self
+            .store
+            .list_file_snapshots_from(session_id, target_seq)
+            .await
+            .map_err(RollbackError::Store)?;
+        let Some(first) = rows.first() else {
+            return Ok(FileImpact::Empty);
+        };
+        let baseline_tree = first.tree_hash.clone();
+        let mut touched: Vec<String> = rows.iter().flat_map(|r| r.files.iter().cloned()).collect();
+        touched.sort();
+        touched.dedup();
+        Ok(FileImpact::Touch {
+            baseline_tree,
+            touched,
+        })
+    }
+
+    /// 把会话回退到目标消息之前（消息侧删行 + 文件侧恢复联动 + 结果事件）
+    ///
+    /// 四步编排，顺序承重不可倒置：
+    /// 1. 查行：`msg_seq >= target_seq` 的快照行（经 [`Self::resolve_file_impact`]
+    ///    与预览共用校验与影响计算；空触碰集跳文件侧）
+    /// 2. 先恢复文件：基线树 = 首行 `tree_hash`、触碰集 = 各行 `files` 并集——
+    ///    存在于基线树的 checkout 回基线内容、快照后新建的删除
+    /// 3. 后动 DB：`rollback_to` 单事务删消息 + 同谓词删快照行 + 重算元数据
+    /// 4. 发 [`OutputEvent::FilesRestored`] 纯事件（文件侧实际联动时），
+    ///    经 app 级单一出口供 UI 消费
+    ///
+    /// 顺序语义：先恢复后动 DB——恢复失败则整个回退中止（消息 / 快照行原封），
+    /// 恢复幂等（重复 checkout 同一基线树是 no-op），可安全重试；若倒置会出现
+    /// 「消息退了文件没退」且不可重试的半截态。
+    ///
+    /// 快照不可用（配置关闭 / git 缺失）：WARN 降级为仅消息回退，返回值明示
+    /// 「文件未回退」——消息侧照常，调用方据返回值向用户交代文件现场未动。
     ///
     /// # 运行态责任边界
     ///
-    /// 本门面是纯存储操作，**不校验该 session 是否有活跃 turn**——若 turn 正在运行，
-    /// 其后续落库会与回退结果竞争（回退被新写入部分抵消、重算计数漂移）。
-    /// 需要安全回退的调用方应先经运行时门面 [`App::stop_session`](crate::App::stop_session)
-    /// 屏障停 turn 再回退——「先停后滚」的顺序是回退安全性的承重前提，不可倒置。
+    /// 编排前**不校验该 session 是否有活跃 turn**——若 turn 正在运行，其后续落库
+    /// 与回退结果竞争。需要安全回退的调用方应先经运行时门面
+    /// [`App::stop_session`](crate::App::stop_session) 屏障停 turn 再回退——
+    /// 「先停后滚」的顺序是回退安全性的承重前提，不可倒置。
+    ///
+    /// # 返回
+    /// - [`FileRollbackOutcome::Restored`]：文件侧已联动（清单可能为空——目标后
+    ///   无触碰集或触碰文件都已回到基线态）；剩余消息与重算后的会话元数据经
+    ///   既有读路径获取（`list_messages` / `get_session`）
+    /// - [`FileRollbackOutcome::Unavailable`]：快照不可用，仅消息回退，文件未回退
     ///
     /// # 错误
-    /// - [`fuyao_session::SessionError::NotFound`]：session_id 不存在，或 target_seq
-    ///   在该 session 中无对应消息
-    /// - [`fuyao_session::SessionError::InvalidCutTarget`]：目标非 user 且非
-    ///   compaction（assistant / tool 中间态）
+    /// - [`RollbackError::Store`]：目标校验 / 存储读写失败（含
+    ///   [`fuyao_session::SessionError::NotFound`]：session_id 不存在或 target_seq
+    ///   无对应消息；`InvalidCutTarget`：目标非 user 且非 compaction）
+    /// - [`RollbackError::Restore`]：文件恢复失败——整个回退已中止（消息 / 快照行
+    ///   原封），恢复幂等、可安全重试
     pub async fn rollback_session(
         &self,
         session_id: &str,
         target_seq: i64,
-    ) -> Result<(), fuyao_session::SessionError> {
-        self.store.rollback_to(session_id, target_seq).await
+    ) -> Result<FileRollbackOutcome, RollbackError> {
+        // ① 查行（含目标校验，与预览共用）
+        let impact = self.resolve_file_impact(session_id, target_seq).await?;
+
+        // ② 先恢复文件：不可用 WARN 降级；有触碰集才执行恢复
+        let outcome = match impact {
+            FileImpact::Unavailable => {
+                tracing::warn!(
+                    session_id = session_id,
+                    target_seq = target_seq,
+                    "快照不可用，回退降级为仅消息回退（文件未回退）"
+                );
+                FileRollbackOutcome::Unavailable
+            }
+            FileImpact::Empty => FileRollbackOutcome::Restored {
+                restored: Vec::new(),
+                deleted: Vec::new(),
+            },
+            FileImpact::Touch {
+                baseline_tree,
+                touched,
+            } => {
+                let restored = self
+                    .snapshot
+                    .restore(&baseline_tree, &touched)
+                    .await
+                    // Ok(None) 只在禁用态出现，resolve 已排除；防御性按降级处理
+                    .map_err(|cause| RollbackError::Restore {
+                        cause,
+                        session_id: session_id.to_string(),
+                        target_seq,
+                    })?
+                    .unwrap_or_default();
+                FileRollbackOutcome::Restored {
+                    restored: restored.restored,
+                    deleted: restored.deleted,
+                }
+            }
+        };
+
+        // ③ 后动 DB：单事务删消息 + 同谓词删快照行 + 重算元数据
+        self.store
+            .rollback_to(session_id, target_seq)
+            .await
+            .map_err(RollbackError::Store)?;
+
+        // ④ 发文件回退结果事件：仅当文件侧实际动了文件（清单非空）才发——
+        // 空触碰集跳过文件侧，纯消息回退不产生文件事件噪声
+        match &outcome {
+            FileRollbackOutcome::Restored { restored, deleted }
+                if !restored.is_empty() || !deleted.is_empty() =>
+            {
+                let event = OutputEvent::FilesRestored(FilesRestoredMessage {
+                    base: EventBase {
+                        session_id: Some(session_id.to_string()),
+                        ..EventBase::default()
+                    },
+                    payload: FilesRestoredPayload {
+                        restored: restored.clone(),
+                        deleted: deleted.clone(),
+                    },
+                });
+                if self.event_tx.send(event).await.is_err() {
+                    tracing::warn!(
+                        session_id = session_id,
+                        "事件出口通道已关闭，文件回退结果事件丢弃"
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        Ok(outcome)
+    }
+
+    /// 回退预览（只读双轴报告：将删消息 + 文件影响）
+    ///
+    /// 上层应用执行回退前的影响面查询：消息侧给出 `seq >= target` 的将删消息
+    /// 清单（复用既有全量读路径过滤，seq 正序）；文件侧给出对基线树的只读分类
+    /// ——将恢复 / 将删除两组清单（由快照器的 [`FileSnapshot::plan_restore`]
+    /// 提供，restore 内部复用同一分类，预览与执行口径一致）。
+    ///
+    /// 与 [`SessionManager::rollback_session`] 共用 [`Self::resolve_file_impact`]
+    /// （同一目标校验 + 同一影响计算），同一状态下两者结论必然一致；预览是建议、
+    /// 执行是权威——预览与执行之间状态可能漂移，执行后的结果事件才是真实载荷。
+    /// 本方法纯只读：不动消息、不动文件、不动快照行。
+    ///
+    /// 快照不可用时文件侧诚实标注 [`FilesPreview::Unavailable`]——不展示虚假的
+    /// 文件影响清单（执行时同样降级为仅消息回退）。
+    ///
+    /// # 返回
+    /// - [`RollbackPreview::messages_to_delete`]：将删消息清单（含目标本身；
+    ///   空清单不可能出现——目标消息本身总在删除范围）
+    /// - [`RollbackPreview::files`]：文件影响（可用 = 分类清单；不可用 = 标注）
+    ///
+    /// # 错误
+    /// 同 [`SessionManager::rollback_session`] 的 `Store` / `Plan` 两类。
+    pub async fn preview_rollback(
+        &self,
+        session_id: &str,
+        target_seq: i64,
+    ) -> Result<RollbackPreview, RollbackError> {
+        // 文件侧：共用校验 + 影响计算
+        let impact = self.resolve_file_impact(session_id, target_seq).await?;
+        let files = match impact {
+            FileImpact::Unavailable => FilesPreview::Unavailable,
+            FileImpact::Empty => FilesPreview::Plan {
+                to_restore: Vec::new(),
+                to_delete: Vec::new(),
+            },
+            FileImpact::Touch {
+                baseline_tree,
+                touched,
+            } => {
+                let plan = self
+                    .snapshot
+                    .plan_restore(&baseline_tree, &touched)
+                    .await
+                    .map_err(RollbackError::Plan)?;
+                // Ok(None) 只在禁用态出现，resolve 已排除；防御性按不可用标注
+                plan.map_or(FilesPreview::Unavailable, |plan| FilesPreview::Plan {
+                    to_restore: plan.to_restore,
+                    to_delete: plan.to_delete,
+                })
+            }
+        };
+
+        // 消息侧：复用既有全量读路径过滤 seq >= target（seq 正序）
+        let messages_to_delete = self
+            .store
+            .load_full_history(session_id)
+            .await
+            .map_err(RollbackError::Store)?
+            .into_iter()
+            .filter(|m| m.seq >= target_seq)
+            .collect();
+
+        Ok(RollbackPreview {
+            messages_to_delete,
+            files,
+        })
     }
 
     // ── 会话派生（fork）──────────────────────────────────────────
@@ -329,17 +559,108 @@ impl SessionManager {
     }
 }
 
+/// 回退文件侧影响（预览与执行共用的中间计算结果）
+///
+/// 由 [`SessionManager::resolve_file_impact`] 产出：预览据此标注文件影响面，
+/// 执行据此编排恢复——同一状态下两条入口拿到同一份结论，口径一致有构造性保证。
+enum FileImpact {
+    /// 快照不可用（配置关闭 / git 缺失）：文件侧无法联动
+    Unavailable,
+    /// 目标后无快照行（回退点之后没有工具批）：文件侧无事可做
+    Empty,
+    /// 有快照行：`baseline_tree` 为首行基线树，`touched` 为各行 files 的
+    /// 排序去重并集（恢复的触碰集）
+    Touch {
+        baseline_tree: String,
+        touched: Vec<String>,
+    },
+}
+
+/// 回退执行结果（文件侧联动结论 + 双清单）
+///
+/// [`SessionManager::rollback_session`] 的返回值：消息侧恒已回退（或整体失败
+/// 上抛），文件侧的结论由此类型明示——快照不可用时明确告知「文件未回退」，
+/// 调用方据比向用户交代文件现场状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileRollbackOutcome {
+    /// 文件侧已联动恢复：清单为恢复（回到回退点内容）与删除（回退点后新建）
+    /// 两组工作区相对路径，已排序去重；可能为空（目标后无触碰集）
+    Restored {
+        /// 已恢复为回退点内容的文件清单
+        restored: Vec<String>,
+        /// 已删除的文件清单（回退点之后新建）
+        deleted: Vec<String>,
+    },
+    /// 快照不可用（配置关闭 / git 缺失）：仅消息回退，文件未回退
+    Unavailable,
+}
+
+/// 回退预览（只读双轴报告）
+///
+/// [`SessionManager::preview_rollback`] 的返回值：执行前的建议性影响面——
+/// 预览是建议、执行是权威，两者之间状态可能漂移，真实结果以执行后的
+/// [`OutputEvent::FilesRestored`] 事件载荷为准。
+#[derive(Debug, Clone)]
+pub struct RollbackPreview {
+    /// 将删除的消息（`seq >= target`，seq 正序，含目标本身）
+    pub messages_to_delete: Vec<Message>,
+    /// 文件侧影响（不可用时诚实标注）
+    pub files: FilesPreview,
+}
+
+/// 文件侧预览结论（对基线树的只读分类）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesPreview {
+    /// 快照可用：触碰集对基线树的「将恢复 / 将删除」分类清单（可能为空）
+    Plan {
+        /// 将恢复为回退点内容的文件清单
+        to_restore: Vec<String>,
+        /// 将删除的文件清单（回退点之后新建）
+        to_delete: Vec<String>,
+    },
+    /// 快照不可用：文件侧无法预览（执行时同样降级为仅消息回退）
+    Unavailable,
+}
+
+/// 回退门面错误（预览与执行共用）
+#[derive(Debug, thiserror::Error)]
+pub enum RollbackError {
+    /// 目标校验 / 存储读写失败
+    #[error("存储访问失败: {0}")]
+    Store(#[from] fuyao_session::SessionError),
+    /// 只读预览的快照分类失败
+    #[error("文件影响预览失败: {0}")]
+    Plan(#[from] fuyao_snapshot::SnapshotError),
+    /// 文件恢复失败：整个回退已中止（消息与快照行未改动），恢复幂等、可安全重试
+    #[error("文件恢复失败，回退已整体中止（消息与快照行未改动，可安全重试）: {cause}")]
+    Restore {
+        /// 快照器报错原因
+        cause: fuyao_snapshot::SnapshotError,
+        /// 回退的会话
+        session_id: String,
+        /// 回退目标消息 seq
+        target_seq: i64,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fuyao_session::SessionError;
+    use fuyao_snapshot::DEFAULT_MAX_UNTRACKED_MB;
     use rstest::rstest;
+
+    /// 构造一个「接收端已 drop」的事件发送端（无消费者场景的标准形态）
+    fn dropped_event_tx() -> mpsc::Sender<OutputEvent> {
+        mpsc::channel(1).0
+    }
 
     /// 构造临时 SQLite 上的 SessionManager + 一个已建会话
     ///
     /// std::mem::forget(dir) 放弃 TempDir 自动清理——async 测试跨 await 持有路径，
     /// TempDir 提前 drop 会删掉 db 文件；临时目录由系统重启时清理。
     /// 未调 set_config，get_config 返回 default（max_len = 80）。
+    /// 快照器恒为禁用态（本组测试只覆盖标题 / 查询路径）。
     async fn manager_with_session() -> (SessionManager, String) {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
         let store = Arc::new(
@@ -352,7 +673,10 @@ mod tests {
             .create_session(None, None, None)
             .await
             .expect("建会话失败");
-        (SessionManager::new(store), session.id)
+        (
+            SessionManager::new(store, FileSnapshot::disabled(), dropped_event_tx()),
+            session.id,
+        )
     }
 
     /// 空串与纯空白标题被拒，错误携带配置的 max_len 真值
@@ -436,5 +760,522 @@ mod tests {
             matches!(err, SessionError::InvalidTitle { max_len: 80 }),
             "实际错误：{err:?}"
         );
+    }
+
+    // ===== 回退编排 + 只读预览 =====
+
+    /// 回退测试台：临时工作区（真实影子仓）+ 临时 SQLite + 事件接收端 + 已建会话
+    struct RollbackFixture {
+        manager: SessionManager,
+        session_id: String,
+        /// 工作区目录（断言文件终态用）
+        worktree: std::path::PathBuf,
+        /// 文件回退结果事件的接收端
+        rx_event: mpsc::Receiver<OutputEvent>,
+    }
+
+    /// 落一条消息，返回其 seq
+    async fn insert_message(store: &SessionStore, sid: &str, msg: Message) -> i64 {
+        let mut msg = msg;
+        store.insert_message(sid, &mut msg).await.unwrap()
+    }
+
+    /// 构造带真实影子仓的回退测试台
+    ///
+    /// std::mem::forget 放弃 TempDir 自动清理——async 测试跨 await 持有路径。
+    async fn rollback_fixture() -> RollbackFixture {
+        let db_dir = tempfile::tempdir().expect("创建临时目录失败");
+        let store = Arc::new(
+            SessionStore::new(db_dir.path().join("test.db"))
+                .await
+                .expect("构造 SessionStore 失败"),
+        );
+        std::mem::forget(db_dir);
+        let ws = tempfile::tempdir().expect("创建工作区失败");
+        let worktree = ws.path().to_path_buf();
+        std::mem::forget(ws);
+        let shadow = tempfile::tempdir().expect("创建影子仓目录失败");
+        let shadow_root = shadow.path().to_path_buf();
+        std::mem::forget(shadow);
+        let snapshot = FileSnapshot::new(&worktree, &shadow_root, DEFAULT_MAX_UNTRACKED_MB).await;
+        assert!(snapshot.is_enabled(), "测试前提：git 在 PATH，影子仓可用");
+
+        let (tx_event, rx_event) = mpsc::channel(8);
+        let session = store
+            .create_session(None, None, None)
+            .await
+            .expect("建会话失败");
+        RollbackFixture {
+            manager: SessionManager::new(store, snapshot, tx_event),
+            session_id: session.id,
+            worktree,
+            rx_event,
+        }
+    }
+
+    /// 模拟一个工具批：assistant 消息落库（快照行锚点）→ 基线采集落行 → 施加
+    /// 一批文件改动（模拟工具执行效果），返回 (assistant seq, 基线树)
+    async fn simulate_tool_batch(
+        fx: &RollbackFixture,
+        prev_tree: Option<&str>,
+        mutations: &[(&str, &str)],
+    ) -> (i64, String) {
+        let seq = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::assistant(Some("调工具".to_string())),
+        )
+        .await;
+        let outcome = fx
+            .manager
+            .snapshot
+            .track(prev_tree)
+            .await
+            .expect("采集应成功")
+            .expect("可用态应有结果");
+        fx.manager
+            .store
+            .insert_file_snapshot(&fx.session_id, seq, &outcome.tree_hash, &outcome.files)
+            .await
+            .unwrap();
+        for (rel, content) in mutations {
+            let path = fx.worktree.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+        (seq, outcome.tree_hash)
+    }
+
+    /// 端到端：预览双轴清单正确 → 回退文件终态与消息终态一致 → 事件载荷与预览
+    /// 结论一致 → 快照行清理
+    ///
+    /// 会话结构：u1 → 批1（改 a.txt）→ u2 → 批2（新建 n.txt）→ u3 → 批3（再改
+    /// a.txt）→ a4 纯回复。回退到 u2：窗口行 = 批2 / 批3 的行，基线树 = 批2 执行
+    /// 前的树，触碰集 = 两行 files 并集——a.txt 恢复为基线内容、n.txt（基线树
+    /// 之后新建）删除。
+    #[tokio::test]
+    async fn rollback_restores_files_deletes_messages_and_emits_event() {
+        let mut fx = rollback_fixture().await;
+        std::fs::write(fx.worktree.join("a.txt"), "v1").unwrap();
+        std::fs::write(fx.worktree.join("b.txt"), "v1").unwrap();
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u1".into()),
+        )
+        .await;
+        let (_, tree1) = simulate_tool_batch(&fx, None, &[("a.txt", "v2 批1修改")]).await;
+        let u2 = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u2".into()),
+        )
+        .await;
+        let (_, tree2) = simulate_tool_batch(&fx, Some(&tree1), &[("n.txt", "新建")]).await;
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u3".into()),
+        )
+        .await;
+        simulate_tool_batch(&fx, Some(&tree2), &[("a.txt", "v3 批3修改")]).await;
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::assistant(Some("a4".into())),
+        )
+        .await;
+
+        // 预览：将删消息 = u2 及其后（u2 / a2 / u3 / a3 / a4，seq 正序）；
+        // 文件影响 = a.txt 恢复为基线内容、n.txt（基线树外）删除
+        let preview = fx
+            .manager
+            .preview_rollback(&fx.session_id, u2)
+            .await
+            .expect("预览应成功");
+        let seqs: Vec<i64> = preview.messages_to_delete.iter().map(|m| m.seq).collect();
+        assert_eq!(seqs.len(), 5, "u2 与其后共 5 条");
+        assert_eq!(seqs[0], u2, "seq 正序，首条即目标");
+        assert_eq!(
+            preview.files,
+            FilesPreview::Plan {
+                to_restore: vec!["a.txt".to_string()],
+                to_delete: vec!["n.txt".to_string()],
+            },
+            "预览文件影响：窗口触碰集对基线树的分类"
+        );
+
+        // 执行：文件终态与消息终态一致
+        let outcome = fx
+            .manager
+            .rollback_session(&fx.session_id, u2)
+            .await
+            .expect("回退应成功");
+        assert_eq!(
+            outcome,
+            FileRollbackOutcome::Restored {
+                restored: vec!["a.txt".to_string()],
+                deleted: vec!["n.txt".to_string()],
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.worktree.join("a.txt")).unwrap(),
+            "v2 批1修改",
+            "批3 的再修改应回到基线（批2 执行前）内容"
+        );
+        assert!(
+            !fx.worktree.join("n.txt").exists(),
+            "基线树之后新建的文件应被删除"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.worktree.join("b.txt")).unwrap(),
+            "v1",
+            "触碰集外文件原封不动"
+        );
+        // 消息侧：只剩 u1 / a1
+        let full = fx
+            .manager
+            .store
+            .load_full_history(&fx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 2, "u2 及其后消息已删");
+        // 快照行同谓词清理
+        let rows = fx
+            .manager
+            .store
+            .list_file_snapshots_from(&fx.session_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "只剩批1的快照行");
+
+        // 事件：载荷与预览结论一致（预览是建议、执行是权威，此处无漂移）
+        let event = fx.rx_event.recv().await.expect("应收到 FilesRestored 事件");
+        let OutputEvent::FilesRestored(m) = event else {
+            panic!("应为 FilesRestored 事件，实际：{event:?}");
+        };
+        assert_eq!(m.base.session_id.as_deref(), Some(fx.session_id.as_str()));
+        assert_eq!(m.payload.restored, vec!["a.txt".to_string()]);
+        assert_eq!(m.payload.deleted, vec!["n.txt".to_string()]);
+    }
+
+    /// 触碰集口径：窗口内各行的记录差异。行的 files 记「自上一快照以来的变更」，
+    /// 由下一批开拍时落账——窗口终批之后的净变更尚无行承载，不在触碰集内
+    #[tokio::test]
+    async fn rollback_touch_set_covers_recorded_window_diffs() {
+        let fx = rollback_fixture().await;
+        std::fs::write(fx.worktree.join("a.txt"), "v1").unwrap();
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u1".into()),
+        )
+        .await;
+        let (_, tree1) = simulate_tool_batch(&fx, None, &[("a.txt", "v2")]).await;
+        // 终批：新建 z.txt——它是「批1 之后、无后续批开拍」的变更，不进任何行的 files
+        let u2 = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u2".into()),
+        )
+        .await;
+        simulate_tool_batch(&fx, Some(&tree1), &[("z.txt", "终批新建")]).await;
+
+        let outcome = fx
+            .manager
+            .rollback_session(&fx.session_id, u2)
+            .await
+            .expect("回退应成功");
+        // 窗口 = 批2 的行（files = 批1 的变更 [a.txt]）：a.txt 在基线树内 → 恢复
+        assert_eq!(
+            outcome,
+            FileRollbackOutcome::Restored {
+                restored: vec!["a.txt".to_string()],
+                deleted: vec![],
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(fx.worktree.join("a.txt")).unwrap(),
+            "v2",
+            "批1 的变更已由批2 的行记录，恢复为基线（批2 执行前）内容"
+        );
+        assert!(
+            fx.worktree.join("z.txt").exists(),
+            "终批的净新建变更无行承载，不在触碰集内"
+        );
+    }
+
+    /// 目标后无工具批（纯对话）：文件侧零动作、无事件，消息照常回退
+    #[tokio::test]
+    async fn rollback_without_snapshots_skips_file_side() {
+        let mut fx = rollback_fixture().await;
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u1".into()),
+        )
+        .await;
+        let u2 = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u2".into()),
+        )
+        .await;
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::assistant(Some("a2".into())),
+        )
+        .await;
+
+        // 预览：文件侧可用但为空计划
+        let preview = fx
+            .manager
+            .preview_rollback(&fx.session_id, u2)
+            .await
+            .expect("预览应成功");
+        assert_eq!(
+            preview.files,
+            FilesPreview::Plan {
+                to_restore: vec![],
+                to_delete: vec![],
+            }
+        );
+
+        // 执行：空清单联动、不发事件
+        let outcome = fx
+            .manager
+            .rollback_session(&fx.session_id, u2)
+            .await
+            .expect("回退应成功");
+        assert_eq!(
+            outcome,
+            FileRollbackOutcome::Restored {
+                restored: vec![],
+                deleted: vec![],
+            }
+        );
+        assert!(
+            fx.rx_event.try_recv().is_err(),
+            "文件侧零动作不应发 FilesRestored 事件"
+        );
+        let full = fx
+            .manager
+            .store
+            .load_full_history(&fx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 1, "消息照常回退");
+    }
+
+    /// 快照禁用态：预览诚实标注不可用，回退降级为仅消息（明示文件未回退），无事件
+    #[tokio::test]
+    async fn disabled_snapshot_degrades_to_message_only_rollback() {
+        let dir = tempfile::tempdir().expect("创建临时目录失败");
+        let store = Arc::new(
+            SessionStore::new(dir.path().join("test.db"))
+                .await
+                .expect("构造 SessionStore 失败"),
+        );
+        std::mem::forget(dir);
+        let ws = tempfile::tempdir().expect("创建工作区失败");
+        let worktree = ws.path().to_path_buf();
+        std::fs::write(worktree.join("a.txt"), "现场").unwrap();
+        std::mem::forget(ws);
+        let (tx_event, mut rx_event) = mpsc::channel(8);
+        let session = store.create_session(None, None, None).await.unwrap();
+        // 历史上落过快照行（禁用态不查行，直接降级）
+        let u1 = {
+            let mut m = Message::user("u1".into());
+            store.insert_message(&session.id, &mut m).await.unwrap()
+        };
+        {
+            let mut m = Message::assistant(Some("a1".into()));
+            let seq = store.insert_message(&session.id, &mut m).await.unwrap();
+            store
+                .insert_file_snapshot(&session.id, seq, "tree_x", &["a.txt".to_string()])
+                .await
+                .unwrap();
+        }
+        let manager = SessionManager::new(store, FileSnapshot::disabled(), tx_event);
+
+        let preview = manager
+            .preview_rollback(&session.id, u1)
+            .await
+            .expect("预览应成功");
+        assert_eq!(preview.files, FilesPreview::Unavailable);
+
+        let outcome = manager
+            .rollback_session(&session.id, u1)
+            .await
+            .expect("消息回退照常");
+        assert_eq!(outcome, FileRollbackOutcome::Unavailable);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join("a.txt")).unwrap(),
+            "现场",
+            "文件现场原封不动"
+        );
+        assert!(rx_event.try_recv().is_err(), "降级路径不发事件");
+    }
+
+    /// 恢复失败：整个回退中止——消息 / 快照行原封，错误明示可重试
+    #[tokio::test]
+    async fn restore_failure_aborts_whole_rollback() {
+        let fx = rollback_fixture().await;
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u1".into()),
+        )
+        .await;
+        // 落一行指向不存在基线树的快照（影子仓没有该对象，恢复必然失败）
+        let u2 = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u2".into()),
+        )
+        .await;
+        {
+            let mut m = Message::assistant(Some("a2".into()));
+            let seq = fx
+                .manager
+                .store
+                .insert_message(&fx.session_id, &mut m)
+                .await
+                .unwrap();
+            fx.manager
+                .store
+                .insert_file_snapshot(
+                    &fx.session_id,
+                    seq,
+                    "0000000000000000000000000000000000000000",
+                    &["a.txt".to_string()],
+                )
+                .await
+                .unwrap();
+        }
+
+        let err = fx
+            .manager
+            .rollback_session(&fx.session_id, u2)
+            .await
+            .expect_err("基线树不存在，恢复应失败");
+        assert!(
+            matches!(err, RollbackError::Restore { .. }),
+            "应为 Restore 错误，实际：{err:?}"
+        );
+        assert!(
+            err.to_string().contains("可安全重试"),
+            "错误信息应明示可重试：{err}"
+        );
+        // 消息与快照行原封
+        let full = fx
+            .manager
+            .store
+            .load_full_history(&fx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 3, "回退中止，消息原封");
+        let rows = fx
+            .manager
+            .store
+            .list_file_snapshots_from(&fx.session_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "快照行原封");
+    }
+
+    /// 预览与执行共用目标校验：非法目标（assistant 中间态）两个入口报同一错误
+    #[tokio::test]
+    async fn preview_and_rollback_share_target_validation() {
+        let fx = rollback_fixture().await;
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u1".into()),
+        )
+        .await;
+        let a1 = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::assistant(Some("a1".into())),
+        )
+        .await;
+
+        let preview_err = fx
+            .manager
+            .preview_rollback(&fx.session_id, a1)
+            .await
+            .expect_err("assistant 目标应被预览拒绝");
+        let rollback_err = fx
+            .manager
+            .rollback_session(&fx.session_id, a1)
+            .await
+            .expect_err("assistant 目标应被回退拒绝");
+        assert!(
+            matches!(
+                (&preview_err, &rollback_err),
+                (
+                    RollbackError::Store(SessionError::InvalidCutTarget(_)),
+                    RollbackError::Store(SessionError::InvalidCutTarget(_))
+                )
+            ),
+            "两个入口应报同一 InvalidCutTarget：{preview_err:?} vs {rollback_err:?}"
+        );
+        // 消息原封
+        let full = fx
+            .manager
+            .store
+            .load_full_history(&fx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 2);
+    }
+
+    /// 预览是纯只读：预览后消息 / 文件 / 快照行全部原封
+    #[tokio::test]
+    async fn preview_is_readonly() {
+        let fx = rollback_fixture().await;
+        std::fs::write(fx.worktree.join("a.txt"), "v1").unwrap();
+        insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u1".into()),
+        )
+        .await;
+        let u2 = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::user("u2".into()),
+        )
+        .await;
+        simulate_tool_batch(&fx, None, &[("a.txt", "v2")]).await;
+
+        let _preview = fx
+            .manager
+            .preview_rollback(&fx.session_id, u2)
+            .await
+            .expect("预览应成功");
+        assert_eq!(
+            std::fs::read_to_string(fx.worktree.join("a.txt")).unwrap(),
+            "v2",
+            "预览不动文件现场"
+        );
+        let full = fx
+            .manager
+            .store
+            .load_full_history(&fx.session_id)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 3, "预览不动消息");
+        let rows = fx
+            .manager
+            .store
+            .list_file_snapshots_from(&fx.session_id, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "预览不动快照行");
     }
 }

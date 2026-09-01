@@ -452,6 +452,26 @@ async fn make_harness_full(
     hooks: fuyao_hooks::SharedHooks,
     agent_paths: fuyao_api::AgentPaths,
 ) -> TestHarness {
+    make_harness_with_snapshot(
+        provider,
+        tools,
+        hooks,
+        agent_paths,
+        fuyao_snapshot::FileSnapshot::disabled(),
+    )
+    .await
+}
+
+/// 同 make_harness_full，但 SessionCtx 注入指定文件快照器（快照采集挂接测试用）
+///
+/// 快照器经 builder 的可选字段注入，生产装配同路（Engine 持句柄 → session 共享）。
+async fn make_harness_with_snapshot(
+    provider: Arc<dyn Provider>,
+    tools: Arc<ToolRegistry>,
+    hooks: fuyao_hooks::SharedHooks,
+    agent_paths: fuyao_api::AgentPaths,
+    snapshot: fuyao_snapshot::FileSnapshot,
+) -> TestHarness {
     let store = temp_store().await;
     // DB 唯一数据源：落库由存储层构造，落库后内核不再持有内存 Session，
     // 只凭 session_id 查 DB。此处落库完即丢弃 Session 对象。
@@ -481,6 +501,7 @@ async fn make_harness_full(
         Emitter::new(tx_event, session_id.clone()),
         agent_paths,
     )
+    .file_snapshot(snapshot)
     .build();
     TestHarness {
         ctx,
@@ -517,6 +538,7 @@ fn event_session_id(event: &OutputEvent) -> Option<&str> {
         OutputEvent::Title(m) => m.base.session_id.as_deref(),
         OutputEvent::Retry(m) => m.base.session_id.as_deref(),
         OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
+        OutputEvent::FilesRestored(m) => m.base.session_id.as_deref(),
         OutputEvent::Control(m) => m.base.session_id.as_deref(),
     }
 }
@@ -3963,5 +3985,308 @@ async fn title_generated_for_child_session() {
     assert_eq!(
         titles[1], "测试标题",
         "子 session 不应被豁免，应生成标题并发 Title 事件"
+    );
+}
+
+// ==================== 文件快照采集挂接（工具批边界） ====================
+
+/// 构造临时工作区 + 指向它的真实影子仓（快照挂接测试夹具）
+///
+/// 返回 (worktree 路径, 可用态快照器)。目录经 std::fs::create_dir_all 落在
+/// 系统临时目录的唯一子目录下，不自动清理（测试进程重启后由系统清理）——
+/// 快照器内部持有两个路径，TempDir 提前 drop 会拆掉现场。
+async fn snapshot_workdir(tag: &str) -> (std::path::PathBuf, fuyao_snapshot::FileSnapshot) {
+    let base = std::env::temp_dir()
+        .join("fuyao_core_snap_test")
+        .join(format!("{tag}-{}", uuid::Uuid::new_v4()));
+    let worktree = base.join("ws");
+    let shadow = base.join("shadow");
+    std::fs::create_dir_all(&worktree).expect("创建工作区失败");
+    std::fs::create_dir_all(&shadow).expect("创建影子仓目录失败");
+    let snapshot = fuyao_snapshot::FileSnapshot::new(
+        &worktree,
+        &shadow,
+        fuyao_snapshot::DEFAULT_MAX_UNTRACKED_MB,
+    )
+    .await;
+    assert!(snapshot.is_enabled(), "真实 git 环境下快照器应为可用态");
+    (worktree, snapshot)
+}
+
+/// 注册写文件工具：参数 `{"path": 相对路径, "content": 内容}`，写入指定工作区
+fn write_file_registry(worktree: std::path::PathBuf) -> Arc<ToolRegistry> {
+    let handler: fuyao_api::ToolFn = Arc::new(move |args, _ctx, _cancel| {
+        let target = worktree.clone();
+        Box::pin(async move {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            match std::fs::write(target.join(path), content) {
+                Ok(()) => fuyao_api::ToolOutput::text(format!("已写入 {path}")),
+                Err(cause) => fuyao_api::ToolOutput::text(format!("写入失败：{cause}")),
+            }
+        })
+    });
+    let entry = fuyao_api::ToolEntry {
+        definition: fuyao_api::ToolDefinition::new("write_file", "向工作区写文件"),
+        handler,
+        child_invisible: false,
+    };
+    Arc::new(ToolRegistry::builder().register(entry).build())
+}
+
+/// 从 DB 取第 n 个携带 tool_calls 的 assistant 消息 seq（工具批的锚点）
+async fn nth_tool_batch_seq(h: &TestHarness, n: usize) -> i64 {
+    let msgs = visible_messages(h).await;
+    let seqs: Vec<i64> = msgs
+        .iter()
+        .filter(|m| m.tool_calls.is_some())
+        .map(|m| m.seq)
+        .collect();
+    *seqs
+        .get(n)
+        .unwrap_or_else(|| panic!("应有至少 {} 个工具批 assistant 消息", n + 1))
+}
+
+/// 工具批边界落行：track 在工具执行前拍工作区，行锚定本批 assistant 消息 seq；
+/// 下一批开拍时把上一批的文件效果落进该行 files（增量 diff 语义）
+#[tokio::test]
+async fn tool_batches_record_snapshot_rows_anchored_to_assistant_seq() {
+    let (worktree, snapshot) = snapshot_workdir("anchor").await;
+    std::fs::write(worktree.join("a.txt"), "v1").expect("预置 a.txt 失败");
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response(
+            "tc_1",
+            "write_file",
+            r#"{"path":"a.txt","content":"v2 批1修改"}"#,
+        ),
+        MockProvider::text_response("批1完成"),
+        MockProvider::tool_call_response(
+            "tc_2",
+            "write_file",
+            r#"{"path":"b.txt","content":"批2新建"}"#,
+        ),
+        MockProvider::text_response("批2完成"),
+    ]));
+    let mut h = make_harness_with_snapshot(
+        provider,
+        write_file_registry(worktree.clone()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        snapshot,
+    )
+    .await;
+
+    // turn1：批1 落首拍行（prev_tree 无行 → files 空集）
+    preload_user(&h, "问题1").await;
+    turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &open_gate(),
+    )
+    .await;
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert_eq!(rows.len(), 1, "批1 应落一行");
+    assert_eq!(
+        rows[0].msg_seq,
+        nth_tool_batch_seq(&h, 0).await,
+        "行锚定本批 assistant 消息 seq"
+    );
+    assert!(rows[0].files.is_empty(), "首拍无上一行，files 为空集");
+    assert!(!rows[0].tree_hash.is_empty(), "基线树哈希非空");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("a.txt")).unwrap(),
+        "v2 批1修改",
+        "track 在工具执行前拍基线，工具照常执行"
+    );
+
+    // turn2：批2 落增量行，files = 批1 的效果（a.txt 的修改）
+    preload_user(&h, "问题2").await;
+    turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &open_gate(),
+    )
+    .await;
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert_eq!(rows.len(), 2, "两个工具批各落一行");
+    assert_eq!(
+        rows[1].msg_seq,
+        nth_tool_batch_seq(&h, 1).await,
+        "第二行锚定批2 的 assistant 消息 seq"
+    );
+    assert_eq!(
+        rows[1].files,
+        vec!["a.txt".to_string()],
+        "批2 的行记录批1 的文件效果"
+    );
+    assert_ne!(rows[0].tree_hash, rows[1].tree_hash, "两批基线树应不同");
+}
+
+/// 纯对话轮（无工具调用）零成本跳过：不落任何快照行
+#[tokio::test]
+async fn pure_dialogue_turn_records_no_snapshot_row() {
+    let (worktree, snapshot) = snapshot_workdir("pure").await;
+    std::fs::write(worktree.join("a.txt"), "工作区有内容").expect("预置 a.txt 失败");
+    let provider = Arc::new(MockProvider::new(vec![MockProvider::text_response(
+        "纯回复",
+    )]));
+    let mut h = make_harness_with_snapshot(
+        provider,
+        Arc::new(ToolRegistry::builder().build()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        snapshot,
+    )
+    .await;
+    preload_user(&h, "纯对话").await;
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &open_gate(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "turn 应正常完成"
+    );
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert!(rows.is_empty(), "纯对话轮不应落快照行");
+}
+
+/// 快照禁用态零成本跳过：工具批照常执行，不落行
+#[tokio::test]
+async fn disabled_snapshot_skips_tracking_but_tools_still_run() {
+    let worktree = std::env::temp_dir()
+        .join("fuyao_core_snap_test")
+        .join(format!("disabled-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&worktree).expect("创建工作区失败");
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response(
+            "tc_1",
+            "write_file",
+            r#"{"path":"a.txt","content":"禁用态写入"}"#,
+        ),
+        MockProvider::text_response("完成"),
+    ]));
+    let mut h = make_harness_with_snapshot(
+        provider,
+        write_file_registry(worktree.clone()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        fuyao_snapshot::FileSnapshot::disabled(),
+    )
+    .await;
+    preload_user(&h, "问题").await;
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &open_gate(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "turn 应正常完成"
+    );
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert!(rows.is_empty(), "禁用态不应落快照行");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("a.txt")).unwrap(),
+        "禁用态写入",
+        "工具执行不受快照禁用影响"
+    );
+}
+
+/// 采集失败 fail-open：prev_tree 指向影子仓不存在的树对象 → diff 失败 →
+/// WARN 跳过本批落行，turn 照常完成、工具照常执行
+#[tokio::test]
+async fn track_failure_degrades_without_interrupting_turn() {
+    let (worktree, snapshot) = snapshot_workdir("failopen").await;
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response(
+            "tc_1",
+            "write_file",
+            r#"{"path":"a.txt","content":"fail-open 写入"}"#,
+        ),
+        MockProvider::text_response("完成"),
+    ]));
+    let mut h = make_harness_with_snapshot(
+        provider,
+        write_file_registry(worktree.clone()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        snapshot,
+    )
+    .await;
+    // 预置一行指向不存在树对象的快照行：下一批 track 取它作 prev_tree，
+    // diff-tree 解析失败 → 采集失败分支
+    h.ctx
+        .store
+        .insert_file_snapshot(
+            &h.session_id,
+            1,
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            &[],
+        )
+        .await
+        .expect("预置脏快照行失败");
+
+    preload_user(&h, "问题").await;
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &open_gate(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "采集失败不应中断 turn"
+    );
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert_eq!(rows.len(), 1, "只剩预置的脏行，本批未落行");
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("a.txt")).unwrap(),
+        "fail-open 写入",
+        "工具执行不受采集失败影响"
     );
 }

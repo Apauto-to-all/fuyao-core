@@ -33,6 +33,7 @@ pub mod models;
 pub mod plugins;
 pub mod providers;
 pub mod session;
+pub mod snapshot;
 pub mod tools;
 
 use std::collections::HashMap;
@@ -54,6 +55,7 @@ pub use mcp::McpGlobalConfig;
 pub use models::{ModelRef, ModelSelection};
 pub use plugins::PluginsConfig;
 pub use session::{CompressionConfig, SessionConfig, SessionStorageConfig, TitleConfig};
+pub use snapshot::SnapshotConfig;
 pub use tools::{
     TerminalConfig, ToolRunnerConfig, ToolsConfig, ToolsLimitsConfig, unknown_tool_names,
 };
@@ -119,6 +121,9 @@ pub struct FuyaoConfig {
 
     /// 日志（级别 / stderr 开关 / 轮转），由 `fuyao-app::init_logging` 消费
     pub logging: LoggingConfig,
+
+    /// 文件快照（影子仓总开关 / 未跟踪大小上限），由装配层构造快照器时消费
+    pub snapshot: SnapshotConfig,
 }
 
 // ==================== 全局只读句柄 ====================
@@ -182,6 +187,8 @@ mod tests {
         assert_eq!(c.logging.level, "info");
         assert!(c.logging.console);
         assert_eq!(c.logging.rotation, LogRotation::Daily);
+        assert!(c.snapshot.enabled);
+        assert_eq!(c.snapshot.max_untracked_mb, 2);
     }
 
     /// get_config 未 set 时返回 default 不 panic。

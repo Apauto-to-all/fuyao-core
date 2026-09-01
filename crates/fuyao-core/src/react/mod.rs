@@ -135,6 +135,12 @@ pub(crate) struct SessionCtx {
     /// 零成本跳过标题判定——含配置关闭 / 非首轮的情形
     /// （标题配置为进程级静态，首次判定即终局）。恒 false 起步，builder 不暴露 setter。
     pub title_gate: std::sync::atomic::AtomicBool,
+    /// 文件快照器（引擎级共享，同进程多会话克隆同一句柄共享影子仓）
+    ///
+    /// 工具批执行前经 [`turn`] 的采集钩子对工作区做基线快照并落行。禁用态
+    /// （配置关闭 / git 缺失探测失败）下 track 静默跳过——类型非 Option：
+    /// 禁用语义内化在快照器自身，调用方零分支。
+    pub file_snapshot: fuyao_snapshot::FileSnapshot,
 }
 
 /// SessionCtx 的可选字段覆盖链（由 [`SessionCtx::builder`] 进入，[`SessionCtxBuilder::build`] 收口）
@@ -160,6 +166,7 @@ pub(crate) struct SessionCtxBuilder {
     shutdown_token: Option<CancellationToken>,
     turn_phase: Option<watch::Sender<TurnPhase>>,
     subagent_ops: Option<Option<std::sync::Weak<dyn fuyao_api::SubagentOps>>>,
+    file_snapshot: Option<fuyao_snapshot::FileSnapshot>,
 }
 
 impl SessionCtxBuilder {
@@ -202,6 +209,12 @@ impl SessionCtxBuilder {
         self
     }
 
+    /// 覆盖文件快照器（默认禁用态；生产传引擎级共享句柄）
+    pub(crate) fn file_snapshot(mut self, snapshot: fuyao_snapshot::FileSnapshot) -> Self {
+        self.file_snapshot = Some(snapshot);
+        self
+    }
+
     /// 收口构造：可选字段取默认（空队列 / 默认压缩配置 / 新 token / None 弱引用），
     /// `last_usage` 恒 None 起步、`title_gate` 恒未消耗——两者无 setter
     pub(crate) fn build(self) -> SessionCtx {
@@ -229,6 +242,9 @@ impl SessionCtxBuilder {
             subagent_ops: self.subagent_ops.flatten(),
             is_child: self.is_child,
             title_gate: std::sync::atomic::AtomicBool::new(false),
+            file_snapshot: self
+                .file_snapshot
+                .unwrap_or_else(fuyao_snapshot::FileSnapshot::disabled),
         }
     }
 }
@@ -270,6 +286,7 @@ impl SessionCtx {
             shutdown_token: None,
             turn_phase: None,
             subagent_ops: None,
+            file_snapshot: None,
         }
     }
 }

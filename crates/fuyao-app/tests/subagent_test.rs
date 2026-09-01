@@ -169,6 +169,7 @@ async fn parent_react_invokes_subagent_and_receives_tool_result() {
         registry,
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
     let app = App::new(engine, None, LogGuard::default());

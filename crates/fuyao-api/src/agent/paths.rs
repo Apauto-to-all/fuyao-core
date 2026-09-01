@@ -1,7 +1,7 @@
 //! Agent 三层目录的身份证明
 
 use crate::paths::{LayeredPaths, get_agent_root, get_fuyao_home, get_workspace_root};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Agent 三层目录的身份证明
 ///
@@ -121,6 +121,23 @@ impl AgentPaths {
         match self.agent_root() {
             Some(root) => root.join("logs"),
             None => self.fuyao_home.join("logs"),
+        }
+    }
+
+    /// 文件快照影子仓根目录
+    ///
+    /// 选址对齐 `sessions_db_path`：快照数据随独立 Agent 隔离，与 sessions 同域。
+    /// - 有 agent_id → Agent 层 `{agent_root}/snapshots/{hash(worktree)}/`
+    /// - 无 agent_id → 全局层 `~/.fuyao/snapshots/{hash(worktree)}/`
+    ///
+    /// hash 按工作区路径的归一化形态（正斜杠）计算，跨平台稳定；同一 workspace
+    /// 的多会话命中同一影子仓目录（共享对象库与互斥串行）。目录由快照器构造时
+    /// 按需创建。
+    pub fn snapshot_root(&self, worktree: &Path) -> PathBuf {
+        let dir = worktree_hash(worktree);
+        match self.agent_root() {
+            Some(root) => root.join("snapshots").join(&dir),
+            None => self.fuyao_home.join("snapshots").join(dir),
         }
     }
 
@@ -300,6 +317,21 @@ impl AgentPaths {
     }
 }
 
+/// 工作区路径的稳定散列（FNV-1a 64 位，十六进制小写 16 字符）
+///
+/// 影子仓目录按工作区区分：同一数据目录下不同工作区的快照互不混放。对路径的
+/// 归一化形态（分隔符统一为正斜杠）计算，Windows 与 Unix 上同一逻辑路径得到
+/// 同一散列值；FNV-1a 零依赖且结果稳定。
+fn worktree_hash(worktree: &Path) -> String {
+    let normalized = worktree.to_string_lossy().replace('\\', "/");
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in normalized.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +441,51 @@ mod tests {
             paths.agent_root(),
             Some(PathBuf::from("/tmp/home/fuyao-agents/coder"))
         );
+    }
+
+    /// snapshot_root：有 agent_id 落 agent_root，无 agent_id 落全局 home，
+    /// 目录名按工作区散列区分
+    #[test]
+    fn snapshot_root_follows_agent_layer_like_sessions_db() {
+        let with_agent = AgentPaths {
+            agent_id: Some("global/coder".to_string()),
+            fuyao_home: PathBuf::from("/tmp/home"),
+            ..Default::default()
+        };
+        let worktree = Path::new("/tmp/project");
+        let expected = with_agent
+            .agent_root()
+            .unwrap()
+            .join("snapshots")
+            .join(worktree_hash(worktree));
+        assert_eq!(with_agent.snapshot_root(worktree), expected);
+
+        let no_agent = AgentPaths {
+            fuyao_home: PathBuf::from("/tmp/home"),
+            ..Default::default()
+        };
+        assert_eq!(
+            no_agent.snapshot_root(worktree),
+            PathBuf::from("/tmp/home/snapshots").join(worktree_hash(worktree))
+        );
+    }
+
+    /// snapshot_root：不同工作区得到不同散列目录，同一工作区（含分隔符形态差异）
+    /// 得到同一目录
+    #[test]
+    fn snapshot_root_distinguishes_worktrees_by_hash() {
+        let paths = AgentPaths {
+            fuyao_home: PathBuf::from("/tmp/home"),
+            ..Default::default()
+        };
+        let a = paths.snapshot_root(Path::new("/tmp/project-a"));
+        let b = paths.snapshot_root(Path::new("/tmp/project-b"));
+        assert_ne!(a, b);
+
+        // 反斜杠与正斜杠是同一逻辑工作区的两种平台形态，散列归一后一致
+        let fwd = paths.snapshot_root(Path::new("/tmp/project"));
+        let back = paths.snapshot_root(Path::new(r"\tmp\project"));
+        assert_eq!(fwd, back);
     }
 
     /// agent_root 遇非法 agent_id（裸名）panic——启动校验后的兜底防线

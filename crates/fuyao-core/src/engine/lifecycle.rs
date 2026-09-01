@@ -321,6 +321,7 @@ impl Engine {
         .shutdown_token(shutdown_token.clone())
         .turn_phase(turn_phase_tx)
         .subagent_ops(Some(self.subagent_ops_weak()))
+        .file_snapshot(self.file_snapshot.clone())
         .build();
         let rx = react::SessionRx {
             inbound: rx_inbound,

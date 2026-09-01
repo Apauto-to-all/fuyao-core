@@ -220,6 +220,16 @@ impl App {
         self.fan_out_rx.lock().await.recv().await
     }
 
+    /// 出站通道发送端的克隆（app 级事件汇入口）
+    ///
+    /// 供不经 session task 的产出方向单一出口投递纯事件（如会话管理门面的
+    /// 文件回退结果）：发送端克隆与 forwarder 共用同一 fan_out 通道，
+    /// [`recv`](Self::recv) 的消费方不区分事件来自 forwarder 还是本入口。
+    /// 有界通道——消费方停滞时 send 阻塞（与 forwarder 同一背压点）。
+    pub fn event_sink(&self) -> mpsc::Sender<OutputEvent> {
+        self.fan_out_tx.clone()
+    }
+
     /// 销毁单个 session（调 [`Engine::destroy_session`] + 单独收尾该 session 的 forwarder）
     ///
     /// 流程：
@@ -418,6 +428,7 @@ mod tests {
             ToolRegistry::builder().build(),
             PluginHost::new(),
             store,
+            fuyao_snapshot::FileSnapshot::disabled(),
         )
         .await;
         App::new(engine, None, LogGuard::default())

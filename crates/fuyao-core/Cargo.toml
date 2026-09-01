@@ -7,6 +7,7 @@ edition.workspace = true
 fuyao-api = { path = "../fuyao-api" }
 fuyao-provider = { path = "../fuyao-provider" }
 fuyao-session = { path = "../fuyao-session" }
+fuyao-snapshot = { path = "../fuyao-snapshot" }
 fuyao-prompt = { path = "../fuyao-prompt" }
 fuyao-hooks = { path = "../fuyao-hooks" }
 tokio = { workspace = true }

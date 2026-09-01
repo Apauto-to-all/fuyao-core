@@ -79,6 +79,7 @@ async fn engine_runs_react_loop_on_direct_channel() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -153,6 +154,7 @@ async fn retry_emits_retry_event_then_succeeds() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -225,6 +227,7 @@ async fn retry_no_retry_on_auth_error() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -312,6 +315,7 @@ async fn retry_no_retry_after_first_chunk() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -396,6 +400,7 @@ async fn retry_emits_multiple_retry_events_under_persistent_error() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 
@@ -453,6 +458,7 @@ async fn send_to_unknown_session_returns_not_found() {
         fuyao_core::ToolRegistry::builder().build(),
         PluginHost::new(),
         store,
+        fuyao_snapshot::FileSnapshot::disabled(),
     )
     .await;
 

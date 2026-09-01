@@ -9,4 +9,6 @@ mod session_manager;
 
 pub use app::App;
 pub use discovery::Discovery;
-pub use session_manager::SessionManager;
+pub use session_manager::{
+    FileRollbackOutcome, FilesPreview, RollbackError, RollbackPreview, SessionManager,
+};
