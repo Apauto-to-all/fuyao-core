@@ -126,6 +126,13 @@ pub(crate) fn parse_ls_files_z(raw: &[u8], command: &str) -> Result<Vec<String>,
     decode_nul_paths(raw, command)
 }
 
+/// 解析 `ls-tree -r --name-only -z <tree>` 输出为树内文件路径列表
+///
+/// `--name-only` 让每条记录只输出路径本身，`-z` 以 NUL 分隔且关闭引号转义。
+pub(crate) fn parse_ls_tree_z(raw: &[u8], command: &str) -> Result<Vec<String>, SnapshotError> {
+    decode_nul_paths(raw, command)
+}
+
 /// 解析 `diff-tree -r -z <old> <new>` 输出为变更文件集
 ///
 /// 每条记录形如 `:old_mode new_mode old_sha new_sha 状态` + NUL + 路径 + NUL，
@@ -212,6 +219,20 @@ mod tests {
     #[test]
     fn parse_ls_files_z_empty_output() {
         assert!(parse_ls_files_z(b"", "git ls-files").unwrap().is_empty());
+    }
+
+    /// ls-tree -z 输出：纯路径段 NUL 分隔，含中文与空格
+    #[test]
+    fn parse_ls_tree_z_decodes_name_only_paths() {
+        let raw = "a.txt\0子 目录/space file.txt\0".as_bytes();
+        let paths = parse_ls_tree_z(raw, "git ls-tree").unwrap();
+        assert_eq!(paths, vec!["a.txt", "子 目录/space file.txt"]);
+    }
+
+    /// ls-tree -z 空树输出得到空列表
+    #[test]
+    fn parse_ls_tree_z_empty_output() {
+        assert!(parse_ls_tree_z(b"", "git ls-tree").unwrap().is_empty());
     }
 
     /// diff-tree -z 输出：元数据段与路径段成对出现，只取路径

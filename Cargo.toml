@@ -80,6 +80,8 @@ rstest = "0.26"
 tempfile = "3"
 pretty_assertions = "1"
 mockito = "1"
+# 测试内伪造对象文件 mtime（模拟超期松散对象）
+filetime = "0.2.29"
 
 # 开发构建瘦身：保留行号级调试信息（panic 栈可定位），不生成变量级信息
 [profile.dev]
