@@ -23,9 +23,11 @@
 //!   parent 由调用方指定，单事务：建行 + 复制 + 按复制结果聚合计数）
 //! - [`visible_window`]：给 LLM 的可见窗口查询（压缩感知，最新摘要 + 摘要后新消息）。
 //!   与 [`message`] 的「给人看的」查询路径正交
-//! - [`rollback`]：对话回退（删目标 seq 之后消息 + 局部 UPDATE 重算 count 类与
-//!   压缩元数据，保护消费类字段不动）
+//! - [`rollback`]：对话回退（删目标 seq 之后消息 + 同谓词快照行 + 局部 UPDATE 重算
+//!   count 类与压缩元数据，保护消费类字段不动）
 //! - [`todo`]：todos 表的读写 + 级联删除（任务列表 CRUD）
+//! - [`snapshot`]：file_snapshots 表的读写（文件快照薄日志：插入 / 按谓词升序查 /
+//!   按谓词删 + 会话组级联删除；files 的 JSON 序列化边界收敛在此）
 
 pub(crate) mod compaction;
 mod fork;
@@ -35,12 +37,15 @@ mod rollback;
 mod row;
 mod session;
 mod session_query;
+mod snapshot;
 mod sql;
 mod todo;
 mod visible_window;
 
 // 压缩原因持久层枚举对外导出（供消费方 fuyao-core 从事件层枚举转换后落库）
 pub use compaction::CompressionReason;
+// 快照行类型对外导出（回退编排方消费：首行取基线树、各行 files 并集取触碰集）
+pub use snapshot::FileSnapshotRow;
 
 use crate::error::SessionError;
 use crate::schema::{SCHEMA_SQL, SCHEMA_VERSION};

@@ -1,7 +1,8 @@
 //! SQLite DDL + 版本管理
 //!
-//! 当前含 sessions + messages + todos 三张表。todos 表存任务列表，按 session_id
-//! 软关联会话（不加外键约束——隔离数据，session_id 仅作字符串过滤键）。
+//! 当前含 sessions + messages + todos + file_snapshots 四张表。todos 表存任务列表，
+//! file_snapshots 表存文件快照薄日志，两表均按 session_id 软关联会话（不加外键
+//! 约束——隔离数据，session_id 仅作字符串过滤键），级联清理走显式删除。
 //!
 //! v2 改动（上下文压缩地基）：
 //! - sessions 加 `compression_count` + `last_compacted_seq`（压缩边界元数据）
@@ -15,6 +16,12 @@
 //! - sessions 加 `last_active_at`（最近活动时间，每次 update 刷新，供列表按最近活动倒序）
 //! - 新增 `idx_sessions_last_active`（支撑按最近活动倒序的列表查询）
 //!
+//! v4 改动（文件回退快照账）：
+//! - 新增 `file_snapshots` 表（文件快照薄日志：每个工具批执行前记一行基线树与
+//!   变更文件集），列含 id 自增主键 / session_id / msg_seq / tree_hash /
+//!   files（JSON 数组）/ created_at
+//! - 新增 `idx_file_snapshots_session_seq`（按会话 + seq 谓词的查删路径）
+//!
 //! 索引设计：显式索引只为有真实查询的路径而建，每个索引可对应到具体 SQL——
 //! - `idx_sessions_last_active`：list_all 的 `ORDER BY last_active_at DESC`
 //! - `idx_sessions_parent`：按父定位子会话的 `WHERE parent_session_id = ?` +
@@ -22,6 +29,8 @@
 //!   `parent_session_id IS NULL` 过滤与 child_count 计数子查询
 //! - `idx_messages_session_kind_seq`：kind 过滤类查询（消息计数 / compaction 边界定位）
 //! - `idx_todos_session`：todo 列表的 `WHERE session_id` + `ORDER BY sort_order`
+//! - `idx_file_snapshots_session_seq`：快照行的 `WHERE session_id` + `msg_seq`
+//!   谓词路径（回退前按 `msg_seq >= target` 查行、回退 / 会话删除时删行）
 //!
 //! session_id+seq 类查询（全量加载 / 游标分页 / 可见窗口过滤 / seq 分配）全部走
 //! `UNIQUE(session_id, seq)` 约束的隐式索引；无查询使用的列（timestamp / started_at）
@@ -36,8 +45,8 @@
 //! 无论子任务是「全新创建」还是「fork 旧的」，只要它是子任务就带此字段。
 //! `idx_sessions_parent` 支撑全部按此列的查询路径（排除过滤 / 按父列举 / 计数子查询）。
 
-/// 当前 schema 版本（开发阶段 db 每次重建，保持 1）
-pub const SCHEMA_VERSION: i32 = 1;
+/// 当前 schema 版本（演进线见模块文档的 v2 / v3 / v4 改动段）
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// 完整的 DDL 语句
 pub const SCHEMA_SQL: &str = r#"
@@ -103,4 +112,15 @@ CREATE TABLE IF NOT EXISTS todos (
 );
 
 CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id, sort_order);
+
+CREATE TABLE IF NOT EXISTS file_snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    msg_seq     INTEGER NOT NULL,
+    tree_hash   TEXT NOT NULL,
+    files       TEXT NOT NULL DEFAULT '[]',
+    created_at  REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_snapshots_session_seq ON file_snapshots(session_id, msg_seq);
 "#;

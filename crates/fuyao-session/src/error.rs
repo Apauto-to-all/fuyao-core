@@ -26,6 +26,11 @@ pub enum SessionError {
     /// 携带 max_len 真值，调用方可直接取用构造面向用户的提示
     #[error("无效的会话标题（空白或超过 {max_len} 字符）")]
     InvalidTitle { max_len: usize },
+
+    /// 文件快照行的 files 列 JSON 处理失败（脏数据）。
+    /// 触碰集是回退删文件的依据，静默丢弃会导致回退漏删文件，故按错误上抛不降级
+    #[error("快照文件清单 JSON 处理失败: {0}")]
+    SnapshotFilesJson(String),
 }
 
 impl SessionError {

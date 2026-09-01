@@ -1,7 +1,8 @@
 //! 对话回退
 //!
 //! [`SessionStore::rollback_to`] 把会话回退到某个目标消息**之前**：删除目标消息及其后
-//! 的所有消息，重算被影响的 count 类字段与压缩元数据，保护消费类字段（token / cost）不动。
+//! 的所有消息与同谓词的文件快照行，重算被影响的 count 类字段与压缩元数据，保护消费类
+//! 字段（token / cost）不动。
 //!
 //! # 回退语义
 //!
@@ -28,6 +29,12 @@
 //! 压缩元数据重算即重新统计剩余消息里的 compaction 情况：被删的 compaction 消息自然不计入，
 //! `last_compacted_seq` 自动落到剩余消息里最新一条 compaction（若无则置空）——这就是
 //! 「动了压缩消息，统一回退到上一个压缩边界」的实现，无需特殊代码分支。
+//!
+//! ## 快照行联动
+//!
+//! file_snapshots 行与消息以同一 `seq >= target` 谓词同生共死：删消息的同一事务内
+//! 同步删快照行。seq 回退后会复用，但复用的 seq 属于新快照——自增 id 主键保证
+//! 行身份回退后也不复用，新旧行永不混淆。
 //!
 //! # 单事务原子
 //!
@@ -82,15 +89,17 @@ pub(super) async fn validate_cut_target(
 }
 
 impl super::SessionStore {
-    /// 把会话回退到目标消息之前（删目标消息及其后的所有消息 + 重算 count 类与压缩元数据）
+    /// 把会话回退到目标消息之前（删目标消息及其后的所有消息与同谓词快照行 + 重算
+    /// count 类与压缩元数据）
     ///
-    /// 单事务原子操作，四步：
+    /// 单事务原子操作，五步：
     /// 1. 校验目标消息存在 + role/kind 合法（只能是 user 或 compaction）
     /// 2. 删除目标消息及其后的所有消息——`RETURNING` 带回被删行的 (role, kind)，
     ///    Rust 侧聚合成删除计数写进日志
-    /// 3. 重算 count 类字段（message_count / tool_call_count）与压缩元数据
+    /// 3. 同谓词删除本会话 `msg_seq >= target` 的文件快照行（与消息同生共死）
+    /// 4. 重算 count 类字段（message_count / tool_call_count）与压缩元数据
     ///    （last_compacted_seq / compression_count）——四个标量聚合进单条查询
-    /// 4. 局部 UPDATE sessions 写回 4 个重算字段——token/cost 原值不动
+    /// 5. 局部 UPDATE sessions 写回 4 个重算字段——token/cost 原值不动
     ///
     /// # 参数
     /// - `session_id`:被回退的会话
@@ -130,7 +139,12 @@ impl super::SessionStore {
             .filter(|(role, kind)| role == "user" || kind == MessageKind::Compaction.as_str())
             .count() as i64;
 
-        // 4. 重算 count 类字段与压缩元数据（基于删除后的剩余消息），四个标量聚合成单条查询
+        // 4. 同谓词删除本会话 `msg_seq >= target` 的文件快照行——与消息同生共死，
+        //    无独立提交窗口；计数仅用于日志
+        let deleted_snapshots =
+            Self::delete_file_snapshots_from_in_tx(&mut tx, session_id, target_seq).await?;
+
+        // 5. 重算 count 类字段与压缩元数据（基于删除后的剩余消息），四个标量聚合成单条查询
         //    message_count：只数普通消息（kind='message'）
         //    tool_call_count：数 tool 结果消息数（一次调用对应一条 tool 结果）
         //    last_compacted_seq：剩余消息里最新一条 compaction 的 seq，无则置空（MAX 空集为 NULL）
@@ -152,7 +166,7 @@ impl super::SessionStore {
         .fetch_one(&mut *tx)
         .await?;
 
-        // 5. 局部 UPDATE sessions：只写回 4 个重算字段，token/cost 原值不动
+        // 6. 局部 UPDATE sessions：只写回 4 个重算字段，token/cost 原值不动
         //    （局部 UPDATE 是 session 表的唯一写范式——DB 单一数据源，无全量写）
         sqlx::query(
             "UPDATE sessions SET
@@ -176,6 +190,7 @@ impl super::SessionStore {
             target_seq = target_seq,
             deleted_count = deleted_count,
             deleted_total = deleted_total,
+            deleted_snapshots = deleted_snapshots,
             message_count = message_count,
             last_compacted_seq = ?last_compacted_seq,
             "对话已回退到目标消息之前"

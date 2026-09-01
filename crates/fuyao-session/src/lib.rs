@@ -27,5 +27,5 @@ mod title_generator;
 pub use compressor::{generate_summary, should_compress};
 pub use cost::{TokenUsage, calculate_cost, fill_message_cost};
 pub use error::SessionError;
-pub use store::{CompressionReason, SessionStore};
+pub use store::{CompressionReason, FileSnapshotRow, SessionStore};
 pub use title_generator::maybe_generate_title;

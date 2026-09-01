@@ -205,13 +205,14 @@ impl super::SessionStore {
         Ok(())
     }
 
-    /// 删除会话（cascade 删该会话及其全部子会话 + 各自的消息 + 任务列表）
+    /// 删除会话（cascade 删该会话及其全部子会话 + 各自的消息 + 任务列表 + 文件快照行）
     ///
     /// 删除范围是「本会话 + 其全部子会话」的会话组：单事务内删 todos + messages +
-    /// sessions，组内每个会话的数据要么全删要么全留——避免出现「消息删了、session
-    /// 行还在」或「session 删了、任务列表孤儿」的不一致窗口，也不留孤儿子会话。
+    /// file_snapshots + sessions，组内每个会话的数据要么全删要么全留——避免出现
+    /// 「消息删了、session 行还在」或「session 删了、任务列表 / 快照账孤儿」的
+    /// 不一致窗口，也不留孤儿子会话。
     /// 返回 `true` = 删到了主会话行；`false` = 主会话不存在（此时组内的子会话与
-    /// todos / messages 即便有残留也会被一并清掉）。
+    /// todos / messages / 快照行即便有残留也会被一并清掉）。
     pub async fn delete(&self, session_id: &str) -> Result<bool, SessionError> {
         let mut tx = self.pool.begin().await?;
 
@@ -223,9 +224,10 @@ impl super::SessionStore {
                 .fetch_one(&mut *tx)
                 .await?;
 
-        // 先清任务列表 + 消息，再删 session 行：组内会话的 id 集合经子查询取自
+        // 先清任务列表 + 消息 + 快照账，再删 session 行：组内会话的 id 集合经子查询取自
         // sessions 表，行仍在时子查询才取得到；session 行不存在时组内残留同样被清
         Self::delete_todos_in_tx(&mut tx, session_id).await?;
+        Self::delete_file_snapshots_group_in_tx(&mut tx, session_id).await?;
         sqlx::query(
             "DELETE FROM messages WHERE session_id IN
              (SELECT id FROM sessions WHERE id = ?1 OR parent_session_id = ?1)",
