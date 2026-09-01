@@ -60,7 +60,7 @@ impl AnthropicProvider {
     /// 从 provider_id 和 agent_paths 创建
     ///
     /// 共享构造骨架解析 API Key、base_url（缺省回退 Anthropic 官方端点）与
-    /// reqwest Client（超时取全局配置 `llm`），失败路径 WARN 后返回 None。
+    /// reqwest Client（连接超时取全局配置 `llm`），失败路径 WARN 后返回 None。
     pub fn new(provider_id: &str, agent_paths: &AgentPaths) -> Option<Self> {
         let parts =
             crate::http::resolve_http_parts(provider_id, agent_paths, "https://api.anthropic.com")?;
@@ -183,8 +183,12 @@ impl Provider for AnthropicProvider {
     ) -> Result<ChatResponse, StreamError> {
         let started = std::time::Instant::now();
         let body = request::build_request_body(request, model, &options, false);
-        let response =
-            crate::http::execute(self.post_builder(&body), classify::classify_http_error).await?;
+        let response = crate::http::execute(
+            self.post_builder(&body)
+                .timeout(crate::http::request_timeout()),
+            classify::classify_http_error,
+        )
+        .await?;
 
         let response_text = response
             .text()

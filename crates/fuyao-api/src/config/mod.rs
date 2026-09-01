@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(c.tools.limits.terminal_max_timeout_secs, 6000);
         assert_eq!(c.tools.terminal.shell, "auto");
         assert_eq!(c.guard.loop_.tool_repeat_threshold, 4);
-        assert_eq!(c.llm.request_timeout_secs, 300);
+        assert_eq!(c.llm.request_timeout_secs, 600);
         assert_eq!(c.image.max_pixels, 2000);
         assert_eq!(c.session.compression.threshold, 0.85);
         assert_eq!(c.mcp.tool_timeout_secs, 120);
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn get_config_without_set_returns_default_no_panic() {
         let c = get_config();
-        assert_eq!(c.llm.request_timeout_secs, 300);
+        assert_eq!(c.llm.request_timeout_secs, 600);
         assert_eq!(c.engine.fan_out_capacity, 512);
         assert!(c.providers.is_empty());
         assert_eq!(c.logging.level, "info");

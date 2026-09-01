@@ -137,8 +137,8 @@ TOML 键为 `[guard.loop]`（Rust 字段名 `loop` 是保留字经 rename 映射
 
 | 字段 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `request_timeout_secs` | 整数 | `300` | HTTP 请求超时 |
-| `connect_timeout_secs` | 整数 | `10` | HTTP 连接超时 |
+| `request_timeout_secs` | 整数 | `600` | 非流式请求总超时（秒），从连接到响应体读毕全程生效；流式对话不设总超时（长思考回复可达数十分钟），流停滞由 SSE 空闲超时防护 |
+| `connect_timeout_secs` | 整数 | `10` | HTTP 连接建立超时（秒），流式 / 非流式共用 |
 
 ```toml
 [llm.retry]

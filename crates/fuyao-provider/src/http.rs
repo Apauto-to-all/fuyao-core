@@ -13,10 +13,10 @@ use std::time::Duration;
 
 /// SSE 流空闲超时：两次 chunk 到达之间的最长等待秒数
 ///
-/// reqwest Client 的整体 `.timeout()` 对逐块消费的流式 body 不可靠——代理 /
-/// 负载均衡器掐断连接后 `bytes_stream.next().await` 可能永久挂起，静默连接
-/// 会让整个轮次卡死。每次取 chunk 用 `tokio::time::timeout` 单独包住，
-/// 窗口内无数据即中断，映射为可重试的 [`StreamError::Timeout`]。
+/// 流式对话不设请求总超时（长思考模型单次回复可达数十分钟，总死线会把
+/// 健康的慢流拦腰掐断），连接停滞的防护完全由本空闲超时承担：每次取
+/// chunk 用 `tokio::time::timeout` 单独包住，窗口内无数据即中断，映射为
+/// 可重试的 [`StreamError::Timeout`]。
 const SSE_IDLE_TIMEOUT_SECS: u64 = 90;
 
 /// 协议支持的图片 MIME 白名单（仅图像：PNG / JPEG / WEBP / 非动画 GIF）
@@ -44,9 +44,9 @@ pub(crate) struct HttpParts {
 /// 解析 Provider HTTP 构造要素
 ///
 /// 注册表解析 API Key（未解析到 WARN 返回 None）→ 注册表解析 base_url
-/// （缺省回退 `default_base_url`）→ 按全局配置 `llm` 的超时参数构建 Client
-/// （构建失败 WARN 返回 None）。供应商级容错：单个供应商要素缺失即跳过，
-/// 不拖垮其余供应商。
+/// （缺省回退 `default_base_url`）→ 按全局配置 `llm.connect_timeout_secs`
+/// 构建客户端（构建失败 WARN 返回 None）。供应商级容错：单个供应商要素
+/// 缺失即跳过，不拖垮其余供应商。
 pub(crate) fn resolve_http_parts(
     provider_id: &str,
     agent_paths: &AgentPaths,
@@ -62,9 +62,11 @@ pub(crate) fn resolve_http_parts(
     let base_url = crate::resolver::get_base_url(provider_id, agent_paths)
         .unwrap_or_else(|| default_base_url.to_string());
 
+    // 客户端只设连接建立超时，不设请求总超时：流式 body 时长无上界（长思考
+    // 模型单次回复可达数十分钟），总死线会把健康的慢流拦腰掐断。流停滞防护
+    // 由 [`next_chunk`] 的空闲超时承担；非流式请求在各自调用点设请求级总超时。
     let llm = fuyao_api::get_config().llm.clone();
     let client = match Client::builder()
-        .timeout(Duration::from_secs(llm.request_timeout_secs))
         .connect_timeout(Duration::from_secs(llm.connect_timeout_secs))
         .build()
     {
@@ -80,6 +82,15 @@ pub(crate) fn resolve_http_parts(
         base_url,
         client,
     })
+}
+
+/// 非流式请求的总超时时长（读全局配置 `llm.request_timeout_secs`）
+///
+/// 流式对话不设总超时（见 [`resolve_http_parts`] 的客户端构建说明）；非流式
+/// `chat()`（标题生成等一次性短文本场景）以本值设请求级总超时，覆盖从连接
+/// 到响应体读毕的全程，防止响应永不返回时调用方永久挂起。
+pub(crate) fn request_timeout() -> Duration {
+    Duration::from_secs(fuyao_api::get_config().llm.request_timeout_secs)
 }
 
 /// 构造 POST 请求构建器：目标 URL + 注入请求头组 + Content-Type + JSON body（未发送）

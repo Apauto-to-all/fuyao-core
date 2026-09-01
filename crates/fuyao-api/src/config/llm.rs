@@ -1,6 +1,4 @@
-//! LLM 调用层配置
-//!
-//! 迁移自 `fuyao-provider/src/openai.rs`（HTTP 超时）、`retry.rs`（退避）的硬编码。
+//! LLM 调用层配置（HTTP 超时 / 重试退避）
 
 use serde::Deserialize;
 
@@ -42,9 +40,11 @@ impl Default for RetryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// HTTP 请求超时（秒），原 `openai.rs:48` = 300
+    /// 非流式请求的总超时（秒）：从连接到响应体读毕全程生效（标题生成等一次性短文本场景）。
+    /// 流式对话不设总超时——长思考模型单次回复可达数十分钟，总死线会掐断健康流；
+    /// 流停滞由 provider 层的 SSE 空闲超时防护
     pub request_timeout_secs: u64,
-    /// HTTP 连接超时（秒），原 `openai.rs:49` = 10
+    /// HTTP 连接建立超时（秒），流式 / 非流式共用
     pub connect_timeout_secs: u64,
     /// 重试退避子段，对应 TOML `[llm.retry]`
     pub retry: RetryConfig,
@@ -53,7 +53,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            request_timeout_secs: 300,
+            request_timeout_secs: 600,
             connect_timeout_secs: 10,
             retry: RetryConfig::default(),
         }
@@ -77,7 +77,7 @@ mod tests {
     #[test]
     fn llm_config_defaults_match_hardcoded() {
         let c = LlmConfig::default();
-        assert_eq!(c.request_timeout_secs, 300);
+        assert_eq!(c.request_timeout_secs, 600);
         assert_eq!(c.connect_timeout_secs, 10);
         assert_eq!(c.retry.initial_delay_ms, 2000);
         assert_eq!(c.retry.max_delay_ms, 30000);
@@ -134,7 +134,7 @@ max_retries = 5
             llm: LlmConfig,
         }
         let w: Wrap = toml::from_str("").unwrap();
-        assert_eq!(w.llm.request_timeout_secs, 300);
+        assert_eq!(w.llm.request_timeout_secs, 600);
         assert_eq!(w.llm.retry.initial_delay_ms, 2000);
     }
 }
