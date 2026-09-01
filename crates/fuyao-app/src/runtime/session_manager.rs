@@ -961,10 +961,35 @@ mod tests {
         assert_eq!(m.payload.deleted, vec!["n.txt".to_string()]);
     }
 
-    /// 触碰集口径：窗口内各行的记录差异。行的 files 记「自上一快照以来的变更」，
-    /// 由下一批开拍时落账——窗口终批之后的净变更尚无行承载，不在触碰集内
+    /// 模拟 turn 收尾补拍：最终回复 assistant 消息落库 → 以它为锚点再采一行
+    /// （files = 自最新一行以来的差异 = 终批工具的变更窗口），不施加文件改动。
+    /// 返回 (锚点 seq, 收尾行基线树)
+    async fn simulate_turn_close(fx: &RollbackFixture, prev_tree: Option<&str>) -> (i64, String) {
+        let seq = insert_message(
+            &fx.manager.store,
+            &fx.session_id,
+            Message::assistant(Some("最终回复".to_string())),
+        )
+        .await;
+        let outcome = fx
+            .manager
+            .snapshot
+            .track(prev_tree)
+            .await
+            .expect("采集应成功")
+            .expect("可用态应有结果");
+        fx.manager
+            .store
+            .insert_file_snapshot(&fx.session_id, seq, &outcome.tree_hash, &outcome.files)
+            .await
+            .unwrap();
+        (seq, outcome.tree_hash)
+    }
+
+    /// 触碰集口径：窗口内各行的记录差异全量进入触碰集——批边界行记批间增量，
+    /// 收尾行记终批变更窗口。回退刚结束的 turn 时，终批的净新建被删、净修改被复原
     #[tokio::test]
-    async fn rollback_touch_set_covers_recorded_window_diffs() {
+    async fn rollback_touch_set_covers_turn_final_batch_diffs() {
         let fx = rollback_fixture().await;
         std::fs::write(fx.worktree.join("a.txt"), "v1").unwrap();
         insert_message(
@@ -973,37 +998,44 @@ mod tests {
             Message::user("u1".into()),
         )
         .await;
+        // turn1：批1 改 a.txt → 收尾行（锚定最终回复）承载批1 的效果
         let (_, tree1) = simulate_tool_batch(&fx, None, &[("a.txt", "v2")]).await;
-        // 终批：新建 z.txt——它是「批1 之后、无后续批开拍」的变更，不进任何行的 files
+        let (_, close1_tree) = simulate_turn_close(&fx, Some(&tree1)).await;
+        // turn2（刚结束的 turn）：终批既再改 a.txt 又新建 z.txt → 收尾行承载终批全部变更
         let u2 = insert_message(
             &fx.manager.store,
             &fx.session_id,
             Message::user("u2".into()),
         )
         .await;
-        simulate_tool_batch(&fx, Some(&tree1), &[("z.txt", "终批新建")]).await;
+        let (_, tree2) = simulate_tool_batch(
+            &fx,
+            Some(&close1_tree),
+            &[("a.txt", "v3 终批修改"), ("z.txt", "终批新建")],
+        )
+        .await;
+        simulate_turn_close(&fx, Some(&tree2)).await;
 
         let outcome = fx
             .manager
             .rollback_session(&fx.session_id, u2)
             .await
             .expect("回退应成功");
-        // 窗口 = 批2 的行（files = 批1 的变更 [a.txt]）：a.txt 在基线树内 → 恢复
         assert_eq!(
             outcome,
             FileRollbackOutcome::Restored {
                 restored: vec!["a.txt".to_string()],
-                deleted: vec![],
+                deleted: vec!["z.txt".to_string()],
             }
         );
         assert_eq!(
             std::fs::read_to_string(fx.worktree.join("a.txt")).unwrap(),
             "v2",
-            "批1 的变更已由批2 的行记录，恢复为基线（批2 执行前）内容"
+            "终批的再修改应回到基线（终批执行前）内容"
         );
         assert!(
-            fx.worktree.join("z.txt").exists(),
-            "终批的净新建变更无行承载，不在触碰集内"
+            !fx.worktree.join("z.txt").exists(),
+            "终批的净新建变更由收尾行承载，回退时删除"
         );
     }
 

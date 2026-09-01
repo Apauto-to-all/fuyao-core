@@ -15,7 +15,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 
 ## 项目导航
 
-所有源码在 `crates/` 下，10 个 crate 依赖严格单向，禁止反向依赖。按职责分五类：
+所有源码在 `crates/` 下，11 个 crate 依赖严格单向，禁止反向依赖。按职责分五类：
 
 **基座**（公共类型）：
 
@@ -37,6 +37,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 - `fuyao-mcp`：MCP Server 连接管理 + 工具发现 / 注册 / 调用
 - `fuyao-tools`：内置工具实现集合（file / terminal / web / todo / skill / subagent）。**依赖 fuyao-prompt（子代理定义加载与校验、Agent 定义查询、skills 读取门面）**
 - `fuyao-guard`：内置防护插件（循环检测，防重复执行 / 输出），基于 hooks 插件机制接入。**依赖 fuyao-hooks**
+- `fuyao-snapshot`：文件快照能力（影子 git 仓：独立 git-dir 落数据目录、work-tree 指向用户工作区，git CLI 子进程封装不引入 git2）——工具批边界与 turn 收尾的全工作区基线采集、按基线树恢复、7 天 TTL gc；用户 `.git` 永不被触碰，git 缺失自动禁用降级。**被 fuyao-core（ReAct 循环采集落账）与 fuyao-app（装配构造 + 回退恢复）双重消费**
 
 **装配入口**（项目唯一的组装点，把下层能力装配成可用的引擎）：
 

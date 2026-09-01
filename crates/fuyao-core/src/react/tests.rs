@@ -4053,8 +4053,19 @@ async fn nth_tool_batch_seq(h: &TestHarness, n: usize) -> i64 {
         .unwrap_or_else(|| panic!("应有至少 {} 个工具批 assistant 消息", n + 1))
 }
 
-/// 工具批边界落行：track 在工具执行前拍工作区，行锚定本批 assistant 消息 seq；
-/// 下一批开拍时把上一批的文件效果落进该行 files（增量 diff 语义）
+/// 从 DB 取指定内容的消息 seq（锚点断言用，找不到即 panic）
+async fn seq_of(h: &TestHarness, needle: &str) -> i64 {
+    visible_messages(h)
+        .await
+        .iter()
+        .find(|m| m.content.as_deref() == Some(needle))
+        .map(|m| m.seq)
+        .unwrap_or_else(|| panic!("消息「{needle}」应进 DB"))
+}
+
+/// 工具批边界落行 + turn 收尾补拍：批边界行锚定本批 assistant 消息 seq（基线 =
+/// 本批执行前现场、files = 批间增量）；收尾行锚定 turn 最后一条 assistant 消息 seq
+/// （files = 最后一批工具的变更窗口），两行配合使任意批的文件效果都有行承载
 #[tokio::test]
 async fn tool_batches_record_snapshot_rows_anchored_to_assistant_seq() {
     let (worktree, snapshot) = snapshot_workdir("anchor").await;
@@ -4082,7 +4093,8 @@ async fn tool_batches_record_snapshot_rows_anchored_to_assistant_seq() {
     )
     .await;
 
-    // turn1：批1 落首拍行（prev_tree 无行 → files 空集）
+    // turn1：批1 落首拍行（prev_tree 无行 → files 空集）；收尾行锚定最终回复 seq，
+    // files = 批1 的效果（a.txt 的修改）
     preload_user(&h, "问题1").await;
     turn::run_turn(
         &h.ctx,
@@ -4098,21 +4110,28 @@ async fn tool_batches_record_snapshot_rows_anchored_to_assistant_seq() {
         .list_file_snapshots_from(&h.session_id, 0)
         .await
         .expect("查快照行失败");
-    assert_eq!(rows.len(), 1, "批1 应落一行");
+    assert_eq!(rows.len(), 2, "批1 边界行 + turn1 收尾行");
     assert_eq!(
         rows[0].msg_seq,
         nth_tool_batch_seq(&h, 0).await,
-        "行锚定本批 assistant 消息 seq"
+        "批边界行锚定本批 assistant 消息 seq"
     );
     assert!(rows[0].files.is_empty(), "首拍无上一行，files 为空集");
+    assert_eq!(rows[1].msg_seq, seq_of(&h, "批1完成").await);
+    assert_eq!(
+        rows[1].files,
+        vec!["a.txt".to_string()],
+        "turn1 收尾行承载批1 的文件效果"
+    );
     assert!(!rows[0].tree_hash.is_empty(), "基线树哈希非空");
+    assert_ne!(rows[0].tree_hash, rows[1].tree_hash, "两行基线树应不同");
     assert_eq!(
         std::fs::read_to_string(worktree.join("a.txt")).unwrap(),
         "v2 批1修改",
         "track 在工具执行前拍基线，工具照常执行"
     );
 
-    // turn2：批2 落增量行，files = 批1 的效果（a.txt 的修改）
+    // turn2：批2 边界行（files = 批间增量，无人工漂移即空集）；收尾行承载批2 的效果
     preload_user(&h, "问题2").await;
     turn::run_turn(
         &h.ctx,
@@ -4128,18 +4147,248 @@ async fn tool_batches_record_snapshot_rows_anchored_to_assistant_seq() {
         .list_file_snapshots_from(&h.session_id, 0)
         .await
         .expect("查快照行失败");
-    assert_eq!(rows.len(), 2, "两个工具批各落一行");
+    assert_eq!(rows.len(), 4, "两个 turn 各一对（边界行 + 收尾行）");
     assert_eq!(
-        rows[1].msg_seq,
+        rows[2].msg_seq,
         nth_tool_batch_seq(&h, 1).await,
-        "第二行锚定批2 的 assistant 消息 seq"
+        "turn2 批边界行锚定批2 的 assistant 消息 seq"
+    );
+    assert!(
+        rows[2].files.is_empty(),
+        "批间增量归属下一行：无人工漂移时 turn2 首行 files 为空集"
+    );
+    assert_eq!(rows[3].msg_seq, seq_of(&h, "批2完成").await);
+    assert_eq!(
+        rows[3].files,
+        vec!["b.txt".to_string()],
+        "turn2 收尾行承载批2 的文件效果"
+    );
+}
+
+/// 单 turn 多批：每批边界行 files 承载上一批的增量、收尾行承载终批的变更窗口——
+/// 回退刚结束的 turn 时终批效果不漏（核心场景的引擎侧挂接证明）
+#[tokio::test]
+async fn turn_final_row_carries_last_batch_changes() {
+    let (worktree, snapshot) = snapshot_workdir("turnfinal").await;
+    std::fs::write(worktree.join("a.txt"), "v1").expect("预置 a.txt 失败");
+    let provider = Arc::new(MockProvider::new(vec![
+        MockProvider::tool_call_response(
+            "tc_1",
+            "write_file",
+            r#"{"path":"a.txt","content":"v2 批1修改"}"#,
+        ),
+        MockProvider::tool_call_response(
+            "tc_2",
+            "write_file",
+            r#"{"path":"n.txt","content":"批2新建"}"#,
+        ),
+        MockProvider::text_response("全部完成"),
+    ]));
+    let mut h = make_harness_with_snapshot(
+        provider,
+        write_file_registry(worktree.clone()),
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        snapshot,
+    )
+    .await;
+    preload_user(&h, "问题").await;
+    let outcome = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &open_gate(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Completed),
+        "turn 应正常完成"
+    );
+
+    // 行形态：批1 边界行（首拍空集）→ 批2 边界行（files = 批1 增量）→
+    // 收尾行（锚定最终回复 seq，files = 批2 即终批的变更窗口）
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert_eq!(rows.len(), 3, "两个批边界行 + 一个收尾行");
+    assert_eq!(rows[1].msg_seq, nth_tool_batch_seq(&h, 1).await);
+    assert_eq!(
+        rows[1].files,
+        vec!["a.txt".to_string()],
+        "批2 边界行承载批1 的增量"
+    );
+    assert_eq!(rows[2].msg_seq, seq_of(&h, "全部完成").await);
+    assert_eq!(
+        rows[2].files,
+        vec!["n.txt".to_string()],
+        "收尾行承载终批（批2）的变更窗口"
+    );
+    assert!(
+        std::fs::read_to_string(worktree.join("n.txt"))
+            .expect("终批新建文件应存在")
+            .contains("批2新建"),
+        "终批工具照常执行"
+    );
+}
+
+/// 中断退出路径同样补收尾行：工具批边界行落账后 turn 被中断，收尾行仍锚定本 turn
+/// 最后一条 assistant 消息（即本批 assistant），files 承载中断前已完成工具的变更
+#[tokio::test]
+async fn interrupted_turn_records_final_row() {
+    use fuyao_api::InterruptSource;
+    use fuyao_api::message::output::InterruptMessage;
+
+    let (worktree, snapshot) = snapshot_workdir("turnfinal-int").await;
+    std::fs::write(worktree.join("a.txt"), "v1").expect("预置 a.txt 失败");
+    // 一批两个工具调用：fast 立即写文件完成，slow 阻塞等中断
+    let provider = Arc::new(MockProvider::new(vec![vec![
+        Ok(StreamEvent::ToolCallChunk {
+            index: 0,
+            id: Some("tc_fast".to_string()),
+            name: Some("write_file".to_string()),
+            args_delta: Some(r#"{"path":"a.txt","content":"v2 中断前写入"}"#.to_string()),
+        }),
+        Ok(StreamEvent::ToolCallChunk {
+            index: 1,
+            id: Some("tc_slow".to_string()),
+            name: Some("blocking_tool".to_string()),
+            args_delta: Some("{}".to_string()),
+        }),
+        Ok(StreamEvent::Done {
+            usage: StreamUsage::default(),
+            finish_reason: FinishReason::ToolCalls,
+        }),
+    ]]));
+    let blocking_handler: fuyao_api::ToolFn = Arc::new(|_args, _ctx, _cancel| {
+        Box::pin(async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            fuyao_api::ToolOutput::text("unreachable")
+        })
+    });
+    // 注册表含两个工具：write_file（快写，写完发通知）+ blocking_tool（阻塞等中断）
+    let write_done = Arc::new(tokio::sync::Notify::new());
+    let tools = {
+        let wt = worktree.clone();
+        let write_done = Arc::clone(&write_done);
+        let write_handler: fuyao_api::ToolFn = Arc::new(move |args, _ctx, _cancel| {
+            let target = wt.clone();
+            let notify = Arc::clone(&write_done);
+            Box::pin(async move {
+                let path = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let content = args
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                match std::fs::write(target.join(path), content) {
+                    Ok(()) => {
+                        notify.notify_one();
+                        fuyao_api::ToolOutput::text(format!("已写入 {path}"))
+                    }
+                    Err(cause) => fuyao_api::ToolOutput::text(format!("写入失败：{cause}")),
+                }
+            })
+        });
+        Arc::new(
+            ToolRegistry::builder()
+                .register(fuyao_api::ToolEntry {
+                    definition: fuyao_api::ToolDefinition::new("write_file", "向工作区写文件"),
+                    handler: write_handler,
+                    child_invisible: false,
+                })
+                .register(fuyao_api::ToolEntry {
+                    definition: fuyao_api::ToolDefinition::new("blocking_tool", "阻塞测试工具"),
+                    handler: blocking_handler,
+                    child_invisible: false,
+                })
+                .build(),
+        )
+    };
+
+    let mut h = make_harness_with_snapshot(
+        provider,
+        tools,
+        empty_hooks(),
+        fuyao_api::AgentPaths::default(),
+        snapshot,
+    )
+    .await;
+    preload_user(&h, "问题").await;
+
+    let tx_interrupt = h.tx_interrupt.clone();
+    let gate = open_gate();
+    let turn_fut = turn::run_turn(
+        &h.ctx,
+        &mut h.rx_inbound,
+        &mut h.rx_interrupt,
+        test_params(),
+        &gate,
+    );
+    tokio::pin!(turn_fut);
+    // 等 write_file 落盘后再发中断：保证中断前已有工具效果进入收尾行的 diff 窗口
+    let interrupter = async {
+        tokio::time::timeout(std::time::Duration::from_secs(2), write_done.notified())
+            .await
+            .expect("write_file 应在中断前完成");
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tx_interrupt
+            .send(InterruptMessage::new("用户取消", InterruptSource::User))
+            .await
+            .unwrap();
+    };
+    let outcome = tokio::select! {
+        _ = &mut turn_fut => panic!("阻塞工具挂起中，turn 不可能先于中断完成"),
+        _ = interrupter => {
+            tokio::time::timeout(std::time::Duration::from_secs(2), turn_fut)
+                .await
+                .expect("run_turn 应在中断后结束")
+        }
+    };
+    assert!(
+        matches!(outcome, turn::TurnOutcome::Interrupted),
+        "工具执行期间中断应返回 Interrupted"
+    );
+
+    // 行形态：批边界行（首拍空集）+ 收尾行（同锚定本批 assistant——中断路径无更晚的
+    // assistant 消息），files 承载中断前已完成工具（write_file）的变更
+    // （直取 ctx.store 字段级借用——turn_fut 的 PinMut 仍持有 h.rx_inbound 等可变借用）
+    let rows = h
+        .ctx
+        .store
+        .list_file_snapshots_from(&h.session_id, 0)
+        .await
+        .expect("查快照行失败");
+    assert_eq!(rows.len(), 2, "批边界行 + 中断收尾行");
+    let msgs = h
+        .ctx
+        .store
+        .load_visible_messages(&h.session_id)
+        .await
+        .expect("加载可见消息失败");
+    let batch_seq = msgs
+        .iter()
+        .find(|m| m.tool_calls.is_some())
+        .map(|m| m.seq)
+        .expect("应有携带 tool_calls 的 assistant 消息");
+    assert_eq!(rows[0].msg_seq, batch_seq, "批边界行锚定本批 assistant seq");
+    assert!(rows[0].files.is_empty(), "首拍无上一行，files 为空集");
+    assert_eq!(
+        rows[1].msg_seq, batch_seq,
+        "收尾行锚定本 turn 最后一条 assistant 消息（即本批 assistant）"
     );
     assert_eq!(
         rows[1].files,
         vec!["a.txt".to_string()],
-        "批2 的行记录批1 的文件效果"
+        "收尾行承载中断前已完成工具的变更窗口"
     );
-    assert_ne!(rows[0].tree_hash, rows[1].tree_hash, "两批基线树应不同");
 }
 
 /// 纯对话轮（无工具调用）零成本跳过：不落任何快照行

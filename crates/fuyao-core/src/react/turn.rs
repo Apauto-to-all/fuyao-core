@@ -78,12 +78,60 @@ pub(crate) enum TurnOutcome {
 /// 返回 [`TurnOutcome`]：主循环经
 /// [`ConsumeGate::on_turn_end`](crate::react::queue::ConsumeGate::on_turn_end)
 /// 迁移消费许可——非 `Completed` 的退出意味着「队列剩余不该继续跑」。
+///
+/// turn 无论以哪种原因退出（正常完成 / 中断 / shutdown / 失败），收尾统一在本函数
+/// 末尾做快照补拍（[`track_at_turn_end`]）——本 turn 有过工具批落账时再采一行，
+/// 承载最后一批工具的变更窗口。
 pub(crate) async fn run_turn(
     ctx: &SessionCtx,
     rx_inbound: &mut Receiver<QueueEntry>,
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     model_config: ModelConfig,
     gate: &ConsumeGate,
+) -> TurnOutcome {
+    // 快照账跟踪：记录本 turn 的锚点线索，收尾补拍的输入
+    let mut ledger = TurnLedger::default();
+    let outcome = run_turn_loop(
+        ctx,
+        rx_inbound,
+        rx_interrupt,
+        model_config,
+        gate,
+        &mut ledger,
+    )
+    .await;
+    track_at_turn_end(ctx, &ledger).await;
+    outcome
+}
+
+/// turn 内快照账跟踪（收尾补拍的输入）
+///
+/// 快照行的 `files` 记「自上一行以来的差异」，由下一次采集落账——turn 最后一批
+/// 工具的效果若无收尾行承载，回退会漏掉它。本结构在 turn 运行期间累积锚点线索：
+/// - [`Self::last_assistant_seq`]：收尾行的锚点（turn 最后一条落库的 assistant 消息 seq）
+/// - [`Self::tool_batch_tracked`]：本 turn 是否有过带锚点的工具批采集——纯对话 turn
+///   不补拍（无批次即无变更窗口要承载）
+#[derive(Default)]
+struct TurnLedger {
+    /// 本 turn 最后一条成功落库的 assistant 消息 seq
+    /// （拦截 Block / 落库失败返回 None 时不覆盖已有值——锚点必须指向真实落库的行）
+    last_assistant_seq: Option<i64>,
+    /// 本 turn 是否有过带锚点的工具批采集（assistant 消息已落库且本批将执行工具）
+    tool_batch_tracked: bool,
+}
+
+/// ReAct 循环主体（[`run_turn`] 的内层执行体）
+///
+/// 参数与返回值同 [`run_turn`]，多一个 `ledger`：turn 运行期间由
+/// [`handle_final_reply`] / [`handle_tool_calls`] 累积快照账锚点线索，
+/// 供外层收尾补拍消费。
+async fn run_turn_loop(
+    ctx: &SessionCtx,
+    rx_inbound: &mut Receiver<QueueEntry>,
+    rx_interrupt: &mut Receiver<OutputInterruptMessage>,
+    model_config: ModelConfig,
+    gate: &ConsumeGate,
+    ledger: &mut TurnLedger,
 ) -> TurnOutcome {
     // 解析本轮 model_id + 从 registry 查 Provider 实例
     // 任一失败：发 Error 事件 + 结束本轮（配置错误，永久不可恢复）
@@ -187,7 +235,7 @@ pub(crate) async fn run_turn(
                     // 无工具调用：最终回复。消费时机②取件（规则见 queue 模块），
                     // 注入过消息 → 回 ReAct 顶部再调一轮 LLM（下一轮 ReAct 循环）；
                     // 双队列都空 → turn 正常结束
-                    if !handle_final_reply(ctx, gate, &result, &model_config).await {
+                    if !handle_final_reply(ctx, gate, &result, &model_config, ledger).await {
                         return TurnOutcome::Completed;
                     }
                 } else {
@@ -200,6 +248,7 @@ pub(crate) async fn run_turn(
                         rx_interrupt,
                         &result,
                         &model_config,
+                        ledger,
                     )
                     .await;
                     if halted {
@@ -254,6 +303,7 @@ async fn handle_final_reply(
     gate: &ConsumeGate,
     result: &StreamResult,
     model_config: &ModelConfig,
+    ledger: &mut TurnLedger,
 ) -> bool {
     // 回传本轮真实 usage 给主循环（pre-turn 压缩触发判定用）
     *ctx.last_usage.lock().await = Some(result.usage.clone());
@@ -263,7 +313,13 @@ async fn handle_final_reply(
         base: EventBase::default(),
         payload: assistant_payload(result),
     });
-    crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
+    let seq =
+        crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
+    // 记锚点线索：最终回复是 turn 的末条 assistant 消息，收尾行锚定它
+    // （None = Block / 落库失败，保留更早的锚点值）
+    if seq.is_some() {
+        ledger.last_assistant_seq = seq;
+    }
     // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
     // 消费时机②：经消费门取件（pending 倒灌 guide 后全取）
@@ -295,6 +351,7 @@ async fn handle_tool_calls(
     rx_interrupt: &mut Receiver<OutputInterruptMessage>,
     result: &StreamResult,
     model_config: &ModelConfig,
+    ledger: &mut TurnLedger,
 ) -> bool {
     // 步骤1：逐个拦截 ToolCall 事件，构造 effective_tool_calls
     // 整批 tool_calls 拆成单个 ToolCall 事件各自拦截；Block 的跳过。
@@ -330,6 +387,10 @@ async fn handle_tool_calls(
     });
     let assistant_seq =
         crate::history::emit_billed_to_history(ctx, event, model_config.model_id.as_str()).await;
+    // 记锚点线索：本批 assistant 消息（None = Block / 落库失败，保留更早的锚点值）
+    if assistant_seq.is_some() {
+        ledger.last_assistant_seq = assistant_seq;
+    }
     // 拦截 Block：消息不进历史、不计费——插件的责任，引擎不替它兜底
 
     // 若全部工具调用被拦截（effective 为空）或 AssistantMessage 被 Block，无需执行
@@ -343,7 +404,9 @@ async fn handle_tool_calls(
     // 步骤2.5：文件快照采集——此刻本批 assistant 消息已落库（seq 已知）、工具尚未
     // 执行，工作区状态即「本批工具执行前」的基线。纯对话轮不进本函数，零快照成本；
     // 采集失败 WARN 不中断（fail-open：该批无快照行，工具照常执行）
-    track_before_tool_batch(ctx, assistant_seq).await;
+    record_snapshot_row(ctx, assistant_seq).await;
+    // 带锚点的采集已尝试：收尾补拍的前置条件成立（无锚点批不计数——无行承载也无收尾义务）
+    ledger.tool_batch_tracked = ledger.tool_batch_tracked || assistant_seq.is_some();
 
     // 步骤3：中断点②——工具执行期间（含 shutdown）
     // execute_tools 通过 result_tx 通知完成（一个一个通知）；本循环边收边走统一历史入口
@@ -480,19 +543,25 @@ async fn drain_finished_results(
     }
 }
 
-/// 工具批执行前的文件快照采集（全局唯一触发点）
+/// 采集工作区基线并落一行快照（两类快照触发点共用的执行体）
 ///
-/// 每个「即将执行工具」的批边界做一次全工作区采集并落一行 file_snapshots：
-/// - 基线树 = 影子仓 write-tree 结果（本批工具执行前的工作区现场）
-/// - 变更集 = 对比本会话上一条快照行的基线树（首拍为空集）
-/// - `msg_seq` = 本批 assistant 消息的落库 seq（行与消息以同一 `seq >= target`
-///   谓词同生共死，回退联动据此取行）
+/// 两类触发点：
+/// - **工具批边界**（[`handle_tool_calls`] 步骤 2.5）：本批 assistant 消息已落库、
+///   工具尚未执行，基线树 = 本批工具执行前的工作区现场
+/// - **turn 收尾补拍**（[`track_at_turn_end`]）：锚定 turn 最后一条 assistant 消息 seq，
+///   基线树 = 收尾时的工作区状态，`files` = 自本会话最新一行以来的差异 = 最后一批
+///   工具的变更窗口
+///
+/// 落行语义：基线树 = 影子仓 write-tree 结果；变更集 = 对比本会话上一条快照行的
+/// 基线树（首拍为空集）；`msg_seq` = 锚点 assistant 消息的落库 seq（行与消息以同一
+/// `seq >= target` 谓词同生共死，回退联动据此取行）。
 ///
 /// 降级路径全部 fail-open（WARN、不中断 turn）：
 /// - `msg_seq` 为 None：assistant 消息未落库（拦截 Block / 落库失败），无锚点跳过
 /// - 快照禁用态（配置关闭 / git 缺失）：零成本跳过
-/// - prev_tree 查询 / 采集 / 落行任一失败：该批无快照行，工具照常执行
-async fn track_before_tool_batch(ctx: &SessionCtx, msg_seq: Option<i64>) {
+/// - prev_tree 查询 / 采集 / 落行任一失败：本次触发点无快照行，工具照常执行、
+///   turn 照常收尾
+async fn record_snapshot_row(ctx: &SessionCtx, msg_seq: Option<i64>) {
     // 无锚点不采集：快照行必须关联到一条已落库的 assistant 消息
     let Some(msg_seq) = msg_seq else {
         return;
@@ -512,7 +581,7 @@ async fn track_before_tool_batch(ctx: &SessionCtx, msg_seq: Option<i64>) {
             tracing::warn!(
                 session_id = ctx.emitter.session_id(),
                 cause = %cause,
-                "查询上一快照基线树失败，本批跳过文件快照（不影响工具执行）"
+                "查询上一快照基线树失败，本次跳过文件快照（不影响工具执行）"
             );
             return;
         }
@@ -525,12 +594,12 @@ async fn track_before_tool_batch(ctx: &SessionCtx, msg_seq: Option<i64>) {
             tracing::warn!(
                 session_id = ctx.emitter.session_id(),
                 cause = %cause,
-                "文件快照采集失败，本批无快照行（不影响工具执行）"
+                "文件快照采集失败，本次无快照行（不影响工具执行）"
             );
             return;
         }
     };
-    // 落行：失败同样 fail-open（该批触碰集缺失由后续批次的增量 diff 自然覆盖）
+    // 落行：失败同样 fail-open（未落上的变更窗口由后续触发点的增量 diff 自然覆盖）
     if let Err(cause) = ctx
         .store
         .insert_file_snapshot(
@@ -544,7 +613,31 @@ async fn track_before_tool_batch(ctx: &SessionCtx, msg_seq: Option<i64>) {
         tracing::warn!(
             session_id = ctx.emitter.session_id(),
             cause = %cause,
-            "文件快照行落库失败，本批无快照行（不影响工具执行）"
+            "文件快照行落库失败，本次无快照行（不影响工具执行）"
         );
     }
+}
+
+/// turn 收尾补拍：承载最后一批工具变更窗口的收尾行
+///
+/// 快照行的 `files` 语义是「自上一行以来的差异」，由下一次采集落账——turn 的最后
+/// 一批工具执行完之后若直接收尾，其文件效果（净新建不删、净修改不复原）无行承载，
+/// 回退刚结束的 turn 会漏掉它。turn 结束时本 turn 有过工具批落账则再采一行：
+/// - 锚点 = 本 turn 最后一条落库的 assistant 消息 seq（正常完成为最终回复、
+///   中断 / 失败退出为最后一批的 assistant 消息），收尾行必为该 turn 末行
+/// - 该行 tree = 收尾时工作区状态，只作触碰集载体，永不作回退基线——
+///   基线恒取目标后首行，而收尾行之前必有同 turn 的批边界行
+/// - 纯对话 turn（无工具批落账）不补拍，零快照成本
+///
+/// 覆盖全部退出路径：本函数由 [`run_turn`] 在循环体返回后统一调用，正常完成、
+/// 中断、shutdown、失败四类退出都经过这里。全链路 fail-open：补拍失败 WARN，
+/// 不影响 turn 正常收尾。
+async fn track_at_turn_end(ctx: &SessionCtx, ledger: &TurnLedger) {
+    if !ledger.tool_batch_tracked {
+        return;
+    }
+    let Some(anchor) = ledger.last_assistant_seq else {
+        return;
+    };
+    record_snapshot_row(ctx, Some(anchor)).await;
 }

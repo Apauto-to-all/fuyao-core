@@ -137,8 +137,9 @@ pub(crate) struct SessionCtx {
     pub title_gate: std::sync::atomic::AtomicBool,
     /// 文件快照器（引擎级共享，同进程多会话克隆同一句柄共享影子仓）
     ///
-    /// 工具批执行前经 [`turn`] 的采集钩子对工作区做基线快照并落行。禁用态
-    /// （配置关闭 / git 缺失探测失败）下 track 静默跳过——类型非 Option：
+    /// 两个采集触发点均经 [`turn`] 的采集钩子落行：工具批执行前（基线 = 本批
+    /// 工具执行前的工作区现场）与 turn 收尾补拍（承载最后一批工具的变更窗口）。
+    /// 禁用态（配置关闭 / git 缺失探测失败）下 track 静默跳过——类型非 Option：
     /// 禁用语义内化在快照器自身，调用方零分支。
     pub file_snapshot: fuyao_snapshot::FileSnapshot,
 }

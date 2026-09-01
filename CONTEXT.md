@@ -14,7 +14,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | ReAct 循环 | `react` 模块 | 每 session 一个 tokio task：想 → 调一批工具 → 消费 guide 队列 → 再想 → 最终回复 |
 | 轮次 | `run_turn` / `TurnOutcome` | 单轮 ReAct 的执行与退出原因（`Completed` / `Interrupted` / `Failed`） |
 | dispatch 管道 | `dispatch` | 统一输出处理链：`intercept`（同步原地修改 / 阻止）→ `deliver`（发送 + 观察） |
-| 输出事件 | `OutputEvent` | Engine → UI 的唯一对外事件，13 个变体（`Chunk` / `User` / `Control` / `ToolCall` / `ToolResult` / `Assistant` / `Interrupt` / `Error` / `PluginNotice` / `Compression` / `Title` / `Retry` / `ChildSession`） |
+| 输出事件 | `OutputEvent` | Engine → UI 的唯一对外事件，14 个变体（`Chunk` / `User` / `Control` / `ToolCall` / `ToolResult` / `Assistant` / `Interrupt` / `Error` / `PluginNotice` / `Compression` / `Title` / `Retry` / `ChildSession` / `FilesRestored`） |
 | 输入事件 | `InputEvent` | UI → Engine 的入口事件（`User` / `Interrupt` / `Control`），入口即转 `OutputEvent`，内核不区分方向 |
 | 控制命令 | `ControlCommand` / `ControlMessage` | 命令主循环做事的消息（如手动压缩）：与用户消息同型排队、同序消费，消费点先以 `OutputEvent::Control` 回显对外、后执行命令本体，执行产物照常走输出事件流 |
 | 控制命令附言 | `ControlPayload.note` | 发送方随命令附带的可选自由文本（如手动压缩的摘要侧重要求）：不落库、回显原样携带，是否消费由各命令自决——多数命令视作一段提示词交给 AI 自行理解；新增命令禁止默认把附言设为必填（见 ADR-0001） |
@@ -28,12 +28,14 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | --- | --- | --- |
 | 会话 | `Session` / `SessionHandle` | 一次对话实体；Handle 是引擎调度表条目（双队列 + 两通道 + 参数句柄） |
 | session 通道 | inbound / interrupt | 统一入站通道（外部用户 + 控制命令与插件注入的 User 条目统一 `QueueEntry` 承载，保证总序；`QueueEntry` 定义在 fuyao-api）/ 中断通道（与队列正交） |
-| 存储层 | `SessionStore` | SQLite（WAL）唯一入口；sessions / messages / todos 三表 |
+| 存储层 | `SessionStore` | SQLite（WAL）唯一入口；sessions / messages / todos / file_snapshots 四表 |
 | 落库序号 | `seq` | 事务内分配，事件级落库后回填到 `EventBase` |
 | 可见窗口 | `load_visible_messages` | 给 LLM 的压缩感知窗口（最新 compaction 摘要 + 其后新消息），与「给人看的」查询路径正交 |
 | 配对兜底 | `pair_missing_tool_results` | wire 消息序列中为缺结果的 tool_call 补占位 tool_result（content 固定「[工具执行被拦截或中断]」标记，读时合成不落库）；主对话与压缩两路共用同一函数——被拦截 / 中断 / 崩溃留下的悬挂对不破协议配对，两路请求前缀序列同口径 |
 | 上下文压缩 | `compaction` / `run_compression` | 插一条 `kind='compaction'` 边界消息 + 更新元数据，旧消息物理保留；触发公式 `prompt_tokens >= threshold × (context_length - summary_max_tokens)` |
-| 回退 | `rollback_to` | 删目标（user 或 compaction 边界）及其后消息；计数类重算，费用不抹账（回退不抹账） |
+| 回退 | `rollback_to` | 删目标（user 或 compaction 边界）及其后消息；计数类重算，费用不抹账（回退不抹账）；文件侧联动见「文件快照」 |
+| 文件快照 | `FileSnapshot` / `file_snapshots` | 回退的文件侧联动机制：ReAct 工具批执行前与 turn 收尾各对工作区采集一行（基线树 + 自上一行的变更文件集），行以 assistant 消息 seq 为锚点、与消息同 `seq >= target` 谓词同生共死；回退时先按基线树恢复文件（修改 checkout 回去、快照后新建删除）后动 DB；纯对话轮零成本，采集失败 fail-open |
+| 影子仓 | `snapshot_root` | 独立于用户 `.git` 的影子 git 仓（git-dir 落数据目录 `snapshots/{hash(worktree)}/`、work-tree 指向用户工作区，同一 workspace 多会话共享）：只做 plumbing（add -A / write-tree / diff-tree / checkout），无 commit 无分支，用户提交历史永不被触碰；`[snapshot]` 段配置（`enabled` / `max_untracked_mb`），git 缺失自动禁用，对象 7 天 TTL gc |
 | 派生 | `fork_session` / `fork_to` | 复制源会话到新独立主会话（parent=None），非破坏（源不动）。两个面：SessionManager / 存储层按目标消息切割复制（`seq < target` 全部消息，纯存储操作非活装配，续聊需 `resume_session`，目标必须是 user / compaction 消息，与回退共用目标校验）；`create_child_session` 的 `Fork` 源复制为子会话（活装配可直接对话，带父标记） |
 | 子会话 | `create_child_session` | 带父标记（`parent_session_id`），rx 不进 fan-in；`Fresh`（空上下文）/ `Fork`（复制）两源 |
 | 双队列 | guide / pending | 用户消息与控制命令消息共用的排队层：条目（`QueueEntry`）自带 mode 决定入队与生效时机——`Guide`（引导队列，工具批完成后即投递）/ `Pending`（排队队列，最终回复后才投递） |
@@ -108,7 +110,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 4. **消息类型只认输出侧**——`InputEvent` 入口即转 `OutputEvent`，内核不引入输入侧类型
 5. **引擎是忠实执行器**——忠实触发外部一切命令，不做去重 / 合并 / 冷却等意图解释，那属于上层职责
 6. **新生命周期信号首选加事件变体**——而非给现有 payload 挂额外字段（消息驱动架构）
-7. **依赖严格单向**——10 个 crate 分五类（基座 → 内核 → 协作者 → 能力 → 装配），禁止反向依赖
+7. **依赖严格单向**——11 个 crate 分五类（基座 → 内核 → 协作者 → 能力 → 装配），禁止反向依赖
 8. **所有消息都可以被拦截**——命令消费的对外回显与执行产物照常过 dispatch 管道（可被拦截钩子修改或阻止）；回显被丢弃只影响对外可见性，命令本体忠实执行不受影响；引擎不为命令开拦截豁免、也不新增拦截扩展，后续有必要再附加
 
 ## 一条消息的旅程
