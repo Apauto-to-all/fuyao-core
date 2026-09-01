@@ -190,6 +190,7 @@ max_len = 80
 
 补充行为：
 
+- 回退门面（`rollback_session` / `preview_rollback`）带 `rollback_files` 参数：`true`（默认语义）文件随消息联动回退；`false` 仅消息模式——文件侧按请求跳过（不恢复、不发文件事件、不发 WARN，有意选择非降级），该段快照行仍随消息同事务删除——之后再回退更早回退点，被保留的文件不会被恢复或删除
 - 快照落在独立影子仓（有 agent_id 时 `{agent_root}/snapshots/`，否则 `~/.fuyao/snapshots/`），用户自己的 `.git` 永不被触碰
 - git 不在 PATH 时引擎照常启动（WARN 一条、自动禁用），回退降级为仅消息回退
 - 快照对象 7 天后自动回收：超 7 天的回退点文件侧退不回（消息照删）

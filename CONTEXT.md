@@ -33,7 +33,7 @@ fuyao-core 是**独立 Agent 引擎 SDK**——配置好模型就能跑的独立
 | 可见窗口 | `load_visible_messages` | 给 LLM 的压缩感知窗口（最新 compaction 摘要 + 其后新消息），与「给人看的」查询路径正交 |
 | 配对兜底 | `pair_missing_tool_results` | wire 消息序列中为缺结果的 tool_call 补占位 tool_result（content 固定「[工具执行被拦截或中断]」标记，读时合成不落库）；主对话与压缩两路共用同一函数——被拦截 / 中断 / 崩溃留下的悬挂对不破协议配对，两路请求前缀序列同口径 |
 | 上下文压缩 | `compaction` / `run_compression` | 插一条 `kind='compaction'` 边界消息 + 更新元数据，旧消息物理保留；触发公式 `prompt_tokens >= threshold × (context_length - summary_max_tokens)` |
-| 回退 | `rollback_to` | 删目标（user 或 compaction 边界）及其后消息；计数类重算，费用不抹账（回退不抹账）；文件侧联动见「文件快照」 |
+| 回退 | `rollback_to` | 删目标（user 或 compaction 边界）及其后消息；计数类重算，费用不抹账（回退不抹账）；文件侧联动见「文件快照」。门面 `rollback_session` / `preview_rollback` 带 `rollback_files` 参数：`true` 文件随消息联动回退；`false` 仅消息模式——文件侧按请求跳过（不查行、不恢复、不发 `FilesRestored`、不发 WARN，有意选择非降级），该段快照行仍随消息同事务删除（账已销：之后再回退更早回退点，被保留的文件不会被恢复或删除）；预览文件侧标注「按请求跳过」（`Skipped`），与「快照不可用」降级态（`Unavailable`）可区分 |
 | 文件快照 | `FileSnapshot` / `file_snapshots` | 回退的文件侧联动机制：ReAct 工具批执行前与 turn 收尾各对工作区采集一行（基线树 + 自上一行的变更文件集），行以 assistant 消息 seq 为锚点、与消息同 `seq >= target` 谓词同生共死；回退时先按基线树恢复文件（修改 checkout 回去、快照后新建删除）后动 DB；纯对话轮零成本，采集失败 fail-open |
 | 影子仓 | `snapshot_root` | 独立于用户 `.git` 的影子 git 仓（git-dir 落数据目录 `snapshots/{hash(worktree)}/`、work-tree 指向用户工作区，同一 workspace 多会话共享）：只做 plumbing（add -A / write-tree / diff-tree / checkout），无 commit 无分支，用户提交历史永不被触碰；`[snapshot]` 段配置（`enabled` / `max_untracked_mb`），git 缺失自动禁用，对象 7 天 TTL gc |
 | 派生 | `fork_session` / `fork_to` | 复制源会话到新独立主会话（parent=None），非破坏（源不动）。两个面：SessionManager / 存储层按目标消息切割复制（`seq < target` 全部消息，纯存储操作非活装配，续聊需 `resume_session`，目标必须是 user / compaction 消息，与回退共用目标校验）；`create_child_session` 的 `Fork` 源复制为子会话（活装配可直接对话，带父标记） |

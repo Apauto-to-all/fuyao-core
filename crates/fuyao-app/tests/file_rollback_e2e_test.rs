@@ -325,7 +325,7 @@ async fn rollback_after_completed_turn_reverts_all_batches_including_last() {
     let target = sole_user_seq(&fx, &session_id).await;
     let preview = fx
         .manager
-        .preview_rollback(&session_id, target)
+        .preview_rollback(&session_id, target, true)
         .await
         .expect("预览应成功");
     assert_eq!(preview.messages_to_delete.len(), 6, "user 及其后共 6 条");
@@ -342,7 +342,7 @@ async fn rollback_after_completed_turn_reverts_all_batches_including_last() {
     // 执行：文件终态与消息终态一致
     let outcome = fx
         .manager
-        .rollback_session(&session_id, target)
+        .rollback_session(&session_id, target, true)
         .await
         .expect("回退应成功");
     assert_eq!(
@@ -474,7 +474,7 @@ async fn disabled_snapshot_rollback_degrades_to_message_only() {
     let target = sole_user_seq(&fx, &session_id).await;
     let preview = fx
         .manager
-        .preview_rollback(&session_id, target)
+        .preview_rollback(&session_id, target, true)
         .await
         .expect("预览应成功");
     assert_eq!(preview.files, FilesPreview::Unavailable);
@@ -487,7 +487,7 @@ async fn disabled_snapshot_rollback_degrades_to_message_only() {
     // 执行：仅消息回退、文件现场不动、结论明示不可用
     let outcome = fx
         .manager
-        .rollback_session(&session_id, target)
+        .rollback_session(&session_id, target, true)
         .await
         .expect("消息回退照常");
     assert_eq!(outcome, FileRollbackOutcome::Unavailable);
