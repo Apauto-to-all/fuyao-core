@@ -11,6 +11,18 @@ use std::process::Stdio;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// 新建 git 子进程命令的基线配置：stdin 关闭，Windows 上不分配控制台窗口
+///
+/// 所有 git 派生点（调用器与构造探测）统一经此函数，避免某条路径漏掉
+/// 无窗口标志导致闪现终端。
+fn base_command(program: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
 /// git 调用器：绑定一个影子仓（git-dir）与一个用户工作区（work-tree）
 ///
 /// 每次调用都显式携带 `--git-dir` 与 `--work-tree`、以工作区为子进程工作目录，
@@ -40,7 +52,7 @@ impl GitInvoker {
     /// stdin 关闭、stdout/stderr 接管；退出码非零折成 [`SnapshotError::Git`]，
     /// stderr 一并带回供上层诊断。
     pub(crate) async fn run(&self, args: &[&str]) -> Result<Vec<u8>, SnapshotError> {
-        let mut cmd = tokio::process::Command::new(&self.program);
+        let mut cmd = base_command(&self.program);
         // 全局选项：换行配置在前，随后锁定影子仓与工作区
         cmd.arg("-c")
             .arg("core.autocrlf=false")
@@ -49,12 +61,8 @@ impl GitInvoker {
             // 以工作区为工作目录，保证无 pathspec 的命令覆盖整个工作区
             .current_dir(&self.work_tree)
             .args(args)
-            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
 
         // output() 内部并发收拢 stdout 与 stderr，不会因管道缓冲阻塞子进程
         let output = cmd.output().await.map_err(|e| SnapshotError::Spawn {
@@ -84,9 +92,8 @@ impl GitInvoker {
 /// ② `git --git-dir <snapshot_root> init` 建影子仓（已存在时幂等补齐目录结构）。
 /// 任何一步失败返回人类可读原因，供禁用态 WARN 日志使用。
 pub(crate) async fn probe_shadow_repo(program: &str, snapshot_root: &Path) -> Result<(), String> {
-    let version = tokio::process::Command::new(program)
+    let version = base_command(program)
         .arg("--version")
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -100,10 +107,14 @@ pub(crate) async fn probe_shadow_repo(program: &str, snapshot_root: &Path) -> Re
         ));
     }
 
-    let init = tokio::process::Command::new(program)
+    // 影子仓可落在多级尚不存在的目录下（如全局层首次使用时 snapshots/ 本身未建），
+    // init 前补齐整条目录链，git 只能创建已存在父目录下的叶子目录
+    std::fs::create_dir_all(snapshot_root)
+        .map_err(|e| format!("快照目录创建失败（{}）: {e}", snapshot_root.display()))?;
+
+    let init = base_command(program)
         .arg(format!("--git-dir={}", snapshot_root.display()))
         .arg("init")
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()

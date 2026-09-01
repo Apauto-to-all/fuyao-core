@@ -538,6 +538,22 @@ mod tests {
         assert!(sh.path().join("info").join("exclude").is_file());
     }
 
+    /// 快照根目录的父链不存在时，构造探测自动补齐目录，快照照常可用
+    #[tokio::test]
+    async fn new_creates_missing_snapshot_root_parents() {
+        let ws = tempdir().unwrap();
+        let base = tempdir().unwrap();
+        // 嵌套多级不存在的父目录，探测前无人创建
+        let root = base.path().join("a").join("b").join("c").join("snap");
+        let snap = snapshot_with_program("git", ws.path(), &root, DEFAULT_MAX_UNTRACKED_MB).await;
+        assert!(snap.is_enabled(), "父链缺失不应导致探测失败");
+        assert!(root.join("objects").is_dir(), "影子仓目录结构应就地创建");
+        // 可用态照常采集
+        fs::write(ws.path().join("f.txt"), "内容").unwrap();
+        let outcome = snap.track(None).await.unwrap().unwrap();
+        assert!(!outcome.tree_hash.is_empty());
+    }
+
     /// git 不在 PATH → 禁用态（不 panic），track 静默跳过返回 Ok(None)
     #[tokio::test]
     async fn new_disables_when_git_missing() {
