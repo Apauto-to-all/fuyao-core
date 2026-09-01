@@ -11,6 +11,7 @@ members = [
     "crates/fuyao-hooks",
     "crates/fuyao-guard",
     "crates/fuyao-app",
+    "crates/fuyao-snapshot",
 ]
 
 [workspace.package]
