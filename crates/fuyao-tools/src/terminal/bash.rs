@@ -5,7 +5,7 @@
 use crate::common::parse_tool_args;
 use crate::redact::redact_sensitive_text;
 use crate::terminal::execute::{execute_command, format_result};
-use crate::terminal::safety::{check_command_safety, validate_workdir};
+use crate::terminal::safety::{DeleteScope, check_command_safety, validate_workdir};
 use crate::terminal::shell::find_shell;
 use crate::terminal::types::BashArgs;
 use fuyao_api::{CancellationToken, ToolCallContext, ToolOutput};
@@ -34,37 +34,40 @@ pub(crate) async fn bash_impl(
         return ToolOutput::error("命令不能为空");
     }
 
-    // 2. 安全检查
-    let security_result = check_command_safety(&raw_command);
+    // 2. 工作目录解析（优先显式 workdir，否则使用 workspace）
+    let workspace = ctx.workspace().map(|p| p.to_path_buf());
+    let effective_dir: Option<PathBuf> = workdir.map(PathBuf::from).or_else(|| workspace.clone());
+    if let Some(dir) = &effective_dir
+        && let Some(err) = validate_workdir(&dir.to_string_lossy())
+    {
+        return ToolOutput::error(err);
+    }
+
+    // 3. 安全检查：危险命令正则 + 递归删除范围（目标须落在 workspace 子树内）
+    let scope = DeleteScope {
+        cwd: effective_dir.clone(),
+        allowed_root: workspace,
+    };
+    let security_result = check_command_safety(&raw_command, &scope);
     if security_result.blocked {
         tracing::warn!(command = %raw_command, reason = %security_result.reason, "阻止执行危险命令");
         return ToolOutput::error(security_result.reason);
     }
 
-    // 3. 提取超时时间（默认/上限从全局配置 get_config().tools.limits 读取）
+    // 4. 提取超时时间（默认/上限从全局配置 get_config().tools.limits 读取）
     let limits = fuyao_api::get_config().tools.limits.clone();
     let timeout_secs = timeout
         .unwrap_or(limits.terminal_default_timeout_secs)
         .min(limits.terminal_max_timeout_secs);
     let timeout = Duration::from_secs(timeout_secs);
 
-    // 4. 工作目录校验（优先显式 workdir，否则使用 workspace）
-    let workspace_dir = ctx.workspace().map(|p| p.to_string_lossy().to_string());
-    let workdir = workdir.as_deref().or(workspace_dir.as_deref());
-    if let Some(dir) = workdir
-        && let Some(err) = validate_workdir(dir)
-    {
-        return ToolOutput::error(err);
-    }
-
     // 5. Shell 自动选择
     let shell_info = find_shell();
 
     // 6. 执行命令
-    let workdir_path = workdir.map(PathBuf::from);
     let mut result = execute_command(
         &raw_command,
-        workdir_path.as_deref(),
+        effective_dir.as_deref(),
         timeout,
         shell_info,
         cancel,
@@ -144,5 +147,74 @@ mod tests {
             .to_wire();
         let parsed: Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["output"].as_str().unwrap().contains("test_workdir"));
+    }
+
+    /// 构造以指定目录为 workspace 的调用上下文
+    fn ctx_with_workspace(ws: &std::path::Path) -> ToolCallContext {
+        ToolCallContext {
+            agent_paths: Some(fuyao_api::AgentPaths {
+                workspace: Some(ws.to_path_buf()),
+                fuyao_home: ws.join("fuyao-home"),
+                ..fuyao_api::AgentPaths::default()
+            }),
+            ..ToolCallContext::default()
+        }
+    }
+
+    /// 递归删除工作区内目标：放行并真实删除（按实际 shell 选命令语法）
+    #[tokio::test]
+    async fn bash_impl_recursive_rm_inside_workspace() {
+        let base = std::env::temp_dir().join("fuyao_test_bash_rm_scope");
+        std::fs::remove_dir_all(&base).ok();
+        let ws = base.join("ws");
+        let target = ws.join("sub");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("f.txt"), "x").unwrap();
+
+        let command = match find_shell().shell_type {
+            "powershell" => "Remove-Item -Recurse -Force sub",
+            "cmd" => "rd /s /q sub",
+            _ => "rm -rf sub",
+        };
+        let args = serde_json::json!({"command": command});
+        let result = bash_impl(args, ctx_with_workspace(&ws), CancellationToken::new())
+            .await
+            .to_wire();
+        let parsed: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(
+            parsed["exit_code"],
+            0,
+            "shell={:?} 实际结果: {result}",
+            find_shell().shell_type
+        );
+        assert!(!target.exists(), "工作区内目标应被真实删除");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 递归删除工作区外目标：安全检查拒绝，磁盘未动
+    #[tokio::test]
+    async fn bash_impl_recursive_rm_outside_workspace_blocked() {
+        let base = std::env::temp_dir().join("fuyao_test_bash_rm_scope_block");
+        std::fs::remove_dir_all(&base).ok();
+        let ws = base.join("ws");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.txt"), "keep").unwrap();
+
+        let args = serde_json::json!({
+            "command": format!("rm -rf {}", outside.to_string_lossy())
+        });
+        let result = bash_impl(args, ctx_with_workspace(&ws), CancellationToken::new())
+            .await
+            .to_wire();
+        assert!(
+            result.contains("递归删除被限制在工作目录内"),
+            "实际结果: {result}"
+        );
+        assert!(outside.join("f.txt").exists(), "工作区外目标不应被删除");
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

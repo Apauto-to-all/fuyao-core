@@ -157,6 +157,29 @@ pub(crate) fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// 判定 child 路径是否位于 root 目录内（含 root 本身）
+///
+/// 按路径组件逐一比较（各自小写化后比对字符串）：
+/// - 组件级比较天然带分隔符边界——`E:\ws2` 不会误命中根 `E:\ws`
+/// - 小写化实现大小写不敏感（Windows 路径语义），Unix 下亦无副作用
+/// - 正反斜杠混写由 `components` 的分隔符归一化吸收
+pub(crate) fn is_within(child: &Path, root: &Path) -> bool {
+    let mut child_components = child.components();
+    for root_component in root.components() {
+        match child_components.next() {
+            Some(child_component) => {
+                let child_name = child_component.as_os_str().to_string_lossy().to_lowercase();
+                let root_name = root_component.as_os_str().to_string_lossy().to_lowercase();
+                if child_name != root_name {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

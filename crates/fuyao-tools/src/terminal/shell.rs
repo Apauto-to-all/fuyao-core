@@ -129,11 +129,23 @@ pub(crate) fn shell_syntax_hint(shell_type: &str) -> Option<&'static str> {
 
 // ==================== 各 shell 定位器 ====================
 
-/// Git Bash 探测：从 PATH 上的 git.exe 推断同发行版的 bin\bash.exe
+/// Git Bash 探测：从 PATH 上每个 git.exe 命中推断同发行版的 bin\bash.exe
+///
+/// git.exe 在安装目录内多处存在（cmd\、mingw64\bin\ 等），PATH 顺序决定
+/// `where` 的首个命中——首个命中的反推根下未必有 bin\bash.exe；逐个命中
+/// 反推，直到找到真实的安装根。
 fn find_git_bash() -> Option<ShellInfo> {
-    let git_path = which("git")?;
-    let git_dir = PathBuf::from(&git_path);
-    let root = git_dir.parent()?.parent()?;
+    which_all("git")
+        .into_iter()
+        .find_map(|git_path| bash_from_git(&git_path))
+}
+
+/// 从单个 git.exe 路径反推同发行版的 bin\bash.exe，反推根下无 bash 时返回 None
+///
+/// 反推规则：git.exe 上溯两级得到安装根，拼 `bin\bash.exe` 并校验存在。
+fn bash_from_git(git_path: &str) -> Option<ShellInfo> {
+    let git = PathBuf::from(git_path);
+    let root = git.parent()?.parent()?;
     let bash_path = root.join("bin").join("bash.exe");
     if bash_path.is_file() {
         Some(ShellInfo {
@@ -229,8 +241,16 @@ fn find_sh_fallback() -> ShellInfo {
     }
 }
 
-/// 在 PATH 中查找可执行文件
+/// 在 PATH 中查找可执行文件（取首个命中）
 fn which(name: &str) -> Option<String> {
+    which_all(name).into_iter().next()
+}
+
+/// 在 PATH 中查找可执行文件的全部命中（按 PATH 顺序）
+///
+/// Windows 经 `where`、Unix 经 `which`，逐行列出全部命中并校验存在性；
+/// 查找失败或无命中时返回空表。
+fn which_all(name: &str) -> Vec<String> {
     let (cmd, arg) = if cfg!(windows) {
         ("where", format!("{name}.exe"))
     } else {
@@ -246,17 +266,19 @@ fn which(name: &str) -> Option<String> {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let output = command.output().ok()?;
+    let Ok(output) = command.output() else {
+        return Vec::new();
+    };
 
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
 
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .next()
         .map(|s| s.trim().to_string())
-        .filter(|p| PathBuf::from(p).exists())
+        .filter(|p| !p.is_empty() && PathBuf::from(p).exists())
+        .collect()
 }
 
 #[cfg(test)]
@@ -345,5 +367,55 @@ mod tests {
                 assert_eq!(info.shell_type, name);
             }
         }
+    }
+
+    /// bash_from_git：cmd 形态命中上溯两级反推 bin\bash.exe；反推根下无 bash 时 None
+    #[test]
+    fn bash_from_git_derives_from_install_root() {
+        let base = std::env::temp_dir().join("fuyao_test_gitbash_derive");
+        std::fs::remove_dir_all(&base).ok();
+
+        // 标准安装布局：root\cmd\git.exe + root\bin\bash.exe
+        let root = base.join("std");
+        std::fs::create_dir_all(root.join("cmd")).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("cmd").join("git.exe"), "").unwrap();
+        std::fs::write(root.join("bin").join("bash.exe"), "").unwrap();
+        let git = root
+            .join("cmd")
+            .join("git.exe")
+            .to_string_lossy()
+            .into_owned();
+        let info = bash_from_git(&git).expect("标准布局应反推出 bash");
+        let expect_bash = root
+            .join("bin")
+            .join("bash.exe")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(info.path, expect_bash);
+        assert_eq!(info.shell_type, "git_bash");
+
+        // mingw64 形态（PATH 首命中）：反推根下无 bin\bash.exe 时返回 None
+        let mingw_bin = base.join("alt").join("mingw64").join("bin");
+        std::fs::create_dir_all(&mingw_bin).unwrap();
+        std::fs::write(mingw_bin.join("git.exe"), "").unwrap();
+        let git = mingw_bin.join("git.exe").to_string_lossy().into_owned();
+        assert!(bash_from_git(&git).is_none());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// which_all：多命中时按 PATH 顺序全量返回且均真实存在
+    #[test]
+    fn which_all_returns_all_existing_hits() {
+        let hits = which_all("git");
+        if hits.is_empty() {
+            return; // 环境未装 git 时跳过（本测试不预设 git 存在）
+        }
+        for p in &hits {
+            assert!(PathBuf::from(p).exists(), "命中路径应存在: {p}");
+        }
+        // 全量命中非空时，首个命中即旧 which 语义的结果
+        assert_eq!(which("git").as_deref(), hits.first().map(|s| s.as_str()));
     }
 }
