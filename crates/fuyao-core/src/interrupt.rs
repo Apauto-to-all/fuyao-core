@@ -6,8 +6,11 @@
 //! - 工具执行期间（工具 handler 正在跑）：[`finish_tool_batch`]
 //! - 空队列时（idle，等待新消息）：[`notify_idle`]
 //!
-//! 三个入口都先发中断通知事件（`OutputEvent::Interrupt`，用户可见的停止信号），
-//! 再按阶段补增量结果。shutdown 与用户中断共用收尾协议——[`shutdown_payload`]
+//! 两个有增量可补的入口先按阶段补增量结果，最后发中断通知事件
+//! （`OutputEvent::Interrupt`，用户可见的停止信号）。通知固定落在收尾事件流的
+//! 末条：消费方收到即代表本轮已静默、再无后续事件——增量若晚于通知到达，会被
+//! 「idle 下活动信号即新 turn」一类的新轮次判定误读，把已停的 turn 拉回运行态。
+//! shutdown 与用户中断共用收尾协议——[`shutdown_payload`]
 //! 提供 source=Shutdown 的载荷，唯一差异是来源标识。
 //!
 //! 未完成判定的真相源统一为**调用方直接观测的内存状态**，不查 DB：
@@ -97,7 +100,7 @@ fn classify(tool_calls: &[ToolCallData]) -> InterruptKind {
     }
 }
 
-/// 流式段中断收尾：通知 + 部分结果落库
+/// 流式段中断收尾：部分结果落库，末位发通知
 ///
 /// select! 中断点①（流式期间，含重试 sleep 期间）命中 shutdown 或 interrupt 时调用。
 /// 补发内容按场景：
@@ -105,6 +108,8 @@ fn classify(tool_calls: &[ToolCallData]) -> InterruptKind {
 ///   finish_reason=interrupted）+ 为每个有效 tool_call 补发中断式 ToolResult。
 ///   工具尚未开始执行（流被截断），全部累积项均未完成。
 /// - `Streaming`：部分 AssistantMessage（含累积的文本/推理）。
+///
+/// 通知在全部补发之后发出（收尾协议：通知是末条，见模块文档）。
 ///
 /// 补发的消息落 DB 后，下轮 build_chat_request 会从 DB 自然看到
 /// 「assistant 调了工具 → 工具结果（中断式）」的完整上下文。
@@ -116,8 +121,6 @@ pub(crate) async fn finish_streaming(
     state: &SharedTurnState,
     payload: &OutputInterruptPayload,
 ) {
-    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
-
     // 先 clone 出所需数据再释放锁（不跨 await 持锁）
     let (text, reasoning, tool_calls) = {
         let s = lock(state);
@@ -161,23 +164,24 @@ pub(crate) async fn finish_streaming(
             }
         }
     }
+
+    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 }
 
-/// 工具执行段中断收尾：通知 + 为未完成 tool_call 补发中断式 ToolResult
+/// 工具执行段中断收尾：为未完成 tool_call 补发中断式 ToolResult，末位发通知
 ///
 /// select! 中断点②（工具执行期间）命中 shutdown 或 interrupt 时调用。
 /// `requested` 为本批请求的全部 tool_call（拦截后的 effective 集合），
 /// `answered` 为调用方在结果通道上已观测到并经历史入口处理的 tool_call_id 集
 /// （内存真相源，见模块文档）——差集即未完成，逐个补发中断式 ToolResult。
 /// 本批的 AssistantMessage 已在工具执行前落库，此处不再补发。
+/// 通知在全部补发之后发出（收尾协议：通知是末条，见模块文档）。
 pub(crate) async fn finish_tool_batch(
     ctx: &SessionCtx,
     requested: &[ToolCallData],
     answered: &HashSet<String>,
     payload: &OutputInterruptPayload,
 ) {
-    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
-
     for tc in unfinished_tool_calls(requested, answered) {
         let event = make_interrupt_tool_result(
             tc.id.clone(),
@@ -187,6 +191,8 @@ pub(crate) async fn finish_tool_batch(
         );
         crate::history::emit_to_history(ctx, event).await;
     }
+
+    emit_interrupt_event(payload, &ctx.emitter, &ctx.hooks).await;
 }
 
 /// idle 段中断：无活跃 turn，只发通知事件（无可补发的增量结果）
