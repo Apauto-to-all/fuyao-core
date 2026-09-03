@@ -15,15 +15,15 @@
 //! [`SessionManager::rollback_session`] 是回退的编排入口：消息侧走存储层
 //! `rollback_to` 单事务，文件侧经共享的 [`fuyao_snapshot::FileSnapshot`]（与 Engine
 //! 内 ReAct 采集共用同一影子仓句柄）先恢复文件后动 DB——顺序承重不可倒置，
-//! 保证失败时消息 / 快照行原封、恢复幂等可安全重试。文件回退结果经
-//! [`OutputEvent::FilesRestored`] 纯事件送进 app 级单一出口（事件通道由装配层
-//! 从 [`App::event_sink`](crate::App::event_sink) 注入，与本门面的存储职责解耦）。
+//! 保证失败时消息 / 快照行原封、恢复幂等可安全重试。文件侧执行结论经方法
+//! 返回值 [`FileRollbackOutcome`] 交付（恢复 / 删除双清单），不产生事件——回退
+//! 是请求-响应型同步原语，调用方即结果的唯一消费者。
 //! [`SessionManager::preview_rollback`] 提供只读双轴预览，与执行共用同一套目标
 //! 校验与影响计算——同一状态下两者结论一致；预览是建议、执行是权威。
 //!
-//! 两入口均带 `rollback_files` 参数：`true` 文件随消息联动回退（上述四步编排）；
+//! 两入口均带 `rollback_files` 参数：`true` 文件随消息联动回退（上述编排）；
 //! `false` **仅消息模式**——文件侧全部动作按请求跳过（不查快照行、不恢复文件、
-//! 不发 `FilesRestored`、不发 WARN——有意选择非降级），直接走 `rollback_to`。
+//! 不发 WARN——有意选择非降级），直接走 `rollback_to`。
 //! 该段快照行仍随消息在同一事务内删除（账已销）：之后再回退更早的回退点，
 //! 被保留的文件不会被恢复或删除。
 //!
@@ -37,11 +37,8 @@
 use std::sync::Arc;
 
 use fuyao_api::Message;
-use fuyao_api::message::output::{FilesRestoredMessage, FilesRestoredPayload};
-use fuyao_api::message::{EventBase, OutputEvent};
 use fuyao_session::SessionStore;
 use fuyao_snapshot::FileSnapshot;
-use tokio::sync::mpsc;
 
 /// 会话管理器：持有会话存储与文件快照句柄，对外提供会话检索 / 浏览 / 元数据编辑 /
 /// 回退编排接口
@@ -61,8 +58,6 @@ pub struct SessionManager {
     store: Arc<SessionStore>,
     /// 文件快照器（与 Engine 内 ReAct 采集共享同一影子仓句柄）
     snapshot: FileSnapshot,
-    /// app 级单一出口的发送端（文件回退结果事件由此投递；与 forwarder 共用通道）
-    event_tx: mpsc::Sender<OutputEvent>,
 }
 
 impl SessionManager {
@@ -72,19 +67,8 @@ impl SessionManager {
     ///   两者指向同一个 `SqlitePool` 连接池
     /// - `snapshot` 与 Engine 共享同一影子仓句柄——回退恢复与 ReAct 采集操作同一份
     ///   快照对象库，经句柄内部互斥串行
-    /// - `event_tx` 是 app 级事件出口的发送端（通常取自
-    ///   [`App::event_sink`](crate::App::event_sink)）——回退的文件结果事件由此
-    ///   进入单一出口，供 UI 消费
-    pub fn new(
-        store: Arc<SessionStore>,
-        snapshot: FileSnapshot,
-        event_tx: mpsc::Sender<OutputEvent>,
-    ) -> Self {
-        Self {
-            store,
-            snapshot,
-            event_tx,
-        }
+    pub fn new(store: Arc<SessionStore>, snapshot: FileSnapshot) -> Self {
+        Self { store, snapshot }
     }
 
     // ── 会话查询 ───────────────────────────────────────────────
@@ -258,16 +242,14 @@ impl SessionManager {
         })
     }
 
-    /// 把会话回退到目标消息之前（消息侧删行 + 文件侧恢复联动 + 结果事件）
+    /// 把会话回退到目标消息之前（消息侧删行 + 文件侧恢复联动）
     ///
-    /// 四步编排，顺序承重不可倒置：
+    /// 三步编排，顺序承重不可倒置：
     /// 1. 查行：`msg_seq >= target_seq` 的快照行（经 [`Self::resolve_file_impact`]
     ///    与预览共用校验与影响计算；空触碰集跳文件侧）
     /// 2. 先恢复文件：基线树 = 首行 `tree_hash`、触碰集 = 各行 `files` 并集——
     ///    存在于基线树的 checkout 回基线内容、快照后新建的删除
     /// 3. 后动 DB：`rollback_to` 单事务删消息 + 同谓词删快照行 + 重算元数据
-    /// 4. 发 [`OutputEvent::FilesRestored`] 纯事件（文件侧实际联动时），
-    ///    经 app 级单一出口供 UI 消费
     ///
     /// 顺序语义：先恢复后动 DB——恢复失败则整个回退中止（消息 / 快照行原封），
     /// 恢复幂等（重复 checkout 同一基线树是 no-op），可安全重试；若倒置会出现
@@ -275,9 +257,9 @@ impl SessionManager {
     ///
     /// # 文件侧模式（`rollback_files` 参数）
     ///
-    /// - `true`：文件随消息联动回退，即上述四步编排
+    /// - `true`：文件随消息联动回退，即上述三步编排
     /// - `false`：**仅消息模式**——文件侧全部动作按请求跳过（不查快照行、不恢复
-    ///   文件、不发 `FilesRestored`、不发 WARN——用户有意选择保留文件现场，
+    ///   文件、不发 WARN——用户有意选择保留文件现场，
     ///   不是降级），直接走 `rollback_to`
     ///
     /// 仅消息模式的语义代价：该段快照行仍随消息在同一事务内删除（账已销）——
@@ -366,33 +348,6 @@ impl SessionManager {
             .await
             .map_err(RollbackError::Store)?;
 
-        // ④ 发文件回退结果事件：仅当文件侧实际动了文件（清单非空）才发——
-        // 仅消息模式（Skipped）、快照不可用（Unavailable）、空触碰集三者文件侧
-        // 零动作，不产生文件事件噪声
-        match &outcome {
-            FileRollbackOutcome::Restored { restored, deleted }
-                if !restored.is_empty() || !deleted.is_empty() =>
-            {
-                let event = OutputEvent::FilesRestored(FilesRestoredMessage {
-                    base: EventBase {
-                        session_id: Some(session_id.to_string()),
-                        ..EventBase::default()
-                    },
-                    payload: FilesRestoredPayload {
-                        restored: restored.clone(),
-                        deleted: deleted.clone(),
-                    },
-                });
-                if self.event_tx.send(event).await.is_err() {
-                    tracing::warn!(
-                        session_id = session_id,
-                        "事件出口通道已关闭，文件回退结果事件丢弃"
-                    );
-                }
-            }
-            _ => {}
-        }
-
         Ok(outcome)
     }
 
@@ -405,8 +360,8 @@ impl SessionManager {
     ///
     /// 与 [`SessionManager::rollback_session`] 共用 [`Self::resolve_file_impact`]
     /// （同一目标校验 + 同一影响计算），同一参数、同一状态下两者结论必然一致；
-    /// 预览是建议、执行是权威——预览与执行之间状态可能漂移，执行后的结果事件
-    /// 才是真实载荷。本方法纯只读：不动消息、不动文件、不动快照行。
+    /// 预览是建议、执行是权威——预览与执行之间状态可能漂移，执行的返回值
+    /// 才是真实结论。本方法纯只读：不动消息、不动文件、不动快照行。
     ///
     /// # 文件侧模式（`rollback_files` 参数，与执行同参）
     ///
@@ -651,8 +606,8 @@ pub enum FileRollbackOutcome {
 /// 回退预览（只读双轴报告）
 ///
 /// [`SessionManager::preview_rollback`] 的返回值：执行前的建议性影响面——
-/// 预览是建议、执行是权威，两者之间状态可能漂移，真实结果以执行后的
-/// [`OutputEvent::FilesRestored`] 事件载荷为准。
+/// 预览是建议、执行是权威，两者之间状态可能漂移，真实结果以执行返回值
+/// [`FileRollbackOutcome`] 为准。
 #[derive(Debug, Clone)]
 pub struct RollbackPreview {
     /// 将删除的消息（`seq >= target`，seq 正序，含目标本身）
@@ -707,11 +662,6 @@ mod tests {
     use fuyao_snapshot::DEFAULT_MAX_UNTRACKED_MB;
     use rstest::rstest;
 
-    /// 构造一个「接收端已 drop」的事件发送端（无消费者场景的标准形态）
-    fn dropped_event_tx() -> mpsc::Sender<OutputEvent> {
-        mpsc::channel(1).0
-    }
-
     /// 构造临时 SQLite 上的 SessionManager + 一个已建会话
     ///
     /// std::mem::forget(dir) 放弃 TempDir 自动清理——async 测试跨 await 持有路径，
@@ -731,7 +681,7 @@ mod tests {
             .await
             .expect("建会话失败");
         (
-            SessionManager::new(store, FileSnapshot::disabled(), dropped_event_tx()),
+            SessionManager::new(store, FileSnapshot::disabled()),
             session.id,
         )
     }
@@ -821,14 +771,12 @@ mod tests {
 
     // ===== 回退编排 + 只读预览 =====
 
-    /// 回退测试台：临时工作区（真实影子仓）+ 临时 SQLite + 事件接收端 + 已建会话
+    /// 回退测试台：临时工作区（真实影子仓）+ 临时 SQLite + 已建会话
     struct RollbackFixture {
         manager: SessionManager,
         session_id: String,
         /// 工作区目录（断言文件终态用）
         worktree: std::path::PathBuf,
-        /// 文件回退结果事件的接收端
-        rx_event: mpsc::Receiver<OutputEvent>,
     }
 
     /// 落一条消息，返回其 seq
@@ -857,16 +805,14 @@ mod tests {
         let snapshot = FileSnapshot::new(&worktree, &shadow_root, DEFAULT_MAX_UNTRACKED_MB).await;
         assert!(snapshot.is_enabled(), "测试前提：git 在 PATH，影子仓可用");
 
-        let (tx_event, rx_event) = mpsc::channel(8);
         let session = store
             .create_session(None, None, None)
             .await
             .expect("建会话失败");
         RollbackFixture {
-            manager: SessionManager::new(store, snapshot, tx_event),
+            manager: SessionManager::new(store, snapshot),
             session_id: session.id,
             worktree,
-            rx_event,
         }
     }
 
@@ -914,7 +860,7 @@ mod tests {
     /// 之后新建）删除。
     #[tokio::test]
     async fn rollback_restores_files_deletes_messages_and_emits_event() {
-        let mut fx = rollback_fixture().await;
+        let fx = rollback_fixture().await;
         std::fs::write(fx.worktree.join("a.txt"), "v1").unwrap();
         std::fs::write(fx.worktree.join("b.txt"), "v1").unwrap();
         insert_message(
@@ -1007,15 +953,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1, "只剩批1的快照行");
-
-        // 事件：载荷与预览结论一致（预览是建议、执行是权威，此处无漂移）
-        let event = fx.rx_event.recv().await.expect("应收到 FilesRestored 事件");
-        let OutputEvent::FilesRestored(m) = event else {
-            panic!("应为 FilesRestored 事件，实际：{event:?}");
-        };
-        assert_eq!(m.base.session_id.as_deref(), Some(fx.session_id.as_str()));
-        assert_eq!(m.payload.restored, vec!["a.txt".to_string()]);
-        assert_eq!(m.payload.deleted, vec!["n.txt".to_string()]);
     }
 
     /// 模拟 turn 收尾补拍：最终回复 assistant 消息落库 → 以它为锚点再采一行
@@ -1096,10 +1033,10 @@ mod tests {
         );
     }
 
-    /// 目标后无工具批（纯对话）：文件侧零动作、无事件，消息照常回退
+    /// 目标后无工具批（纯对话）：文件侧零动作（空清单联动），消息照常回退
     #[tokio::test]
     async fn rollback_without_snapshots_skips_file_side() {
-        let mut fx = rollback_fixture().await;
+        let fx = rollback_fixture().await;
         insert_message(
             &fx.manager.store,
             &fx.session_id,
@@ -1133,7 +1070,7 @@ mod tests {
             }
         );
 
-        // 执行：空清单联动、不发事件
+        // 执行：空清单联动
         let outcome = fx
             .manager
             .rollback_session(&fx.session_id, u2, true)
@@ -1146,10 +1083,6 @@ mod tests {
                 deleted: vec![],
             }
         );
-        assert!(
-            fx.rx_event.try_recv().is_err(),
-            "文件侧零动作不应发 FilesRestored 事件"
-        );
         let full = fx
             .manager
             .store
@@ -1159,7 +1092,7 @@ mod tests {
         assert_eq!(full.len(), 1, "消息照常回退");
     }
 
-    /// 快照禁用态：预览诚实标注不可用，回退降级为仅消息（明示文件未回退），无事件
+    /// 快照禁用态：预览诚实标注不可用，回退降级为仅消息（明示文件未回退）
     #[tokio::test]
     async fn disabled_snapshot_degrades_to_message_only_rollback() {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
@@ -1173,7 +1106,6 @@ mod tests {
         let worktree = ws.path().to_path_buf();
         std::fs::write(worktree.join("a.txt"), "现场").unwrap();
         std::mem::forget(ws);
-        let (tx_event, mut rx_event) = mpsc::channel(8);
         let session = store.create_session(None, None, None).await.unwrap();
         // 历史上落过快照行（禁用态不查行，直接降级）
         let u1 = {
@@ -1188,7 +1120,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let manager = SessionManager::new(store, FileSnapshot::disabled(), tx_event);
+        let manager = SessionManager::new(store, FileSnapshot::disabled());
 
         let preview = manager
             .preview_rollback(&session.id, u1, true)
@@ -1206,7 +1138,6 @@ mod tests {
             "现场",
             "文件现场原封不动"
         );
-        assert!(rx_event.try_recv().is_err(), "降级路径不发事件");
     }
 
     /// 恢复失败：整个回退中止——消息 / 快照行原封，错误明示可重试
@@ -1378,7 +1309,7 @@ mod tests {
     /// n.txt 保留在盘上，u2 及其后消息与批2 / 收尾的快照行删除。
     #[tokio::test]
     async fn messages_only_rollback_preserves_files_and_clears_ledger() {
-        let mut fx = rollback_fixture().await;
+        let fx = rollback_fixture().await;
         std::fs::write(fx.worktree.join("a.txt"), "v1").unwrap();
         let u1 = insert_message(
             &fx.manager.store,
@@ -1428,7 +1359,7 @@ mod tests {
             "联动模式预览不受仅消息预览影响，两状态可区分"
         );
 
-        // 执行（仅消息）：文件原封、消息与快照行照删、无事件
+        // 执行（仅消息）：文件原封、消息与快照行照删
         let outcome = fx
             .manager
             .rollback_session(&fx.session_id, u2, false)
@@ -1445,7 +1376,6 @@ mod tests {
             "批2新建",
             "被保留的新建文件原样在盘上"
         );
-        assert!(fx.rx_event.try_recv().is_err(), "仅消息模式不发文件事件");
         let full = fx
             .manager
             .store
@@ -1489,7 +1419,7 @@ mod tests {
 
     /// 仅消息模式与快照状态无关：快照禁用 + rollback_files = false 时文件侧仍是
     /// 「按请求跳过」（Skipped）而非「不可用」降级（Unavailable）——有意选择
-    /// 优先于环境能力标注；快照行照旧随事务删除、文件现场原封、无事件
+    /// 优先于环境能力标注；快照行照旧随事务删除、文件现场原封
     #[tokio::test]
     async fn messages_only_mode_marks_skipped_even_when_snapshot_disabled() {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
@@ -1503,7 +1433,6 @@ mod tests {
         let worktree = ws.path().to_path_buf();
         std::fs::write(worktree.join("a.txt"), "现场").unwrap();
         std::mem::forget(ws);
-        let (tx_event, mut rx_event) = mpsc::channel(8);
         let session = store.create_session(None, None, None).await.unwrap();
         let u1 = {
             let mut m = Message::user("u1".into());
@@ -1517,7 +1446,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let manager = SessionManager::new(store.clone(), FileSnapshot::disabled(), tx_event);
+        let manager = SessionManager::new(store.clone(), FileSnapshot::disabled());
 
         // 禁用态 + 仅消息：标注是 Skipped（有意选择）而非 Unavailable（降级）
         let preview = manager
@@ -1536,7 +1465,6 @@ mod tests {
             "现场",
             "文件现场原封不动"
         );
-        assert!(rx_event.try_recv().is_err(), "跳过路径不发事件");
         let rows = store
             .list_file_snapshots_from(&session.id, 0)
             .await

@@ -4,9 +4,9 @@
 //! 跑通「工具批改文件 → 快照落账（含 turn 收尾行）→ 只读预览 → 回退 → 文件与消息
 //! 终态一致」全流程：
 //! 1. 核心场景：回退刚结束的 turn，该 turn 全部批次（含最后一批）的文件改动完整
-//!    回退——修改恢复为回退点内容、新建被删除；事件载荷与预览结论一致；快照行
+//!    回退——修改恢复为回退点内容、新建被删除；执行结论与预览一致；快照行
 //!    同谓词清理。
-//! 2. 降级路径：快照禁用时工具照常执行、回退仅消息、文件现场不动、无文件事件。
+//! 2. 降级路径：快照禁用时工具照常执行、回退仅消息、文件现场不动。
 //!
 //! 真实性边界：LLM 用脚本化 fake（外部不可控依赖），其余全真实——FileSnapshot 走
 //! 真实 git、SessionStore 走真实 SQLite、快照行由引擎真实 turn 落账（不手工插行）。
@@ -178,7 +178,7 @@ async fn e2e_fixture(scripts: Vec<Vec<StreamEvent>>) -> E2eFixture {
     )
     .await;
     let app = App::new(engine, None, LogGuard::default());
-    let manager = SessionManager::new(store.clone(), snapshot, app.event_sink());
+    let manager = SessionManager::new(store.clone(), snapshot);
     E2eFixture {
         manager,
         app,
@@ -205,8 +205,7 @@ fn guide_msg(content: &str) -> InputEvent {
 }
 
 /// 跑完一个 turn：建会话 → 发用户消息 → 消费事件直到最终回复（finish_reason=stop），
-/// 返回 (session_id, 最终回复内容)。期间若有 FilesRestored 事件即 panic（回退前
-/// 不应出现文件回退结果）。
+/// 返回 (session_id, 最终回复内容)。
 async fn run_turn_to_completion(fx: &E2eFixture, user_content: &str) -> (String, String) {
     let session_id = fx
         .app
@@ -224,18 +223,12 @@ async fn run_turn_to_completion(fx: &E2eFixture, user_content: &str) -> (String,
         let Ok(Some(ev)) = timeout(Duration::from_secs(5), fx.app.recv()).await else {
             break;
         };
-        match ev {
-            OutputEvent::FilesRestored(m) => {
-                panic!("回退执行前不应出现文件回退事件：{m:?}")
-            }
-            OutputEvent::Assistant(a)
-                if a.payload.finish_reason.as_deref() == Some("stop")
-                    && a.base.session_id.as_deref() == Some(session_id.as_str()) =>
-            {
-                final_reply = a.payload.content.unwrap_or_default();
-                break;
-            }
-            _ => {}
+        if let OutputEvent::Assistant(a) = ev
+            && a.payload.finish_reason.as_deref() == Some("stop")
+            && a.base.session_id.as_deref() == Some(session_id.as_str())
+        {
+            final_reply = a.payload.content.unwrap_or_default();
+            break;
         }
     }
     assert!(
@@ -286,7 +279,7 @@ async fn sole_user_seq(fx: &E2eFixture, session_id: &str) -> i64 {
 /// turn 结构：批1 改 a.txt（v1→v2）→ 批2 新建 n.txt → 最终回复。快照账 = 批1 边界行
 /// + 批2 边界行 + 收尾行（承载终批新建）。回退到本 turn 的 user 消息：基线树 =
 /// 批1 执行前现场（a.txt=v1、无 n.txt），触碰集 = 收尾行的 files——a.txt 恢复 v1、
-/// n.txt（基线树外）删除；预览与执行结论一致、事件载荷与预览一致、快照行清理。
+/// n.txt（基线树外）删除；预览与执行结论一致、快照行清理。
 #[tokio::test]
 async fn rollback_after_completed_turn_reverts_all_batches_including_last() {
     let fx = e2e_fixture(vec![
@@ -377,31 +370,11 @@ async fn rollback_after_completed_turn_reverts_all_batches_including_last() {
         .expect("查快照行失败");
     assert!(rows.is_empty(), "回退后快照行应全部清理");
 
-    // 事件：载荷与预览结论一致（预览是建议、执行是权威，此处无漂移）
-    let mut got_event = None;
-    for _ in 0..20 {
-        let Ok(Some(ev)) = timeout(Duration::from_secs(5), fx.app.recv()).await else {
-            break;
-        };
-        if let OutputEvent::FilesRestored(m) = ev {
-            got_event = Some(m);
-            break;
-        }
-    }
-    let event = got_event.expect("应收到 FilesRestored 事件");
-    assert_eq!(
-        event.base.session_id.as_deref(),
-        Some(session_id.as_str()),
-        "事件应归属本会话"
-    );
-    assert_eq!(event.payload.restored, vec!["a.txt".to_string()]);
-    assert_eq!(event.payload.deleted, vec!["n.txt".to_string()]);
-
     fx.app.shutdown().await;
 }
 
 /// 降级路径：快照禁用时工具照常执行、不落快照行；回退降级为仅消息——文件现场
-/// 不动、结论明示不可用、不发文件事件
+/// 不动、结论明示不可用
 #[tokio::test]
 async fn disabled_snapshot_rollback_degrades_to_message_only() {
     // 与 e2e_fixture 同构，但快照器为禁用态（enabled = false 的装配分支）
@@ -444,7 +417,7 @@ async fn disabled_snapshot_rollback_degrades_to_message_only() {
     )
     .await;
     let app = App::new(engine, None, LogGuard::default());
-    let manager = SessionManager::new(store.clone(), FileSnapshot::disabled(), app.event_sink());
+    let manager = SessionManager::new(store.clone(), FileSnapshot::disabled());
     let fx = E2eFixture {
         manager,
         app,
@@ -502,10 +475,6 @@ async fn disabled_snapshot_rollback_degrades_to_message_only() {
         .await
         .expect("查历史失败");
     assert!(page.items.is_empty(), "消息照常回退");
-
-    // 无文件事件：回退后短时间内出口通道无任何事件
-    let got = timeout(Duration::from_millis(300), fx.app.recv()).await;
-    assert!(got.is_err(), "降级路径不应发 FilesRestored 或任何文件事件");
 
     fx.app.shutdown().await;
 }

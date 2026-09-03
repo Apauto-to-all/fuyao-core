@@ -16,7 +16,6 @@
 //! - `retry`: LLM 重试事件（重试前发，前端据此渲染「N 秒后重试」提示）
 //! - `child_session`: 子任务 session 生命周期（子代理 / 后台任务派生时发出）
 //! - `control`: 控制命令消息（消费时刻回显：引擎先发出本事件、后执行命令本体）
-//! - `files_restored`: 文件回退结果（回退联动恢复文件后发出，恢复 / 删除双清单）
 //!
 //! `ControlMessage` 同时也是 guide / pending 双队列的条目载荷：队列中的条目
 //! 在消费时机以 `control` 事件回显，此后命令本体才被执行。
@@ -27,7 +26,6 @@ mod chunk;
 mod compression;
 mod control;
 mod error;
-mod files_restored;
 mod interrupt;
 mod notice;
 mod retry;
@@ -48,7 +46,6 @@ pub use compression::{
 };
 pub use control::{ControlMessage, ControlPayload};
 pub use error::{ErrorMessage, ErrorPayload};
-pub use files_restored::{FilesRestoredMessage, FilesRestoredPayload};
 pub use interrupt::{InterruptMessage, InterruptPayload};
 pub use notice::{NoticeLevel, PluginNoticeMessage, PluginNoticePayload};
 pub use retry::{RetryMessage, RetryPayload};
@@ -90,9 +87,6 @@ pub enum OutputEvent {
     /// 子任务 session 生命周期（子代理 / 后台任务派生时发，前端据此追踪 child_session_id
     /// 并把后续 session_id == child_session_id 的事件归到此任务的渲染区）
     ChildSession(ChildSessionMessage),
-    /// 文件回退结果（回退联动恢复文件后发，前端据此展示恢复 / 删除清单；
-    /// 纯实时事件，不进对话历史）
-    FilesRestored(FilesRestoredMessage),
 }
 
 impl OutputEvent {
@@ -115,7 +109,6 @@ impl OutputEvent {
             OutputEvent::Title(m) => &mut m.base,
             OutputEvent::Retry(m) => &mut m.base,
             OutputEvent::ChildSession(m) => &mut m.base,
-            OutputEvent::FilesRestored(m) => &mut m.base,
         }
     }
 }
@@ -256,21 +249,5 @@ mod tests {
             },
         });
         assert!(matches!(event, OutputEvent::Retry(_)));
-    }
-
-    #[test]
-    fn files_restored_variant() {
-        let event = OutputEvent::FilesRestored(FilesRestoredMessage {
-            base: EventBase::default(),
-            payload: FilesRestoredPayload {
-                restored: vec!["src/main.rs".into()],
-                deleted: vec!["新 目录/新建 文件.txt".into()],
-            },
-        });
-        assert!(matches!(event, OutputEvent::FilesRestored(_)));
-        // base_mut 多态访问器可触达（session_id 全程标签的落点）
-        let mut event = event;
-        event.base_mut().session_id = Some("sess-1".into());
-        assert!(matches!(event, OutputEvent::FilesRestored(_)));
     }
 }

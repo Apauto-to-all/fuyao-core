@@ -153,10 +153,10 @@ pub async fn start(params: EngineParams) -> Result<FuyaoApp, SetupError> {
 
     tracing::info!("引擎启动完成");
 
-    // 8. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store 与快照器，
-    //    事件出口接 app 级单一出口）+ 选择支持门面
+    // 8. 装配产物：运行时交互门面 + 会话管理门面（共享同一份 store 与快照器）
+    //    + 选择支持门面
     let app = App::new(engine, mcp_manager, log_guard);
-    let sessions = SessionManager::new(store, snapshot, app.event_sink());
+    let sessions = SessionManager::new(store, snapshot);
     Ok(FuyaoApp {
         app,
         sessions,

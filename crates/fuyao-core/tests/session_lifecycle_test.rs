@@ -254,7 +254,6 @@ async fn child_session_has_independent_channel_from_parent() {
                 OutputEvent::Title(m) => m.base.session_id.as_deref(),
                 OutputEvent::Retry(m) => m.base.session_id.as_deref(),
                 OutputEvent::ChildSession(m) => m.base.session_id.as_deref(),
-                OutputEvent::FilesRestored(m) => m.base.session_id.as_deref(),
             }
             .unwrap_or("");
             assert_eq!(
