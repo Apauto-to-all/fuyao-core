@@ -51,10 +51,10 @@ mod tests {
     #[test]
     fn option_版_反斜杠统一为正斜杠() {
         // Windows 反斜杠路径 → 统一为正斜杠（跨平台形态一致）
-        let ws = Some(PathBuf::from(r"C:\Users\TF\proj"));
+        let ws = Some(PathBuf::from(r"C:\Users\alice\proj"));
         assert_eq!(
             normalize_workspace(&ws).as_deref(),
-            Some("C:/Users/TF/proj")
+            Some("C:/Users/alice/proj")
         );
     }
 
@@ -73,7 +73,7 @@ mod tests {
     #[test]
     fn str_版与_option_版结果一致() {
         // 同一路径，&str 入参与 Option<PathBuf> 入参归一结果必须一致
-        let path = r"C:\Users\TF\proj";
+        let path = r"C:\Users\alice\proj";
         let via_opt = normalize_workspace(&Some(PathBuf::from(path)));
         let via_str = normalize_workspace_str(path);
         assert_eq!(via_str, via_opt.unwrap_or_default());
